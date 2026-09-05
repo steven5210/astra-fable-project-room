@@ -14,11 +14,17 @@ INSTRUCTIONS = (
     "Open the existing project/feature room; load status/history. Submit once with a stable request_id; wait on its job_id "
     "in <=45-second calls. Resolve each finding before exact-revision handoff. Use existing user authorization; "
     "bring meaningful product tradeoffs to the user. Never replay uncertain jobs. "
-    "Scope changes return to Astra; optional enhancements go to backlog. The project-room skill supplies the workflow."
+    "Scope changes return to Astra. Encourage useful enhancements, track their proposal and filed issue link, "
+    "and surface their benefit and tradeoff for the user's opinion and scope approval before implementation. "
+    "The project-room skill supplies the workflow."
 )
 
 
 def error_response(identifier, code, message):
+    if identifier is not None and (not isinstance(identifier, (str, int, float))
+                                   or isinstance(identifier, bool)
+                                   or (isinstance(identifier, float) and not math.isfinite(identifier))):
+        identifier = None
     return {"jsonrpc": "2.0", "id": identifier, "error": {"code": code, "message": message}}
 
 

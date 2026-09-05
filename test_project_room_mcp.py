@@ -30,8 +30,12 @@ class ProjectRoomMcpTests(ProjectFixture):
             server.stderr.close()
         super().tearDown()
 
-    def start_server(self):
-        server = subprocess.Popen([sys.executable, str(ROOT / "project_room_mcp.py")], stdin=subprocess.PIPE,
+    def start_server(self, bootstrap=None):
+        command = [sys.executable]
+        if bootstrap is not None:
+            command.extend(["-c", bootstrap])
+        command.append(str(ROOT / "project_room_mcp.py"))
+        server = subprocess.Popen(command, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env={**os.environ, "PROJECT_ROOM_HOME": str(self.home), "PYTHONDONTWRITEBYTECODE": "1"})
         self.servers.append(server)
@@ -106,6 +110,33 @@ class ProjectRoomMcpTests(ProjectFixture):
                 self.assertEqual(self.raw(data)["error"]["code"], code)
                 self.assertEqual(self.request("ping", identifier="still-alive")["result"], {})
 
+    def test_malformed_envelopes_return_null_for_invalid_ids_and_preserve_valid_ids(self):
+        for identifier in ({"nested": "id"}, ["id"], True, False):
+            for envelope in ({"jsonrpc": "invalid-version", "method": "ping"},
+                             {"jsonrpc": "2.0", "method": 17}):
+                with self.subTest(identifier=identifier, envelope=envelope):
+                    response = self.raw(json.dumps({**envelope, "id": identifier}).encode() + b"\n")
+                    self.assertEqual(response["error"]["code"], -32600)
+                    self.assertIsNone(response["id"])
+        for identifier in ("valid-id", 7, 1.5, None):
+            with self.subTest(identifier=identifier):
+                response = self.raw(json.dumps({"jsonrpc": "invalid-version", "method": "ping", "id": identifier}).encode() + b"\n")
+                self.assertEqual(response["error"]["code"], -32600)
+                self.assertEqual(response["id"], identifier)
+        # Overflowing JSON is already rejected by the parser. Verify the shared
+        # error-response boundary also normalizes nonfinite direct-call IDs.
+        from project_room_mcp import error_response
+        for identifier in (float("inf"), float("-inf"), float("nan")):
+            self.assertIsNone(error_response(identifier, -32600, "Invalid request")["id"])
+        self.assertEqual(self.request("ping", identifier="after-invalid-ids")["result"], {})
+
+    def test_nested_id_in_malformed_envelope_never_escapes_or_kills_server(self):
+        data = b'{"jsonrpc":"invalid-version","method":"ping","id":' + b"[" * 1500 + b"0" + b"]" * 1500 + b"}\n"
+        response = self.raw(data)
+        self.assertIn(response["error"]["code"], (-32700, -32600))
+        self.assertIsNone(response["id"])
+        self.assertEqual(self.request("ping", identifier="after-nested-id")["result"], {})
+
     def test_invalid_tool_arguments_fail_without_mutating_registry_or_starting_model(self):
         cases = [("room_open", {"project_path": str(self.project), "feature": "Unsafe extra", "unexpected": True}),
                  ("room_spec_put", {"room_id": self.room_id, "revision": True, "content": "Bad revision"}),
@@ -135,10 +166,32 @@ class ProjectRoomMcpTests(ProjectFixture):
         self.assertEqual(self.raw(data)["error"]["code"], -32600)
         self.assertEqual(self.request("ping", identifier=9)["id"], 9)
 
-    def test_excessive_json_nesting_returns_parse_error_and_server_survives(self):
+    def test_nested_json_is_rejected_and_server_survives(self):
         data = b"[" * 1500 + b"0" + b"]" * 1500 + b"\n"
-        self.assertEqual(self.raw(data)["error"]["code"], -32700)
+        # Decoder nesting limits differ across Python versions. This is valid
+        # JSON: if decoded, its array envelope is invalid JSON-RPC (-32600);
+        # if the decoder hits its limit, it is a parse error (-32700).
+        self.assertIn(self.raw(data)["error"]["code"], (-32700, -32600))
         self.assertEqual(self.request("ping", identifier=10)["id"], 10)
+
+    def test_decoder_recursion_error_returns_parse_error_and_server_survives(self):
+        # Exercise the decoder-error recovery independently of the interpreter's
+        # native nesting threshold. Removing the runtime RecursionError handler
+        # makes this real MCP child exit and this test fail.
+        bootstrap = '''import json, runpy, sys
+original_loads = json.loads
+def fixture_loads(value, *args, **kwargs):
+    if value == b'{"jsonrpc":"2.0","id":"decoder-depth-fixture","method":"ping"}\\n':
+        raise RecursionError("fixture decoder nesting limit")
+    return original_loads(value, *args, **kwargs)
+json.loads = fixture_loads
+runpy.run_path(sys.argv[1], run_name="__main__")
+'''
+        server = self.start_server(bootstrap=bootstrap)
+        response = self.raw(b'{"jsonrpc":"2.0","id":"decoder-depth-fixture","method":"ping"}\n', server)
+        self.assertEqual(response["error"]["code"], -32700)
+        self.assertIsNone(response["id"])
+        self.assertEqual(self.request("ping", identifier="after-decoder-error", server=server)["result"], {})
 
     def test_overflowing_json_number_cannot_crash_response_serialization(self):
         response = self.raw(b'{"jsonrpc":"2.0","id":1e999,"method":"ping"}\n')
