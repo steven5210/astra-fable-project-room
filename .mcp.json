@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "project-room": {
+      "command": "python3",
+      "args": [
+        "./project_room_mcp.py"
+      ],
+      "cwd": "."
+    }
+  }
+}

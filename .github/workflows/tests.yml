@@ -22,4 +22,4 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run tests with fake model and MCP backends
-        run: python -m unittest -v test_room test_qwen_guard
+        run: python -m unittest discover -v

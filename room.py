@@ -110,6 +110,10 @@ def connect(room, create=False):
             id INTEGER PRIMARY KEY AUTOINCREMENT, turn_id INTEGER NOT NULL REFERENCES turns(id),
             created_at TEXT NOT NULL, note BLOB NOT NULL, original_turn_json TEXT NOT NULL,
             evidence_json TEXT NOT NULL, return_code_basis TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS nondelivery_recoveries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, turn_id INTEGER NOT NULL REFERENCES turns(id),
+            created_at TEXT NOT NULL, note BLOB NOT NULL, original_turn_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL)""")
         db.commit()
     return db
 
@@ -475,7 +479,7 @@ def ask(args, room):
         unresolved = db.execute("SELECT request_id,status FROM turns WHERE status IN ('pending','uncertain','failed') ORDER BY id DESC LIMIT 1").fetchone()
         if unresolved:
             raise RoomError(f"Room is blocked by {unresolved['status']} request {unresolved['request_id']}; inspect attempt files and reconcile externally. This pilot never replays an unverified turn")
-        if db.execute("SELECT COUNT(*) FROM turns").fetchone()[0] >= MAX_REVIEW_TURNS:
+        if db.execute("SELECT COUNT(*) FROM turns WHERE status != 'not_sent'").fetchone()[0] >= MAX_REVIEW_TURNS:
             raise RoomError(f"The {MAX_REVIEW_TURNS}-turn review limit is reached; bring unresolved decisions to the user")
         get_spec(db, room, args.revision, current=True)
         validate_subscription_environment()
@@ -613,6 +617,60 @@ def reconcile(args, room):
         return result
 
 
+def recover_not_sent(args, room):
+    """Audit only Claude's exact local not-logged-in zero-usage result; never retry."""
+    note = read_text_bytes(args.note_file)
+    if not note.strip():
+        raise RoomError("Recovery requires a diagnosis note")
+    with lock_room(room), contextlib.closing(connect(room)) as db:
+        row = db.execute("SELECT * FROM turns WHERE request_id=?", (args.request_id,)).fetchone()
+        if row is None or row["status"] != "failed" or row["return_code"] != 1:
+            raise RoomError("Only an exact failed local authentication preflight can be marked not sent")
+        raw = Path(row["stdout_path"]).read_bytes()
+        if not row["stdout_sha256"] or sha(raw) != row["stdout_sha256"]:
+            raise RoomError("Saved authentication evidence was modified")
+        value = json.loads(raw)
+        if canonical(value) != row["result_json"]:
+            raise RoomError("Saved authentication result differs from the original")
+        usage = value.get("usage") if isinstance(value, dict) else None
+        zero_fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        if (not isinstance(usage, dict) or any(type(usage.get(key)) is not int or usage[key] != 0 for key in zero_fields)
+                or value.get("session_id") != row["session_id"] or value.get("session_id") != meta(db, "session_id")
+                or value.get("type") != "result" or value.get("is_error") is not True
+                or value.get("terminal_reason") != "api_error" or value.get("modelUsage") != {}
+                or value.get("result") != "Not logged in · Please run /login"
+                or type(value.get("duration_api_ms")) is not int or value["duration_api_ms"] != 0
+                or type(value.get("total_cost_usd")) not in (int, float) or value["total_cost_usd"] != 0
+                or value.get("structured_output") is not None):
+            raise RoomError("Evidence does not prove the supported local authentication non-delivery; keep the turn blocked")
+        evidence = {"kind": "local_authentication_preflight", "stdout_sha256": sha(raw),
+                    "return_code": 1, "model_usage": {}, "token_usage": {key: usage[key] for key in zero_fields},
+                    "duration_api_ms": 0, "model_resubmitted": False}
+        session_path = getattr(args, "session_transcript", None)
+        if session_path:
+            path = Path(session_path)
+            if not path.is_absolute() or path.name != row["session_id"] + ".jsonl":
+                raise RoomError("Recovery session evidence must name the exact saved UUID")
+            raw_session = path.read_bytes()
+            try:
+                events = [json.loads(line) for line in raw_session.splitlines()]
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise RoomError("Local recovery session contains malformed JSON") from exc
+            matching = [event for event in events if isinstance(event, dict) and event.get("sessionId") == row["session_id"]]
+            if not matching or any("cwd" in event and (not isinstance(event["cwd"], str) or Path(event["cwd"]).resolve() != room.resolve()) for event in matching):
+                raise RoomError("Local recovery session metadata does not match this room")
+            evidence.update(resume_local_session=True, session_transcript=str(path), session_transcript_sha256=sha(raw_session))
+            # The CLI may have persisted the user/error locally before sign-in failed.
+            # Resume that exact file; this is not evidence of a delivered model turn.
+            set_meta(db, "session_started", "1")
+        db.execute("INSERT INTO nondelivery_recoveries(turn_id,created_at,note,original_turn_json,evidence_json) VALUES(?,?,?,?,?)",
+                   (row["id"], now(), note, canonical(dict(row)), canonical(evidence)))
+        db.execute("UPDATE turns SET status='not_sent' WHERE id=?", (row["id"],))
+        db.commit()
+        return {"request_id": args.request_id, "status": "not_sent", "evidence": evidence,
+                "next_step": "After fixing sign-in/configuration, submit a new request ID in this same room. Original evidence is preserved."}
+
+
 def status_report(room):
     with contextlib.closing(connect(room)) as db:
         spec = db.execute("SELECT * FROM specs ORDER BY revision DESC LIMIT 1").fetchone()
@@ -621,8 +679,8 @@ def status_report(room):
         if spec:
             get_spec(db, room, revision)
         astra = db.execute("SELECT id FROM messages WHERE sender='astra' AND kind='approval' AND revision=? AND spec_sha256=? ORDER BY id DESC LIMIT 1", (revision, digest)).fetchone()
-        latest = db.execute("SELECT * FROM turns WHERE revision=? AND spec_sha256=? ORDER BY id DESC LIMIT 1", (revision, digest)).fetchone()
-        blockers = [dict(row) for row in db.execute("SELECT request_id,status,error FROM turns WHERE status != 'completed' ORDER BY id")]
+        latest = db.execute("SELECT * FROM turns WHERE revision=? AND spec_sha256=? AND status != 'not_sent' ORDER BY id DESC LIMIT 1", (revision, digest)).fetchone()
+        blockers = [dict(row) for row in db.execute("SELECT request_id,status,error FROM turns WHERE status NOT IN ('completed','not_sent') ORDER BY id")]
         result = json.loads(latest["result_json"]) if latest and latest["result_json"] else None
         review = result.get("structured_output") if isinstance(result, dict) else None
         fable_accepted = bool(latest and latest["status"] == "completed" and review and review["decision"] == "accept")
@@ -637,6 +695,7 @@ def status_report(room):
             "review_turn_limit": MAX_REVIEW_TURNS,
             "turns": [dict(row) for row in db.execute("SELECT request_id,status,revision,spec_sha256,session_id,actual_models_json,primary_model,auxiliary_models_json,identity_evidence_json,return_code,started_at,finished_at,error FROM turns ORDER BY id")],
             "reconciliations": [dict(row) for row in db.execute("SELECT id,turn_id,created_at,return_code_basis FROM reconciliations ORDER BY id")],
+            "nondelivery_recoveries": [dict(row) for row in db.execute("SELECT id,turn_id,created_at,evidence_json FROM nondelivery_recoveries ORDER BY id")],
         }
 
 
@@ -677,6 +736,10 @@ def transcript(args, room):
                           f"Return-code evidence: {audit['return_code_basis']}", "",
                           bytes(audit["note"]).decode("utf-8"), "", "```json",
                           json.dumps(json.loads(audit["evidence_json"]), indent=2), "```", ""])
+        for audit in db.execute("SELECT * FROM nondelivery_recoveries ORDER BY id"):
+            original = json.loads(audit["original_turn_json"])
+            lines.extend([f"## Non-delivery diagnosis · {original['request_id']}", "", audit["created_at"], "",
+                          bytes(audit["note"]).decode("utf-8"), "", "Original failed authentication response and raw output are preserved; no model was resubmitted by recovery.", ""])
         output = "\n".join(lines)
         if args.file:
             destination = Path(args.file).resolve()
@@ -725,6 +788,10 @@ def parser():
     reconciliation.add_argument("--request-id", required=True)
     reconciliation.add_argument("--session-transcript", required=True)
     reconciliation.add_argument("--note-file", required=True)
+    nondelivery = commands.add_parser("recover-not-sent", help="audit an exact zero-usage local login failure; no model call")
+    nondelivery.add_argument("--request-id", required=True)
+    nondelivery.add_argument("--note-file", required=True)
+    nondelivery.add_argument("--session-transcript", help="exact saved UUID file if the CLI persisted its local auth error")
     commands.add_parser("status")
     export = commands.add_parser("transcript")
     export.add_argument("--file")
@@ -745,12 +812,14 @@ def main(argv=None):
             result = ask(args, room)
         elif args.command == "reconcile":
             result = reconcile(args, room)
+        elif args.command == "recover-not-sent":
+            result = recover_not_sent(args, room)
         elif args.command == "status":
             result = status_report(room)
         else:
             result = transcript(args, room)
         print(result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False))
-        return 0 if not isinstance(result, dict) or result.get("status", "completed") == "completed" else 2
+        return 0 if not isinstance(result, dict) or result.get("status", "completed") in ("completed", "not_sent") else 2
     except (RoomError, OSError, sqlite3.Error) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

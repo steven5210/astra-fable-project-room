@@ -17,6 +17,9 @@ envs/
 .local/
 rooms/
 room-data/
+project-room-data/
+worktrees/
+jobs/
 attempts/
 transcripts/
 receipts/
@@ -43,6 +46,7 @@ astra-approval*.md
 local-config*.json
 local-mcp*.json
 *.local.json
+project-room-config.json
 mcp-review.json
 credentials*.json
 token*.json

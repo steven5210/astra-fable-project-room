@@ -1,0 +1,32 @@
+{
+  "name": "astra-fable-project-room",
+  "version": "0.2.0",
+  "description": "A persistent room where Astra shapes features and Fable reviews and implements them.",
+  "author": {
+    "name": "steven5210"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Project Room",
+    "shortDescription": "Astra plans. Fable builds. Both review.",
+    "longDescription": "Turn a feature request into a shared specification, reviewed implementation, and durable decision history. Astra handles product planning and final acceptance; Fable handles engineering review and delegate orchestration through your local Claude Code session.",
+    "developerName": "steven5210",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Project Room for this feature.",
+      "Resume our Project Room and show the next decision."
+    ]
+  },
+  "mcpServers": "./.mcp.json",
+  "repository": "https://github.com/steven5210/astra-fable-project-room",
+  "keywords": [
+    "project-room",
+    "specifications",
+    "code-review",
+    "orchestration"
+  ]
+}

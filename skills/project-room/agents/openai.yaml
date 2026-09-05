@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Room"
+  short_description: "Astra and Fable plan, review, and deliver features"
+  default_prompt: "Use $project-room for this feature: describe the outcome and carry it through the authorized workflow."

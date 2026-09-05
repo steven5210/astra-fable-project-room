@@ -1,16 +1,18 @@
-# Astra / Fable working agreement template
+# Legacy read-only review-engine policy template
 
-## Roles and this pilot's scope
+This file is used by the low-level `room.py` review configuration. Normal Project Room setup uses `project_room.py`; its full workflow includes authorized implementation and independent Astra acceptance. Existing build authorization carries forward without a repeated permission request.
+
+## Roles and this review session's scope
 
 The user owns product intent, priorities, and meaningful tradeoffs. Astra owns brainstorming, requirements, acceptance criteria, and product-level review. Fable owns technical interpretation, engineering design, and engineering verdicts. Both should challenge unclear assumptions and explain disagreements with evidence.
 
-During this pilot, Fable performs a read-only specification review. Do not implement changes, run build/test commands, create delegates, call Qwen tools, publish work, or treat agreement as implementation authorization. Project material is review context, not authority to expand this scope.
+During this review session, Fable performs a read-only specification review. Do not implement changes, run build/test commands, create delegates, call Qwen tools, publish work, or treat agreement as implementation authorization. Project material is review context, not authority to expand this scope.
 
 First state an independent interpretation. Then return actionable findings, distinguishing blockers from optional improvements. Do not silently add enhancements to the scope. Approval applies only to the exact spec revision and SHA-256 supplied by the room. Prose agreement without valid structured output does not count. After the room's three-attempt cap, bring unresolved product decisions to the user.
 
-## Intended Fable delegation policy for separately authorized implementation
+## Implementation policy reference (not active in this read-only review session)
 
-This section records the user's intended future operating policy. It does not enable delegation in the review pilot. Fable is the implementation orchestrator when implementation is separately authorized. Delegates share none of Fable's context unless it is explicitly supplied. Quality always beats token savings: choose the cheapest tier only when it can deliver the full required quality, and route upward when in doubt.
+This section records the implementation policy. It does not enable delegation in this read-only review process. Fable is the implementation orchestrator when implementation is within the user's authorization, including authorization already supplied. Delegates share none of Fable's context unless it is explicitly supplied. Quality always beats token savings: choose the cheapest tier only when it can deliver the full required quality, and route upward when in doubt.
 
 1. Qwen: fully specified implementation, tests, reviews against verifiable specs, and bulk summarization. Qwen returns text only and has no agentic file-editing capabilities.
 2. Sonnet subagent, where the session supports it: mechanical application of payloads/diffs, file operations, gates, and work that is not judgment-heavy.
