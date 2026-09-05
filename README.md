@@ -17,7 +17,7 @@ The bundled skill supplies the roles and handoff workflow. You do not need to pa
 | Fable | Technical interpretation, engineering design, implementation planning, delegate orchestration, and engineering verdicts. |
 | Qwen / Sonnet / Opus | Bounded delegated work, with output checked by Fable. Availability depends on your setup. |
 
-Astra and Fable review the same immutable spec revision and digest. Findings receive explicit dispositions and reasons; optional enhancements go to a backlog. Consensus permits handoff when implementation is within your request. Fable then works against executable gates, and Astra records acceptance only after inspecting the delivered behavior and evidence. See [the workflow](docs/workflow.md).
+Astra and Fable review the same immutable spec revision and digest. Findings receive explicit dispositions and reasons. Both agents actively suggest useful enhancements; Astra brings you the benefit, tradeoff, and a project GitHub issue link for your opinion and approval. Proposals remain tracked in the room, and filing is reported as pending if no tracker is available. An enhancement enters implementation only after you approve its scope and the revised spec is agreed. Consensus permits handoff when implementation is within your request. Fable then works against executable gates, and Astra records acceptance only after inspecting the delivered behavior and evidence. See [the workflow](docs/workflow.md).
 
 ## Install and configure
 
@@ -63,7 +63,7 @@ Existing app conversations retain their own history. Rooms start dedicated Claud
 
 ## CLI fallback
 
-The controller exposes the same 17 operations as MCP. From the plugin directory:
+The controller exposes the same 18 operations as MCP. From the plugin directory:
 
 ```sh
 python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'
@@ -96,7 +96,7 @@ Tool discovery, health, and successful inference are different checks. Installat
 
 ## Reliability and verification limits
 
-The controller preserves exact spec binding, request IDs, session identity evidence, and durable outcomes. It prevents accidental duplicate model submission and blocks uncertain delivery. Do not delete state, reuse a request ID with changed content, or create a replacement room to evade a blocked attempt. The review budget bounds agent debate; unresolved product decisions return to you. See [recovery](docs/recovery.md).
+The controller preserves exact spec binding, request IDs, session identity evidence, and durable outcomes. It prevents accidental duplicate model submission and blocks uncertain delivery. Do not delete state, reuse a request ID with changed content, or create a replacement room to evade a blocked attempt. Each review round allows three Fable reviews. If further debate is needed, Astra brings you a focused product decision; recording your answer permits the next bounded round while retaining every prior attempt. Agreement can proceed directly to handoff. See [continuation and recovery](docs/recovery.md).
 
 The bundled skill drives Astra's reasoning and independent product review. Automated gates prove their own checks, not every aspect of product quality. Fable's delegate choices and engineering judgments must remain reviewable in its result. The package does not certify model quality, install local inference, or assume every Claude session supports subagents.
 

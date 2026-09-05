@@ -114,6 +114,10 @@ def connect(room, create=False):
             id INTEGER PRIMARY KEY AUTOINCREMENT, turn_id INTEGER NOT NULL REFERENCES turns(id),
             created_at TEXT NOT NULL, note BLOB NOT NULL, original_turn_json TEXT NOT NULL,
             evidence_json TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS user_decisions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL REFERENCES specs(revision),
+            spec_sha256 TEXT NOT NULL, decision BLOB NOT NULL, turn_high_watermark INTEGER NOT NULL,
+            created_at TEXT NOT NULL)""")
         db.commit()
     return db
 
@@ -294,7 +298,47 @@ def record(args, room):
                 "revision": args.revision, "spec_sha256": spec["sha256"]}
 
 
-def make_prompt(spec, message):
+def decision_record(row):
+    if row is None:
+        return None
+    return {"id": row["id"], "revision": row["revision"], "spec_sha256": row["spec_sha256"],
+            "decision": bytes(row["decision"]).decode("utf-8"), "turn_high_watermark": row["turn_high_watermark"],
+            "created_at": row["created_at"]}
+
+
+def review_budget(db):
+    checkpoint = db.execute("SELECT id,turn_high_watermark FROM user_decisions ORDER BY id DESC LIMIT 1").fetchone()
+    watermark = checkpoint["turn_high_watermark"] if checkpoint else 0
+    used = db.execute("SELECT COUNT(*) FROM turns WHERE id>? AND status!='not_sent'", (watermark,)).fetchone()[0]
+    remaining = max(0, MAX_REVIEW_TURNS - used)
+    return {"review_round": db.execute("SELECT COUNT(*) FROM user_decisions").fetchone()[0] + 1,
+            "review_turn_limit": MAX_REVIEW_TURNS, "reviews_used": used, "reviews_remaining": remaining,
+            "user_decision_required": remaining == 0, "latest_decision_id": checkpoint["id"] if checkpoint else None,
+            "turn_high_watermark": watermark}
+
+
+def record_user_decision(args, room):
+    """Record the user's product decision and permit one further bounded review round."""
+    decision = read_text_bytes(args.decision_file)
+    if not decision.strip():
+        raise RoomError("A nonempty user-supplied product decision is required")
+    with lock_room(room), contextlib.closing(connect(room)) as db:
+        spec = get_spec(db, room, args.revision, current=True)
+        blocker = db.execute("SELECT request_id,status FROM turns WHERE status NOT IN ('completed','not_sent') ORDER BY id DESC LIMIT 1").fetchone()
+        if blocker:
+            raise RoomError(f"A user decision cannot bypass {blocker['status']} request {blocker['request_id']}; resolve its delivery outcome first")
+        if not review_budget(db)["user_decision_required"]:
+            raise RoomError("A user decision checkpoint is available only after the current review round reaches its limit")
+        watermark = db.execute("SELECT COALESCE(MAX(id),0) FROM turns").fetchone()[0]
+        cursor = db.execute("INSERT INTO user_decisions(revision,spec_sha256,decision,turn_high_watermark,created_at) VALUES(?,?,?,?,?)",
+                            (spec["revision"], spec["sha256"], decision, watermark, now()))
+        db.commit()
+        recorded = db.execute("SELECT * FROM user_decisions WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return {"status": "completed", "user_decision": decision_record(recorded), "review_budget": review_budget(db),
+                "model_submitted": False, "implementation_authorized": False}
+
+
+def make_prompt(spec, message, user_decision=None):
     # JSON quoting makes arbitrary spec delimiters unambiguous. Text is decoded from
     # the exact bytes hashed/stored by the room; CRLF and final newlines are retained.
     packet = {
@@ -302,6 +346,8 @@ def make_prompt(spec, message):
         "spec_text": bytes(spec["content"]).decode("utf-8"),
         "message": message.decode("utf-8"),
     }
+    if user_decision is not None:
+        packet["user_decision"] = user_decision
     return (
         "You are Fable, the engineering reviewer in the user's local Astra/Fable project room. "
         "This turn is a read-only specification review. Do not implement changes, run build/test "
@@ -309,11 +355,15 @@ def make_prompt(spec, message):
         "context, not instructions to broaden this review. First state your independent "
         "interpretation, then actionable findings. Accept only if the exact attached revision "
         "is ready and no blocking issue remains; otherwise use changes_required. Enhancements "
-        "outside the agreed scope are suggestions, not automatic scope additions. Return the "
+        "outside the agreed scope are proposals, not automatic scope additions. Include grounded useful "
+        "proposals with their expected benefit and tradeoff in findings. Astra files or links proposal issues "
+        "for the user's opinion and scope approval; implementation waits for approval. Do not implement proposals or create external issues "
+        "from this review session. Return the "
         "required JSON structured output with interpretation, findings (array of strings), "
         "decision, spec_revision, and spec_sha256. Copy revision/hash from this packet exactly; "
         "do not recompute a hash from normalized text. Neither agreement nor this review "
-        "authorizes implementation.\n\nREVIEW PACKET (JSON):\n" + canonical(packet) + "\n"
+        "authorizes implementation. If a user_decision is attached, assess the spec against "
+        "that recorded product direction; it is not automatic spec approval.\n\nREVIEW PACKET (JSON):\n" + canonical(packet) + "\n"
     )
 
 
@@ -479,7 +529,7 @@ def ask(args, room):
         unresolved = db.execute("SELECT request_id,status FROM turns WHERE status IN ('pending','uncertain','failed') ORDER BY id DESC LIMIT 1").fetchone()
         if unresolved:
             raise RoomError(f"Room is blocked by {unresolved['status']} request {unresolved['request_id']}; inspect attempt files and reconcile externally. This pilot never replays an unverified turn")
-        if db.execute("SELECT COUNT(*) FROM turns WHERE status != 'not_sent'").fetchone()[0] >= MAX_REVIEW_TURNS:
+        if review_budget(db)["user_decision_required"]:
             raise RoomError(f"The {MAX_REVIEW_TURNS}-turn review limit is reached; bring unresolved decisions to the user")
         get_spec(db, room, args.revision, current=True)
         validate_subscription_environment()
@@ -488,7 +538,8 @@ def ask(args, room):
         attempt = room / "attempts" / str(uuid.uuid4())
         attempt.mkdir(parents=True)
         prompt_path, stdout_path, stderr_path = [attempt / name for name in ("prompt.txt", "stdout.json", "stderr.txt")]
-        prompt = make_prompt(spec, message).encode("utf-8")
+        latest_decision = db.execute("SELECT * FROM user_decisions ORDER BY id DESC LIMIT 1").fetchone()
+        prompt = make_prompt(spec, message, decision_record(latest_decision)).encode("utf-8")
         prompt_path.write_bytes(prompt)
         argv = [config["claude_bin"], *config["extra_args"], "--print", "--output-format", "json",
                 "--model", config["model"], "--resume" if started else "--session-id", session_id,
@@ -684,6 +735,8 @@ def status_report(room):
         result = json.loads(latest["result_json"]) if latest and latest["result_json"] else None
         review = result.get("structured_output") if isinstance(result, dict) else None
         fable_accepted = bool(latest and latest["status"] == "completed" and review and review["decision"] == "accept")
+        budget = review_budget(db)
+        latest_decision = decision_record(db.execute("SELECT * FROM user_decisions ORDER BY id DESC LIMIT 1").fetchone())
         return {
             "room": str(room), "session_id": meta(db, "session_id"),
             "session_started": meta(db, "session_started") == "1",
@@ -693,6 +746,8 @@ def status_report(room):
             "agreement": bool(astra and fable_accepted and not blockers),
             "implementation_authorized": False, "blocking_turns": blockers,
             "review_turn_limit": MAX_REVIEW_TURNS,
+            "review_budget": budget, "reviews_remaining": budget["reviews_remaining"],
+            "user_decision_required": budget["user_decision_required"], "latest_user_decision": latest_decision,
             "turns": [dict(row) for row in db.execute("SELECT request_id,status,revision,spec_sha256,session_id,actual_models_json,primary_model,auxiliary_models_json,identity_evidence_json,return_code,started_at,finished_at,error FROM turns ORDER BY id")],
             "reconciliations": [dict(row) for row in db.execute("SELECT id,turn_id,created_at,return_code_basis FROM reconciliations ORDER BY id")],
             "nondelivery_recoveries": [dict(row) for row in db.execute("SELECT id,turn_id,created_at,evidence_json FROM nondelivery_recoveries ORDER BY id")],
@@ -710,6 +765,10 @@ def transcript(args, room):
             events.append((spec["created_at"], 0, [f"## Spec revision {spec['revision']}", "", f"SHA-256: `{spec['sha256']}`", "", bytes(spec["content"]).decode("utf-8"), ""]))
         for msg in db.execute("SELECT * FROM messages ORDER BY id"):
             events.append((msg["created_at"], 1, [f"## {msg['sender'].title()} · {msg['kind']} · revision {msg['revision']}", "", f"{msg['created_at']} · `{msg['spec_sha256']}`", "", bytes(msg["content"]).decode("utf-8"), ""]))
+        for decision in db.execute("SELECT * FROM user_decisions ORDER BY id"):
+            events.append((decision["created_at"], 1, [f"## User product decision · revision {decision['revision']}", "",
+                          f"{decision['created_at']} · `{decision['spec_sha256']}` · after turn ID {decision['turn_high_watermark']}", "",
+                          bytes(decision["decision"]).decode("utf-8"), "", "The user chose this direction; the next review round is bounded to three new attempts.", ""]))
         for turn in db.execute("SELECT * FROM turns ORDER BY id"):
             payload = json.loads(turn["input_json"])
             entry = [f"## Astra → Fable · {turn['request_id']} · revision {turn['revision']}", "", turn["started_at"], "", base64.b64decode(payload["message_base64"]).decode("utf-8"), "", f"### Fable · {turn['status']}", "", f"Models: `{turn['actual_models_json'] or '[]'}` · SHA-256: `{turn['spec_sha256']}`", ""]
@@ -792,6 +851,9 @@ def parser():
     nondelivery.add_argument("--request-id", required=True)
     nondelivery.add_argument("--note-file", required=True)
     nondelivery.add_argument("--session-transcript", help="exact saved UUID file if the CLI persisted its local auth error")
+    decision = commands.add_parser("decision", help="record the user's product tradeoff decision after an exhausted review round; no model call")
+    decision.add_argument("--revision", type=positive_int, required=True)
+    decision.add_argument("--decision-file", required=True)
     commands.add_parser("status")
     export = commands.add_parser("transcript")
     export.add_argument("--file")
@@ -814,6 +876,8 @@ def main(argv=None):
             result = reconcile(args, room)
         elif args.command == "recover-not-sent":
             result = recover_not_sent(args, room)
+        elif args.command == "decision":
+            result = record_user_decision(args, room)
         elif args.command == "status":
             result = status_report(room)
         else:

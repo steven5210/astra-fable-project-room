@@ -273,6 +273,7 @@ class Service:
             handoffs = [dict(r) for r in db.execute("SELECT * FROM handoffs WHERE room_id=?", (room_id,))]
         core = room.status_report(review)
         return {"room": entry, "review": core, "issues": issues, "jobs": jobs, "handoffs": handoffs,
+                "enhancements": self._enhancements(room_id),
                 "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues)
                 and not any(j["status"] in (*ACTIVE, "uncertain") for j in jobs)}
 
@@ -330,10 +331,75 @@ class Service:
                 self._event(room_id, "backlog", {"content": issue["content"], "rationale": rationale})
             return {"issue_id": issue_id, "disposition": disposition, "revision": revision}
 
-    def room_backlog_add(self, room_id, content, rationale):
+    def room_backlog_add(self, room_id, content, rationale, issue_url=None, proposal_id=None,
+                         user_decision=None, decision_rationale=None):
         self.entry(room_id)
-        self._event(room_id, "backlog", {"content": text_value(content, "content"), "rationale": text_value(rationale, "rationale")})
-        return {"recorded": True}
+        text_value(content, "content")
+        text_value(rationale, "rationale")
+        if issue_url is not None:
+            text_value(issue_url, "issue_url", 2048)
+            match = re.fullmatch(r"https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/([A-Za-z0-9_.-]+)/issues/[1-9][0-9]*", issue_url)
+            if not match or match.group(1) in (".", ".."):
+                raise room.RoomError("issue_url must be an HTTPS github.com/owner/repo/issues/positive-integer URL")
+        if proposal_id is not None and (not isinstance(proposal_id, str) or not re.fullmatch(r"[0-9a-f]{32}", proposal_id)):
+            raise room.RoomError("proposal_id must be the stable ID returned for an existing proposal")
+        if user_decision is not None and user_decision not in ("pending", "approved", "declined", "deferred"):
+            raise room.RoomError("user_decision must be pending, approved, declined, or deferred")
+        if decision_rationale is not None:
+            text_value(decision_rationale, "decision_rationale")
+            if user_decision is None:
+                raise room.RoomError("decision_rationale requires an explicit user_decision")
+        if user_decision in ("approved", "declined", "deferred") and decision_rationale is None:
+            raise room.RoomError("A nonpending user_decision requires actual user decision evidence in decision_rationale")
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")  # Serialize read/update so linked events cannot lose an intervening decision.
+            previous, previous_id = None, None
+            if proposal_id is not None:
+                for event in db.execute("SELECT id,content FROM events WHERE room_id=? AND kind='backlog' ORDER BY id DESC", (room_id,)):
+                    value = json.loads(event["content"])
+                    if isinstance(value, dict) and value.get("proposal_id") == proposal_id:
+                        previous, previous_id = value, event["id"]
+                        break
+                if previous is None:
+                    raise room.RoomError("Unknown enhancement proposal for this room")
+            else:
+                proposal_id = uuid.uuid4().hex
+            unchanged = previous is not None and previous["content"] == content and previous["rationale"] == rationale
+            decision = user_decision if user_decision is not None else previous["user_decision"] if unchanged else "pending"
+            evidence = decision_rationale if user_decision is not None else previous.get("decision_rationale") if unchanged else None
+            value = {"proposal_id": proposal_id, "previous_event_id": previous_id, "content": content, "rationale": rationale,
+                     "issue_url": issue_url if issue_url is not None else previous.get("issue_url") if previous else None,
+                     "user_decision": decision, "decision_rationale": evidence}
+            stamp = room.now()
+            event_id = db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,'backlog',?,?)",
+                                  (room_id, room.canonical(value), stamp)).lastrowid
+        return {"recorded": True, **value, "event_id": event_id, "recorded_at": stamp,
+                "needs_issue": value["issue_url"] is None, "needs_user_decision": decision == "pending"}
+
+    def _enhancements(self, room_id):
+        latest = {}
+        with self.db() as db:
+            for event in db.execute("SELECT id,content,created_at FROM events WHERE room_id=? AND kind='backlog' ORDER BY id", (room_id,)):
+                value = json.loads(event["content"])
+                if not isinstance(value, dict) or not value.get("proposal_id") or "user_decision" not in value:
+                    continue  # Legacy technical backlog entries never imply a user decision.
+                latest[value["proposal_id"]] = {**value, "event_id": event["id"], "recorded_at": event["created_at"],
+                                                 "needs_issue": value.get("issue_url") is None,
+                                                 "needs_user_decision": value["user_decision"] == "pending"}
+        return sorted(latest.values(), key=lambda value: value["event_id"])
+
+    def room_decision_record(self, room_id, revision, decision):
+        positive_revision(revision)
+        text_value(decision, "decision")
+        _, root, review = self.paths(room_id)
+        with room.lock_room(root / "control"):
+            self._guard_idle(room_id)
+            note = root / "inputs" / ("user-decision-" + uuid.uuid4().hex + ".md")
+            note.parent.mkdir(exist_ok=True)
+            note.write_text(decision, encoding="utf-8")
+            result = room.record_user_decision(SimpleNamespace(revision=revision, decision_file=str(note)), review)
+            self._event(room_id, "user_decision", {"revision": revision, "decision": decision, "checkpoint": result})
+            return result
 
     def room_history(self, room_id):
         entry, root, review = self.paths(room_id)
@@ -344,7 +410,8 @@ class Service:
         destination = root / "history.md"
         destination.write_text(history, encoding="utf-8")
         return {"room": entry, "review_history": history[-60000:], "truncated": len(history) > 60000,
-                "full_review_history_path": str(destination), "events": events[-200:]}
+                "full_review_history_path": str(destination), "events": events[-200:],
+                "enhancements": self._enhancements(room_id)}
 
     def _job_path(self, job_id):
         if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{32}", job_id):
@@ -401,7 +468,7 @@ class Service:
                 report = room.status_report(review_room)
                 if report["blocking_turns"]:
                     raise room.RoomError("A prior review has an unresolved outcome; inspect or use its narrow audited recovery")
-                if sum(turn["status"] != "not_sent" for turn in report["turns"]) >= report["review_turn_limit"]:
+                if report.get("user_decision_required", sum(turn["status"] != "not_sent" for turn in report["turns"]) >= report["review_turn_limit"]):
                     raise room.RoomError("Review exchange limit reached; bring unresolved decisions to the user")
                 room.validate_subscription_environment()
             if kind == "implementation":
@@ -687,7 +754,10 @@ TOOL_SCHEMAS = {
     "room_job_recover": ("After diagnosis, audit only an exact zero-usage local login failure as not sent. Preserves original failure; runs no model. Then use a new request_id in the same room after fixing setup. Cannot recover unknown delivery.", schema({"job_id": S, "diagnosis": S})),
     "room_history": ("Read room discussion, decisions, backlog, and implementation events. Contains no private model thinking.", schema(R)),
     "room_issue_dispose": ("Record a rationale for every Fable finding: address in a revision, reject with evidence, or defer optional enhancement to backlog.", schema({**R, "issue_id": S, "disposition": {"type": "string", "enum": ["addressed", "rejected", "deferred"]}, "rationale": S, "revision": I})),
-    "room_backlog_add": ("Record an optional enhancement without changing agreed implementation scope.", schema({**R, "content": S, "rationale": S})),
+    "room_backlog_add": ("Record or update an optional enhancement for the user's opinion, preserving its stable proposal_id and event history. issue_url records an issue Astra separately filed; this tool never publishes. New proposals and changed content/rationale default to pending. Any explicit approved/declined/deferred decision requires actual user decision evidence in decision_rationale, never Fable's suggestion or technical disposition. Approval here does not change the agreed implementation spec.", schema({**R, "content": S, "rationale": S, "issue_url": S, "proposal_id": S,
+                                "user_decision": {"type": "string", "enum": ["pending", "approved", "declined", "deferred"]},
+                                "decision_rationale": S}, ["room_id", "content", "rationale"])),
+    "room_decision_record": ("After the bounded review round is exhausted, record the user's actual decision on the unresolved product tradeoff to allow the next bounded round. Never invent a decision or use this to bypass unknown/failed delivery.", schema({**R, "revision": I, "decision": S})),
     "room_handoff": ("Prepare Fable implementation from exact agreement, resolved findings, original user authorization, and nonempty verification argv gates. Creates isolated git worktree.", schema({**R, "revision": I, "authorization": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}})),
     "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow fixed Qwen/Sonnet/Opus policy; Astra checks product outcome after evidence.", schema({**R, "handoff_id": S, "request_id": S})),
     "room_implementation_review": ("Record Astra's independent product-outcome verdict against the exact verified candidate. Engineering/delegate verdicts remain Fable's responsibility.", schema({**R, "handoff_id": S, "accepted": {"type": "boolean"}, "review": S})),

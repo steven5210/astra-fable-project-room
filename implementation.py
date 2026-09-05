@@ -50,6 +50,9 @@ Work only in the isolated worktree. Do not deploy, push, merge, change other che
 change git administrative data, or weaken security/model/Qwen policies. Do not commit;
 leave the candidate changes available for independent review and later integration.
 Do not modify handoff records, configuration, or evidence outside the worktree.
+Propose grounded useful enhancements in backlog with their expected benefit and
+tradeoff. Astra files or links proposal issues for the user's opinion and scope
+approval outside this delegate session; implementation waits for approval.
 """
 
 ROUTE_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
@@ -403,6 +406,12 @@ def run_implementation(handoff_path):
                   "this exact handoff separately authorizes implementation. Follow the fixed delegation policy "
                   "and leave the candidate for independently executed gates and Astra review. Return the "
                   "required structured report, with actual evidence and remaining gaps; no self-certification. "
+                  "remaining_gaps is only for unresolved agreed acceptance criteria or verification blockers. "
+                  "Keep nonblocking capability observations, optional-tool availability, evidence provenance, "
+                  "and expected workflow limits in review_findings. Never relabel an actual unmet requirement "
+                  "as nonblocking merely to obtain acceptance. Describe grounded useful enhancements in backlog "
+                  "with each proposal's benefit and tradeoff. Astra files or links proposal issues for the "
+                  "user's opinion and scope approval outside this session; implementation waits for approval. "
                   "If discoveries require a material scope change, stop and return outcome=scope_change with "
                   "a concrete scope_change explanation for Astra. Put optional enhancements in backlog.\n"
                   + "IMPLEMENTATION PACKET (JSON):\n" + room.canonical(packet) + "\n").encode()

@@ -48,6 +48,9 @@ result={"type":"result","subtype":"success","is_error":False,"session_id":sessio
 if mode == "denied": result["permission_denials"]=[{"tool_name":"Bash","tool_input":"denied fixture operation"}]
 if mode == "wrong-session": result["session_id"]="wrong"
 if mode == "gaps": report["remaining_gaps"]=["Missing required independent engineering review"]
+if mode == "observations":
+    report["review_findings"]=["Optional local Qwen was unavailable; Fable completed the required work.","No commit was created, as required by the handoff."]
+    report["backlog"]=["Add a saved filter preset later: benefit is fewer repeated selections; tradeoff is new persistence and migration work, requiring user approval."]
 event={"type":"assistant","sessionId":session,"timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat(),
  "message":{"id":"fixture-message","model":"helper-model" if mode=="wrong-primary" else "claude-fable-5-1",
  "content":[{"type":"thinking","thinking":"DO_NOT_EXPOSE_PRIVATE_THINKING"},
@@ -233,6 +236,23 @@ class ImplementationTests(unittest.TestCase):
             impl.record_astra_review(handoff["handoff_path"],True,"Independent review text.")
         with self.assertRaisesRegex(impl.ImplementationError,"gate output changed"):
             impl.request_changes(handoff["handoff_path"],"Fix reported problem.")
+
+    def test_actual_report_blockers_reject_acceptance_while_nonblocking_observations_remain_visible(self):
+        self.mode.write_text("gaps")
+        handoff=self.prepare()
+        blocked_report=impl.run_implementation(handoff["handoff_path"])
+        self.assertTrue(blocked_report["gates_passed"])
+        with self.assertRaisesRegex(impl.ImplementationError,"remaining gaps"):
+            impl.record_astra_review(handoff["handoff_path"],True,"Gates passed, but required engineering review is still unresolved.")
+        impl.request_changes(handoff["handoff_path"],"Resolve the required engineering review; report optional capabilities separately without hiding real blockers.")
+        self.mode.write_text("observations")
+        corrected=impl.run_implementation(handoff["handoff_path"])
+        self.assertEqual(corrected["report"]["remaining_gaps"],[])
+        self.assertTrue(corrected["report"]["review_findings"])
+        self.assertTrue(corrected["report"]["backlog"])
+        accepted=impl.record_astra_review(handoff["handoff_path"],True,"Checked required behavior, resolved engineering-review evidence and independent gates; optional proposal remains unapproved backlog.")
+        self.assertTrue(accepted["astra_accepted"])
+        self.assertEqual(accepted["report"]["backlog"],corrected["report"]["backlog"])
 
     def test_stale_spec_cannot_run_accept_or_request_corrections(self):
         handoff=self.prepare()

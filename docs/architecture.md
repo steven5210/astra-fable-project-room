@@ -5,7 +5,7 @@ The package separates the agent workflow from durable execution:
 - `skills/project-room/SKILL.md` supplies Astra's roles, review loop, handoff, and product acceptance workflow.
 - `project_room_mcp.py` exposes local stdio tools. The plugin manifest starts it from the installed plugin root.
 - `project_room.py` provides setup, diagnostics, a project/feature room registry, and the CLI equivalent of the MCP operations.
-- `room.py` supplies the underlying specification-review engine: immutable spec revisions, exact digests, persistent Claude identity, idempotency, verification, and audited identity/authentication recovery.
+- `room.py` supplies the underlying specification-review engine: immutable specs, exact digests, persistent Claude identity, idempotency, verification, audited recovery, and bounded review rounds continued by recorded user decisions.
 - `implementation.py` supplies the authorized implementation lifecycle and validation evidence.
 - `session_paths.py` locates only the saved UUID transcript and validates session/worktree metadata, including hashed directories for long paths.
 - `qwen_guard.py` wraps an existing upstream stdio server to enforce fixed submit settings and bounded blocking waits.
@@ -19,3 +19,5 @@ Implementation handoff requires a clean Git source checkout and pins its baselin
 MCP job submission and model execution are distinct. A job ID lets an active Astra turn wait in bounded intervals and lets a later turn resume after disconnect. Persistent jobs do not automatically trigger an idle Astra task. Deployment, PR publication, notifications to third parties, and schedules are outside the room's automatic lifecycle unless the user explicitly includes them.
 
 The Qwen proxy enforces tool parameters rather than model quality or server configuration. Fable's engineering judgment determines whether a delegate is suitable. Model/window/health verification must be reported separately from tool discovery, and unavailable capabilities must stay visible.
+
+Enhancement proposals are durable room records that Astra surfaces for the user's opinion and scope approval. Astra creates or links issues through the available GitHub connector or CLI in the feature project's repository, then records the verified link; the model report itself does not execute issue operations. Filing authorization does not expand implementation scope. Missing tracker access leaves an explicit pending-filing record.

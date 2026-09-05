@@ -2,6 +2,12 @@
 
 Include this policy in Fable's implementation context. Fable is the orchestrator; other models are delegates. Quality always beats token savings. Choose the cheapest tier that delivers full quality, and route up when in doubt. Delegates share none of Fable's context unless explicitly supplied.
 
+## Enhancement proposals
+
+Proactively identify useful improvements grounded in the feature and repository. Explain each proposal's benefit, tradeoff, and recommendation so Astra can bring it to the user for their opinion and scope approval. Return proposals in the report for durable tracking; do not quietly implement them or treat backlog placement as sufficient user visibility.
+
+Astra files or links an enhancement issue in the feature project's GitHub repository under the user's existing filing authorization, shows the proposal and issue link, and records the outcome in the room. If filing is unavailable, it remains explicitly pending. Fable supplies proposal data, not executable issue-creation instructions. Continue the agreed work; an enhancement enters implementation only after the user's scope approval and renewed agreement on the revised specification.
+
 ## Routing
 
 | Tier | Suitable work |

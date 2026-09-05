@@ -6,6 +6,14 @@ A matching completed request returns its saved result without another model call
 
 A user-requested cancellation uses `room_job_cancel`; then inspect its terminal outcome. Do not call cancellation a rollback of changes or proof that no model tokens were used. Work already performed may need inspection.
 
+## Continue after a product decision
+
+Review rounds allow three Fable reviews. If the agents agree, proceed to the authorized handoff. If they need further review, Astra presents the unresolved product tradeoff and waits for your actual answer.
+
+`room_decision_record(room_id, revision, decision)` records that answer against the current spec and permits the next bounded round. It works only when the current round is exhausted and no failed, pending, or uncertain review blocks the room. The audit preserves the exact revision/hash and prior attempt boundary; earlier attempts remain intact. The selected direction is included in Fable's next review context.
+
+This is continuation after a real product decision, not a failure-recovery shortcut. Do not invent an answer, reuse the original build request, renew automatically, or erase history. Revise the specification to reflect the decision and regain exact-revision agreement.
+
 ## Local authentication failure
 
 Use `room_job_recover(job_id, diagnosis)` only after diagnosing the saved review job's local sign-in failure. This audits unchanged raw output and preserves the original failure. It requires Claude's exact “Not logged in” result, exit code 1, the saved session UUID, zero token usage, empty model usage, zero API duration/cost, and no structured model output. It cannot recover implementation jobs or unknown delivery. The diagnosis is an explanation, not a substitute for evidence.
@@ -38,6 +46,8 @@ The evidence note explains what was examined. This command does not recover a no
 An implementation `scope_change` creates a blocking issue. Register a strictly newer specification, record the issue's disposition and rationale against that revision, and obtain renewed Astra/Fable agreement before another handoff. The old consensus cannot clear the discovery.
 
 For a known completed implementation within the same scope, record actionable rejection, call `room_implementation_revise`, then submit a new implementation request ID for that handoff. Rerun gates and independently review the correction. This repair path does not apply to uncertain delivery.
+
+Optional enhancements are proposed visibly and filed as project GitHub issues under existing authorization. Preserve the proposal and verified link locally, and check existing records before retrying issue creation after an interruption. If no tracker is available or filing failed, show the proposal and state that filing is pending; do not invent an issue URL. Continue agreed work while awaiting the user's opinion and scope approval. Creating an issue does not authorize implementing the enhancement.
 
 ## Diagnose capabilities separately
 
