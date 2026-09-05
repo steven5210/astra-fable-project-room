@@ -1,0 +1,5 @@
+{
+  "command": "/absolute/path/to/existing-qwen-mcp-server",
+  "args": [],
+  "env": {}
+}

@@ -1,0 +1,19 @@
+{
+  "claude_bin": "/absolute/path/to/claude",
+  "model": "claude-fable-5-1",
+  "expected_model_ids": ["claude-fable-5-1"],
+  "timeout_seconds": 1800,
+  "extra_args": [
+    "--effort", "max",
+    "--permission-mode", "dontAsk",
+    "--permission-prompts", "none",
+    "--tools", "Read,Glob,Grep",
+    "--allowedTools", "Read,Glob,Grep",
+    "--setting-sources", "",
+    "--settings", "{\"disableAllHooks\":true}",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config", "/absolute/path/to/astra-fable-project-room/local-mcp.json",
+    "--append-system-prompt-file", "/absolute/path/to/astra-fable-project-room/examples/policy.example.md"
+  ]
+}

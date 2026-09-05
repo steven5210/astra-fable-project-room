@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "qwen-local": {
+      "command": "/absolute/path/to/python3",
+      "args": [
+        "/absolute/path/to/astra-fable-project-room/qwen_guard.py",
+        "--config",
+        "/absolute/path/to/astra-fable-project-room/qwen-upstream.local.json"
+      ]
+    }
+  }
+}
