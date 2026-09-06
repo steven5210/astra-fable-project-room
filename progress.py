@@ -26,6 +26,7 @@ import implementation
 import room
 import recovery
 import session_paths
+import heartbeat
 
 SCHEMA_VERSION = 1
 PARENT_TAIL_BYTES = 2 * 1024 * 1024
@@ -51,7 +52,7 @@ MODEL_ID = re.compile(r"^claude-(?:fable|mythos|opus|sonnet|haiku)-[0-9]{1,2}(?:
 MAX_CWD_LENGTH = 1024
 MAX_CWD_LOOKUPS = 256
 AGENT_FILE = re.compile(r"^agent-([A-Za-z0-9_-]{1,64})\.jsonl$")
-Event = collections.namedtuple("Event", "ts order kind category source")
+Event = collections.namedtuple("Event", "ts order kind category source actor", defaults=(None,))
 
 
 def clock():
@@ -548,9 +549,28 @@ def _attach_children(transcript, session_id, window, parent, cache, root=None):
         ended = (None if scan["last_stop"] is None else scan["last_stop"] == "end_turn") if scan["last_type"] == "assistant" else False
         delegate["child"] = {"observed_model": model, "last_observed_at": stamp(latest.ts), "last_category": latest.category,
                              "turn_ended": ended}
-        parent["events"].extend(scan["events"])
+        parent["events"].extend(event._replace(actor=delegate['handle']) for event in scan["events"])
         attributed += 1
     return observed, attributed, limitations
+
+
+def recent_activity(events, limitations):
+    """Latest five category/source/actor transitions, ordered by observed time (not causality)."""
+    ordered = sorted(events, key=lambda event: (event.ts, event.source == "parent_session", event.actor or "", event.order))
+    transitions = []
+    for event in ordered:
+        key = (event.category, event.source, event.actor)
+        if transitions and (transitions[-1].category, transitions[-1].source, transitions[-1].actor) == key:
+            transitions[-1] = event  # Retain the most recent observation within a repeated run.
+        else:
+            transitions.append(event)
+    return {"items": [{"observed_at": stamp(event.ts), "category": event.category, "source": event.source,
+                       "event": event.kind, "actor": event.actor} for event in transitions[-5:]],
+            "truncated": len(transitions) > 5, "window_incomplete": bool(limitations), "unavailable_reason": None}
+
+
+def empty_timeline(reason):
+    return {"items": [], "truncated": False, "window_incomplete": False, "unavailable_reason": reason}
 
 
 def observe_session(transcript, session_id, expected_cwd, window_start, now, cache=None):
@@ -595,6 +615,7 @@ def observe_session(transcript, session_id, expected_cwd, window_start, now, cac
             result["activity_unavailable_reason"] = "cwd_mismatch" if parent["cwd_rejected"] else "no_records_in_attempt_window"
         priority = {"pending": 0, "background": 1, "completed": 2}
         delegates = sorted(parent["delegates"].values(), key=lambda item: (priority[item["state"]], -item["requested_at"].timestamp(), -item["order"]))
+        result["recent_activity"] = recent_activity(parent["events"], result["limitations"]) if parent["events"] else empty_timeline(result["activity_unavailable_reason"])
         result["delegates"] = {
             "requested": len(delegates),
             **{state: sum(item["state"] == state for item in delegates) for state in ("pending", "background", "completed")},
@@ -704,7 +725,8 @@ def _deadline(scope, basis, start, timeout, now, limitations):
 
 
 def _stall(out, phase, reason):
-    out.update(phase=phase, deadline_unavailable_reason=reason, activity_unavailable_reason=reason)
+    out.update(phase=phase, deadline_unavailable_reason=reason, activity_unavailable_reason=reason,
+               recent_activity=empty_timeline(reason))
 
 
 def _model_stage(out, basis, start, timeout, transcript, session_id, expected_cwd, now, limitations, cache, active=True):
@@ -719,7 +741,7 @@ def _model_stage(out, basis, start, timeout, transcript, session_id, expected_cw
     observation = observe_session(transcript, session_id, expected_cwd, start, now, cache)
     limitations |= observation["limitations"]
     out.update(activity=observation["activity"], activity_unavailable_reason=observation["activity_unavailable_reason"],
-               delegates=observation["delegates"])
+               delegates=observation["delegates"], recent_activity=observation.get("recent_activity") or empty_timeline(observation["activity_unavailable_reason"]))
     delegates = observation["delegates"]
     if delegates and (delegates["pending"] or any(item["state"] == "background" and item["child"] and item["child"]["turn_ended"] is not True
                                                   for item in delegates["items"])):
@@ -784,7 +806,7 @@ def _running_implementation(out, job, now, handoff, limitations, cache):
         else:
             deadline, reason = None, "stage_transition" if owner is not None else "gate_start_unavailable_legacy_worker"
         out.update(gate={"index": index, "count": count}, deadline=deadline, deadline_unavailable_reason=reason,
-                   activity_unavailable_reason="gate_phase")
+                   activity_unavailable_reason="gate_phase", recent_activity=empty_timeline("gate_phase"))
     else:
         _stall(out, "finalizing", "finalizing")
 
@@ -794,7 +816,8 @@ def _base(job, now):
     return {"schema_version": SCHEMA_VERSION, "observed_at": stamp(now), "phase": "unknown", "phase_detail": None,
             "outcome": status if isinstance(status, str) else "unknown", "attempt": None,
             "elapsed_seconds": None, "elapsed_basis": "unavailable", "deadline": None, "deadline_unavailable_reason": None,
-            "gate": None, "activity": None, "activity_unavailable_reason": None, "delegates": None, "limitations": []}
+            "gate": None, "activity": None, "activity_unavailable_reason": None, "delegates": None,
+            "heartbeat": heartbeat.unavailable("not_observed"), "recent_activity": empty_timeline("unavailable"), "limitations": []}
 
 
 def job_progress(job, now=None, review=None, handoff=None, cache=None):

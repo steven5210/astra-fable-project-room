@@ -20,7 +20,7 @@ From another working directory, replace `project_room.py` with its absolute inst
 
 ## Operations
 
-The plugin exposes these 20 tools:
+The plugin exposes these 21 tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -38,6 +38,7 @@ The plugin exposes these 20 tools:
 | `room_issue_dispose(room_id, issue_id, disposition, rationale, revision)` | Record addressed/rejected findings or defer an optional finding to backlog. A blocker cannot be deferred. |
 | `room_backlog_add(room_id, content, rationale, issue_url?, proposal_id?, user_decision?, decision_rationale?)` | Create a tracked enhancement or update its issue link and actual user decision using the stable proposal ID. |
 | `room_handoff(room_id, revision, authorization, gates)` | Bind authorized implementation and executable gates to the agreed spec. |
+| `room_implementation_status(room_id, handoff_id)` | Read the current saved phase, acceptance, candidate/gate identities, and recovery lineage, including historical handoffs. |
 | `room_implementation_audit(room_id, handoff_id, job_id)` | Read-only observation of a stopped implementation job; runs no model and reports eligibility, interruption kind, and whether a host restart is required. |
 | `room_implementation_recover(room_id, handoff_id, job_id, spec_revision, spec_sha256, candidate_sha256, evidence_digest, diagnosis, remaining_work, authorization, request_id)` | Re-audit under locks and, only on an exact match, write the immutable recovery record that authorizes one successor job. |
 | `room_implementation_submit(room_id, handoff_id, request_id, recovery_id?)` | Start Fable's implementation job; supply `recovery_id` to dispatch the one authorized successor after a prepared recovery. |
@@ -45,7 +46,7 @@ The plugin exposes these 20 tools:
 | `room_implementation_revise(room_id, handoff_id, review)` | Queue diagnosed corrections after a known result, then submit using a new request ID. |
 | `room_doctor()` | Inspect local setup and authentication status. |
 
-Job `progress` reports the phase (`queued`, `starting`, `model`, `gate`, `finalizing`, `awaiting_review`, `terminal`, `unknown`), `elapsed_seconds`, the last observed `activity` (category, source, time), `delegates` requested/pending/background/completed with attributable child models, and a `deadline` countdown to the pinned model or gate timeout with `remaining_seconds`. The countdown is not an ETA. Null values carry a reason code, and `limitations` lists any bounded or degraded reads. Reading progress never changes a job; only allowlisted metadata is emitted. Legacy workers without stage telemetry report null gate deadlines with `gate_start_unavailable_legacy_worker`. The exact schema is in [progress](../../../docs/progress.md).
+Job `progress` reports the phase (`queued`, `starting`, `model`, `gate`, `finalizing`, `awaiting_review`, `terminal`, `unknown`), `elapsed_seconds`, the last observed `activity` (category, source, time), `delegates` requested/pending/background/completed with attributable child models, and a `deadline` countdown to the pinned model or gate timeout with `remaining_seconds`. The countdown is not an ETA. Null values carry a reason code, and `limitations` lists any bounded or degraded reads. Reading progress never changes a job; only allowlisted metadata is emitted. Legacy workers without stage telemetry report null gate deadlines with `gate_start_unavailable_legacy_worker`. The additive `heartbeat` field means worker liveness only; `recent_activity` contains at most five safe category transitions. Current handoff state is separate from frozen job results; see [status follow-ups](../../../docs/status-followups.md). The exact progress schema is in [progress](../../../docs/progress.md).
 
 `gates` is a list of argument arrays, such as `[["python3", "-m", "unittest", "discover"]]`. Select the project's actual commands and working assumptions; do not use a shell string. At least one gate is required. Gates run in the isolated implementation worktree and must leave candidate source unchanged. A gate passing establishes only what it exercises, so combine it with product acceptance evidence. Handoff requires a clean Git source checkout with a baseline commit. Candidate acceptance does not itself commit, merge, push, or deploy the work. Astra continues integration and any authorized publication using normal repository tools when the user requested delivery.
 

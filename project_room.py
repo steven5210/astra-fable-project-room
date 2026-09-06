@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import uuid
 
 import progress
+import heartbeat
 import room
 
 ROOT = Path(__file__).resolve().parent
@@ -97,6 +98,8 @@ class Service:
                   request_key TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
                   created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, pid INTEGER,
                   result TEXT, error TEXT, UNIQUE(room_id,kind,request_key));
+                CREATE TABLE IF NOT EXISTS worker_executions(
+                  job_id TEXT PRIMARY KEY REFERENCES jobs(id), execution_id TEXT NOT NULL, started_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS issues(
                   id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), job_id TEXT NOT NULL,
                   revision INTEGER NOT NULL, content TEXT NOT NULL, severity TEXT NOT NULL,
@@ -502,6 +505,16 @@ class Service:
                 elif job["kind"] == "implementation":
                     context["handoff"] = progress.handoff_context(job["payload"].get("handoff_path"), self._progress_cache)
             value = progress.job_progress(job, now, **context)
+            execution = None
+            if job['status'] == 'running':
+                try:
+                    with self.db() as db:
+                        row = db.execute('SELECT execution_id,started_at FROM worker_executions WHERE job_id=?', (job['id'],)).fetchone()
+                        execution = dict(row) if row else None
+                except sqlite3.Error:
+                    execution = 'unreadable'
+            value['heartbeat'] = (heartbeat.unavailable('registry_unreadable') if execution == 'unreadable' else
+                                  heartbeat.observe(self.home / 'jobs', job, execution, now, value.get('attempt')))
         except Exception as exc:  # Status must stay readable; a failed observation is reported, never raised.
             print(json.dumps({"progress_error": type(exc).__name__, "job_id": job.get("id")}), file=sys.stderr)
             value = progress.unavailable(job, now)
@@ -829,6 +842,13 @@ class Service:
             raise room.RoomError("Unknown handoff for this room")
         return Path(row[0])
 
+    def room_implementation_status(self, room_id, handoff_id):
+        import handoff_status
+        if not isinstance(handoff_id, str) or not re.fullmatch(r'[0-9a-f]{64}', handoff_id):
+            raise room.RoomError('Invalid handoff_id')
+        path = self._handoff_path(room_id, handoff_id)
+        return handoff_status.load(room_id, handoff_id, path)
+
     def _ensure_handoff_current(self, room_id, handoff_id):
         import implementation
         _, _, review = self.paths(room_id)
@@ -933,8 +953,24 @@ class Service:
                 job = self._job(job_id)
                 if job["status"] != "queued":
                     return
+                started, execution_id = room.now(), uuid.uuid4().hex
                 with self.db() as db:
-                    db.execute("UPDATE jobs SET status='running',started_at=?,pid=? WHERE id=?", (room.now(), os.getpid(), job_id))
+                    db.execute("UPDATE jobs SET status='running',started_at=?,pid=? WHERE id=?", (started, os.getpid(), job_id))
+                try:
+                    with self.db() as db:
+                        db.execute('INSERT INTO worker_executions(job_id,execution_id,started_at) VALUES(?,?,?)', (job_id, execution_id, started))
+                except sqlite3.Error:
+                    execution_id = None  # Heartbeat storage failure must not stop authorized work.
+                def owned_attempt():
+                    if job['kind'] != 'implementation':
+                        return None
+                    path_value = job['payload'].get('handoff_path')
+                    if not isinstance(path_value, str):
+                        return None
+                    state, _ = progress.read_json(Path(path_value).parent / 'state.json', progress.MAX_STATE_BYTES)
+                    return state.get('attempt_count') if isinstance(state, dict) and state.get('owner_job_id') == job_id else None
+                beat = heartbeat.Emitter(self.home / 'jobs', {**job, 'started_at': started}, execution_id, owned_attempt)
+                beat.pulse()
                 process = None
                 result, error, status = None, None, "uncertain"
                 try:
@@ -945,6 +981,7 @@ class Service:
                             process = subprocess.Popen([sys.executable, str(ROOT / "project_room.py"), "--home", str(self.home), "_execute", job_id],
                                                        stdin=subprocess.DEVNULL, stdout=output, stderr=errors, start_new_session=True)
                             while process.poll() is None:
+                                beat.pulse()
                                 if (path / "cancel.json").exists():
                                     # Signal only the child we created, never a PID read from old state.
                                     process.send_signal(signal.SIGTERM)
@@ -975,6 +1012,7 @@ class Service:
                         except subprocess.TimeoutExpired:
                             room.stop_process(process)
                     error = f"Worker interrupted ({type(exc).__name__}); delivery may be uncertain"
+                beat.pulse(final=True)
                 if job["kind"] == "implementation" and isinstance(result, dict):
                     report = result.get("report", {})
                     if report.get("outcome") == "scope_change":
@@ -1066,7 +1104,7 @@ TOOL_SCHEMAS = {
     "room_spec_put": ("Register immutable exact UTF-8 spec revision with repository context and concrete verification.", schema({**R, "revision": I, "content": S})),
     "room_record": ("Record Astra/user discussion or Astra approval of the current exact spec. Does not authorize implementation.", schema({**R, "sender": {"type": "string", "enum": ["astra", "user"]}, "kind": {"type": "string", "enum": ["message", "approval"]}, "revision": I, "content": S})),
     "room_review_submit": ("Start one Fable review asynchronously. Save returned job id; identical request_id/payload reuses the job, never resubmit to poll.", schema({**R, "revision": I, "message": S, "request_id": S})),
-    "room_job_status": ("Read or wait up to 45 seconds on a saved job; repeat bounded waits while working. Returns saved terminal evidence plus a read-only progress object: phase (queued/starting/model/gate/finalizing/awaiting_review/terminal/unknown), elapsed_seconds, activity (last observed category/time/source), delegates (requested/pending/background/completed, attributable child models), deadline (remaining seconds until the pinned model or gate timeout, not an ETA), and limitation codes. Unavailable evidence is reported as unavailable, never inferred as a stall or completion; reading progress never changes the job.", schema({"job_id": S, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["job_id"])),
+    "room_job_status": ("Read or wait up to 45 seconds on a saved job; repeat bounded waits while working. Returns saved terminal evidence plus a read-only progress object: phase (queued/starting/model/gate/finalizing/awaiting_review/terminal/unknown), elapsed_seconds, activity (last observed category/time/source), delegates (requested/pending/background/completed, attributable child models), deadline (remaining seconds until the pinned model or gate timeout, not an ETA), worker heartbeat (liveness only), up to five recent safe activity transitions, and limitation codes. Unavailable evidence is reported as unavailable, never inferred as a stall or completion; reading progress never changes the job.", schema({"job_id": S, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["job_id"])),
     "room_job_cancel": ("Request cancellation of the owning worker. Started operations may remain uncertain; inspect status before continuing.", schema({"job_id": S})),
     "room_job_recover": ("After diagnosis, audit only an exact zero-usage local login failure as not sent. Preserves original failure; runs no model. Then use a new request_id in the same room after fixing setup. Cannot recover unknown delivery.", schema({"job_id": S, "diagnosis": S})),
     "room_history": ("Read room discussion, decisions, backlog, and implementation events. Contains no private model thinking.", schema(R)),
@@ -1077,6 +1115,7 @@ TOOL_SCHEMAS = {
     "room_decision_record": ("After the bounded review round is exhausted, record the user's actual decision on the unresolved product tradeoff to allow the next bounded round. Never invent a decision or use this to bypass unknown/failed delivery.", schema({**R, "revision": I, "decision": S})),
     "room_handoff": ("Prepare Fable implementation from exact agreement, resolved findings, original user authorization, and nonempty verification argv gates. Creates isolated git worktree.", schema({**R, "revision": I, "authorization": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}})),
     "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow fixed Qwen/Sonnet/Opus policy; Astra checks product outcome after evidence. With recovery_id, dispatches the single audited successor of an interrupted attempt (new job/request ID, same session, --resume).", schema({**R, "handoff_id": S, "request_id": S, "recovery_id": S}, ["room_id", "handoff_id", "request_id"])),
+    "room_implementation_status": ("Read the current saved handoff phase, spec/candidate identity, acceptance, gate digests and recovery lineage. Historical handoffs remain readable. This compact read does not run gates, inspect candidate files, audit recovery or change frozen job outcomes.", schema({**R, "handoff_id": S})),
     "room_implementation_audit": ("Read-only audit of one interrupted implementation job (configured timeout or session-usage limit): identity, stopped-work evidence, boot boundary, current writers, partial candidate and transcript digests. Runs no model/Qwen/network and repairs nothing. Reports restart_required until the host booted after the interruption.", schema({**R, "handoff_id": S, "job_id": S})),
     "room_implementation_recover": ("After Astra's diagnosis and the user's actual authorization, durably prepare one audited continuation of an eligible interrupted implementation. Requires the audit's exact spec revision/hash, candidate sha256 and evidence digest; never adopts new bytes. Idempotent per request_id. Then submit with the returned recovery_id.", schema({**R, "handoff_id": S, "job_id": S, "spec_revision": I, "spec_sha256": S, "candidate_sha256": S, "evidence_digest": S, "diagnosis": S, "remaining_work": S, "authorization": S, "request_id": S})),
     "room_implementation_review": ("Record Astra's independent product-outcome verdict against the exact verified candidate. Engineering/delegate verdicts remain Fable's responsibility.", schema({**R, "handoff_id": S, "accepted": {"type": "boolean"}, "review": S})),

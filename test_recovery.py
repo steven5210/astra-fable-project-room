@@ -1382,7 +1382,7 @@ class RecoveryTransportTests(ProjectFixture):
         from project_room_mcp import handle
         listing = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, self.service)["result"]["tools"]
         names = {tool["name"]: tool for tool in listing}
-        self.assertEqual(len(names), 20)
+        self.assertEqual(len(names), 21)
         self.assertTrue(names["room_implementation_audit"]["annotations"]["readOnlyHint"])
         self.assertFalse(names["room_implementation_recover"]["annotations"]["readOnlyHint"])
         self.assertIn("recovery_id", names["room_implementation_submit"]["inputSchema"]["properties"])

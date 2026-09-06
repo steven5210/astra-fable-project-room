@@ -8,6 +8,8 @@ The package separates the agent workflow from durable execution:
 - `room.py` supplies the underlying specification-review engine: immutable specs, exact digests, persistent Claude identity, idempotency, verification, audited recovery, and bounded review rounds continued by recorded user decisions.
 - `implementation.py` supplies the authorized implementation lifecycle and validation evidence, saving each model or gate stage start before the child runs so status can report accurate countdowns.
 - `progress.py` derives the additive read-only `progress` object for job status from owned registry, review-turn, and handoff state plus a bounded scan of the exact owned session transcript; it never spawns, calls a model, or edits state. See [progress](progress.md).
+- `heartbeat.py` writes a bounded private worker liveness record from the existing supervision loop; it never changes execution policy.
+- `handoff_status.py` projects verified saved handoff metadata through an allowlist without running gates or recovery.
 - `recovery.py` classifies an eligible interruption, observes host boot time and local processes, audits the stopped job read-only, and writes the immutable recovery record that an authorized successor job resumes from.
 - `session_paths.py` locates only the saved UUID transcript and validates session/worktree metadata, including hashed directories for long paths.
 - `qwen_guard.py` wraps an existing upstream stdio server to enforce fixed submit settings and bounded blocking waits.

@@ -65,15 +65,17 @@ The worker can continue after the MCP connection closes. The plugin does **not**
 
 ## Observe job progress
 
-Each job in `room_status` and `room_job_status` includes a read-only `progress` object: the lifecycle phase (queued, starting, model, gate, finalizing, awaiting review, terminal, or unknown), elapsed seconds, the category and time of the last observed activity, delegates that were requested, still pending, launched in the background, or completed (with an attributable child session's model and last activity where the evidence allows), and a countdown of seconds remaining until the pinned model or gate timeout. Astra can therefore say that Fable is waiting on a delegate whose last observed action was a shell operation at a given time, with a given elapsed time and remaining budget, without any new tool or monitor.
+Each job in `room_status` and `room_job_status` includes a read-only `progress` object: the lifecycle phase (queued, starting, model, gate, finalizing, awaiting review, terminal, or unknown), elapsed seconds, the category and time of the last observed activity, delegates that were requested, still pending, launched in the background, or completed (with an attributable child session's model and last activity where the evidence allows), and a countdown of seconds remaining until the pinned model or gate timeout. Astra can therefore say that Fable is waiting on a delegate whose last observed action was a shell operation at a given time, with a given elapsed time and remaining budget, through the existing status tools.
 
 The countdown is a deadline, never an estimate of completion, and observing it never cancels, replays, or extends a job. Activity comes from a bounded scan of the exact owned session transcript for the current attempt, with only allowlisted metadata (categories, timestamps, counts, validated model IDs); no thinking, prose, tool inputs, results, paths, or raw identifiers are exposed. Missing evidence is reported as unavailable with a reason code, never inferred as a stall or as completion. Workers started before this version remain readable with null timing where the saved evidence is insufficient. See [progress](docs/progress.md) for the exact schema, limits, and how Astra uses it.
 
 Existing app conversations retain their own history. Rooms start dedicated Claude sessions and resume their saved UUIDs; they do not automatically import or synchronize your exact Codex/Claude Desktop transcripts. Relevant decisions and context are recorded explicitly in the room.
 
+Use `room_implementation_status(room_id, handoff_id)` for the handoff's current saved phase after acceptance or a correction request. Earlier job results remain frozen. The `progress.heartbeat` field reports only when the owning worker last wrote a liveness record, while `progress.recent_activity` shows up to five observed category transitions. Neither is proof of useful work or completion. See [status and heartbeat details](docs/status-followups.md).
+
 ## CLI fallback
 
-The controller exposes the same 20 operations as MCP. From the plugin directory:
+The controller exposes the same 21 operations as MCP. From the plugin directory:
 
 ```sh
 python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'

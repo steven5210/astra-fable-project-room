@@ -150,7 +150,7 @@ class EnhancementTests(ProjectFixture):
         self.assertEqual(self.service.room_status(self.room_id)["enhancements"][0]["event_id"], events[-1]["id"])
 
     def test_existing_tool_accepts_optional_metadata_without_expanding_tool_inventory(self):
-        self.assertEqual(len(project_room.TOOL_SCHEMAS), 20)
+        self.assertEqual(len(project_room.TOOL_SCHEMAS), 21)
         created = self.service.call("room_backlog_add", {"room_id": self.room_id, "content": "An optional improvement", "rationale": "Grounded benefit"})
         updated = self.service.call("room_backlog_add", {"room_id": self.room_id, "content": created["content"], "rationale": created["rationale"],
                                                          "proposal_id": created["proposal_id"], "user_decision": "deferred",
