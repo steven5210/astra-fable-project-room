@@ -15,7 +15,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    # Recovery tests exercise real timeout boundaries; include container setup time.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
