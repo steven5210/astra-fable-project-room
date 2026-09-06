@@ -6,7 +6,8 @@ The package separates the agent workflow from durable execution:
 - `project_room_mcp.py` exposes local stdio tools. The plugin manifest starts it from the installed plugin root.
 - `project_room.py` provides setup, diagnostics, a project/feature room registry, and the CLI equivalent of the MCP operations.
 - `room.py` supplies the underlying specification-review engine: immutable specs, exact digests, persistent Claude identity, idempotency, verification, audited recovery, and bounded review rounds continued by recorded user decisions.
-- `implementation.py` supplies the authorized implementation lifecycle and validation evidence.
+- `implementation.py` supplies the authorized implementation lifecycle and validation evidence, saving each model or gate stage start before the child runs so status can report accurate countdowns.
+- `progress.py` derives the additive read-only `progress` object for job status from owned registry, review-turn, and handoff state plus a bounded scan of the exact owned session transcript; it never spawns, calls a model, or edits state. See [progress](progress.md).
 - `recovery.py` classifies an eligible interruption, observes host boot time and local processes, audits the stopped job read-only, and writes the immutable recovery record that an authorized successor job resumes from.
 - `session_paths.py` locates only the saved UUID transcript and validates session/worktree metadata, including hashed directories for long paths.
 - `qwen_guard.py` wraps an existing upstream stdio server to enforce fixed submit settings and bounded blocking waits.

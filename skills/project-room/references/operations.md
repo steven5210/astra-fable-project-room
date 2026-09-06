@@ -26,12 +26,12 @@ The plugin exposes these 20 tools:
 | --- | --- |
 | `room_open(project_path, feature)` | Create or reuse the project/feature room. |
 | `room_list(project_path?)` | Find existing rooms. |
-| `room_status(room_id)` | Read lifecycle state, current revision, and work status. |
+| `room_status(room_id)` | Read lifecycle state, current revision, and work status. Each job carries a read-only `progress` object. |
 | `room_spec_put(room_id, revision, content)` | Store immutable specification bytes. |
 | `room_record(room_id, sender, kind, revision, content)` | Record user/Astra discussion against an existing revision or Astra approval of the current revision. |
 | `room_decision_record(room_id, revision, decision)` | After an exhausted round, audit the user's actual product decision and permit the next bounded review round. |
 | `room_review_submit(room_id, revision, message, request_id)` | Submit Fable's independent spec review as an asynchronous job. |
-| `room_job_status(job_id, wait_seconds)` | Read or wait for a job, at most 45 seconds per call. |
+| `room_job_status(job_id, wait_seconds)` | Read or wait for a job, at most 45 seconds per call. Returns saved evidence plus a read-only `progress` object. |
 | `room_job_cancel(job_id)` | Cancel a job when requested. Inspect its resulting state before further action. |
 | `room_job_recover(job_id, diagnosis)` | Audit a proven local login failure as `not_sent`; preserves original evidence and calls no model. |
 | `room_history(room_id)` | Read the preserved discussion and decisions. |
@@ -44,6 +44,8 @@ The plugin exposes these 20 tools:
 | `room_implementation_review(room_id, handoff_id, accepted, review)` | Record Astra's independent acceptance or actionable rejection. |
 | `room_implementation_revise(room_id, handoff_id, review)` | Queue diagnosed corrections after a known result, then submit using a new request ID. |
 | `room_doctor()` | Inspect local setup and authentication status. |
+
+Job `progress` reports the phase (`queued`, `starting`, `model`, `gate`, `finalizing`, `awaiting_review`, `terminal`, `unknown`), `elapsed_seconds`, the last observed `activity` (category, source, time), `delegates` requested/pending/background/completed with attributable child models, and a `deadline` countdown to the pinned model or gate timeout with `remaining_seconds`. The countdown is not an ETA. Null values carry a reason code, and `limitations` lists any bounded or degraded reads. Reading progress never changes a job; only allowlisted metadata is emitted. Legacy workers without stage telemetry report null gate deadlines with `gate_start_unavailable_legacy_worker`. The exact schema is in [progress](../../../docs/progress.md).
 
 `gates` is a list of argument arrays, such as `[["python3", "-m", "unittest", "discover"]]`. Select the project's actual commands and working assumptions; do not use a shell string. At least one gate is required. Gates run in the isolated implementation worktree and must leave candidate source unchanged. A gate passing establishes only what it exercises, so combine it with product acceptance evidence. Handoff requires a clean Git source checkout with a baseline commit. Candidate acceptance does not itself commit, merge, push, or deploy the work. Astra continues integration and any authorized publication using normal repository tools when the user requested delivery.
 

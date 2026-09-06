@@ -63,6 +63,12 @@ Once the exact current spec is accepted by both agents and blocking findings are
 
 The worker can continue after the MCP connection closes. The plugin does **not** wake an idle Astra conversation: ask to resume the room, and Astra reads its saved status and history. A background job finishing is distinct from gates passing and Astra accepting the result. Gates run independently in the implementation worktree, and acceptance binds the candidate content they checked. A gate that changes candidate files invalidates that evidence; use verification commands that leave source unchanged.
 
+## Observe job progress
+
+Each job in `room_status` and `room_job_status` includes a read-only `progress` object: the lifecycle phase (queued, starting, model, gate, finalizing, awaiting review, terminal, or unknown), elapsed seconds, the category and time of the last observed activity, delegates that were requested, still pending, launched in the background, or completed (with an attributable child session's model and last activity where the evidence allows), and a countdown of seconds remaining until the pinned model or gate timeout. Astra can therefore say that Fable is waiting on a delegate whose last observed action was a shell operation at a given time, with a given elapsed time and remaining budget, without any new tool or monitor.
+
+The countdown is a deadline, never an estimate of completion, and observing it never cancels, replays, or extends a job. Activity comes from a bounded scan of the exact owned session transcript for the current attempt, with only allowlisted metadata (categories, timestamps, counts, validated model IDs); no thinking, prose, tool inputs, results, paths, or raw identifiers are exposed. Missing evidence is reported as unavailable with a reason code, never inferred as a stall or as completion. Workers started before this version remain readable with null timing where the saved evidence is insufficient. See [progress](docs/progress.md) for the exact schema, limits, and how Astra uses it.
+
 Existing app conversations retain their own history. Rooms start dedicated Claude sessions and resume their saved UUIDs; they do not automatically import or synchronize your exact Codex/Claude Desktop transcripts. Relevant decisions and context are recorded explicitly in the room.
 
 ## CLI fallback

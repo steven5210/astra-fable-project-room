@@ -19,6 +19,7 @@ import time
 from types import SimpleNamespace
 import uuid
 
+import progress
 import room
 
 ROOT = Path(__file__).resolve().parent
@@ -85,6 +86,7 @@ class Service:
     def __init__(self, home=None):
         self.home = Path(home or os.environ.get("PROJECT_ROOM_HOME") or Path.home() / ".project-room").expanduser().resolve()
         self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._progress_cache = {}  # Parsed, stat-keyed metadata reused by read-only progress observation.
         with self.db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS rooms(
@@ -187,6 +189,10 @@ class Service:
         entry = self.entry(room_id)
         root = Path(entry["path"])
         return entry, root, root / "review"
+
+    @staticmethod
+    def _room_settings(root):
+        return json.loads((root / "settings.json").read_text())
 
     def _profiles(self, root, project_path, settings):
         # These files are private snapshots: package updates cannot silently change a room.
@@ -323,6 +329,8 @@ class Service:
                 handoff["lineage"] = {"error": "handoff integrity check failed"}
         core = room.status_report(review)
         blocking = [job for job in jobs if job["status"] in (*ACTIVE, "uncertain") and job["id"] not in exempt]
+        now = progress.clock()
+        jobs = [self._with_progress(job, now, (entry, root, review)) for job in jobs]
         return {"room": entry, "review": core, "issues": issues, "jobs": jobs, "handoffs": handoffs,
                 "recoveries": recoveries, "enhancements": self._enhancements(room_id),
                 "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues) and not blocking}
@@ -478,6 +486,26 @@ class Service:
         value["payload"] = json.loads(value["payload"])
         value["result"] = json.loads(value["result"]) if value["result"] else None
         return value
+
+    def _with_progress(self, job, now, paths=None):
+        """Attach the additive read-only progress view. Observation never changes a job."""
+        try:
+            context = {}
+            if job["status"] == "running":
+                _, root, review = paths or self.paths(job["room_id"])
+                if len(self._progress_cache) > 64:
+                    self._progress_cache.clear()
+                context["cache"] = self._progress_cache
+                if job["kind"] == "review":
+                    config_dir = self._room_settings(root).get("claude_config_dir")
+                    context["review"] = progress.review_context(review, job["request_key"], job["payload"].get("session_transcript"), config_dir)
+                elif job["kind"] == "implementation":
+                    context["handoff"] = progress.handoff_context(job["payload"].get("handoff_path"), self._progress_cache)
+            value = progress.job_progress(job, now, **context)
+        except Exception as exc:  # Status must stay readable; a failed observation is reported, never raised.
+            print(json.dumps({"progress_error": type(exc).__name__, "job_id": job.get("id")}), file=sys.stderr)
+            value = progress.unavailable(job, now)
+        return {**job, "progress": value}
 
     def _refresh(self, job_id):
         value = self._job(job_id)
@@ -728,7 +756,7 @@ class Service:
         with contextlib.closing(room.connect(review)) as db:
             spec = room.get_spec(db, review, revision)
             session = room.meta(db, "session_id")
-        settings = json.loads((root / "settings.json").read_text())
+        settings = self._room_settings(root)
         return self._submit(room_id, "review", request_id, {"revision": revision, "message": message,
                             "spec_sha256": spec["sha256"], "session_transcript": transcript_path(settings["claude_config_dir"], review, session)})
 
@@ -739,7 +767,7 @@ class Service:
         while True:
             job = self._refresh(job_id)
             if job["status"] not in ACTIVE or time.monotonic() >= deadline:
-                return job
+                return self._with_progress(job, progress.clock())
             time.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
     def room_job_cancel(self, job_id):
@@ -760,7 +788,7 @@ class Service:
             note = self._job_path(job_id) / "nondelivery-diagnosis.md"
             note.write_text(diagnosis, encoding="utf-8")
             from session_paths import find_session_transcript, SessionPathError
-            settings = json.loads((root / "settings.json").read_text())
+            settings = self._room_settings(root)
             current = room.status_report(review)
             explicit = None
             try:
@@ -847,7 +875,7 @@ class Service:
     def execute_job(self, job_id):
         job = self._job(job_id)
         _, root, review = self.paths(job["room_id"])
-        settings = json.loads((root / "settings.json").read_text())
+        settings = self._room_settings(root)
         if settings.get("claude_config_dir_override") is None:
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else:
@@ -876,7 +904,7 @@ class Service:
             import implementation
             recovery_id = payload.get("recovery_id")
             if recovery_id is None:
-                return implementation.run_implementation(Path(payload["handoff_path"]))
+                return implementation.run_implementation(Path(payload["handoff_path"]), owner_job_id=job_id)
             import recovery
             try:
                 row = self._recovery_row(recovery_id)
@@ -894,7 +922,7 @@ class Service:
                 return report
             return implementation.run_implementation(Path(payload["handoff_path"]),
                                                      successor={"recovery_id": recovery_id, "successor_job_id": job_id, "recheck": recheck,
-                                                                "registry": str(self.home)})
+                                                                "registry": str(self.home)}, owner_job_id=job_id)
         raise room.RoomError("Unknown job kind")
 
     def worker(self, job_id):
@@ -1034,11 +1062,11 @@ TOOL_SCHEMAS = {
     "room_doctor": ("Check local setup and Claude subscription sign-in; does not call a model or Qwen inference.", schema({})),
     "room_open": ("Open or create the persistent room for this exact project directory and feature. Reuses history/session; does not start models.", schema({"project_path": S, "feature": S})),
     "room_list": ("Find existing project/feature rooms before creating another.", schema({"project_path": S}, [])),
-    "room_status": ("Read review agreement, unresolved findings, jobs, and implementation handoffs.", schema(R)),
+    "room_status": ("Read review agreement, unresolved findings, jobs, and implementation handoffs. Each job carries an additive read-only progress object (phase, elapsed_seconds, last observed activity category, attributable delegates, countdown to the pinned timeout, limitations); the countdown is a deadline, never an ETA.", schema(R)),
     "room_spec_put": ("Register immutable exact UTF-8 spec revision with repository context and concrete verification.", schema({**R, "revision": I, "content": S})),
     "room_record": ("Record Astra/user discussion or Astra approval of the current exact spec. Does not authorize implementation.", schema({**R, "sender": {"type": "string", "enum": ["astra", "user"]}, "kind": {"type": "string", "enum": ["message", "approval"]}, "revision": I, "content": S})),
     "room_review_submit": ("Start one Fable review asynchronously. Save returned job id; identical request_id/payload reuses the job, never resubmit to poll.", schema({**R, "revision": I, "message": S, "request_id": S})),
-    "room_job_status": ("Read or wait up to 45 seconds on a saved job; repeat bounded waits while working. Returns saved terminal evidence.", schema({"job_id": S, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["job_id"])),
+    "room_job_status": ("Read or wait up to 45 seconds on a saved job; repeat bounded waits while working. Returns saved terminal evidence plus a read-only progress object: phase (queued/starting/model/gate/finalizing/awaiting_review/terminal/unknown), elapsed_seconds, activity (last observed category/time/source), delegates (requested/pending/background/completed, attributable child models), deadline (remaining seconds until the pinned model or gate timeout, not an ETA), and limitation codes. Unavailable evidence is reported as unavailable, never inferred as a stall or completion; reading progress never changes the job.", schema({"job_id": S, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["job_id"])),
     "room_job_cancel": ("Request cancellation of the owning worker. Started operations may remain uncertain; inspect status before continuing.", schema({"job_id": S})),
     "room_job_recover": ("After diagnosis, audit only an exact zero-usage local login failure as not sent. Preserves original failure; runs no model. Then use a new request_id in the same room after fixing setup. Cannot recover unknown delivery.", schema({"job_id": S, "diagnosis": S})),
     "room_history": ("Read room discussion, decisions, backlog, and implementation events. Contains no private model thinking.", schema(R)),

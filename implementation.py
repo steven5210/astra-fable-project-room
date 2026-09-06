@@ -505,7 +505,7 @@ def _recovery_refusal(directory, manifest, state, successor, root=None):
     return None, current
 
 
-def run_implementation(handoff_path, successor=None):
+def run_implementation(handoff_path, successor=None, owner_job_id=None):
     """Run the next authorized attempt. `successor` binds a registered recovery successor job:
     {"recovery_id", "successor_job_id", "recheck": zero-argument callable returning the audit report}."""
     if successor is not None:
@@ -527,12 +527,13 @@ def run_implementation(handoff_path, successor=None):
         else:
             directory, manifest, state = _load(directory)
         with root if root is not None else contextlib.nullcontext():
-            return _continue_run(directory, manifest, state, successor, root)
+            return _continue_run(directory, manifest, state, successor, root, owner_job_id)
 
 
-def _continue_run(directory, manifest, state, successor, root):
+def _continue_run(directory, manifest, state, successor, root, owner_job_id=None):
     if state["phase"] in ("running_model", "running_gates", "preparing"):
-        state.update(phase="blocked", needs_attention=True, error="Previous invocation ended without a recorded outcome; no replay is allowed")
+        state.update(phase="blocked", needs_attention=True, active_stage=None,
+                     error="Previous invocation ended without a recorded outcome; no replay is allowed")
         _atomic(directory / "state.json", state)
     is_recovery = state["phase"] == "recovery_prepared"
     current = None
@@ -556,7 +557,8 @@ def _continue_run(directory, manifest, state, successor, root):
     expected_candidate = state["recovery"]["candidate"] if is_recovery else state["candidate"] if is_correction else state["initial_candidate"]
     if (current if is_recovery else candidate_snapshot(worktree)) != expected_candidate:
         raise ImplementationError("Prepared worktree changed before its authorized implementation began")
-    return _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root)
+    return _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root,
+                           successor["successor_job_id"] if is_recovery else owner_job_id)
 
 
 def _set_aside(attempt):
@@ -578,7 +580,7 @@ def _pinned_bytes(directory, name, root=None):
     return recovery.read_owned(directory / name, recovery.EVIDENCE_LIMIT, "handoff", root=root)
 
 
-def _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root=None):
+def _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root=None, owner_job_id=None):
     import copy
     import recovery
     rollback = copy.deepcopy(state)
@@ -591,7 +593,7 @@ def _launch_attempt(directory, manifest, state, worktree, is_correction, is_reco
             _set_aside(attempt)  # A stray directory from an earlier pre-launch failure must not wedge the lane.
         attempt.mkdir(parents=True, exist_ok=False)
         argv, prompt, model_env = _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor,
-                                                   config, attempt, attempt_number, recovery, root)
+                                                   config, attempt, attempt_number, recovery, root, owner_job_id)
     except Exception as exc:
         if is_recovery:
             # The on-disk projection is still recovery_prepared and no process was spawned.
@@ -604,7 +606,7 @@ def _launch_attempt(directory, manifest, state, worktree, is_correction, is_reco
                         argv, prompt, model_env, rollback, recovery)
 
 
-def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, config, attempt, attempt_number, recovery, root=None):
+def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, config, attempt, attempt_number, recovery, root=None, owner_job_id=None):
     packet = {"handoff_id": manifest["handoff_id"], "spec_revision": manifest["revision"],
               "spec_sha256": manifest["spec_sha256"], "baseline_commit": manifest["baseline_commit"],
               "authorization": manifest["authorization_text"], "gates": manifest["gates"],
@@ -683,8 +685,12 @@ def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_rec
         model_env.pop("CLAUDE_CONFIG_DIR", None)
     else:
         model_env["CLAUDE_CONFIG_DIR"] = config["claude_config_dir_override"]
-    state.update(phase="running_model", started_at=room.now(), attempt_path=str(attempt), attempt_count=attempt_number,
-                 astra_accepted=False, gates_passed=False)
+    started_at = room.now()
+    # Advisory ownership/stage telemetry; this never replaces launch or acceptance evidence.
+    state.update(phase="running_model", started_at=started_at, attempt_path=str(attempt), attempt_count=attempt_number,
+                 astra_accepted=False, gates_passed=False,
+                 owner_job_id=owner_job_id if isinstance(owner_job_id, str) and owner_job_id else None,
+                 active_stage={"kind": "model", "index": 1, "started_at": started_at})
     _atomic(directory / "state.json", state)
     return argv, prompt, model_env
 
@@ -744,7 +750,8 @@ def _run_attempt(directory, manifest, state, worktree, is_recovery, successor, c
                 state["recovery"]["launch_state"] = "unknown"
             raise
         finished = room.now()
-        state.update(model_finished_at=finished, model_return_code=code)
+        state.update(model_finished_at=finished, model_return_code=code, active_stage=None)
+        _atomic(directory / "state.json", state)
         raw = (attempt / "stdout.json").read_bytes()
         state["model_stdout_sha256"] = room.sha(raw)
         result = json.loads(raw)
@@ -776,7 +783,7 @@ def _run_attempt(directory, manifest, state, worktree, is_recovery, successor, c
         if candidate["head"] != manifest["baseline_commit"]:
             raise ImplementationError("Implementation changed worktree HEAD; committed candidates require separate integration review")
         if report["outcome"] == "scope_change":
-            state.update(phase="scope_change", needs_attention=True, candidate=candidate, gate_results=[], finished_at=room.now())
+            state.update(phase="scope_change", needs_attention=True, candidate=candidate, gate_results=[], finished_at=room.now(), active_stage=None)
             _atomic(directory / "state.json", state)
             return _summary(directory, manifest, state)
         state.update(phase="running_gates", candidate=candidate, gate_results=[])
@@ -786,8 +793,12 @@ def _run_attempt(directory, manifest, state, worktree, is_recovery, successor, c
             gate_dir = attempt / f"gate-{index + 1}"
             gate_dir.mkdir()
             started = room.now()
+            state["active_stage"] = {"kind": "gate", "index": index + 1, "started_at": started}
+            _atomic(directory / "state.json", state)
             result_code = _run_child(gate, worktree, gate_dir / "stdout.txt", gate_dir / "stderr.txt",
                                      config["gate_timeout_seconds"], env=gate_env)
+            state["active_stage"] = None
+            _atomic(directory / "state.json", state)
             after = candidate_snapshot(worktree)
             gate_result = {"argv": gate, "return_code": result_code, "started_at": started,
                            "finished_at": room.now(), "stdout_path": str(gate_dir / "stdout.txt"),
@@ -799,10 +810,10 @@ def _run_attempt(directory, manifest, state, worktree, is_recovery, successor, c
             if after != candidate:
                 raise ImplementationError("A gate changed candidate content or HEAD; gate evidence cannot certify this candidate")
         state.update(phase="awaiting_astra_review", gates_passed=all(gate["return_code"] == 0 for gate in state["gate_results"]),
-                     candidate=candidate, finished_at=room.now(), needs_attention=False)
+                     candidate=candidate, finished_at=room.now(), needs_attention=False, active_stage=None)
     except BaseException as exc:
         state.update(phase="blocked", needs_attention=True, finished_at=room.now(),
-                     error=f"{type(exc).__name__}: {exc}", replay_allowed=False)
+                     error=f"{type(exc).__name__}: {exc}", replay_allowed=False, active_stage=None)
         _atomic(directory / "state.json", state)
         if not isinstance(exc, (Exception, KeyboardInterrupt)):
             raise
@@ -889,7 +900,7 @@ def main(argv=None):
             result = prepare_handoff(args.room, args.project, args.revision, Path(args.authorization_file).read_text(),
                                      json.loads(Path(args.gates_file).read_text()), args.config)
         elif args.command == "run":
-            result = run_implementation(args.handoff)
+            result = run_implementation(args.handoff, owner_job_id="cli")
         elif args.command == "review":
             result = record_astra_review(args.handoff, args.decision == "accept", Path(args.review_file).read_text())
         elif args.command == "request-changes":
