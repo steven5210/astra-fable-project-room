@@ -17,6 +17,8 @@ import subprocess
 import sys
 import uuid
 
+import session_paths
+
 
 SCHEMA = {
     "type": "object",
@@ -708,7 +710,7 @@ def recover_not_sent(args, room):
             except (ValueError, UnicodeDecodeError) as exc:
                 raise RoomError("Local recovery session contains malformed JSON") from exc
             matching = [event for event in events if isinstance(event, dict) and event.get("sessionId") == row["session_id"]]
-            if not matching or any("cwd" in event and (not isinstance(event["cwd"], str) or Path(event["cwd"]).resolve() != room.resolve()) for event in matching):
+            if not matching or any("cwd" in event and session_paths.cwd_relation(event["cwd"], room.resolve()) is None for event in matching):
                 raise RoomError("Local recovery session metadata does not match this room")
             evidence.update(resume_local_session=True, session_transcript=str(path), session_transcript_sha256=sha(raw_session))
             # The CLI may have persisted the user/error locally before sign-in failed.

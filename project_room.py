@@ -105,7 +105,15 @@ class Service:
                 CREATE TABLE IF NOT EXISTS handoffs(
                   id TEXT NOT NULL, room_id TEXT NOT NULL REFERENCES rooms(id), path TEXT NOT NULL,
                   PRIMARY KEY(room_id,id));
+                CREATE TABLE IF NOT EXISTS implementation_recoveries(
+                  id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), handoff_id TEXT NOT NULL,
+                  predecessor_job_id TEXT NOT NULL, request_key TEXT NOT NULL, payload TEXT NOT NULL,
+                  status TEXT NOT NULL, created_at TEXT NOT NULL, dispatched_at TEXT, successor_job_id TEXT,
+                  invalidated_at TEXT, reason TEXT, record_sha256 TEXT NOT NULL, UNIQUE(room_id,request_key));
+                CREATE UNIQUE INDEX IF NOT EXISTS implementation_recoveries_active
+                  ON implementation_recoveries(predecessor_job_id) WHERE status IN ('prepared','dispatched');
             """)
+        self.process_inspector = None  # Python-only test injection; CLI/MCP callers cannot reach it.
 
     @contextlib.contextmanager
     def db(self):
@@ -253,29 +261,71 @@ class Service:
         with self.db() as db:
             db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,?,?,?)", (room_id, kind, room.canonical(value), room.now()))
 
-    def _guard_idle(self, room_id):
+    def _superseded(self, room_id, recovery_id=None):
+        """Predecessor jobs exempt from blocking: only verified lineage edges to a registered successor,
+        plus the predecessor of a prepared recovery for the submit that carries that exact recovery_id."""
+        exempt = {}
+        with self.db() as db:
+            for row in db.execute("SELECT id,status,predecessor_job_id,successor_job_id FROM implementation_recoveries WHERE room_id=?", (room_id,)):
+                if row["status"] in ("dispatched", "consumed") and row["successor_job_id"]:
+                    successor = db.execute("SELECT status FROM jobs WHERE id=? AND room_id=?", (row["successor_job_id"], room_id)).fetchone()
+                    # A dispatched edge counts only while its successor is still active; a successor that ended
+                    # without a classifiable outcome never launched provably, so its predecessor blocks again.
+                    if successor and (row["status"] == "consumed" or successor["status"] in ACTIVE):
+                        exempt[row["predecessor_job_id"]] = {"recovery_id": row["id"], "successor_job_id": row["successor_job_id"], "status": row["status"]}
+                elif row["status"] == "prepared" and recovery_id is not None and row["id"] == recovery_id:
+                    exempt[row["predecessor_job_id"]] = {"recovery_id": row["id"], "successor_job_id": None, "status": row["status"]}
+        return exempt
+
+    def _blocking_jobs(self, room_id, recovery_id=None):
         with self.db() as db:
             identifiers = [row[0] for row in db.execute("SELECT id FROM jobs WHERE room_id=? AND status IN ('queued','running')", (room_id,))]
         for identifier in identifiers:
             self._refresh(identifier)
+        exempt = self._superseded(room_id, recovery_id)
         with self.db() as db:
-            active = db.execute("SELECT id,status FROM jobs WHERE room_id=? AND status IN ('queued','running','uncertain') LIMIT 1", (room_id,)).fetchone()
-        if active:
+            rows = db.execute("SELECT id,status FROM jobs WHERE room_id=? AND status IN ('queued','running','uncertain') ORDER BY created_at", (room_id,)).fetchall()
+        return [dict(row) for row in rows if row["id"] not in exempt]
+
+    def _guard_idle(self, room_id, recovery_id=None):
+        blocking = self._blocking_jobs(room_id, recovery_id)
+        if blocking:
+            active = blocking[0]
             raise room.RoomError(f"Room is blocked by {active['status']} job {active['id']}; inspect its status, do not resubmit")
 
+    def _recoveries(self, room_id):
+        with self.db() as db:
+            rows = db.execute("SELECT id,handoff_id,predecessor_job_id,successor_job_id,status,created_at,dispatched_at,invalidated_at,reason,record_sha256 "
+                              "FROM implementation_recoveries WHERE room_id=? ORDER BY created_at", (room_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     def room_status(self, room_id):
+        import implementation
+        import recovery
         entry, root, review = self.paths(room_id)
         with self.db() as db:
             ids = [row[0] for row in db.execute("SELECT id FROM jobs WHERE room_id=? ORDER BY created_at", (room_id,))]
         jobs = [self._refresh(identifier) for identifier in ids]
+        exempt = self._superseded(room_id)
+        recoveries = self._recoveries(room_id)
+        for job in jobs:
+            edge = exempt.get(job["id"])
+            job["superseded_by"] = edge["successor_job_id"] if edge else None
+            job["recovery_id"] = next((row["id"] for row in recoveries if job["id"] in (row["predecessor_job_id"], row["successor_job_id"])), None)
         with self.db() as db:
             issues = [dict(r) for r in db.execute("SELECT * FROM issues WHERE room_id=? ORDER BY rowid", (room_id,))]
             handoffs = [dict(r) for r in db.execute("SELECT * FROM handoffs WHERE room_id=?", (room_id,))]
+        for handoff in handoffs:
+            try:
+                _, _, state = implementation._load(handoff["path"])
+                handoff["lineage"] = recovery.lineage(state)
+            except (implementation.ImplementationError, OSError, ValueError, KeyError, TypeError, AttributeError):
+                handoff["lineage"] = {"error": "handoff integrity check failed"}
         core = room.status_report(review)
+        blocking = [job for job in jobs if job["status"] in (*ACTIVE, "uncertain") and job["id"] not in exempt]
         return {"room": entry, "review": core, "issues": issues, "jobs": jobs, "handoffs": handoffs,
-                "enhancements": self._enhancements(room_id),
-                "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues)
-                and not any(j["status"] in (*ACTIVE, "uncertain") for j in jobs)}
+                "recoveries": recoveries, "enhancements": self._enhancements(room_id),
+                "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues) and not blocking}
 
     def room_spec_put(self, room_id, revision, content):
         positive_revision(revision)
@@ -457,7 +507,10 @@ class Service:
                 if old["payload"] != encoded:
                     raise room.RoomError("request_id was already used with different content")
                 return {**self._refresh(old["id"]), "duplicate": True}
-            self._guard_idle(room_id)
+            recovery_id = payload.get("recovery_id") if kind == "implementation" else None
+            if recovery_id is not None:
+                self._prepared_recovery(room_id, payload["handoff_id"], recovery_id)
+            self._guard_idle(room_id, recovery_id)
             if kind == "review":
                 review_room = root / "review"
                 with contextlib.closing(room.connect(review_room)) as db:
@@ -471,14 +524,24 @@ class Service:
                 if report.get("user_decision_required", sum(turn["status"] != "not_sent" for turn in report["turns"]) >= report["review_turn_limit"]):
                     raise room.RoomError("Review exchange limit reached; bring unresolved decisions to the user")
                 room.validate_subscription_environment()
+            identifier = uuid.uuid4().hex
             if kind == "implementation":
                 self._ensure_handoff_current(room_id, payload["handoff_id"])
-            identifier = uuid.uuid4().hex
+                if recovery_id is not None:
+                    self._dispatch_recovery(room_id, payload["handoff_id"], recovery_id, identifier)
             path = self._job_path(identifier)
             path.mkdir(parents=True, mode=0o700)
             with self.db() as db:
+                db.execute("BEGIN IMMEDIATE")
                 db.execute("INSERT INTO jobs(id,room_id,kind,request_key,payload,status,created_at) VALUES(?,?,?,?,?,'queued',?)",
                            (identifier, room_id, kind, request_id, encoded, room.now()))
+                if recovery_id is not None:
+                    changed = db.execute("UPDATE implementation_recoveries SET status='dispatched',dispatched_at=?,successor_job_id=? "
+                                         "WHERE id=? AND room_id=? AND status='prepared'", (room.now(), identifier, recovery_id, room_id)).rowcount
+                    if changed != 1:
+                        raise room.RoomError("Recovery is no longer prepared; audit it again")
+            if recovery_id is not None:
+                self._event(room_id, "implementation_recovery_dispatched", {"recovery_id": recovery_id, "successor_job_id": identifier, "handoff_id": payload["handoff_id"]})
             try:
                 with (path / "worker.log").open("wb") as output:
                     process = subprocess.Popen([sys.executable, str(ROOT / "project_room.py"), "--home", str(self.home), "_worker", identifier],
@@ -492,7 +555,171 @@ class Service:
             except OSError as exc:
                 with self.db() as db:
                     db.execute("UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=?", (room.now(), f"Worker did not start: {exc}", identifier))
+                if recovery_id is not None:
+                    self._invalidate_recovery(room_id, recovery_id, "worker_spawn_failure", identifier)
             return self._job(identifier)
+
+    def _recovery_row(self, recovery_id):
+        if not isinstance(recovery_id, str) or not re.fullmatch(r"[0-9a-f]{32}", recovery_id):
+            raise room.RoomError("Invalid recovery_id")
+        with self.db() as db:
+            row = db.execute("SELECT * FROM implementation_recoveries WHERE id=?", (recovery_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _active_recovery(self, job_id):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM implementation_recoveries WHERE predecessor_job_id=? AND status IN ('prepared','dispatched')", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _recovery_context(self, room_id, handoff_id, job_id):
+        handoff_path = self._handoff_path(room_id, handoff_id)
+        job = self._job(job_id)
+        if job["room_id"] != room_id:
+            raise room.RoomError("Job does not belong to this room")
+        _, root, review = self.paths(room_id)
+        with self.db() as db:
+            open_issues = db.execute("SELECT 1 FROM issues WHERE room_id=? AND disposition='open'", (room_id,)).fetchone() is not None
+        return {"job": job, "handoff_id": handoff_id, "handoff_path": handoff_path, "review_path": review,
+                "open_issues": open_issues, "job_dir": self._job_path(job_id), "inspector": self.process_inspector}
+
+    def _invalidate_recovery(self, room_id, recovery_id, reason, successor_job_id=None):
+        import recovery
+        row = self._recovery_row(recovery_id)
+        if row is None:
+            return
+        with self.db() as db:
+            db.execute("UPDATE implementation_recoveries SET status='invalidated',invalidated_at=?,reason=?,successor_job_id=COALESCE(successor_job_id,?) "
+                       "WHERE id=? AND status IN ('prepared','dispatched')", (room.now(), reason, successor_job_id, recovery_id))
+        try:
+            recovery.invalidate(self._handoff_path(room_id, row["handoff_id"]), recovery_id, reason, successor_job_id)
+        except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError):
+            pass  # The registry row is authoritative; the next room_implementation_recover completes the projection lazily.
+        self._event(room_id, "implementation_recovery_invalidated", {"recovery_id": recovery_id, "reason": reason, "successor_job_id": successor_job_id})
+
+    def _reconcile_projection(self, room_id, handoff_id):
+        """Mutating-only lazy reconciliation: a projection left recovery_prepared by a crash before registration,
+        or after the registry already invalidated its recovery, returns to blocked through an audited transition."""
+        import implementation
+        import recovery
+        path = self._handoff_path(room_id, handoff_id)
+        _, _, state = implementation._load(path)
+        prepared = state.get("recovery") if isinstance(state.get("recovery"), dict) else None
+        if state.get("phase") != "recovery_prepared" or not prepared:
+            return
+        row = self._recovery_row(prepared["recovery_id"]) if re.fullmatch(r"[0-9a-f]{32}", str(prepared.get("recovery_id"))) else None
+        try:
+            if row is None:
+                recovery.invalidate(path, prepared["recovery_id"], "registration_incomplete")
+                self._event(room_id, "implementation_recovery_invalidated", {"recovery_id": prepared["recovery_id"], "reason": "registration_incomplete", "successor_job_id": None})
+            elif row["status"] == "invalidated":
+                recovery.invalidate(path, prepared["recovery_id"], row["reason"] or "invalidated", row["successor_job_id"])
+        except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+            pass  # The projection stays where it is; the following audit reports projection_out_of_sync instead of guessing.
+
+    def room_implementation_audit(self, room_id, handoff_id, job_id):
+        """Read-only observation; repairs nothing and creates no authorization."""
+        import recovery
+        text_value(handoff_id, "handoff_id", 200)
+        context = self._recovery_context(room_id, handoff_id, job_id)
+        _, root, _ = self.paths(room_id)
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(room.lock_room(root / "control"))
+            except room.RoomError:
+                return recovery.blocked_report(handoff_id, job_id, "cooperating_owner_active")
+            try:
+                report, _ = recovery.audit(active_recovery=self._active_recovery(job_id), **context)
+            except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+                return recovery.blocked_report(handoff_id, job_id, "handoff_integrity")
+        return report
+
+    def room_implementation_recover(self, room_id, handoff_id, job_id, spec_revision, spec_sha256, candidate_sha256,
+                                    evidence_digest, diagnosis, remaining_work, authorization, request_id):
+        import recovery
+        text_value(handoff_id, "handoff_id", 200)
+        positive_revision(spec_revision)
+        for name, value in (("spec_sha256", spec_sha256), ("candidate_sha256", candidate_sha256), ("evidence_digest", evidence_digest)):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise room.RoomError(f"{name} must be a 64-character lowercase hex digest from the audit")
+        text_value(diagnosis, "diagnosis")
+        text_value(remaining_work, "remaining_work")
+        text_value(authorization, "authorization")
+        text_value(request_id, "request_id", 200)
+        supplied = {"spec_revision": spec_revision, "spec_sha256": spec_sha256, "candidate_sha256": candidate_sha256, "evidence_digest": evidence_digest}
+        encoded = room.canonical({"handoff_id": handoff_id, "job_id": job_id, **supplied, "diagnosis": diagnosis,
+                                  "remaining_work": remaining_work, "authorization": authorization})
+        _, root, _ = self.paths(room_id)
+        with room.lock_room(root / "control"):
+            with self.db() as db:
+                old = db.execute("SELECT * FROM implementation_recoveries WHERE room_id=? AND request_key=?", (room_id, request_id)).fetchone()
+            if old:
+                if old["payload"] != encoded:
+                    raise room.RoomError("request_id was already used with different content")
+                return self._recovery_public(dict(old), duplicate=True)
+            context = self._recovery_context(room_id, handoff_id, job_id)
+            self._reconcile_projection(room_id, handoff_id)
+            active = self._active_recovery(job_id)
+            if active:
+                raise room.RoomError("Recovery is not eligible: recovery_already_exists")
+            recovery_id = uuid.uuid4().hex
+            def on_locked(report, private):
+                return recovery.prepare(report, private, recovery_id, room_id, request_id, context["job"], diagnosis, remaining_work,
+                                        authorization, supplied, self.home)
+            report, prepared = recovery.audit(active_recovery=None, on_locked=on_locked, **context)
+            if not report["eligible"]:
+                raise room.RoomError("Recovery is not eligible: " + ", ".join(report["reasons"]))
+            try:
+                with self.db() as db:
+                    db.execute("INSERT INTO implementation_recoveries(id,room_id,handoff_id,predecessor_job_id,request_key,payload,status,created_at,record_sha256) "
+                               "VALUES(?,?,?,?,?,?,'prepared',?,?)", (recovery_id, room_id, handoff_id, job_id, request_id, encoded, prepared["created_at"], prepared["record_sha256"]))
+            except sqlite3.Error as exc:
+                # The projection advanced before registration; return it to blocked through the audited transition.
+                recovery.invalidate(context["handoff_path"], recovery_id, "registration_failed")
+                raise room.RoomError("Recovery registration failed; the handoff returned to blocked and may be audited again") from exc
+            self._event(room_id, "implementation_recovery_prepared", {"recovery_id": recovery_id, "job_id": job_id, "handoff_id": handoff_id,
+                                                                     "kind": prepared["kind"], "record_sha256": prepared["record_sha256"]})
+            return self._recovery_public(self._recovery_row(recovery_id), duplicate=False, report=report)
+
+    def _recovery_public(self, row, duplicate, report=None):
+        value = {"recovery_id": row["id"], "status": row["status"], "duplicate": duplicate, "handoff_id": row["handoff_id"],
+                 "predecessor_job_id": row["predecessor_job_id"], "successor_job_id": row["successor_job_id"],
+                 "created_at": row["created_at"], "record_sha256": row["record_sha256"], "reason": row["reason"],
+                 "next": {"tool": "room_implementation_submit", "handoff_id": row["handoff_id"], "recovery_id": row["id"]} if row["status"] == "prepared" else None}
+        if report is not None:
+            value["audit"] = report
+        return value
+
+    def _prepared_recovery(self, room_id, handoff_id, recovery_id):
+        row = self._recovery_row(recovery_id)
+        if row is None or row["room_id"] != room_id or row["handoff_id"] != handoff_id:
+            raise room.RoomError("Unknown recovery for this room and handoff")
+        if row["status"] != "prepared":
+            raise room.RoomError(f"Recovery is {row['status']}; only a prepared recovery dispatches its single successor")
+        return row
+
+    def _dispatch_recovery(self, room_id, handoff_id, recovery_id, successor_job_id):
+        import recovery
+        row = self._prepared_recovery(room_id, handoff_id, recovery_id)
+        context = self._recovery_context(room_id, handoff_id, row["predecessor_job_id"])
+        handoff_dir = Path(context["handoff_path"]).parent
+        existing = handoff_dir / "recoveries" / recovery_id / "dispatch.json"
+        try:
+            # A dispatch file whose job never reached the registry (crash before the transaction) may be replaced;
+            # one naming a registered job proves an earlier dispatch and refuses. Read only through owned descriptors.
+            named = json.loads(recovery.read_owned(existing, recovery.EVIDENCE_LIMIT, "record", root=handoff_dir)).get("successor_job_id")
+        except (recovery.ObservationError, ValueError, AttributeError):
+            named = None
+        if named is not None:
+            with self.db() as db:
+                if named and db.execute("SELECT 1 FROM jobs WHERE id=?", (named,)).fetchone():
+                    raise room.RoomError("Recovery already has a registered successor")
+        def on_locked(report, private):
+            return recovery.write_dispatch(private["directory"], recovery_id, successor_job_id, private["root"])
+        report, _ = recovery.audit(active_recovery=row, expect_recovery=recovery_id, on_locked=on_locked, **context)
+        if not report["eligible"]:
+            if any(reason in recovery.INVALIDATING for reason in report["reasons"]):
+                self._invalidate_recovery(room_id, recovery_id, ",".join(report["reasons"]))
+            raise room.RoomError("Recovery dispatch refused: " + ", ".join(report["reasons"]))
 
     def room_review_submit(self, room_id, revision, message, request_id):
         positive_revision(revision)
@@ -585,9 +812,13 @@ class Service:
                 or current["spec_sha256"] != handoff["spec_sha256"]):
             raise room.RoomError("Handoff no longer matches the current agreed spec and resolved findings")
 
-    def room_implementation_submit(self, room_id, handoff_id, request_id):
+    def room_implementation_submit(self, room_id, handoff_id, request_id, recovery_id=None):
         path = self._handoff_path(room_id, handoff_id)
-        return self._submit(room_id, "implementation", request_id, {"handoff_id": handoff_id, "handoff_path": str(path)})
+        payload = {"handoff_id": handoff_id, "handoff_path": str(path)}
+        if recovery_id is not None:
+            self._recovery_row(recovery_id)  # Validates the identifier shape before any registry work.
+            payload["recovery_id"] = recovery_id
+        return self._submit(room_id, "implementation", request_id, payload)
 
     def room_implementation_review(self, room_id, handoff_id, accepted, review):
         import implementation
@@ -643,7 +874,27 @@ class Service:
             return result
         if job["kind"] == "implementation":
             import implementation
-            return implementation.run_implementation(Path(payload["handoff_path"]))
+            recovery_id = payload.get("recovery_id")
+            if recovery_id is None:
+                return implementation.run_implementation(Path(payload["handoff_path"]))
+            import recovery
+            try:
+                row = self._recovery_row(recovery_id)
+                if (row is None or row["status"] != "dispatched" or row["successor_job_id"] != job_id
+                        or row["room_id"] != job["room_id"] or row["handoff_id"] != payload["handoff_id"]):
+                    return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": "recovery_binding_mismatch",
+                            "recovery_id": recovery_id, "handoff_id": payload["handoff_id"], "model_launched": False}
+                context = self._recovery_context(job["room_id"], payload["handoff_id"], row["predecessor_job_id"])
+            except Exception as exc:  # nothing written or spawned yet: a proven pre-launch refusal, never an unclassifiable successor
+                return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": "prelaunch_error", "detail": type(exc).__name__,
+                        "recovery_id": recovery_id, "handoff_id": payload["handoff_id"], "model_launched": False}
+            def recheck():
+                # The handoff lock is already held by run_implementation; take only the predecessor's job lock and lease.
+                report, _ = recovery.audit(active_recovery=row, expect_recovery=recovery_id, locks=("job", "lease"), **context)
+                return report
+            return implementation.run_implementation(Path(payload["handoff_path"]),
+                                                     successor={"recovery_id": recovery_id, "successor_job_id": job_id, "recheck": recheck,
+                                                                "registry": str(self.home)})
         raise room.RoomError("Unknown job kind")
 
     def worker(self, job_id):
@@ -655,7 +906,7 @@ class Service:
                 if job["status"] != "queued":
                     return
                 with self.db() as db:
-                    db.execute("UPDATE jobs SET status='running',started_at=? WHERE id=?", (room.now(), job_id))
+                    db.execute("UPDATE jobs SET status='running',started_at=?,pid=? WHERE id=?", (room.now(), os.getpid(), job_id))
                 process = None
                 result, error, status = None, None, "uncertain"
                 try:
@@ -684,6 +935,8 @@ class Service:
                             phase = result.get("status", result.get("phase"))
                             status = "succeeded" if process.returncode == 0 and phase in ("completed", "awaiting_astra_review", "accepted", "scope_change") else "uncertain" if phase in ("uncertain", "blocked") else "failed"
                             error = result.get("error")
+                            if phase == "refused_before_launch" and not error:
+                                error = "Refused before launch: " + str(result.get("reason"))
                         if (path / "cancel.json").exists() and status != "succeeded":
                             status, error = "uncertain", "Operation cancelled after starting; session/worktree may have advanced"
                 except BaseException as exc:
@@ -702,8 +955,19 @@ class Service:
                         note.write_text("Fable returned this implementation discovery to Astra for requirements review:\n"
                                         + room.canonical({"handoff_id": job["payload"]["handoff_id"], "report": report}), encoding="utf-8")
                         room.record(SimpleNamespace(sender="astra", kind="message", revision=result["spec_revision"], file=str(note)), review_room)
+                recovery_id = job["payload"].get("recovery_id") if job["kind"] == "implementation" else None
+                linkage, link_reason = recovery_linkage(result, status) if recovery_id is not None else (None, None)
                 with self.db() as db:
                     db.execute("UPDATE jobs SET status=?,finished_at=?,result=?,error=? WHERE id=?", (status, room.now(), room.canonical(result) if result is not None else None, error, job_id))
+                    if linkage == "invalidated":
+                        db.execute("UPDATE implementation_recoveries SET status='invalidated',invalidated_at=?,reason=? WHERE id=? AND status='dispatched' AND successor_job_id=?",
+                                   (room.now(), link_reason, recovery_id, job_id))
+                    elif linkage == "consumed":
+                        db.execute("UPDATE implementation_recoveries SET status='consumed' WHERE id=? AND status='dispatched' AND successor_job_id=?", (recovery_id, job_id))
+                    if linkage:
+                        # "launch_unknown" changes no row: the recovery stays dispatched and the successor stays blocked (documented limit).
+                        db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,?,?,?)", (job["room_id"], "implementation_recovery_" + linkage,
+                                   room.canonical({"recovery_id": recovery_id, "successor_job_id": job_id, "reason": link_reason}), room.now()))
                     if job["kind"] == "review" and status == "succeeded":
                         review = result["result"]["structured_output"]
                         for index, finding in enumerate(review["findings"]):
@@ -720,6 +984,12 @@ class Service:
                                        (job_id + "-scope", job["room_id"], job_id, result["spec_revision"], report["scope_change"]))
                         for kind, value in event_values:
                             db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,?,?,?)", (job["room_id"], kind, room.canonical(value), room.now()))
+                if linkage == "invalidated":
+                    import recovery
+                    try:
+                        recovery.invalidate(Path(job["payload"]["handoff_path"]), recovery_id, link_reason, job_id)
+                    except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+                        pass  # The registry row is authoritative; the next mutating operation completes the projection lazily.
 
     def call(self, name, arguments):
         if name not in TOOL_SCHEMAS:
@@ -732,6 +1002,25 @@ class Service:
         if missing or extra:
             raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
         return getattr(self, name)(**arguments)
+
+
+def implementation_error_types():
+    import implementation
+    return implementation.ImplementationError
+
+
+def recovery_linkage(result, status):
+    """Classify a finished recovery successor for the registry: ("invalidated", reason) for a proven pre-launch
+    refusal, ("consumed", None) once the engine confirmed the model process was created, otherwise
+    ("launch_unknown", reason): no row changes, the recovery stays dispatched and the successor stays blocked."""
+    recovery = result.get("recovery") if isinstance(result, dict) else None
+    if isinstance(recovery, dict) and recovery.get("launched_at"):
+        return "consumed", None  # A confirmed spawn always wins: a later cancellation is a post-launch interruption.
+    if isinstance(result, dict) and result.get("phase") == "refused_before_launch":
+        return "invalidated", str(result.get("reason") or "refused_before_launch")
+    if status == "cancelled":
+        return "invalidated", "cancelled_before_launch"  # The worker never started the operation; no result exists.
+    return "launch_unknown", (recovery.get("launch_state") if isinstance(recovery, dict) else None) or "no_classifiable_result"
 
 
 def schema(properties, required=None):
@@ -759,7 +1048,9 @@ TOOL_SCHEMAS = {
                                 "decision_rationale": S}, ["room_id", "content", "rationale"])),
     "room_decision_record": ("After the bounded review round is exhausted, record the user's actual decision on the unresolved product tradeoff to allow the next bounded round. Never invent a decision or use this to bypass unknown/failed delivery.", schema({**R, "revision": I, "decision": S})),
     "room_handoff": ("Prepare Fable implementation from exact agreement, resolved findings, original user authorization, and nonempty verification argv gates. Creates isolated git worktree.", schema({**R, "revision": I, "authorization": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}})),
-    "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow fixed Qwen/Sonnet/Opus policy; Astra checks product outcome after evidence.", schema({**R, "handoff_id": S, "request_id": S})),
+    "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow fixed Qwen/Sonnet/Opus policy; Astra checks product outcome after evidence. With recovery_id, dispatches the single audited successor of an interrupted attempt (new job/request ID, same session, --resume).", schema({**R, "handoff_id": S, "request_id": S, "recovery_id": S}, ["room_id", "handoff_id", "request_id"])),
+    "room_implementation_audit": ("Read-only audit of one interrupted implementation job (configured timeout or session-usage limit): identity, stopped-work evidence, boot boundary, current writers, partial candidate and transcript digests. Runs no model/Qwen/network and repairs nothing. Reports restart_required until the host booted after the interruption.", schema({**R, "handoff_id": S, "job_id": S})),
+    "room_implementation_recover": ("After Astra's diagnosis and the user's actual authorization, durably prepare one audited continuation of an eligible interrupted implementation. Requires the audit's exact spec revision/hash, candidate sha256 and evidence digest; never adopts new bytes. Idempotent per request_id. Then submit with the returned recovery_id.", schema({**R, "handoff_id": S, "job_id": S, "spec_revision": I, "spec_sha256": S, "candidate_sha256": S, "evidence_digest": S, "diagnosis": S, "remaining_work": S, "authorization": S, "request_id": S})),
     "room_implementation_review": ("Record Astra's independent product-outcome verdict against the exact verified candidate. Engineering/delegate verdicts remain Fable's responsibility.", schema({**R, "handoff_id": S, "accepted": {"type": "boolean"}, "review": S})),
     "room_implementation_revise": ("Request a diagnosed correction within the same agreed spec, then submit with a new request_id. Unknown delivery cannot be retried.", schema({**R, "handoff_id": S, "review": S})),
 }

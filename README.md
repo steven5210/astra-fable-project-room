@@ -47,11 +47,15 @@ Authenticate through Claude Code's standard login flow when needed, then rerun d
 
 The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use a different private directory. It contains `config.json`, `registry.sqlite3`, and `rooms/<id>/`. Keep it outside the source repository and installed plugin cache so reinstalling the plugin does not replace your rooms.
 
-The plugin starts a local stdio MCP server with `python3 ./project_room_mcp.py` and `cwd: "."`. This follows the portable pattern in OpenAI's [bundled local MCP example](https://github.com/openai/plugins/blob/main/plugins/openai-developers/.mcp.json). It requires no hosted room server or exposed listening port. After installing or updating, test in a new Codex task so the current skill and tool definitions load.
+The plugin starts a local stdio MCP server with `python3 ./project_room_mcp.py` and `cwd: "."`. This follows the portable pattern in OpenAI's [bundled local MCP example](https://github.com/openai/plugins/blob/main/plugins/openai-developers/.mcp.json). It requires no hosted room server or exposed listening port. After installing or updating, test in a new Codex task so the current skill and tool definitions load. Existing tasks and room history remain available; use the CLI fallback below to continue an existing room when that task still has older tool definitions.
 
 ## Use the room
 
 Astra opens or reuses one room for the project path and feature, records intent, writes a spec, and submits Fable's independent review. Review and implementation calls return job IDs promptly. Bounded status waits follow the job; the room retains results across process restarts.
+
+Continue in the Astra task where you are shaping the feature to keep its conversation history. Astra reads Fable's results from the saved room there. Another task can resume that room when you deliberately hand work over. There is no central Astra task or automatic forwarding between conversations.
+
+Separate feature rooms can run concurrently, including separate worktrees of the same repository. A blocked job blocks its own room. Keep one active owner for a particular room and use its saved room/job IDs when resuming. Claude account limits and local inference capacity remain shared resources.
 
 Implementation requires a clean Git checkout with a commit to use as its baseline. Preserve existing changes deliberately before handoff; the plugin does not automatically commit or discard them. It creates an isolated `codex/implementation-*` worktree and leaves the candidate uncommitted for review. Acceptance records the reviewed candidate; that controller operation does not merge, push, deploy, or apply it to another checkout. When you requested a finished feature, the Astra skill continues integration through normal repository tools, preserving unrelated changes and verifying the integrated result. Publishing follows the scope you authorized.
 
@@ -63,7 +67,7 @@ Existing app conversations retain their own history. Rooms start dedicated Claud
 
 ## CLI fallback
 
-The controller exposes the same 18 operations as MCP. From the plugin directory:
+The controller exposes the same 20 operations as MCP. From the plugin directory:
 
 ```sh
 python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'
@@ -97,6 +101,8 @@ Tool discovery, health, and successful inference are different checks. Installat
 ## Reliability and verification limits
 
 The controller preserves exact spec binding, request IDs, session identity evidence, and durable outcomes. It prevents accidental duplicate model submission and blocks uncertain delivery. Do not delete state, reuse a request ID with changed content, or create a replacement room to evade a blocked attempt. Each review round allows three Fable reviews. If further debate is needed, Astra brings you a focused product decision; recording your answer permits the next bounded round while retaining every prior attempt. Agreement can proceed directly to handoff. See [continuation and recovery](docs/recovery.md).
+
+An implementation job that stopped only from the configured model-invocation timeout or the provider's session-usage-limit error is not silently retried. `room_implementation_audit` observes the stopped job and calls no model; `room_implementation_recover` prepares an immutable continuation record only after every identity and evidence value matches a fresh check; `room_implementation_submit` then dispatches the one authorized successor. Continuation also requires a host restart after the original failure, and nothing is prepared or launched before trusted boot-time evidence postdates it. The successor is a new job: Fable inspects the partial work again, and fresh gates and Astra acceptance still apply. A successor refused before its model process existed frees the interruption for a fresh audit; a successor whose launch cannot be classified stays blocked by design. See [interrupted implementation continuation](docs/recovery.md).
 
 The bundled skill drives Astra's reasoning and independent product review. Automated gates prove their own checks, not every aspect of product quality. Fable's delegate choices and engineering judgments must remain reviewable in its result. The package does not certify model quality, install local inference, or assume every Claude session supports subagents.
 

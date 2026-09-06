@@ -2,6 +2,8 @@
 
 One room identifies a feature in a project. The room keeps the specification, issues, backlog, decisions, Claude session identity, jobs, handoffs, and acceptance evidence needed to resume work later.
 
+Use the room from the Astra task where the feature is being shaped. That task retains its conversation history and reads Fable's responses from the room; no central Astra task or automatic forwarding is involved. Deliberately handing work to another task does not require a replacement room. Separate feature rooms can run concurrently, while each room keeps one active owner and its own saved job IDs. Account quotas and local model capacity remain shared.
+
 1. **Intent:** Astra identifies the user problem, examples, constraints, and scope. If the request is to build, that authorization is carried forward; if it is to plan, the workflow stops at the agreed spec.
 2. **Specification:** Astra grounds requirements in the current repository and writes a self-contained revision with acceptance criteria and executable verification. Reference-based behavior gets a probe in the plan.
 3. **Independent interpretation:** Fable states what it thinks the feature means and proposes useful improvements with their benefits and tradeoffs. Findings distinguish blockers from optional enhancements.
@@ -9,7 +11,7 @@ One room identifies a feature in a project. The room keeps the specification, is
 5. **Consensus:** Both agents accept the same revision and SHA-256, with blockers resolved. Changing the spec invalidates previous agreement.
 6. **Handoff:** Astra binds existing implementation authorization and argument-array gates to the agreed spec. This record does not expand the user's scope or grant unrelated external actions.
 7. **Implementation:** Fable chooses delegates under the fixed policy, supplies context, verifies returned code, runs gates and engineering reviews, and supplies evidence. A scope discovery creates a blocking issue; its resolution requires a strictly newer spec revision and renewed agreement before another handoff.
-8. **Product acceptance:** Astra inspects delivered behavior and evidence independently. It records acceptance or specific findings. Known results can enter the diagnosed correction loop; uncertain delivery cannot.
+8. **Product acceptance:** Astra inspects delivered behavior and evidence independently. It records acceptance or specific findings. Known results can enter the diagnosed correction loop; uncertain delivery cannot. An implementation stopped only by the configured model-invocation timeout or the provider's session-usage-limit error can continue through the audited recovery workflow after the host restarts; the resulting successor still needs fresh gates and Astra's independent acceptance like any other implementation.
 9. **Delivery:** When the user requested the finished feature, Astra integrates the accepted work using normal repository tools, checks the pinned source baseline and current candidate evidence, preserves unrelated changes, and completes authorized review/publication steps. Integration that changes reviewed code requires renewed verification.
 
 Astra need not read every delegate transcript. It inspects the code, behavior, engineering verdict, gate output, and remaining risks, then drills into routing or delegate details when a concern requires it. Fable remains accountable for every engineering verdict.

@@ -23,6 +23,19 @@ class ImplementationError(Exception):
     pass
 
 
+class ModelSpawnError(ImplementationError):
+    """No child process exists: the launch failed, or the invocation was terminated before any process was created.
+    `reason` is the allowlisted refusal code (model_spawn_failure or cancelled_before_launch)."""
+
+    def __init__(self, message, reason="model_spawn_failure"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class LaunchUnknown(ImplementationError):
+    """The invocation was interrupted while the process was being created; whether a child exists is unknown."""
+
+
 POLICY = """Fable is the implementation orchestrator and owns engineering judgments.
 Quality always beats token savings. Use the cheapest delegate only when it delivers
 full quality: Qwen for self-contained specified work, Sonnet for mechanical agentic
@@ -219,9 +232,13 @@ def _summary(directory, manifest, state):
         if isinstance(compact.get(key), dict):
             snapshot = compact[key]
             compact[key] = {"head": snapshot["head"], "sha256": snapshot["sha256"], "path_count": len(snapshot["entries"])}
+    if isinstance(compact.get("recovery"), dict) and isinstance(compact["recovery"].get("candidate"), dict):
+        snapshot = compact["recovery"]["candidate"]
+        compact["recovery"] = {**compact["recovery"], "candidate": {"head": snapshot["head"], "sha256": snapshot["sha256"], "path_count": len(snapshot["entries"])}}
     compact["turn_history"] = [{"attempt_count": item.get("attempt_count"), "attempt_path": item.get("attempt_path"),
-                                 "outcome": (item.get("report") or {}).get("outcome"),
+                                 "outcome": item.get("outcome") or (item.get("report") or {}).get("outcome"),
                                  "summary": (item.get("report") or {}).get("summary"),
+                                 "recovery_id": item.get("recovery_id"),
                                  "gate_return_codes": [gate.get("return_code") for gate in item.get("gate_results") or []]}
                                 for item in state.get("turn_history", [])]
     return {"handoff_id": manifest["handoff_id"], "handoff_path": str(directory / "handoff.json"),
@@ -350,16 +367,45 @@ def _validate_report(report, manifest):
             raise ImplementationError("Invalid routing fixes")
 
 
-def _run_child(argv, cwd, output, errors, timeout, input_bytes=None, env=None):
+def _run_child(argv, cwd, output, errors, timeout, input_bytes=None, env=None, spawn_receipt=None, on_spawn=None):
+    """Run one bounded child. Three launch outcomes are distinguished truthfully: ModelSpawnError proves no process
+    was created (failures and terminations before Popen, or Popen's own cleanup-guaranteed failures); a normal
+    return or any later exception means the process was created and `spawn_receipt` (when given) was written
+    immediately after creation; LaunchUnknown means the interruption landed inside process creation itself."""
     process = None
+    stage = "before_spawn"
     previous_term = signal.signal(signal.SIGTERM, room.handle_termination)
     previous_int = signal.signal(signal.SIGINT, room.handle_termination)
     try:
-        with output.open("wb") as stdout, errors.open("wb") as stderr:
-            process = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                                       stdout=stdout, stderr=stderr, start_new_session=True, env=env)
+        streams = contextlib.ExitStack()
+        try:
+            stdout = streams.enter_context(output.open("wb"))
+            stderr = streams.enter_context(errors.open("wb"))
+        except OSError as exc:
+            streams.close()
+            raise ModelSpawnError(f"Process output could not be opened: {exc}") from exc
+        with streams:
+            stage = "spawning"
+            try:
+                process = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                                           stdout=stdout, stderr=stderr, start_new_session=True, env=env)
+            except (OSError, ValueError, TypeError) as exc:
+                stage = "before_spawn"  # Popen reaps any partially created child before raising these.
+                raise ModelSpawnError(f"Process did not start: {exc}") from exc
+            stage = "spawned"
+            if spawn_receipt is not None:
+                _atomic(spawn_receipt, {"pid": process.pid, "started_at": room.now()})
+            if on_spawn is not None:
+                on_spawn()  # durable launch bookkeeping while the child runs
             process.communicate(input=input_bytes, timeout=timeout)
         return process.returncode
+    except Exception as exc:
+        if stage == "before_spawn" and not isinstance(exc, ModelSpawnError):
+            reason = "cancelled_before_launch" if isinstance(exc, room.InvocationTerminated) else "model_spawn_failure"
+            raise ModelSpawnError(f"Terminated before any process was created: {type(exc).__name__}", reason) from exc
+        if stage == "spawning":
+            raise LaunchUnknown(f"Interrupted while creating the process: {type(exc).__name__}") from exc
+        raise
     finally:
         if process is not None and process.poll() is None:
             room.stop_process(process)
@@ -369,130 +415,399 @@ def _run_child(argv, cwd, output, errors, timeout, input_bytes=None, env=None):
         signal.signal(signal.SIGINT, previous_int)
 
 
-def run_implementation(handoff_path):
-    directory, _, _ = _load(handoff_path)
-    with room.lock_room(directory):
-        directory, manifest, state = _load(directory)
-        if state["phase"] in ("running_model", "running_gates", "preparing"):
-            state.update(phase="blocked", needs_attention=True, error="Previous invocation ended without a recorded outcome; no replay is allowed")
-            _atomic(directory / "state.json", state)
-        if state["phase"] not in ("prepared", "correction_pending"):
-            return _summary(directory, manifest, state)
+def _registered_successor(record, record_sha, manifest, recovery_id, successor_job_id, invoking_registry=None):
+    """True only when the registry named by the durable recovery record (and by the invoking service) has this
+    exact successor job dispatched for this recovery, the registered worker process is this invocation's parent,
+    and that worker's lease is currently held.
+
+    A dispatch file, a caller-supplied dictionary or an eligible callback cannot stand in for that registration:
+    the registry rows, the parent-process identity recorded at worker spawn, and the held lease bind the engine
+    to the owning worker. A held lease alone only proves that someone holds it."""
+    import fcntl
+    import sqlite3
+    registry = record.get("registry_home") if isinstance(record, dict) else None
+    if (not isinstance(registry, str) or not re.fullmatch(r"[0-9a-f]{32}", str(successor_job_id))
+            or not isinstance(invoking_registry, str) or invoking_registry != registry):
+        return False  # The invoking service must name the same registry the durable record was prepared in.
+    home = Path(registry)
+    database = home / "registry.sqlite3"
+    if not home.is_dir() or not database.is_file():
+        return False
+    try:
+        with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
+            db.row_factory = sqlite3.Row
+            job = db.execute("SELECT room_id,kind,status,payload,pid FROM jobs WHERE id=?", (successor_job_id,)).fetchone()
+            row = db.execute("SELECT room_id,handoff_id,status,successor_job_id,record_sha256 FROM implementation_recoveries WHERE id=?",
+                             (recovery_id,)).fetchone()
+        payload = json.loads(job["payload"]) if job else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return False
+    if (not job or not row or job["kind"] != "implementation" or job["status"] != "running" or not isinstance(payload, dict)
+            or type(job["pid"]) is not int or job["pid"] != os.getppid()  # this invocation must be the registered worker's child
+            or payload.get("recovery_id") != recovery_id or payload.get("handoff_id") != manifest["handoff_id"]
+            or row["status"] != "dispatched" or row["successor_job_id"] != successor_job_id or row["room_id"] != job["room_id"]
+            or row["handoff_id"] != manifest["handoff_id"] or row["record_sha256"] != record_sha):
+        return False
+    lease = home / "jobs" / successor_job_id / "worker.lock"
+    try:
+        with lease.open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True  # Held: this invocation runs under the registered worker's lease.
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False  # Nobody holds the registered worker's lease, so this is not the owning invocation.
+
+
+def _recovery_refusal(directory, manifest, state, successor, root=None):
+    """Deterministic pre-launch rechecks for a registered successor.
+
+    Returns (reason code or None, current candidate). A reason code proves no launch happened. The engine
+    binds itself to the durable registration (registry rows named by the recovery record plus the held worker
+    lease) before consulting the registered recheck; a caller-supplied callback alone can never reach launch.
+    """
+    prepared = state.get("recovery") if isinstance(state.get("recovery"), dict) else None
+    if not isinstance(successor, dict) or not prepared or prepared.get("recovery_id") != successor.get("recovery_id"):
+        return "recovery_binding_mismatch", None
+    home = directory / "recoveries" / str(successor["recovery_id"])
+    try:
+        import recovery
+        bound = root if root is not None else directory
+        dispatch = json.loads(recovery.read_owned(home / "dispatch.json", recovery.EVIDENCE_LIMIT, "record", root=bound))
+        record_bytes = recovery.read_owned(home / "record.json", recovery.EVIDENCE_LIMIT, "record", root=bound)
+        record = json.loads(record_bytes)
+    except (recovery.ObservationError, OSError, ValueError):
+        return "recovery_binding_mismatch", None
+    if (not isinstance(dispatch, dict) or dispatch.get("recovery_id") != successor["recovery_id"]
+            or dispatch.get("successor_job_id") != successor.get("successor_job_id") or not successor.get("successor_job_id")):
+        return "recovery_binding_mismatch", None
+    if room.sha(record_bytes) != prepared.get("record_sha256") or not isinstance(record, dict):
+        return "evidence_changed", None
+    if not _registered_successor(record, room.sha(record_bytes), manifest, successor["recovery_id"], successor["successor_job_id"],
+                                 successor.get("registry")):
+        return "recovery_binding_mismatch", None
+    recheck = successor.get("recheck")
+    if not callable(recheck):
+        return "recovery_binding_mismatch", None
+    report = recheck()
+    if not isinstance(report, dict) or not report.get("eligible"):
+        reasons = report.get("reasons") if isinstance(report, dict) else None
+        return (",".join(reasons) if reasons else "recovery_binding_mismatch"), None
+    try:
         _require_current_agreement(manifest)
-        is_correction = state["phase"] == "correction_pending"
-        worktree = Path(manifest["worktree_path"])
-        expected_candidate = state["candidate"] if is_correction else state["initial_candidate"]
-        if candidate_snapshot(worktree) != expected_candidate:
-            raise ImplementationError("Prepared worktree changed before its authorized implementation began")
-        room.validate_subscription_environment()
-        config = json.loads((directory / "implementation-config.json").read_text())
-        attempt_number = state.get("attempt_count", 0) + 1
-        attempt = directory / "attempts" / f"{attempt_number:04d}"
-        attempt.mkdir(parents=True, exist_ok=False)
-        packet = {"handoff_id": manifest["handoff_id"], "spec_revision": manifest["revision"],
-                  "spec_sha256": manifest["spec_sha256"], "baseline_commit": manifest["baseline_commit"],
-                  "authorization": manifest["authorization_text"], "gates": manifest["gates"],
-                  "spec": (directory / "spec.md").read_text(), "review_history": (directory / "review-history.md").read_text(),
-                  "worktree_path": str(worktree), "delegation_policy": (directory / "delegation-policy.txt").read_text()}
-        if is_correction:
-            packet.update(correction_request=state["correction_request"], previous_report=state.get("report"),
-                          previous_gate_results=state.get("gate_results", []))
-            packet["previous_gate_output"] = [{"argv": gate["argv"], "return_code": gate["return_code"],
-                                               "stdout": Path(gate["stdout_path"]).read_text(errors="replace"),
-                                               "stderr": Path(gate["stderr_path"]).read_text(errors="replace")}
-                                              for gate in state.get("gate_results", [])]
-        prompt = ("Implement only the authorized agreed specification in this isolated worktree. "
-                  "The review-only restrictions in the historical transcript applied to that prior review; "
-                  "this exact handoff separately authorizes implementation. Follow the fixed delegation policy "
-                  "and leave the candidate for independently executed gates and Astra review. Return the "
-                  "required structured report, with actual evidence and remaining gaps; no self-certification. "
-                  "remaining_gaps is only for unresolved agreed acceptance criteria or verification blockers. "
-                  "Keep nonblocking capability observations, optional-tool availability, evidence provenance, "
-                  "and expected workflow limits in review_findings. Never relabel an actual unmet requirement "
-                  "as nonblocking merely to obtain acceptance. Describe grounded useful enhancements in backlog "
-                  "with each proposal's benefit and tradeoff. Astra files or links proposal issues for the "
-                  "user's opinion and scope approval outside this session; implementation waits for approval. "
-                  "If discoveries require a material scope change, stop and return outcome=scope_change with "
-                  "a concrete scope_change explanation for Astra. Put optional enhancements in backlog.\n"
-                  + "IMPLEMENTATION PACKET (JSON):\n" + room.canonical(packet) + "\n").encode()
-        (attempt / "prompt.txt").write_bytes(prompt)
-        argv = [config["claude_bin"], *config["extra_args"], "--print", "--output-format", "json", "--model", config["model"],
-                "--resume" if is_correction else "--session-id", manifest["session_id"], "--json-schema", room.canonical(REPORT_SCHEMA)]
-        _atomic(attempt / "argv.json", argv)
-        if is_correction:
-            state.setdefault("turn_history", []).append({key: state.get(key) for key in
-                ("attempt_count", "attempt_path", "report", "identity_evidence", "gate_results", "candidate", "astra_review", "correction_request")})
-        state.update(phase="running_model", started_at=room.now(), attempt_path=str(attempt), attempt_count=attempt_number,
-                     astra_accepted=False, gates_passed=False)
+    except ImplementationError:
+        return "spec_mismatch", None
+    current = candidate_snapshot(manifest["worktree_path"])
+    if current != prepared["candidate"]:
+        return "candidate_changed", None
+    return None, current
+
+
+def run_implementation(handoff_path, successor=None):
+    """Run the next authorized attempt. `successor` binds a registered recovery successor job:
+    {"recovery_id", "successor_job_id", "recheck": zero-argument callable returning the audit report}."""
+    if successor is not None:
+        directory = Path(handoff_path).resolve()  # the registered path only; the recovery lane reads nothing before binding
+        if directory.is_file():
+            directory = directory.parent
+    else:
+        directory, _, _ = _load(handoff_path)
+    with room.lock_room(directory):
+        root = None
+        if successor is not None:
+            import recovery
+            try:
+                # The recovery lane binds the handoff directory: identity captured around validation, one descriptor for every read.
+                root, directory, manifest, state, _ = recovery.bind_handoff(directory)
+            except Exception as exc:
+                return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": "prelaunch_error", "detail": type(exc).__name__,
+                        "recovery_id": successor.get("recovery_id") if isinstance(successor, dict) else None, "handoff_id": None, "model_launched": False}
+        else:
+            directory, manifest, state = _load(directory)
+        with root if root is not None else contextlib.nullcontext():
+            return _continue_run(directory, manifest, state, successor, root)
+
+
+def _continue_run(directory, manifest, state, successor, root):
+    if state["phase"] in ("running_model", "running_gates", "preparing"):
+        state.update(phase="blocked", needs_attention=True, error="Previous invocation ended without a recorded outcome; no replay is allowed")
         _atomic(directory / "state.json", state)
+    is_recovery = state["phase"] == "recovery_prepared"
+    current = None
+    if is_recovery:
+        if successor is None:
+            raise ImplementationError("A prepared recovery runs only through its registered successor job")
         try:
-            model_env = dict(os.environ)
-            if config["claude_config_dir_override"] is None:
-                model_env.pop("CLAUDE_CONFIG_DIR", None)
-            else:
-                model_env["CLAUDE_CONFIG_DIR"] = config["claude_config_dir_override"]
-            code = _run_child(argv, worktree, attempt / "stdout.json", attempt / "stderr.txt", config["timeout_seconds"], prompt, model_env)
-            finished = room.now()
-            state.update(model_finished_at=finished, model_return_code=code)
-            raw = (attempt / "stdout.json").read_bytes()
-            state["model_stdout_sha256"] = room.sha(raw)
-            result = json.loads(raw)
-            _atomic(attempt / "parsed-result.json", result)
-            if (code != 0 or not isinstance(result, dict) or result.get("is_error") is not False
-                    or result.get("type") != "result" or result.get("subtype") != "success"
-                    or result.get("terminal_reason") not in (None, "completed") or result.get("session_id") != manifest["session_id"]):
-                raise ImplementationError("Claude did not return a successful terminal result for the exact implementation session")
-            if result.get("permission_denials"):
-                state["permission_denials"] = result["permission_denials"]
-                raise ImplementationError("Claude reported permission denials; required work needs attention")
-            report = result.get("structured_output")
-            _validate_report(report, manifest)
-            usage = result.get("modelUsage")
-            models = sorted(usage) if isinstance(usage, dict) else []
-            transcript_path = manifest["session_transcript_path"]
-            if not config["session_transcript_path"]:
-                transcript_path = session_paths.find_session_transcript(config["claude_config_dir"], manifest["session_id"],
-                                                                        worktree, transcript_path)
-            evidence = room.primary_producer_evidence(transcript_path, manifest["session_id"],
-                                                     state["started_at"], finished, report, models, config)
-            state.update(report=report, primary_model=evidence["primary_model"], actual_models=models,
-                         auxiliary_models=[value for value in models if value != evidence["primary_model"]], identity_evidence=evidence)
-            candidate = candidate_snapshot(worktree)
-            if candidate["head"] != manifest["baseline_commit"]:
-                raise ImplementationError("Implementation changed worktree HEAD; committed candidates require separate integration review")
-            if report["outcome"] == "scope_change":
-                state.update(phase="scope_change", needs_attention=True, candidate=candidate, gate_results=[], finished_at=room.now())
-                _atomic(directory / "state.json", state)
-                return _summary(directory, manifest, state)
-            state.update(phase="running_gates", candidate=candidate, gate_results=[])
-            _atomic(directory / "state.json", state)
-            gate_env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-            for index, gate in enumerate(manifest["gates"]):
-                gate_dir = attempt / f"gate-{index + 1}"
-                gate_dir.mkdir()
-                started = room.now()
-                result_code = _run_child(gate, worktree, gate_dir / "stdout.txt", gate_dir / "stderr.txt",
-                                         config["gate_timeout_seconds"], env=gate_env)
-                after = candidate_snapshot(worktree)
-                gate_result = {"argv": gate, "return_code": result_code, "started_at": started,
-                               "finished_at": room.now(), "stdout_path": str(gate_dir / "stdout.txt"),
-                               "stderr_path": str(gate_dir / "stderr.txt"),
-                               "stdout_sha256": room.sha((gate_dir / "stdout.txt").read_bytes()),
-                               "stderr_sha256": room.sha((gate_dir / "stderr.txt").read_bytes()), "candidate_unchanged": after == candidate}
-                state["gate_results"].append(gate_result)
-                _atomic(directory / "state.json", state)
-                if after != candidate:
-                    raise ImplementationError("A gate changed candidate content or HEAD; gate evidence cannot certify this candidate")
-            state.update(phase="awaiting_astra_review", gates_passed=all(gate["return_code"] == 0 for gate in state["gate_results"]),
-                         candidate=candidate, finished_at=room.now(), needs_attention=False)
-        except BaseException as exc:
-            state.update(phase="blocked", needs_attention=True, finished_at=room.now(),
-                         error=f"{type(exc).__name__}: {exc}", replay_allowed=False)
-            _atomic(directory / "state.json", state)
-            if not isinstance(exc, (Exception, KeyboardInterrupt)):
-                raise
-        _atomic(directory / "state.json", state)
+            refusal, current = _recovery_refusal(directory, manifest, state, successor, root)
+        except Exception as exc:  # Nothing has been written or spawned yet: any failure here is a proven non-launch.
+            return _refused("prelaunch_error", manifest, successor, type(exc).__name__)
+        if refusal:
+            return _refused(refusal, manifest, successor)
+    elif successor is not None:
+        raise ImplementationError("Recovery identity was supplied for a handoff that has no prepared recovery")
+    elif state["phase"] not in ("prepared", "correction_pending"):
         return _summary(directory, manifest, state)
+    if not is_recovery:
+        _require_current_agreement(manifest)
+    is_correction = state["phase"] == "correction_pending"
+    worktree = Path(manifest["worktree_path"])
+    expected_candidate = state["recovery"]["candidate"] if is_recovery else state["candidate"] if is_correction else state["initial_candidate"]
+    if (current if is_recovery else candidate_snapshot(worktree)) != expected_candidate:
+        raise ImplementationError("Prepared worktree changed before its authorized implementation began")
+    return _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root)
+
+
+def _set_aside(attempt):
+    """Keep an unlaunched attempt directory's files without letting them block the next launch."""
+    if attempt.is_dir():
+        attempt.rename(attempt.with_name(attempt.name + "-unlaunched-" + uuid.uuid4().hex))
+
+
+def _refused(reason, manifest, successor, detail=None):
+    return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": reason, "detail": detail,
+            "recovery_id": successor.get("recovery_id"), "handoff_id": manifest["handoff_id"], "model_launched": False}
+
+
+def _pinned_bytes(directory, name, root=None):
+    """Bytes of a pinned handoff input: through the bound root descriptor in the recovery lane, by path otherwise."""
+    if root is None:
+        return (directory / name).read_bytes()
+    import recovery
+    return recovery.read_owned(directory / name, recovery.EVIDENCE_LIMIT, "handoff", root=root)
+
+
+def _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root=None):
+    import copy
+    import recovery
+    rollback = copy.deepcopy(state)
+    attempt_number = state.get("attempt_count", 0) + 1
+    attempt = directory / "attempts" / f"{attempt_number:04d}"
+    try:
+        config = json.loads(_pinned_bytes(directory, "implementation-config.json", root))
+        room.validate_subscription_environment()
+        if is_recovery:
+            _set_aside(attempt)  # A stray directory from an earlier pre-launch failure must not wedge the lane.
+        attempt.mkdir(parents=True, exist_ok=False)
+        argv, prompt, model_env = _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor,
+                                                   config, attempt, attempt_number, recovery, root)
+    except Exception as exc:
+        if is_recovery:
+            # The on-disk projection is still recovery_prepared and no process was spawned.
+            _set_aside(attempt)
+            state.clear()
+            state.update(rollback)
+            return _refused("prelaunch_error", manifest, successor, type(exc).__name__)
+        raise
+    return _run_attempt(directory, manifest, state, worktree, is_recovery, successor, config, attempt, attempt_number,
+                        argv, prompt, model_env, rollback, recovery)
+
+
+def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, config, attempt, attempt_number, recovery, root=None):
+    packet = {"handoff_id": manifest["handoff_id"], "spec_revision": manifest["revision"],
+              "spec_sha256": manifest["spec_sha256"], "baseline_commit": manifest["baseline_commit"],
+              "authorization": manifest["authorization_text"], "gates": manifest["gates"],
+              "spec": _pinned_bytes(directory, "spec.md", root).decode("utf-8"),
+              "review_history": _pinned_bytes(directory, "review-history.md", root).decode("utf-8"),
+              "worktree_path": str(worktree), "delegation_policy": _pinned_bytes(directory, "delegation-policy.txt", root).decode("utf-8")}
+    if is_correction:
+        packet.update(correction_request=state["correction_request"], previous_report=state.get("report"),
+                      previous_gate_results=state.get("gate_results", []))
+        packet["previous_gate_output"] = [{"argv": gate["argv"], "return_code": gate["return_code"],
+                                           "stdout": Path(gate["stdout_path"]).read_text(errors="replace"),
+                                           "stderr": Path(gate["stderr_path"]).read_text(errors="replace")}
+                                          for gate in state.get("gate_results", [])]
+    if is_recovery:
+        prepared = state["recovery"]
+        bound = root if root is not None else directory
+        record = json.loads(recovery.read_owned(directory / "recoveries" / prepared["recovery_id"] / "record.json", recovery.EVIDENCE_LIMIT, "record", root=bound))
+        interrupted = Path(state["attempt_path"])
+        try:
+            stderr_tail = recovery.read_owned(interrupted / "stderr.txt", recovery.EVIDENCE_LIMIT, root=bound)[-4000:].decode("utf-8", "replace")
+        except recovery.ObservationError:
+            stderr_tail = ""
+        # A correction stays pending until an attempt after it completed with a report; interrupted
+        # attempts (including earlier recovered successors) never satisfy it.
+        correction = state.get("correction_request") if isinstance(state.get("correction_request"), dict) else None
+        after = correction.get("after_attempt") if correction else None
+        reported_attempt = state["attempt_count"] - 1 if state.get("report") else None
+        pending_correction = correction if (type(after) is int and after < state["attempt_count"]
+                                            and (reported_attempt is None or reported_attempt <= after)) else None
+        packet.update(recovery={
+            "recovery_id": prepared["recovery_id"], "interrupted_attempt": state["attempt_count"],
+            "interruption": record["interruption"], "diagnosis": record["diagnosis"], "remaining_work": record["remaining_work"],
+            "recovery_authorization": record["authorization"],
+            "partial_candidate": {"sha256": prepared["candidate"]["sha256"], "head": prepared["candidate"]["head"],
+                                  "changed_vs_initial": recovery._changed_paths(state.get("initial_candidate"), prepared["candidate"])},
+            "pending_correction_request": pending_correction,
+            "interrupted_attempt_stderr_tail_unverified": stderr_tail,
+            "instructions": ("This is an authorized continuation of the interrupted implementation session in the same worktree. "
+                             "Inspect the existing partial work before editing. Nothing produced by the interrupted attempt "
+                             "(code, tests, comments, claims) is verified; no report or gate result from it exists. Complete the "
+                             "remaining agreed requirements, run the gates yourself, and return a fresh structured report.")})
+    prompt = ("Implement only the authorized agreed specification in this isolated worktree. "
+              "The review-only restrictions in the historical transcript applied to that prior review; "
+              "this exact handoff separately authorizes implementation. Follow the fixed delegation policy "
+              "and leave the candidate for independently executed gates and Astra review. Return the "
+              "required structured report, with actual evidence and remaining gaps; no self-certification. "
+              "remaining_gaps is only for unresolved agreed acceptance criteria or verification blockers. "
+              "Keep nonblocking capability observations, optional-tool availability, evidence provenance, "
+              "and expected workflow limits in review_findings. Never relabel an actual unmet requirement "
+              "as nonblocking merely to obtain acceptance. Describe grounded useful enhancements in backlog "
+              "with each proposal's benefit and tradeoff. Astra files or links proposal issues for the "
+              "user's opinion and scope approval outside this session; implementation waits for approval. "
+              "If discoveries require a material scope change, stop and return outcome=scope_change with "
+              "a concrete scope_change explanation for Astra. Put optional enhancements in backlog.\n"
+              + "IMPLEMENTATION PACKET (JSON):\n" + room.canonical(packet) + "\n").encode()
+    (attempt / "prompt.txt").write_bytes(prompt)
+    argv = [config["claude_bin"], *config["extra_args"], "--print", "--output-format", "json", "--model", config["model"],
+            "--resume" if (is_correction or is_recovery) else "--session-id", manifest["session_id"], "--json-schema", room.canonical(REPORT_SCHEMA)]
+    _atomic(attempt / "argv.json", argv)
+    if is_correction:
+        state.setdefault("turn_history", []).append({key: state.get(key) for key in
+            ("attempt_count", "attempt_path", "report", "identity_evidence", "gate_results", "candidate", "astra_review", "correction_request")})
+    if is_recovery:
+        state.setdefault("turn_history", []).append({
+            "attempt_count": state["attempt_count"], "attempt_path": state["attempt_path"], "outcome": "interrupted",
+            "interruption": record["interruption"], "recovery_id": prepared["recovery_id"], "error": state.get("error"),
+            "correction_request": pending_correction})
+        # launched_at is recorded only from the spawn receipt written after the process exists (see _record_launch).
+        state["recovery"] = {**prepared, "successor_job_id": successor["successor_job_id"], "successor_attempt": attempt_number,
+                             "launch_state": "pending"}
+        for key in ("report", "identity_evidence", "gate_results", "astra_review", "primary_model", "actual_models", "auxiliary_models"):
+            state.pop(key, None)
+        state.update(replay_allowed=False, error=None, needs_attention=False)
+    model_env = dict(os.environ)
+    if config["claude_config_dir_override"] is None:
+        model_env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        model_env["CLAUDE_CONFIG_DIR"] = config["claude_config_dir_override"]
+    state.update(phase="running_model", started_at=room.now(), attempt_path=str(attempt), attempt_count=attempt_number,
+                 astra_accepted=False, gates_passed=False)
+    _atomic(directory / "state.json", state)
+    return argv, prompt, model_env
+
+
+def _record_launch(state, attempt, successor, attempt_number):
+    """Mark the recovery launched only from the spawn receipt that _run_child writes after the process exists."""
+    if not isinstance(state.get("recovery"), dict) or state["recovery"].get("launched_at"):
+        return bool(isinstance(state.get("recovery"), dict) and state["recovery"].get("launched_at"))
+    launched_at, evidence = None, None
+    for name in ("process-start.json", "process-result.json"):
+        receipt = attempt / name
+        if not receipt.is_file():
+            continue
+        try:
+            saved = json.loads(receipt.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if isinstance(saved, dict) and type(saved.get("pid")) is int:
+            # The start receipt carries the spawn instant; the exit receipt (written in _run_child's finally only when a
+            # process existed) proves a launch whose start receipt was lost to a signal or write failure.
+            launched_at, evidence = (saved.get("started_at") if name == "process-start.json" else state.get("started_at")), name
+            if isinstance(launched_at, str):
+                break
+    if not isinstance(launched_at, str):
+        return False
+    state["recovery"].update(launched_at=launched_at, launch_state="launched", launch_evidence=evidence)
+    for entry in state.get("recovery_history", []):
+        if isinstance(entry, dict) and entry.get("recovery_id") == state["recovery"].get("recovery_id") and entry.get("status") == "prepared":
+            entry.update(status="launched", launched_at=launched_at, successor_job_id=successor["successor_job_id"], successor_attempt=attempt_number)
+    return True
+
+
+def _run_attempt(directory, manifest, state, worktree, is_recovery, successor, config, attempt, attempt_number, argv, prompt, model_env, rollback, recovery):
+    try:
+        try:
+            def launched():
+                if is_recovery and _record_launch(state, attempt, successor, attempt_number):
+                    _atomic(directory / "state.json", state)
+            try:
+                code = _run_child(argv, worktree, attempt / "stdout.json", attempt / "stderr.txt", config["timeout_seconds"], prompt, model_env,
+                                  spawn_receipt=attempt / "process-start.json", on_spawn=launched)
+            finally:
+                if is_recovery:
+                    _record_launch(state, attempt, successor, attempt_number)
+        except ModelSpawnError as exc:
+            if is_recovery:
+                # No process was created: restore the prepared projection first, then keep the unlaunched attempt files aside.
+                _atomic(directory / "state.json", rollback)
+                state.clear()
+                state.update(rollback)
+                _set_aside(attempt)
+                return _refused(exc.reason, manifest, successor)
+            raise
+        except LaunchUnknown:
+            if is_recovery:
+                # Whether a process exists is unknown: this stays a blocked, unclassifiable successor, never a proven non-launch.
+                state["recovery"]["launch_state"] = "unknown"
+            raise
+        finished = room.now()
+        state.update(model_finished_at=finished, model_return_code=code)
+        raw = (attempt / "stdout.json").read_bytes()
+        state["model_stdout_sha256"] = room.sha(raw)
+        result = json.loads(raw)
+        _atomic(attempt / "parsed-result.json", result)
+        if (code != 0 or not isinstance(result, dict) or result.get("is_error") is not False
+                or result.get("type") != "result" or result.get("subtype") != "success"
+                or result.get("terminal_reason") not in (None, "completed") or result.get("session_id") != manifest["session_id"]):
+            raise ImplementationError("Claude did not return a successful terminal result for the exact implementation session")
+        if result.get("permission_denials"):
+            state["permission_denials"] = result["permission_denials"]
+            raise ImplementationError("Claude reported permission denials; required work needs attention")
+        report = result.get("structured_output")
+        _validate_report(report, manifest)
+        usage = result.get("modelUsage")
+        models = sorted(usage) if isinstance(usage, dict) else []
+        transcript_path = manifest["session_transcript_path"]
+        if not config["session_transcript_path"]:
+            transcript_path = session_paths.find_session_transcript(config["claude_config_dir"], manifest["session_id"],
+                                                                    worktree, transcript_path)
+        located = recovery.locate_transcript(config, manifest, worktree) if state.get("recovery_history") else None
+        prefix_problem = recovery.prefix_violation(located, state, recovery.transcript_root(config, located)) if located is not None else None
+        if prefix_problem:
+            raise ImplementationError(prefix_problem + ": the captured pre-recovery transcript prefix could not be verified as intact")
+        evidence = room.primary_producer_evidence(transcript_path, manifest["session_id"],
+                                                 state["started_at"], finished, report, models, config)
+        state.update(report=report, primary_model=evidence["primary_model"], actual_models=models,
+                     auxiliary_models=[value for value in models if value != evidence["primary_model"]], identity_evidence=evidence)
+        candidate = candidate_snapshot(worktree)
+        if candidate["head"] != manifest["baseline_commit"]:
+            raise ImplementationError("Implementation changed worktree HEAD; committed candidates require separate integration review")
+        if report["outcome"] == "scope_change":
+            state.update(phase="scope_change", needs_attention=True, candidate=candidate, gate_results=[], finished_at=room.now())
+            _atomic(directory / "state.json", state)
+            return _summary(directory, manifest, state)
+        state.update(phase="running_gates", candidate=candidate, gate_results=[])
+        _atomic(directory / "state.json", state)
+        gate_env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        for index, gate in enumerate(manifest["gates"]):
+            gate_dir = attempt / f"gate-{index + 1}"
+            gate_dir.mkdir()
+            started = room.now()
+            result_code = _run_child(gate, worktree, gate_dir / "stdout.txt", gate_dir / "stderr.txt",
+                                     config["gate_timeout_seconds"], env=gate_env)
+            after = candidate_snapshot(worktree)
+            gate_result = {"argv": gate, "return_code": result_code, "started_at": started,
+                           "finished_at": room.now(), "stdout_path": str(gate_dir / "stdout.txt"),
+                           "stderr_path": str(gate_dir / "stderr.txt"),
+                           "stdout_sha256": room.sha((gate_dir / "stdout.txt").read_bytes()),
+                           "stderr_sha256": room.sha((gate_dir / "stderr.txt").read_bytes()), "candidate_unchanged": after == candidate}
+            state["gate_results"].append(gate_result)
+            _atomic(directory / "state.json", state)
+            if after != candidate:
+                raise ImplementationError("A gate changed candidate content or HEAD; gate evidence cannot certify this candidate")
+        state.update(phase="awaiting_astra_review", gates_passed=all(gate["return_code"] == 0 for gate in state["gate_results"]),
+                     candidate=candidate, finished_at=room.now(), needs_attention=False)
+    except BaseException as exc:
+        state.update(phase="blocked", needs_attention=True, finished_at=room.now(),
+                     error=f"{type(exc).__name__}: {exc}", replay_allowed=False)
+        _atomic(directory / "state.json", state)
+        if not isinstance(exc, (Exception, KeyboardInterrupt)):
+            raise
+    _atomic(directory / "state.json", state)
+    return _summary(directory, manifest, state)
 
 
 def record_astra_review(handoff_path, accepted, review_text):
