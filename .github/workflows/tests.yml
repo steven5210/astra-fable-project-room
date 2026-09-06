@@ -18,8 +18,30 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
+        if: runner.os == 'macOS'
         with:
           python-version: ${{ matrix.python }}
-      - name: Run tests with fake model and MCP backends
+      - name: Run macOS tests with fake model and MCP backends
+        if: runner.os == 'macOS'
         run: python -m unittest discover -v
+      - name: Run Linux tests in an isolated process namespace
+        if: runner.os == 'Linux'
+        env:
+          PROJECT_ROOM_TEST_IMAGE: python:${{ matrix.python }}-bookworm
+        run: |
+          # Hosted runner services can deny same-user /proc reads. Keep that
+          # production refusal intact and inspect only this test container's processes.
+          docker pull "$PROJECT_ROOM_TEST_IMAGE"
+          project_room_candidate="$(mktemp -d "${RUNNER_TEMP}/project-room-tests.XXXXXX")"
+          git archive HEAD | tar -x -C "$project_room_candidate"
+          docker run --rm --pull never --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=1g,mode=1777 \
+            --mount "type=bind,source=$project_room_candidate,target=/candidate,readonly" \
+            --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
+            --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
+            "$PROJECT_ROOM_TEST_IMAGE" python -B -m unittest discover -v
