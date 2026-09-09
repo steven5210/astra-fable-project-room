@@ -15,8 +15,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
-    # Recovery tests exercise real timeout boundaries; include container setup time.
-    timeout-minutes: 10
+    # Recovery tests exercise real timeout boundaries and the suite grew to four more offline modules (adapter,
+    # controller wiring, supervisor lease, transcript audit); include container setup time. This is a CI budget,
+    # not a Fable, model or gate deadline.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:

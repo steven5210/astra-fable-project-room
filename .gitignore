@@ -46,11 +46,14 @@ astra-approval*.md
 local-config*.json
 local-mcp*.json
 *.local.json
+deepseek*.local.json
+*-provider.local.json
 project-room-config.json
 mcp-review.json
 credentials*.json
 token*.json
 *.pem
 *.key
+secrets/
 .claude/
 .codex/

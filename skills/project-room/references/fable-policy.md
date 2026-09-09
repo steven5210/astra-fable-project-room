@@ -2,6 +2,8 @@
 
 Include this policy in Fable's implementation context. Fable is the orchestrator; other models are delegates. Quality always beats token savings. Choose the cheapest tier that delivers full quality, and route up when in doubt. Delegates share none of Fable's context unless explicitly supplied.
 
+A room pins exactly one first-tier delegate provider at creation — DeepSeek, legacy Qwen, or none — and `implementation.py` selects the matching policy text (`POLICY_DEEPSEEK`, `POLICY_QWEN`, or `POLICY_NONE`) for that room's handoff. Only the section below matching a room's actual provider applies there; the two provider sections are never combined, and neither is a substitute for the other.
+
 ## Enhancement proposals
 
 Proactively identify useful improvements grounded in the feature and repository. Explain each proposal's benefit, tradeoff, and recommendation so Astra can bring it to the user for their opinion and scope approval. Return proposals in the report for durable tracking; do not quietly implement them or treat backlog placement as sufficient user visibility.
@@ -12,14 +14,25 @@ Astra files or links an enhancement issue in the feature project's GitHub reposi
 
 | Tier | Suitable work |
 | --- | --- |
-| Qwen | Specified implementation, tests, and reviews against verifiable specs with cheap gates; bulk summarization. First choice whenever it qualifies. Text output only, with no agentic file access. |
-| Sonnet subagent | Mechanical application of payloads/diffs, file operations, gates, and work beyond Qwen that is not judgment-heavy. Can run while Qwen is busy when the session supports it. |
+| DeepSeek (DeepSeek rooms only) | Self-contained implementation, tests, and reviews against verifiable specs, plus bounded module design, debugging, or review when its demonstrated quality warrants it. First choice whenever it qualifies. Text output only, with no agentic file access. |
+| Qwen (legacy Qwen rooms only) | Specified implementation, tests, and reviews against verifiable specs with cheap gates; bulk summarization. First choice whenever it qualifies. Text output only, with no agentic file access. |
+| Sonnet subagent | Mechanical application of payloads/diffs, file operations, gates, and work beyond the room's first-tier delegate that is not judgment-heavy. Can run while the delegate is busy when the session supports it. |
 | Opus subagent | Bounded module design/debugging and deep review assistance that does not require Fable's cross-cutting judgment. |
 | Fable | Cross-cutting design, specification, adjudication, final engineering review, and tasks for which Fable is the best fit. |
 
-When subagents are unavailable, the ladder is Qwen and Fable. Do not claim unavailable delegates were used. Record the tier, reason, outcome, fixes needed, and escalation evidence for each routed subtask.
+A room offers DeepSeek or Qwen, never both. When subagents are unavailable, the ladder is the room's first-tier delegate (if any) and Fable. Do not claim unavailable delegates were used. Record the tier, reason, outcome, fixes needed, and escalation evidence for each routed subtask.
 
 Diagnose a failure before escalating. Repair spec/context gaps and retry the same tier. Escalate a demonstrated capability miss to the tier indicated by the evidence, skipping tiers when appropriate. Carry the spec and failure evidence forward. After two failed tiers on one subtask, Fable takes it over. If the user requests a delegation Fable judges unsuitable, explain why and let the user decide.
+
+## Fixed DeepSeek operating parameters
+
+Applies only to a room whose pinned provider is DeepSeek. DeepSeek is a text delegate: it returns code, tests, reviews, and reasoning summaries but executes nothing, edits no files, and invokes no tools; Sonnet applies and verifies what it returns, exactly as Fable already treats Qwen's output. Never invoke local Qwen in a DeepSeek room; the two are not combined.
+
+Every `deepseek_submit` runs the exact configured model with thinking enabled, the pinned `reasoning_effort` (default `max`), and the pinned `max_tokens` (default 393,216) — the tool schema carries no `effort` or `max_tokens` fields, so no call can lower them. Give the delegate the full relevant context and never trim it to save its tokens; use `context_path` for large file context, naming only files beneath the verified worktree. `deepseek_ask` alone permits effort `none` or `low`, with a small pinned output budget, for quick questions.
+
+Use `deepseek_status` with `wait=true` and bounded waits of at most 49 seconds, chaining waits instead of polling; keep the durable `job_id` and never resubmit to poll. Read completed answers with `deepseek_result` or the exported content file, validating `content_sha256` before relying on either; truncated or unverified output is never an accepted answer. Cite `job_id` in routing records; token usage facts come from the ledger, never a delegate's own claim.
+
+Unknown or unresolved delivery (`unknown_delivery`, `failed_after_send`) stops the room's DeepSeek lane until the user resolves it at their own terminal; never work around it or resubmit to evade it. If DeepSeek is unavailable or rejects the pinned parameters, report it and route to an appropriate Claude tier, recording why; never substitute another model silently. See [the DeepSeek delegate guide](../../../docs/deepseek.md) for the full state table, the resolve procedure, and export semantics.
 
 ## Fixed Qwen operating parameters
 

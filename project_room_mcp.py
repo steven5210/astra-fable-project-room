@@ -16,6 +16,9 @@ INSTRUCTIONS = (
     "bring meaningful product tradeoffs to the user. Never replay uncertain jobs. "
     "Scope changes return to Astra. Encourage useful enhancements, track their proposal and filed issue link, "
     "and surface their benefit and tradeoff for the user's opinion and scope approval before implementation. "
+    "Fable's delegates follow each room's pinned provider policy: a DeepSeek room routes self-contained work to the "
+    "text-only deepseek_* tools with pinned max effort and output, a legacy qwen room keeps its Qwen ladder, and a "
+    "room without a provider routes among Claude tiers only; existing rooms never migrate silently. "
     "The project-room skill supplies the workflow."
 )
 
@@ -51,7 +54,7 @@ def handle(message, service):
         version = params.get("protocolVersion")
         result = {"protocolVersion": version if version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2024-11-05",
                   "capabilities": {"tools": {"listChanged": False}},
-                  "serverInfo": {"name": "astra-fable-project-room", "version": "0.2.0"}, "instructions": INSTRUCTIONS}
+                  "serverInfo": {"name": "astra-fable-project-room", "version": "0.3.0"}, "instructions": INSTRUCTIONS}
     elif method == "ping":
         result = {}
     elif method == "tools/list":

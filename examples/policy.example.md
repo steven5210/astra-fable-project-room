@@ -2,6 +2,8 @@
 
 This file is used by the low-level `room.py` review configuration. Normal Project Room setup uses `project_room.py`; its full workflow includes authorized implementation and independent Astra acceptance. Existing build authorization carries forward without a repeated permission request.
 
+This template only wires up the legacy Qwen parameters below; it predates and does not reference the newer DeepSeek delegate provider, which is a `project_room.py`-level, per-room concern (snapshotted configuration, key handling, durable jobs) documented separately in [the DeepSeek delegate guide](../docs/deepseek.md), not part of this read-only engine's policy text.
+
 ## Roles and this review session's scope
 
 The user owns product intent, priorities, and meaningful tradeoffs. Astra owns brainstorming, requirements, acceptance criteria, and product-level review. Fable owns technical interpretation, engineering design, and engineering verdicts. Both should challenge unclear assumptions and explain disagreements with evidence.

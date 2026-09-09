@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -27,6 +28,14 @@ ROOT = Path(__file__).resolve().parent
 MODEL = "claude-fable-5-1"
 ACTIVE = ("queued", "running")
 MAX_TEXT = 2_000_000
+PROVIDERS = ("none", "qwen", "deepseek")
+STARTUP_GRACE_SECONDS = 10.0  # status never probes a job lease younger than this; a live worker holds its lease from spawn
+LEASE_RETRIES = 40  # legacy workers without an inherited lease retry transient contention for about two seconds
+DELEGATE_JOB_FIELDS = ("request_id", "lane", "state", "requested_model", "observed_model", "thinking", "reasoning_effort", "max_tokens",
+                       "created_at", "submitting_at", "streaming_at", "finished_at", "deadline_at", "usage_source", "finish_reason",
+                       "http_status", "error_code", "error_type", "availability", "remote_outcome", "input_bytes", "content_bytes",
+                       "reasoning_bytes", "wire_bytes", "content_sha256", "content_path", "export_reason")
+LATEST_DELEGATE_JOBS = 20
 
 
 def text_value(value, name, maximum=MAX_TEXT):
@@ -83,9 +92,14 @@ def claude_environment(settings):
     return environment
 
 
+def controller_home(home=None):
+    """The controller home a command names (--home, PROJECT_ROOM_HOME or ~/.project-room), resolved but never created."""
+    return Path(home or os.environ.get("PROJECT_ROOM_HOME") or Path.home() / ".project-room").expanduser().resolve()
+
+
 class Service:
     def __init__(self, home=None):
-        self.home = Path(home or os.environ.get("PROJECT_ROOM_HOME") or Path.home() / ".project-room").expanduser().resolve()
+        self.home = controller_home(home)
         self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._progress_cache = {}  # Parsed, stat-keyed metadata reused by read-only progress observation.
         with self.db() as db:
@@ -134,31 +148,86 @@ class Service:
     def settings(self):
         try:
             value = json.loads((self.home / "config.json").read_text())
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             raise room.RoomError("Project Room is not configured; run project_room.py setup first") from exc
+        if not isinstance(value, dict):
+            raise room.RoomError("Project Room configuration must be a JSON object; move config.json aside and run project_room.py setup again")
         if value.get("model") != MODEL:
             raise room.RoomError(f"This installation requires the configured Fable model {MODEL}")
         return value
 
-    def setup(self, claude_bin=None, qwen_config=None):
+    def setup(self, claude_bin=None, qwen_config=None, deepseek_config=None, delegate_provider=None):
+        """Persist the private controller configuration for future rooms.
+
+        Provider selection is compatible with the documented flows: a `delegate_provider` recorded in config.json is
+        a deliberate selection and is kept until an explicit --delegate-provider replaces it; with no recorded
+        selection the legacy inference applies (qwen when a Qwen configuration exists, else none), so a plain setup
+        followed by --qwen-config enables Qwen exactly as before. Selecting DeepSeek is explicit: a newly supplied
+        --deepseek-config with no recorded selection is refused before anything is written, with the flag to pass.
+        Only a configuration supplied in this run, or a provider explicitly reselected in it, is validated, so a
+        stored provider file that is missing or unmounted never blocks unrelated repairs such as --claude-bin."""
         with room.lock_room(self.home / "setup-lock"):
             target = self.home / "config.json"
-            prior = json.loads(target.read_text()) if target.exists() else {}
+            try:
+                prior = json.loads(target.read_text()) if target.exists() else {}
+            except (ValueError, RecursionError) as exc:
+                raise room.RoomError("The existing configuration is not valid JSON; move " + str(target) + " aside before running setup") from exc
+            if not isinstance(prior, dict):
+                raise room.RoomError("The existing configuration is not a JSON object; move " + str(target) + " aside before running setup")
             executable = str(Path(claude_bin).expanduser().resolve()) if claude_bin else prior.get("claude_bin") or discover_claude()
             if not Path(executable).is_file() or not os.access(executable, os.X_OK):
                 raise room.RoomError("claude_bin must name an executable file")
             qwen = str(Path(qwen_config).expanduser().resolve()) if qwen_config else prior.get("qwen_config")
-            if qwen:
+            deepseek = str(Path(deepseek_config).expanduser().resolve()) if deepseek_config else prior.get("deepseek_config")
+            if delegate_provider is not None and delegate_provider not in PROVIDERS:
+                raise room.RoomError("delegate_provider must be deepseek, qwen or none")
+            selected = delegate_provider or prior.get("delegate_provider")  # recorded only when chosen deliberately
+            if selected is not None and selected not in PROVIDERS:
+                raise room.RoomError("Unknown delegate provider recorded in configuration; pass --delegate-provider deepseek, qwen or none")
+            provider = selected or ("qwen" if qwen else "none")
+            if provider == "qwen" and not qwen:
+                raise room.RoomError("delegate_provider qwen requires --qwen-config")
+            if provider == "deepseek" and not deepseek:
+                raise room.RoomError("delegate_provider deepseek requires --deepseek-config")
+            if deepseek_config and selected is None:
+                raise room.RoomError("A DeepSeek provider configuration was supplied but no delegate provider is selected, so it would be "
+                                     "stored without ever being used; pass --delegate-provider deepseek to select it for new rooms "
+                                     "(or --delegate-provider qwen/none to keep it stored but unselected). Nothing was written.")
+            if qwen and (qwen_config or delegate_provider == "qwen"):
                 from qwen_guard import load_server
                 load_server(qwen)  # Validate configuration only; never launch upstream here.
+            if deepseek and (deepseek_config or delegate_provider == "deepseek"):
+                self._deepseek_config(deepseek)  # key-free validation of the supplied or reselected file; no key, no network
             config = {"version": 1, "claude_bin": executable, "model": MODEL,
                       "claude_config_dir": prior.get("claude_config_dir") or str(Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser().resolve()),
                       "claude_config_dir_override": prior.get("claude_config_dir_override", os.environ.get("CLAUDE_CONFIG_DIR")),
-                      "qwen_config": qwen, "review_timeout_seconds": prior.get("review_timeout_seconds", 1800),
+                      "qwen_config": qwen, "deepseek_config": deepseek,
+                      "review_timeout_seconds": prior.get("review_timeout_seconds", 1800),
                       "implementation_timeout_seconds": prior.get("implementation_timeout_seconds", 3600)}
+            if selected is not None:
+                config["delegate_provider"] = selected
             atomic_json(target, config)
-            return {"configured": True, "config_path": str(target), "model": MODEL,
-                    "qwen_configured": bool(qwen), "existing_rooms_unchanged": True}
+            return {"configured": True, "config_path": str(target), "model": MODEL, "delegate_provider": provider,
+                    "delegate_provider_selected": selected is not None, "qwen_configured": bool(qwen), "deepseek_configured": bool(deepseek),
+                    "existing_rooms_unchanged": True}
+
+    def _deepseek_config(self, path):
+        import deepseek_adapter
+        try:
+            return deepseek_adapter.load_config(path, self.home)[0]
+        except deepseek_adapter.AdapterError as exc:
+            raise room.RoomError("DeepSeek provider configuration rejected (" + exc.code + "): " + str(exc)) from exc
+
+    @staticmethod
+    def _provider(settings):
+        provider = provider_name(settings)
+        if provider not in PROVIDERS:
+            raise room.RoomError("Unknown delegate provider in configuration")
+        if provider == "qwen" and not settings.get("qwen_config"):
+            raise room.RoomError("delegate_provider qwen requires a configured qwen_config")
+        if provider == "deepseek" and not settings.get("deepseek_config"):
+            raise room.RoomError("delegate_provider deepseek requires a configured deepseek_config")
+        return provider
 
     def room_doctor(self):
         try:
@@ -167,8 +236,28 @@ class Service:
             return {"configured": False, "error": str(exc)}
         result = {"configured": True, "model": config["model"], "home": str(self.home),
                   "claude_executable_exists": Path(config["claude_bin"]).is_file(),
+                  "delegate_provider": provider_name(config),
+                  "delegate_provider_selected": "delegate_provider" in config,
                   "qwen_configured": bool(config.get("qwen_config")),
-                  "qwen_inference_verified": False}
+                  "qwen_inference_verified": False,
+                  "deepseek_configured": bool(config.get("deepseek_config")),
+                  "deepseek_inference_verified": False}
+        try:
+            self._provider(config)  # the same consistency rules setup and room_open apply; doctor names the problem instead of hiding it
+        except room.RoomError as exc:
+            result["delegate_provider_error"] = str(exc)
+        if config.get("deepseek_config"):
+            try:
+                import deepseek_adapter
+                provider = self._deepseek_config(config["deepseek_config"])
+                result["deepseek"] = {"model": provider["model"], "deep_lane": deepseek_adapter.lane_parameters(provider, "deep"),
+                                      "key_file": deepseek_adapter.key_diagnostics(provider["api_key_file"]),
+                                      "latest_probe": deepseek_adapter.latest_probe(self.home / "deepseek" / "probes"),
+                                      "meaning": "metadata only: the key is never read here and no probe or model call is made"}
+            except room.RoomError as exc:
+                result["deepseek"] = {"error": str(exc)}
+            except ImportError as exc:
+                result["deepseek"] = {"error": "deepseek_adapter cannot be imported: " + str(exc)}
         try:
             room.validate_subscription_environment()
             process = subprocess.run([config["claude_bin"], "auth", "status"], capture_output=True, timeout=15,
@@ -209,11 +298,29 @@ class Service:
                                  "--disable-slash-commands", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                                  "--add-dir", project_path]}
         atomic_json(profiles / "review.json", review)
+        provider = self._provider(settings)
         mcp = {"mcpServers": {}}
-        if settings.get("qwen_config"):
+        add_dirs, inventory = [], None
+        if provider == "qwen":
             # The upstream config remains private; never embed its env/credential values.
             shutil.copyfile(ROOT / "qwen_guard.py", profiles / "qwen_guard.py")
             mcp["mcpServers"]["qwen-local"] = {"command": sys.executable, "args": [str(profiles / "qwen_guard.py"), "--config", settings["qwen_config"]]}
+        elif provider == "deepseek":
+            import deepseek_adapter
+            adapter_copy = profiles / "deepseek_adapter.py"
+            shutil.copyfile(ROOT / "deepseek_adapter.py", adapter_copy)
+            snapshot = profiles / "deepseek.json"
+            atomic_json(snapshot, self._deepseek_config(settings["deepseek_config"]))  # normalized, key-free
+            export_dir = self.home / "deepseek" / "exports" / root.name
+            try:
+                deepseek_adapter.ensure_private_directory(export_dir)
+            except deepseek_adapter.AdapterError as exc:
+                raise room.RoomError("Cannot create the room export directory: " + str(exc)) from exc
+            mcp["mcpServers"]["deepseek"] = {"command": sys.executable, "args": [str(adapter_copy), "serve", "--home", str(self.home), "--room", root.name,
+                                                                                  "--room-root", str(root), "--config", str(snapshot)]}
+            add_dirs = ["--add-dir", str(export_dir)]  # exactly this room's content-only export directory, nothing else
+            inventory = {"provider": "deepseek", "room_id": root.name, "export_dir": str(export_dir), "recorded_at": room.now(),
+                         "files": {str(adapter_copy): room.sha(adapter_copy.read_bytes()), str(snapshot): room.sha(snapshot.read_bytes())}}
         atomic_json(profiles / "implementation-mcp.json", mcp)
         agents = {
             "sonnet-worker": {"description": "Mechanical code application, file operations, and verification delegated by Fable.",
@@ -229,9 +336,12 @@ class Service:
                           "extra_args": ["--effort", "max", "--permission-mode", "auto", "--permission-prompts", "none",
                                          "--tools", "Read,Glob,Grep,Edit,Write,Bash,Agent,Skill", "--agents", room.canonical(agents),
                                          "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
-                                         "--strict-mcp-config", "--mcp-config", str(profiles / "implementation-mcp.json")]}
+                                         "--strict-mcp-config", "--mcp-config", str(profiles / "implementation-mcp.json"), *add_dirs]}
         atomic_json(profiles / "implementation.json", implementation)
-        atomic_json(root / "settings.json", settings)
+        pinned = {**settings, "delegate_provider": provider}
+        if inventory is not None:
+            pinned["provider_inventory"] = inventory
+        atomic_json(root / "settings.json", pinned)
 
     def room_open(self, project_path, feature):
         project = Path(text_value(project_path, "project_path", 4096)).expanduser().resolve()
@@ -335,8 +445,61 @@ class Service:
         now = progress.clock()
         jobs = [self._with_progress(job, now, (entry, root, review)) for job in jobs]
         return {"room": entry, "review": core, "issues": issues, "jobs": jobs, "handoffs": handoffs,
-                "recoveries": recoveries, "enhancements": self._enhancements(room_id),
+                "recoveries": recoveries, "enhancements": self._enhancements(room_id), "delegate_jobs": self._delegate_jobs(room_id, root),
                 "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues) and not blocking}
+
+    def _delegate_jobs(self, room_id, root):
+        """Bounded read-only summary of this room's provider jobs from the private ledger: allowlisted facts only, no network,
+        no lease probe and no relabelling; token counts are provider usage from the ledger, never model assertions."""
+        value = {"provider": None, "items": [], "truncated": False, "unavailable_reason": None,
+                 "meaning": "latest ledger facts for this room's delegate jobs; usage is provider-reported or unknown"}
+        try:
+            settings = self._room_settings(root)
+            if not isinstance(settings, dict):
+                raise ValueError("settings.json is not a JSON object")
+            value["provider"] = provider_name(settings)
+        except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+            value["unavailable_reason"] = "settings_unreadable"  # a damaged settings file never breaks the read-only status surface
+            return value
+        if value["provider"] != "deepseek":
+            value["unavailable_reason"] = "provider_not_deepseek"
+            return value
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        if not ledger.is_file():
+            value["unavailable_reason"] = "ledger_missing"
+            return value
+        try:
+            db = sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True, timeout=2)
+            db.row_factory = sqlite3.Row
+            try:
+                rows = db.execute("SELECT * FROM jobs WHERE room_id=? ORDER BY created_at DESC, id DESC LIMIT ?", (room_id, LATEST_DELEGATE_JOBS + 1)).fetchall()
+                resolved = {row[0] for row in db.execute("SELECT job_id FROM resolutions WHERE room_id=?", (room_id,))}
+            finally:
+                db.close()
+        except sqlite3.Error:
+            value["unavailable_reason"] = "ledger_unreadable"
+            return value
+        try:
+            import deepseek_adapter
+        except ImportError:
+            value["unavailable_reason"] = "adapter_unavailable"
+            return value
+        required = set(DELEGATE_JOB_FIELDS) | {"id", "possibly_billed", "usage_json"}
+        if rows and not required <= set(rows[0].keys()):
+            value["unavailable_reason"] = "ledger_schema_mismatch"  # an older or newer ledger never breaks room_status
+            return value
+        for row in rows[:LATEST_DELEGATE_JOBS]:
+            item = {"job_id": row["id"], **{field: row[field] for field in DELEGATE_JOB_FIELDS}}
+            item["possibly_billed"] = bool(row["possibly_billed"])
+            try:
+                item["usage"] = json.loads(row["usage_json"]) if row["usage_json"] else None
+            except ValueError:
+                item["usage"] = None
+            item["resolved"] = row["id"] in resolved
+            item["stops_room_lane"] = row["state"] in deepseek_adapter.STOP_STATES and row["id"] not in resolved
+            value["items"].append(item)
+        value["truncated"] = len(rows) > LATEST_DELEGATE_JOBS
+        return value
 
     def room_spec_put(self, room_id, revision, content):
         positive_revision(revision)
@@ -523,18 +686,21 @@ class Service:
     def _refresh(self, job_id):
         value = self._job(job_id)
         if value["status"] in ACTIVE:
+            # The startup grace is checked before the lease is touched: status never competes with a starting worker
+            # for its lease. New workers inherit the lease held since before spawn, so a free lease after the grace
+            # proves that no owner survives.
+            age = time.time() - room.parse_timestamp(value["created_at"]).timestamp()
+            if age <= STARTUP_GRACE_SECONDS:
+                return value
             with (self._job_path(job_id) / "worker.lock").open("a") as handle:
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     return value
-                # A startup grace interval prevents a second caller racing process startup.
-                age = time.time() - room.parse_timestamp(value["created_at"]).timestamp()
-                if age > 10:
-                    with self.db() as db:
-                        db.execute("UPDATE jobs SET status='uncertain',finished_at=?,error=? WHERE id=? AND status IN ('queued','running')",
-                                   (room.now(), "Worker disappeared before saving a terminal outcome; do not resubmit", job_id))
-                    value = self._job(job_id)
+                with self.db() as db:
+                    db.execute("UPDATE jobs SET status='uncertain',finished_at=?,error=? WHERE id=? AND status IN ('queued','running')",
+                               (room.now(), "Worker disappeared before saving a terminal outcome; do not resubmit", job_id))
+                value = self._job(job_id)
         return value
 
     def _submit(self, room_id, kind, request_id, payload):
@@ -572,32 +738,48 @@ class Service:
                     self._dispatch_recovery(room_id, payload["handoff_id"], recovery_id, identifier)
             path = self._job_path(identifier)
             path.mkdir(parents=True, mode=0o700)
-            with self.db() as db:
-                db.execute("BEGIN IMMEDIATE")
-                db.execute("INSERT INTO jobs(id,room_id,kind,request_key,payload,status,created_at) VALUES(?,?,?,?,?,'queued',?)",
-                           (identifier, room_id, kind, request_id, encoded, room.now()))
-                if recovery_id is not None:
-                    changed = db.execute("UPDATE implementation_recoveries SET status='dispatched',dispatched_at=?,successor_job_id=? "
-                                         "WHERE id=? AND room_id=? AND status='prepared'", (room.now(), identifier, recovery_id, room_id)).rowcount
-                    if changed != 1:
-                        raise room.RoomError("Recovery is no longer prepared; audit it again")
-            if recovery_id is not None:
-                self._event(room_id, "implementation_recovery_dispatched", {"recovery_id": recovery_id, "successor_job_id": identifier, "handoff_id": payload["handoff_id"]})
+            # The worker lease is acquired here, before the job row is published, and handed to the worker as an
+            # inherited descriptor: a live worker holds its lease from its first instant, so status can never take it
+            # during startup and a delayed worker is never mistaken for a vanished one.
             try:
-                with (path / "worker.log").open("wb") as output:
-                    process = subprocess.Popen([sys.executable, str(ROOT / "project_room.py"), "--home", str(self.home), "_worker", identifier],
-                                               stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
-                                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
-                with self.db() as db:
-                    db.execute("UPDATE jobs SET pid=? WHERE id=?", (process.pid, identifier))
-                # Reap children while this MCP lives; a disconnected client still leaves
-                # the detached worker running, with no wait thread keeping the host alive.
-                threading.Thread(target=process.wait, daemon=True).start()
+                lease = os.open(str(path / "worker.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             except OSError as exc:
+                raise room.RoomError(f"Worker lease could not be created; nothing was submitted: {type(exc).__name__}") from exc
+            try:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise room.RoomError(f"Worker lease could not be acquired; nothing was submitted: {type(exc).__name__}") from exc
                 with self.db() as db:
-                    db.execute("UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=?", (room.now(), f"Worker did not start: {exc}", identifier))
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("INSERT INTO jobs(id,room_id,kind,request_key,payload,status,created_at) VALUES(?,?,?,?,?,'queued',?)",
+                               (identifier, room_id, kind, request_id, encoded, room.now()))
+                    if recovery_id is not None:
+                        changed = db.execute("UPDATE implementation_recoveries SET status='dispatched',dispatched_at=?,successor_job_id=? "
+                                             "WHERE id=? AND room_id=? AND status='prepared'", (room.now(), identifier, recovery_id, room_id)).rowcount
+                        if changed != 1:
+                            raise room.RoomError("Recovery is no longer prepared; audit it again")
                 if recovery_id is not None:
-                    self._invalidate_recovery(room_id, recovery_id, "worker_spawn_failure", identifier)
+                    self._event(room_id, "implementation_recovery_dispatched", {"recovery_id": recovery_id, "successor_job_id": identifier, "handoff_id": payload["handoff_id"]})
+                try:
+                    with (path / "worker.log").open("wb") as output:
+                        process = subprocess.Popen([sys.executable, str(ROOT / "project_room.py"), "--home", str(self.home), "_worker", identifier,
+                                                    "--lease-fd", str(lease)],
+                                                   stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
+                                                   pass_fds=(lease,), env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET pid=? WHERE id=?", (process.pid, identifier))
+                    # Reap children while this MCP lives; a disconnected client still leaves
+                    # the detached worker running, with no wait thread keeping the host alive.
+                    threading.Thread(target=process.wait, daemon=True).start()
+                except OSError as exc:
+                    # No worker exists: closing the parent's descriptor below releases ownership; the failure stays truthful.
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=?", (room.now(), f"Worker did not start: {exc}", identifier))
+                    if recovery_id is not None:
+                        self._invalidate_recovery(room_id, recovery_id, "worker_spawn_failure", identifier)
+            finally:
+                os.close(lease)  # the spawned worker keeps the inherited lease; the parent's copy is released
             return self._job(identifier)
 
     def _recovery_row(self, recovery_id):
@@ -945,11 +1127,49 @@ class Service:
                                                                 "registry": str(self.home)}, owner_job_id=job_id)
         raise room.RoomError("Unknown job kind")
 
-    def worker(self, job_id):
+    @contextlib.contextmanager
+    def _worker_lease(self, path, lease_fd):
+        """Hold this job's worker lease for the whole execution.
+
+        A descriptor inherited from _submit is used only after it is proven to be this job's worker.lock (same
+        device and inode, user-owned regular file) and its lease can be re-asserted on that same open file
+        description; the inherited lease has then been held since before the spawn. A launch without a handed-off
+        descriptor (legacy) or with an invalid one acquires the lease itself with a bounded retry, so transient
+        contention such as a status probe never kills the worker."""
+        if lease_fd is not None:
+            valid = False
+            try:
+                held, expected = os.fstat(lease_fd), os.lstat(path / "worker.lock")
+                valid = (stat.S_ISREG(expected.st_mode) and stat.S_ISREG(held.st_mode) and held.st_uid == os.getuid()
+                         and (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino))
+                if valid:
+                    fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # idempotent on the inherited description
+            except OSError:
+                valid = False
+            if valid:
+                try:
+                    yield lease_fd
+                finally:
+                    os.close(lease_fd)
+                return
+            # The rejected number is left exactly as it was: closing it could drop whatever this process really holds
+            # at that number (its own stderr, the room lock or another job's lease), so only a proven descriptor is owned.
+            print(json.dumps({"worker": job_id_of(path), "note": "inherited lease descriptor was not this job's worker.lock; acquiring the lease directly"}), file=sys.stderr, flush=True)
+        with (path / "worker.lock").open("a") as lease:
+            for attempt in range(LEASE_RETRIES):
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt == LEASE_RETRIES - 1:
+                        raise
+                    time.sleep(0.05)
+            yield lease.fileno()
+
+    def worker(self, job_id, lease_fd=None):
         path = self._job_path(job_id)
         with room.lock_room(path):
-            with (path / "worker.lock").open("a") as lease:
-                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self._worker_lease(path, lease_fd):
                 job = self._job(job_id)
                 if job["status"] != "queued":
                     return
@@ -1075,6 +1295,18 @@ def implementation_error_types():
     return implementation.ImplementationError
 
 
+def job_id_of(path):
+    return Path(path).name
+
+
+def provider_name(settings):
+    """The delegate provider a configuration records (exactly as recorded, so an empty or null selection is judged by
+    the provider rules rather than silently inferred), or the legacy inference: qwen when a Qwen config exists, else none."""
+    if "delegate_provider" in settings:
+        return settings["delegate_provider"]
+    return "qwen" if settings.get("qwen_config") else "none"
+
+
 def recovery_linkage(result, status):
     """Classify a finished recovery successor for the registry: ("invalidated", reason) for a proven pre-launch
     refusal, ("consumed", None) once the engine confirmed the model process was created, otherwise
@@ -1100,7 +1332,7 @@ TOOL_SCHEMAS = {
     "room_doctor": ("Check local setup and Claude subscription sign-in; does not call a model or Qwen inference.", schema({})),
     "room_open": ("Open or create the persistent room for this exact project directory and feature. Reuses history/session; does not start models.", schema({"project_path": S, "feature": S})),
     "room_list": ("Find existing project/feature rooms before creating another.", schema({"project_path": S}, [])),
-    "room_status": ("Read review agreement, unresolved findings, jobs, and implementation handoffs. Each job carries an additive read-only progress object (phase, elapsed_seconds, last observed activity category, attributable delegates, countdown to the pinned timeout, limitations); the countdown is a deadline, never an ETA.", schema(R)),
+    "room_status": ("Read review agreement, unresolved findings, jobs, implementation handoffs and, for a DeepSeek room, delegate_jobs (the latest 20 allowlisted provider ledger facts with usage from the provider, never model assertions). Each job carries an additive read-only progress object (phase, elapsed_seconds, last observed activity category, attributable delegates, countdown to the pinned timeout, limitations); the countdown is a deadline, never an ETA.", schema(R)),
     "room_spec_put": ("Register immutable exact UTF-8 spec revision with repository context and concrete verification.", schema({**R, "revision": I, "content": S})),
     "room_record": ("Record Astra/user discussion or Astra approval of the current exact spec. Does not authorize implementation.", schema({**R, "sender": {"type": "string", "enum": ["astra", "user"]}, "kind": {"type": "string", "enum": ["message", "approval"]}, "revision": I, "content": S})),
     "room_review_submit": ("Start one Fable review asynchronously. Save returned job id; identical request_id/payload reuses the job, never resubmit to poll.", schema({**R, "revision": I, "message": S, "request_id": S})),
@@ -1114,7 +1346,7 @@ TOOL_SCHEMAS = {
                                 "decision_rationale": S}, ["room_id", "content", "rationale"])),
     "room_decision_record": ("After the bounded review round is exhausted, record the user's actual decision on the unresolved product tradeoff to allow the next bounded round. Never invent a decision or use this to bypass unknown/failed delivery.", schema({**R, "revision": I, "decision": S})),
     "room_handoff": ("Prepare Fable implementation from exact agreement, resolved findings, original user authorization, and nonempty verification argv gates. Creates isolated git worktree.", schema({**R, "revision": I, "authorization": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}})),
-    "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow fixed Qwen/Sonnet/Opus policy; Astra checks product outcome after evidence. With recovery_id, dispatches the single audited successor of an interrupted attempt (new job/request ID, same session, --resume).", schema({**R, "handoff_id": S, "request_id": S, "recovery_id": S}, ["room_id", "handoff_id", "request_id"])),
+    "room_implementation_submit": ("Start/resume authorized Fable implementation asynchronously. Delegates follow the room's pinned provider policy (DeepSeek for new DeepSeek rooms, the legacy Qwen ladder for qwen rooms, Claude tiers only otherwise) plus Sonnet/Opus subagents; Astra checks product outcome after evidence. A tampered provider snapshot is refused before launch (provider_inventory_mismatch). With recovery_id, dispatches the single audited successor of an interrupted attempt (new job/request ID, same session, --resume).", schema({**R, "handoff_id": S, "request_id": S, "recovery_id": S}, ["room_id", "handoff_id", "request_id"])),
     "room_implementation_status": ("Read the current saved handoff phase, spec/candidate identity, acceptance, gate digests and recovery lineage. Historical handoffs remain readable. This compact read does not run gates, inspect candidate files, audit recovery or change frozen job outcomes.", schema({**R, "handoff_id": S})),
     "room_implementation_audit": ("Read-only audit of one interrupted implementation job (configured timeout or session-usage limit): identity, stopped-work evidence, boot boundary, current writers, partial candidate and transcript digests. Runs no model/Qwen/network and repairs nothing. Reports restart_required until the host booted after the interruption.", schema({**R, "handoff_id": S, "job_id": S})),
     "room_implementation_recover": ("After Astra's diagnosis and the user's actual authorization, durably prepare one audited continuation of an eligible interrupted implementation. Requires the audit's exact spec revision/hash, candidate sha256 and evidence digest; never adopts new bytes. Idempotent per request_id. Then submit with the returned recovery_id.", schema({**R, "handoff_id": S, "job_id": S, "spec_revision": I, "spec_sha256": S, "candidate_sha256": S, "evidence_digest": S, "diagnosis": S, "remaining_work": S, "authorization": S, "request_id": S})),
@@ -1130,25 +1362,44 @@ def main(argv=None):
     setup = commands.add_parser("setup")
     setup.add_argument("--claude-bin")
     setup.add_argument("--qwen-config")
+    setup.add_argument("--deepseek-config", help="absolute path to a private key-free DeepSeek provider configuration")
+    setup.add_argument("--delegate-provider", choices=PROVIDERS, help="provider snapshotted into NEW rooms; existing rooms keep their pins")
     commands.add_parser("doctor")
+    audit = commands.add_parser("transcript-audit", help="read-only tool-use count of one attempt's exact session transcript and its subagent files; no model, no network")
+    audit.add_argument("--room", required=True)
+    audit.add_argument("--handoff", required=True)
+    audit.add_argument("--attempt", type=int, required=True)
     call = commands.add_parser("call")
     call.add_argument("tool", choices=sorted(TOOL_SCHEMAS))
     call.add_argument("--args", default="{}", help="JSON argument object")
     call.add_argument("--args-file", help="UTF-8 JSON file; avoids shell escaping for large specs")
     for name in ("_worker", "_execute"):
-        commands.add_parser(name).add_argument("job_id")
+        internal = commands.add_parser(name)
+        internal.add_argument("job_id")
+        if name == "_worker":
+            internal.add_argument("--lease-fd", type=int)
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, room.handle_termination)
     try:
+        if args.command == "transcript-audit":
+            # Read-only by contract: the home is only resolved (never created) and the registry is opened read-only by
+            # the audit itself, so a mistyped --home provisions nothing and reports the same error as transcript_audit.py.
+            import transcript_audit
+            try:
+                result = transcript_audit.audit(controller_home(args.home), args.room, args.handoff, args.attempt)
+            except transcript_audit.AuditError as exc:
+                raise room.RoomError(str(exc)) from exc
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0 if result["complete"] else 1  # the documented contract shared with transcript_audit.py: 1 means incomplete
         service = Service(args.home)
         if args.command == "setup":
-            result = service.setup(args.claude_bin, args.qwen_config)
+            result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider)
         elif args.command == "doctor":
             result = service.room_doctor()
         elif args.command == "call":
             result = service.call(args.tool, json.loads(Path(args.args_file).read_text() if args.args_file else args.args))
         elif args.command == "_worker":
-            service.worker(args.job_id)
+            service.worker(args.job_id, args.lease_fd)
             return 0
         else:
             try:
@@ -1159,7 +1410,7 @@ def main(argv=None):
                 result = {"status": "uncertain", "error": f"{type(exc).__name__}: {exc}"}
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0
-    except (room.RoomError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
+    except (room.RoomError, OSError, ValueError, TypeError, RecursionError, ImportError, sqlite3.Error) as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
 

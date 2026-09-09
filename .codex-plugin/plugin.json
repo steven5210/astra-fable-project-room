@@ -1,6 +1,6 @@
 {
   "name": "astra-fable-project-room",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A persistent room where Astra shapes features and Fable reviews and implements them.",
   "author": {
     "name": "steven5210"

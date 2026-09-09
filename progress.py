@@ -46,6 +46,7 @@ CATEGORIES = {"Read": "read", "Glob": "read", "Grep": "read", "LS": "read", "Not
               "Bash": "shell", "BashOutput": "shell", "KillShell": "shell",
               "Agent": "delegate", "Task": "delegate", "Skill": "skill", "StructuredOutput": "output"}
 LOCAL_MODEL_PREFIX = "mcp__qwen-local__"
+REMOTE_MODEL_PREFIX = "mcp__deepseek__"
 DELEGATE_TOOLS = ("Agent", "Task")
 KNOWN_ROLES = ("sonnet-worker", "opus-reviewer")
 MODEL_ID = re.compile(r"^claude-(?:fable|mythos|opus|sonnet|haiku)-[0-9]{1,2}(?:-[0-9]{1,2})?(?:-[0-9]{8})?$")
@@ -334,6 +335,8 @@ def _category(name):
         return "other"
     if name.startswith(LOCAL_MODEL_PREFIX):
         return "local-model"
+    if name.startswith(REMOTE_MODEL_PREFIX):
+        return "remote-model"
     return CATEGORIES.get(name, "other")
 
 

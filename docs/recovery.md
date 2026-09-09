@@ -6,6 +6,12 @@ A matching completed request returns its saved result without another model call
 
 A user-requested cancellation uses `room_job_cancel`; then inspect its terminal outcome. Do not call cancellation a rollback of changes or proof that no model tokens were used. Work already performed may need inspection.
 
+## Worker startup and the inherited lease
+
+Every job's supervisor acquires that job's `worker.lock` lease before its queued row is published, and hands the already-held descriptor to the detached worker through `pass_fds` instead of letting the worker race to reacquire it after spawn. The worker validates the inherited descriptor (same device and inode as its own `worker.lock`, a regular user-owned file) before treating it as its lease; a launch without a handed-off descriptor (a legacy worker) or with an invalid one falls back to acquiring the lease itself with a bounded retry (40 tries at 50 ms) rather than dying on transient contention. A status read never touches a job's lease until it is at least 10 seconds old, so a worker that is merely slow to start is never mistaken for one that vanished. This applies to the general job supervisor in `project_room.py` and, independently, to the DeepSeek adapter's own per-job worker; see [the DeepSeek delegate guide](deepseek.md) for its ledger and state table.
+
+A host restart is the same boot boundary this document uses for implementation recovery below, and it kills any still-running local worker, including one streaming a DeepSeek response. That DeepSeek job's remote delivery is left unknown — it ends `unknown_delivery` or `failed_after_send` — which stops only that room's DeepSeek lane until the user resolves it at their own terminal; see [room stop and the user-run resolve procedure](deepseek.md#room-stop-and-the-user-run-resolve-procedure). This is independent of whether the implementation job itself qualifies for the audited continuation below.
+
 ## Continue after a product decision
 
 Review rounds allow three Fable reviews. If the agents agree, proceed to the authorized handoff. If they need further review, Astra presents the unresolved product tradeoff and waits for your actual answer.

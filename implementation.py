@@ -36,18 +36,7 @@ class LaunchUnknown(ImplementationError):
     """The invocation was interrupted while the process was being created; whether a child exists is unknown."""
 
 
-POLICY = """Fable is the implementation orchestrator and owns engineering judgments.
-Quality always beats token savings. Use the cheapest delegate only when it delivers
-full quality: Qwen for self-contained specified work, Sonnet for mechanical agentic
-work, Opus for bounded judgment, Fable for cross-cutting judgment and final review.
-Where subagents are unavailable, use Qwen/Fable and report that limitation.
-Qwen3.8-27B's intended server window is 262144 tokens. Every qwen_submit uses
-effort=xhigh and max_tokens=131072, never less; 131072 remains for task/context/system.
-Use context_path for large contexts and retain the upstream prompt-budget precheck.
-qwen_ask alone permits none/low effort. qwen_status uses wait=true and bounded waits
-under 50 seconds, chaining waits instead of polling. Access Qwen only via the configured
-qwen-local guard; never bypass it through Bash or a direct upstream connection.
-Delegates share none of your context: give self-contained specs, anchors, interfaces,
+COMMON_POLICY = """Delegates share none of your context: give self-contained specs, anchors, interfaces,
 acceptance criteria, and verification. Diagnose failures before escalation; fix input
 gaps and retry the same tier. Escalate true capability misses with evidence. After two
 failed tiers on one subtask, Fable takes over. Record every route, escalation and fix,
@@ -68,8 +57,62 @@ tradeoff. Astra files or links proposal issues for the user's opinion and scope
 approval outside this delegate session; implementation waits for approval.
 """
 
+# Legacy Qwen policy: byte-identical to the text pinned by earlier handoffs, so a qwen room keeps its policy hash.
+POLICY_QWEN = """Fable is the implementation orchestrator and owns engineering judgments.
+Quality always beats token savings. Use the cheapest delegate only when it delivers
+full quality: Qwen for self-contained specified work, Sonnet for mechanical agentic
+work, Opus for bounded judgment, Fable for cross-cutting judgment and final review.
+Where subagents are unavailable, use Qwen/Fable and report that limitation.
+Qwen3.8-27B's intended server window is 262144 tokens. Every qwen_submit uses
+effort=xhigh and max_tokens=131072, never less; 131072 remains for task/context/system.
+Use context_path for large contexts and retain the upstream prompt-budget precheck.
+qwen_ask alone permits none/low effort. qwen_status uses wait=true and bounded waits
+under 50 seconds, chaining waits instead of polling. Access Qwen only via the configured
+qwen-local guard; never bypass it through Bash or a direct upstream connection.
+""" + COMMON_POLICY
+
+POLICY_DEEPSEEK = """Fable is the implementation orchestrator and owns engineering judgments.
+Quality always beats token savings. Use the cheapest delegate only when it delivers
+full quality: DeepSeek (deepseek_submit) for self-contained specified work such as
+implementation, tests and reviews against verifiable specs, and for bounded module
+design, debugging or review when its demonstrated quality warrants it; Sonnet for
+mechanical agentic work; Opus for bounded judgment; Fable for cross-cutting judgment
+and final review. Where subagents are unavailable, use DeepSeek/Fable and report it.
+DeepSeek is a text delegate: it returns code, tests, reviews and reasoning summaries
+but executes nothing, edits no files and invokes no tools; Sonnet applies and verifies.
+Every deepseek_submit runs the exact configured model with thinking enabled, the
+room's pinned reasoning effort and pinned output budget (max and 393216 tokens by
+default; the packet's delegate_settings carry the exact pinned values); tool calls
+cannot lower them, and nobody changes the room's snapshot as a workaround.
+Give the delegate the full relevant context and never trim it to save its tokens.
+deepseek_ask alone permits effort none or low. context_path names explicit files
+beneath the verified worktree only. deepseek_status uses wait=true and bounded waits
+of at most 49 seconds, chaining waits instead of polling; keep the durable job_id and
+never resubmit to poll. Read completed answers with deepseek_result or the exported
+content file after validating its digest; truncated or unverified output is never an
+accepted answer. Size deep tasks to the remaining implementation window in the packet;
+a detached job may outlive this session and a later authorized attempt can read it
+without resubmitting. Unknown delivery stops the room's DeepSeek lane until the user
+resolves it at their own terminal; never work around it. Cite job_id in routing
+records; token facts come from the ledger. Never invoke local Qwen in this room. If
+DeepSeek is unavailable or rejects the pinned parameters, report it and route to an
+appropriate Claude tier, recording why; never substitute another model silently.
+""" + COMMON_POLICY
+
+POLICY_NONE = """Fable is the implementation orchestrator and owns engineering judgments.
+Quality always beats token savings. This room pins no delegate provider: use Sonnet
+for mechanical agentic work, Opus for bounded judgment, and Fable for cross-cutting
+judgment and final review. Where subagents are unavailable, Fable does the work and
+reports that limitation. Never invoke a Qwen or DeepSeek tool; none is configured here.
+""" + COMMON_POLICY
+
+POLICIES = {"none": POLICY_NONE, "qwen": POLICY_QWEN, "deepseek": POLICY_DEEPSEEK}
+POLICY = POLICY_QWEN  # legacy name
+PROVIDERS = ("none", "qwen", "deepseek")
+INVENTORY_FILE_LIMIT = 8 * 1024 * 1024
+
 ROUTE_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
-    "task": {"type": "string"}, "tier": {"type": "string", "enum": ["qwen", "sonnet", "opus", "fable"]},
+    "task": {"type": "string"}, "tier": {"type": "string", "enum": ["qwen", "deepseek", "sonnet", "opus", "fable"]},
     "requested_model": {"type": "string"}, "actual_model": {"type": "string"},
     "reason": {"type": "string"}, "result": {"type": "string"},
     "fixes": {"type": "array", "items": {"type": "string"}}, "escalation": {"type": "string"}},
@@ -174,6 +217,215 @@ def _config(path):
             "claude_config_dir": config_dir, "claude_config_dir_override": override}
 
 
+def _mcp_servers(config):
+    """Server names launched by the pinned --mcp-config values of an implementation profile: inline JSON or files,
+    collecting every value of every occurrence exactly as room.load_config does, so no launched server is overlooked."""
+    args = config["extra_args"]
+    values, index = [], 0
+    while index < len(args):
+        option, equals, inline = args[index].partition("=")
+        index += 1
+        if option != "--mcp-config":
+            continue
+        if equals:
+            values.append(inline)
+            continue
+        while index < len(args) and not args[index].startswith("--"):
+            values.append(args[index])
+            index += 1
+    servers = {}
+    references = config.get("referenced_files_sha256") if isinstance(config.get("referenced_files_sha256"), dict) else {}
+    for value in values:
+        try:
+            if value.lstrip().startswith("{"):
+                loaded = json.loads(value)
+            else:
+                # The same bytes room.load_config hashed decide the provider: read owned, bounded and symlink-refusing,
+                # then compared with the recorded digest so a file replaced in between is a refusal, not a silent choice.
+                import recovery
+                reference = Path(value).expanduser()
+                data = recovery.read_owned(reference, INVENTORY_FILE_LIMIT, "handoff", root=reference.parent)
+                expected = references.get(str(reference))
+                if expected is not None and room.sha(data) != expected:
+                    raise ImplementationError("Implementation MCP configuration changed since the profile was loaded")
+                loaded = json.loads(data)
+        except (OSError, ValueError, RecursionError) as exc:
+            raise ImplementationError("Implementation MCP configuration is unreadable") from exc
+        except Exception as exc:
+            if isinstance(exc, ImplementationError):
+                raise
+            raise ImplementationError("Implementation MCP configuration is unreadable") from exc
+        found = loaded.get("mcpServers") if isinstance(loaded, dict) else None
+        if not isinstance(found, dict):
+            raise ImplementationError("Implementation MCP configuration must contain an mcpServers object")
+        servers.update(found)
+    return servers
+
+
+def _read_inventory_file(path):
+    """Bytes of a snapshotted provider file, read like every other pinned input: descriptor-relative below the room
+    directory (the trusted prefix two levels up), O_NOFOLLOW on each component, user-owned, regular and bounded."""
+    import recovery
+    if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+        raise ImplementationError("Provider inventory paths must be absolute")
+    target = Path(path)
+    if len(target.parts) < 4 or any(part in (".", "..") for part in target.parts):
+        raise ImplementationError("Provider inventory paths must lie below a room directory")
+    try:
+        return recovery.read_owned(target, INVENTORY_FILE_LIMIT, "handoff", root=target.parent.parent)
+    except recovery.ObservationError as exc:
+        if exc.reason.endswith("_missing"):
+            raise FileNotFoundError(path) from exc
+        raise ImplementationError("Provider inventory file is not an owned regular file within bounds: " + exc.reason) from exc
+
+
+def verify_provider_inventory(inventory, repair_export_dir=True):
+    """(mismatch code or None, {pinned path: verified bytes}) for a pinned DeepSeek inventory.
+
+    Every snapshotted file is read descriptor-relatively and compared with its pinned digest; the verified bytes are
+    returned so a caller that needs the pinned configuration (the packet builder) reuses exactly the bytes that
+    passed rather than a second read that could be tampered with. Paths are pinned as strings; the export directory
+    is verified by identity at each use (an existing user-owned, non-symlink directory with no group/other permission
+    bits, exactly what the room's --add-dir grant assumes) and recreated only when merely missing. Inodes are never
+    pinned into the inventory and modes are never repaired."""
+    if inventory is None:
+        return None, {}
+    if not isinstance(inventory, dict) or not isinstance(inventory.get("files"), dict) or not inventory["files"]:
+        return "inventory_invalid", {}
+    verified = {}
+    for path, digest in inventory["files"].items():
+        try:
+            data = _read_inventory_file(path)
+        except FileNotFoundError:
+            return "file_missing:" + Path(str(path)).name, {}
+        except (OSError, ImplementationError):
+            return "file_unsafe:" + Path(str(path)).name, {}
+        if room.sha(data) != digest:
+            return "content_changed:" + Path(str(path)).name, {}
+        verified[path] = data
+    export_dir = inventory.get("export_dir")
+    if not isinstance(export_dir, str) or not os.path.isabs(export_dir):
+        return "export_dir_unrecorded", {}
+    problem = _export_dir_problem(export_dir, repair_export_dir)
+    return problem, ({} if problem else verified)
+
+
+def _export_dir_problem(export_dir, repair):
+    """None when the export directory (<home>/deepseek/exports/<room>) is reachable component by component below its
+    existing user-owned grandparent without following a symlink, is user-owned, and carries no group/other permission
+    bits. With `repair`, at most the three missing levels below that grandparent are recreated 0700 relative to the
+    previous descriptor (a concurrent creator's directory is revalidated, never trusted). Modes are never repaired."""
+    import recovery
+    target = Path(export_dir)
+    if len(target.parts) < 4:
+        return "export_dir_unsafe"
+    try:
+        with recovery.OwnedRoot(target.parents[2], kind="export_dir") as root:
+            fd = recovery.directory_below(root, target.parts[-3:], "export_dir", create=repair)
+    except recovery.ObservationError as exc:
+        return "export_dir_missing" if exc.reason.endswith("_missing") else "export_dir_unsafe"
+    except OSError:
+        return "export_dir_unsafe"
+    try:
+        metadata = os.fstat(fd)
+    except OSError:
+        return "export_dir_unsafe"
+    finally:
+        os.close(fd)
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        return "export_dir_unsafe_mode"  # group/other bits would widen the --add-dir grant; never chmod on the launch path
+    return None
+
+
+def provider_inventory_mismatch(inventory, repair_export_dir=True):
+    """Allowlisted mismatch code for a pinned DeepSeek inventory, or None when every snapshotted byte still matches."""
+    return verify_provider_inventory(inventory, repair_export_dir)[0]
+
+
+DELEGATE_SETTING_KEYS = ("model", "reasoning_effort", "max_tokens", "ask_effort", "ask_max_tokens", "max_input_bytes", "request_timeout_seconds")
+
+
+def _pinned_delegate_settings(inventory, verified):
+    """(delegate settings, None) from the verified bytes of the pinned provider configuration, or (None, code).
+
+    The configuration is the pinned deepseek.json (or the single pinned .json when no file carries that name); its
+    values come from the exact bytes the digest check just verified, so nothing is re-read after the check and a
+    snapshot that cannot be parsed is a proven refusal, never a silently null packet field."""
+    candidates = [path for path in inventory.get("files", {}) if isinstance(path, str) and path.endswith(".json")]
+    preferred = [path for path in candidates if Path(path).name == "deepseek.json"]
+    if len(preferred) == 1:
+        chosen = preferred[0]
+    elif len(candidates) == 1:
+        chosen = candidates[0]
+    elif not candidates:
+        return None, "config_unpinned"
+    else:
+        return None, "config_ambiguous"
+    try:
+        snapshot = json.loads(verified[chosen].decode("utf-8"))
+    except (KeyError, ValueError, UnicodeDecodeError):
+        return None, "config_unparsable:" + Path(chosen).name
+    if not isinstance(snapshot, dict) or any(key not in snapshot for key in DELEGATE_SETTING_KEYS):
+        return None, "config_incomplete:" + Path(chosen).name
+    return {key: snapshot[key] for key in DELEGATE_SETTING_KEYS}, None
+
+
+def resolve_provider(config_path, config):
+    """(provider, pinned inventory or None) for the room owning an implementation profile.
+
+    An explicit delegate_provider in the room's settings.json wins. Legacy settings without one infer only from the
+    pinned profile: a lone qwen-local server means qwen, no server means none, anything else refuses before handoff.
+    A deepseek room must carry a consistent inventory whose snapshotted bytes still match; a qwen room never
+    receives DeepSeek instructions and a none room routes only among its Claude tiers."""
+    config_path = Path(config_path).resolve()
+    room_root = config_path.parent.parent if config_path.parent.name == "profiles" else None
+    settings = None
+    if room_root is not None:
+        import recovery
+        try:  # the same owned, bounded, symlink-refusing read the adapter applies to this file at startup
+            settings = json.loads(recovery.read_owned(room_root / "settings.json", INVENTORY_FILE_LIMIT, "handoff", root=room_root))
+        except recovery.ObservationError as exc:
+            if not exc.reason.endswith("_missing"):
+                raise ImplementationError("Room settings are unreadable; refusing handoff") from exc
+        except (ValueError, RecursionError) as exc:
+            raise ImplementationError("Room settings are unreadable; refusing handoff") from exc
+        if settings is not None and not isinstance(settings, dict):
+            raise ImplementationError("Room settings must be a JSON object; refusing handoff")
+    servers = _mcp_servers(config)
+    explicit = settings.get("delegate_provider") if settings else None
+    if explicit is not None:
+        if explicit not in PROVIDERS:
+            raise ImplementationError("Unknown delegate provider in room settings; refusing handoff")
+        provider = explicit
+    elif not servers:
+        provider = "none"
+    elif set(servers) == {"qwen-local"}:
+        provider = "qwen"
+    else:
+        raise ImplementationError("Ambiguous legacy delegate configuration; refusing handoff")
+    if provider == "qwen" and set(servers) != {"qwen-local"}:
+        raise ImplementationError("Room selects qwen but its pinned profile does not launch exactly the qwen-local guard")
+    if provider == "none" and servers:
+        raise ImplementationError("Room selects no delegate but its pinned profile launches MCP servers")
+    if provider != "deepseek":
+        return provider, None
+    inventory = settings.get("provider_inventory") if settings else None
+    if (set(servers) != {"deepseek"} or not isinstance(inventory, dict) or inventory.get("provider") != "deepseek"
+            or not isinstance(inventory.get("files"), dict) or not inventory["files"] or not isinstance(inventory.get("export_dir"), str)
+            or any(not isinstance(path, str) or not os.path.isabs(path) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                   for path, digest in inventory["files"].items())):
+        raise ImplementationError("DeepSeek provider inventory is missing or inconsistent; refusing handoff")
+    if inventory.get("room_id") != room_root.name or any(Path(path).parent != room_root / "profiles" for path in inventory["files"]):
+        # The adapter enforces the same binding at startup (inventory_room_mismatch); refusing here keeps a copied or
+        # restored room from launching an attempt whose delegate would refuse every job.
+        raise ImplementationError("DeepSeek provider inventory does not belong to this room; refusing handoff")
+    pinned = {"provider": "deepseek", "room_id": inventory.get("room_id"), "files": dict(inventory["files"]), "export_dir": inventory["export_dir"]}
+    mismatch = provider_inventory_mismatch(pinned)
+    if mismatch:
+        raise ImplementationError("DeepSeek provider snapshot does not match its inventory (" + mismatch + "); refusing handoff")
+    return provider, pinned
+
+
 def candidate_snapshot(worktree):
     """Bind every committable path, deletion, file mode, symlink, and current HEAD."""
     worktree = Path(worktree)
@@ -271,6 +523,8 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
         raise ImplementationError("Provide at least one independent gate as a nonempty argument array")
     room_path, project = Path(room_path).resolve(), Path(project_path).resolve()
     config = _config(config_path)
+    provider, inventory = resolve_provider(config_path, config)
+    policy = POLICIES[provider]
     with room.lock_room(room_path):
         report = room.status_report(room_path)
         if not report["agreement"] or report["current_revision"] != revision:
@@ -286,7 +540,9 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
         identity = {"room_path": str(room_path), "project_path": str(project), "revision": revision,
                     "spec_sha256": room.sha(spec_bytes), "review_history_sha256": room.sha(history.encode()),
                     "baseline_commit": baseline, "authorization_text": authorization_text, "gates": gates,
-                    "config": config, "delegation_policy_sha256": room.sha(POLICY.encode())}
+                    "config": config, "delegation_policy_sha256": room.sha(policy.encode())}
+        if inventory is not None:
+            identity["provider_inventory"] = inventory  # pinned bytes of the provider snapshot enter the handoff identity
         handoff_id = _digest(identity)
         directory = room_path / "implementations" / handoff_id
         if (directory / "handoff.json").exists():
@@ -304,7 +560,7 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
         pin("spec.md", spec_bytes)
         pin("review-history.md", history.encode())
         pin("authorization.txt", authorization_text.encode())
-        pin("delegation-policy.txt", POLICY.encode())
+        pin("delegation-policy.txt", policy.encode())
         owned = dict(config)
         owned_args = list(config["extra_args"])
         for index, (source, digest) in enumerate(config["referenced_files_sha256"].items()):
@@ -313,7 +569,7 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
                 raise ImplementationError("Configuration reference changed during preparation")
             name = f"config-inputs/{index}-{Path(source).name}"
             pin(name, content)
-            owned_args = [str(directory / name) if arg == source else arg.replace("=" + source, "=" + str(directory / name)) for arg in owned_args]
+            owned_args = [_pinned_arg(arg, source, str(directory / name)) for arg in owned_args]
         owned["extra_args"] = owned_args
         pin("implementation-config.json", (room.canonical(owned) + "\n").encode())
         transcript_template = config["session_transcript_path"]
@@ -322,7 +578,7 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
                           re.sub(r"[^a-zA-Z0-9]", "-", str(worktree)) / (session_id + ".jsonl")))
         manifest = {**identity, "handoff_id": handoff_id, "created_at": room.now(), "branch": branch,
                     "worktree_path": str(worktree), "session_id": session_id, "session_transcript_path": transcript,
-                    "pinned_files": pinned}
+                    "pinned_files": pinned, "provider": provider}
         _atomic(directory / "handoff.json", manifest)
         state = {"phase": "preparing", "manifest_sha256": _digest(manifest), "implementation_authorized": True,
                  "astra_accepted": False, "created_at": room.now()}
@@ -336,6 +592,20 @@ def prepare_handoff(room_path, project_path, revision, authorization_text, gates
             raise
         _atomic(directory / "state.json", state)
         return _summary(directory, manifest, state)
+
+
+def _pinned_arg(arg, source, replacement):
+    """`arg` with a reference to `source` (bare or --flag=value, written literally or with a leading ~ as the loader
+    expands it) replaced by the pinned copy, so the launched argv names the pinned bytes rather than the live file."""
+    try:
+        if str(Path(arg).expanduser()) == source:
+            return replacement  # a bare reference (a path may itself contain '='), literal or with a leading ~
+        option, equals, value = arg.partition("=")
+        if equals and option.startswith("--") and str(Path(value).expanduser()) == source:
+            return option + "=" + replacement
+    except RuntimeError:
+        pass  # no home directory to expand ~ against; the literal argument is left alone
+    return arg
 
 
 def _validate_report(report, manifest):
@@ -359,7 +629,7 @@ def _validate_report(report, manifest):
     for route in routes:
         if not isinstance(route, dict) or set(route) != set(ROUTE_SCHEMA["required"]):
             raise ImplementationError("Invalid routing record")
-        if route["tier"] not in ("qwen", "sonnet", "opus", "fable"):
+        if route["tier"] not in ("qwen", "deepseek", "sonnet", "opus", "fable"):
             raise ImplementationError("Invalid routing tier")
         if any(not isinstance(route[key], str) for key in route if key != "fixes"):
             raise ImplementationError("Invalid routing metadata")
@@ -537,28 +807,59 @@ def _continue_run(directory, manifest, state, successor, root, owner_job_id=None
         _atomic(directory / "state.json", state)
     is_recovery = state["phase"] == "recovery_prepared"
     current = None
+    if is_recovery and successor is None:
+        raise ImplementationError("A prepared recovery runs only through its registered successor job")
+    if not is_recovery and successor is not None:
+        raise ImplementationError("Recovery identity was supplied for a handoff that has no prepared recovery")
+    if not is_recovery and state["phase"] not in ("prepared", "correction_pending"):
+        return _summary(directory, manifest, state)
+    # Each lane's own safety checks run first (the recovery recheck, or the agreement check), so their reasons are the
+    # ones durably recorded; the pinned provider snapshot is then re-verified before any candidate fingerprint, state
+    # write, attempt increment or spawn. A mismatch is a proven non-launch: initial and correction attempts return the
+    # refusal shape (the worker records failed, never uncertain) with the handoff phase and candidate untouched; a
+    # registered successor takes the existing invalidation path, and any exception in its pre-launch work is the same
+    # proven non-launch (prelaunch_error) because nothing has been written or spawned yet.
     if is_recovery:
-        if successor is None:
-            raise ImplementationError("A prepared recovery runs only through its registered successor job")
         try:
             refusal, current = _recovery_refusal(directory, manifest, state, successor, root)
+            if refusal:
+                return _refused(refusal, manifest, successor)
+            refused, delegate_settings = _verify_delegate_snapshot(manifest, successor)
         except Exception as exc:  # Nothing has been written or spawned yet: any failure here is a proven non-launch.
             return _refused("prelaunch_error", manifest, successor, type(exc).__name__)
-        if refusal:
-            return _refused(refusal, manifest, successor)
-    elif successor is not None:
-        raise ImplementationError("Recovery identity was supplied for a handoff that has no prepared recovery")
-    elif state["phase"] not in ("prepared", "correction_pending"):
-        return _summary(directory, manifest, state)
-    if not is_recovery:
+    else:
         _require_current_agreement(manifest)
+        try:
+            refused, delegate_settings = _verify_delegate_snapshot(manifest, successor)
+        except Exception as exc:  # nothing has been written or spawned: a proven non-launch, never an uncertain job
+            return _refused("prelaunch_error", manifest, successor, type(exc).__name__)
+    if refused is not None:
+        return refused
     is_correction = state["phase"] == "correction_pending"
     worktree = Path(manifest["worktree_path"])
     expected_candidate = state["recovery"]["candidate"] if is_recovery else state["candidate"] if is_correction else state["initial_candidate"]
     if (current if is_recovery else candidate_snapshot(worktree)) != expected_candidate:
         raise ImplementationError("Prepared worktree changed before its authorized implementation began")
     return _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root,
-                           successor["successor_job_id"] if is_recovery else owner_job_id)
+                           successor["successor_job_id"] if is_recovery else owner_job_id, delegate_settings)
+
+
+def _verify_delegate_snapshot(manifest, successor):
+    """(refusal, delegate settings): the refusal for a pinned DeepSeek snapshot that no longer matches or cannot be
+    parsed, or None with the packet's delegate settings taken from the verified bytes themselves (None for a room
+    without a pinned provider snapshot)."""
+    inventory = manifest.get("provider_inventory")
+    if not inventory:
+        return None, None
+    mismatch, verified = verify_provider_inventory(inventory)
+    if mismatch:
+        return _refused("provider_inventory_mismatch", manifest, successor, mismatch), None
+    # The packet's pinned delegate settings come from the verified bytes themselves, so no later read exists to
+    # tamper with, and an unusable snapshot is refused here, before any state mutation, attempt or spawn.
+    delegate_settings, problem = _pinned_delegate_settings(inventory, verified)
+    if problem:
+        return _refused("provider_inventory_mismatch", manifest, successor, problem), None
+    return None, delegate_settings
 
 
 def _set_aside(attempt):
@@ -569,7 +870,8 @@ def _set_aside(attempt):
 
 def _refused(reason, manifest, successor, detail=None):
     return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": reason, "detail": detail,
-            "recovery_id": successor.get("recovery_id"), "handoff_id": manifest["handoff_id"], "model_launched": False}
+            "recovery_id": successor.get("recovery_id") if isinstance(successor, dict) else None,
+            "handoff_id": manifest["handoff_id"], "model_launched": False}
 
 
 def _pinned_bytes(directory, name, root=None):
@@ -580,7 +882,7 @@ def _pinned_bytes(directory, name, root=None):
     return recovery.read_owned(directory / name, recovery.EVIDENCE_LIMIT, "handoff", root=root)
 
 
-def _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root=None, owner_job_id=None):
+def _launch_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, root=None, owner_job_id=None, delegate_settings=None):
     import copy
     import recovery
     rollback = copy.deepcopy(state)
@@ -593,7 +895,7 @@ def _launch_attempt(directory, manifest, state, worktree, is_correction, is_reco
             _set_aside(attempt)  # A stray directory from an earlier pre-launch failure must not wedge the lane.
         attempt.mkdir(parents=True, exist_ok=False)
         argv, prompt, model_env = _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor,
-                                                   config, attempt, attempt_number, recovery, root, owner_job_id)
+                                                   config, attempt, attempt_number, recovery, root, owner_job_id, delegate_settings)
     except Exception as exc:
         if is_recovery:
             # The on-disk projection is still recovery_prepared and no process was spawned.
@@ -606,13 +908,26 @@ def _launch_attempt(directory, manifest, state, worktree, is_correction, is_reco
                         argv, prompt, model_env, rollback, recovery)
 
 
-def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, config, attempt, attempt_number, recovery, root=None, owner_job_id=None):
+def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_recovery, successor, config, attempt, attempt_number, recovery, root=None, owner_job_id=None, delegate_settings=None):
+    started_at = room.now()
+    import datetime as _dt
+    deadline = (room.parse_timestamp(started_at) + _dt.timedelta(seconds=config["timeout_seconds"])).isoformat()
+    inventory = manifest.get("provider_inventory") if isinstance(manifest.get("provider_inventory"), dict) else None
+    settings = delegate_settings  # bound to the verified pinned bytes by _continue_run; never re-read here
     packet = {"handoff_id": manifest["handoff_id"], "spec_revision": manifest["revision"],
               "spec_sha256": manifest["spec_sha256"], "baseline_commit": manifest["baseline_commit"],
               "authorization": manifest["authorization_text"], "gates": manifest["gates"],
               "spec": _pinned_bytes(directory, "spec.md", root).decode("utf-8"),
               "review_history": _pinned_bytes(directory, "review-history.md", root).decode("utf-8"),
-              "worktree_path": str(worktree), "delegation_policy": _pinned_bytes(directory, "delegation-policy.txt", root).decode("utf-8")}
+              "worktree_path": str(worktree), "delegation_policy": _pinned_bytes(directory, "delegation-policy.txt", root).decode("utf-8"),
+              "implementation_timeout_seconds": config["timeout_seconds"], "attempt_started_at": started_at, "attempt_deadline_at": deadline,
+              "delegate_provider": manifest.get("provider", "unrecorded"),
+              "delegate_export_dir": inventory.get("export_dir") if inventory else None,
+              "delegate_settings": settings,
+              "timeout_note": ("The pinned Claude invocation timeout ends this attempt at attempt_deadline_at. Size delegated work to the "
+                               "remaining window; a detached provider job may outlive it and a later authorized attempt can read the "
+                               "saved job without resubmitting. A host restart (the recovery lane's boot boundary) kills a streaming "
+                               "local worker and leaves its remote delivery unknown.")}
     if is_correction:
         packet.update(correction_request=state["correction_request"], previous_report=state.get("report"),
                       previous_gate_results=state.get("gate_results", []))
@@ -685,7 +1000,7 @@ def _prepare_attempt(directory, manifest, state, worktree, is_correction, is_rec
         model_env.pop("CLAUDE_CONFIG_DIR", None)
     else:
         model_env["CLAUDE_CONFIG_DIR"] = config["claude_config_dir_override"]
-    started_at = room.now()
+    model_env["PROJECT_ROOM_WORKTREE"] = str(worktree)  # the verified worktree root the delegate adapter binds context_path to
     # Advisory ownership/stage telemetry; this never replaces launch or acceptance evidence.
     state.update(phase="running_model", started_at=started_at, attempt_path=str(attempt), attempt_count=attempt_number,
                  astra_accepted=False, gates_passed=False,

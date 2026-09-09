@@ -135,13 +135,13 @@ class ProjectFixture(unittest.TestCase):
         self.git("add", "README.md")
         self.git("-c", "commit.gpgSign=false", "commit", "-qm", "Fixture baseline")
 
-    def insert_orphan(self, status="running", pid=None, age_seconds=60):
+    def insert_orphan(self, status="running", pid=None, age_seconds=60, request_key="orphan"):
         identifier = uuid.uuid4().hex
         self.service._job_path(identifier).mkdir(parents=True)
         stamp = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age_seconds)).isoformat()
         with self.service.db() as db:
             db.execute("INSERT INTO jobs(id,room_id,kind,request_key,payload,status,created_at,pid) VALUES(?,?,?,?,?,?,?,?)",
-                       (identifier, self.room_id, "review", "orphan", "{}", status, stamp, pid))
+                       (identifier, self.room_id, "review", request_key, "{}", status, stamp, pid))
         return identifier
 
 

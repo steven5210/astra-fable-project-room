@@ -117,9 +117,18 @@ class RecoveryTests(ProjectFixture):
         return Path(self.state()["attempt_path"])
 
     def backdate(self, days=2):
-        """Fixture boot after the interrupted receipt: move the saved attempt times before the real boot."""
+        """Fixture boot after the interrupted receipt: move the saved attempt times before the real boot.
+
+        The saved chronology is placed at least `days` in the past and, on a host that has been up longer than
+        that, before its actual boot instant; the production boot boundary itself is never relaxed."""
         state = self.state()
         base = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        try:
+            booted = datetime.datetime.fromtimestamp(recovery.boot_time()[0], datetime.timezone.utc)
+        except recovery.ObservationError:
+            booted = None
+        if booted is not None and booted - datetime.timedelta(minutes=10) < base:
+            base = booted - datetime.timedelta(minutes=10)
         state["started_at"] = (base - datetime.timedelta(minutes=5)).isoformat()
         receipt_path = self.attempt_dir() / "process-result.json"
         receipt = json.loads(receipt_path.read_text())

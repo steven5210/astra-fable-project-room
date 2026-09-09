@@ -8,6 +8,8 @@ After installing and setting up the plugin, use it in ordinary language:
 
 The bundled skill supplies the roles and handoff workflow. You do not need to paste an orchestration prompt each time. A request to build a feature carries through implementation; a planning-only request stops at the agreed specification. Existing authorization carries forward.
 
+Version 0.3.0 adds an explicit DeepSeek delegate provider for Fable's implementation sessions (configured key-free, entered separately at your own terminal) alongside the existing legacy Qwen provider, plus a worker-lease fix so a slow-to-start job is never mistaken for a vanished one. Existing rooms and their pinned provider are unaffected.
+
 ## What each participant owns
 
 | Participant | Responsibility |
@@ -15,7 +17,7 @@ The bundled skill supplies the roles and handoff workflow. You do not need to pa
 | You | Product intent, priorities, and meaningful tradeoffs. |
 | Astra | Brainstorming, requirements, acceptance criteria, decisions, and independent product outcome review. |
 | Fable | Technical interpretation, engineering design, implementation planning, delegate orchestration, and engineering verdicts. |
-| Qwen / Sonnet / Opus | Bounded delegated work, with output checked by Fable. Availability depends on your setup. |
+| DeepSeek / Qwen (legacy) / Sonnet / Opus | Bounded delegated work, with output checked by Fable. A room pins exactly one first-tier provider (DeepSeek or legacy Qwen) at creation, plus the Claude subagent tiers. Availability depends on your setup. |
 
 Astra and Fable review the same immutable spec revision and digest. Findings receive explicit dispositions and reasons. Both agents actively suggest useful enhancements; Astra brings you the benefit, tradeoff, and a project GitHub issue link for your opinion and approval. Proposals remain tracked in the room, and filing is reported as pending if no tracker is available. An enhancement enters implementation only after you approve its scope and the revised spec is agreed. Consensus permits handoff when implementation is within your request. Fable then works against executable gates, and Astra records acceptance only after inspecting the delivered behavior and evidence. See [the workflow](docs/workflow.md).
 
@@ -42,6 +44,16 @@ If Claude is not found, pass its actual executable path:
 ```sh
 python3 project_room.py setup --claude-bin /absolute/path/to/claude
 ```
+
+To use the DeepSeek delegate provider, pass a private key-free provider configuration, select it explicitly, and store the key at your own terminal. The one-request live probe is an explicit paid CLI action, not an interactive step: Astra runs it after independent acceptance and installation, and you may run it yourself too.
+
+```sh
+python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepseek-provider.json --delegate-provider deepseek
+python3 deepseek_adapter.py set-key --home ~/.project-room
+python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/rooms/ROOM_ID --config ~/.project-room/rooms/ROOM_ID/profiles/deepseek.json
+```
+
+`--delegate-provider` accepts `deepseek`, `qwen`, or `none`. A provider chosen with that flag is recorded and kept until another explicit flag replaces it; without any recorded choice the legacy inference applies (`qwen` when a Qwen config is configured, else `none`), so a plain `setup` followed by `setup --qwen-config ...` enables Qwen for new rooms exactly as before. Selecting DeepSeek is always explicit: supplying `--deepseek-config` with no recorded choice is refused before anything is written, asking for `--delegate-provider deepseek` (or `qwen`/`none` to store the file unselected). Setup validates only a configuration supplied in the same run or a provider explicitly reselected in it, so a stored provider file that is missing or on an unmounted volume never blocks unrelated changes such as `--claude-bin`. The probe's `--config` must be the absolute path of the room's pinned snapshot; relative paths are refused. Only rooms opened after this setup snapshot the selected provider; existing rooms keep their pinned provider and are never migrated silently. See [the DeepSeek delegate guide](docs/deepseek.md) for the configuration reference, the key file, what the probe actually verifies, and the post-install calibration order (probe, two bounded deep calibration tasks, actual Read-access proof, Fable adjudication, Astra acceptance).
 
 Authenticate through Claude Code's standard login flow when needed, then rerun doctor. The controller uses the CLI's saved login and preserves its original configuration-directory override; it does not ask for an API key, extract credentials, or silently switch providers. Model calls still count toward the account's applicable usage. Setup and doctor are distinct from making a model request. See [authentication recovery](docs/recovery.md) if a saved job failed before reaching the model.
 
@@ -86,9 +98,15 @@ python3 project_room.py call room_history --args '{"room_id":"ROOM_ID"}'
 
 Replace `ROOM_ID` with the value returned by `room_open`. From another directory, use the absolute path to `project_room.py`. Prefer structured MCP arguments or `call TOOL --args-file /absolute/private/path/to/arguments.json` for multiline specs and review notes. The complete tool reference is in [operations](skills/project-room/references/operations.md).
 
-## Qwen and delegation
+## DeepSeek delegate
 
-Qwen is optional; Fable orchestrates the available delegates without lowering the quality bar. To connect an existing trusted `qwen-local` stdio server during setup:
+A DeepSeek room routes self-contained implementation, test, and review work to the exact configured DeepSeek model over `https://api.deepseek.com`, at a pinned deep-lane reasoning effort and output budget that no tool call can lower. DeepSeek is a text delegate: it returns code, tests, reviews, and reasoning summaries, but executes nothing, edits no files, and calls no tools; Sonnet applies and verifies what it returns, the same way Fable already treats Qwen's output.
+
+Each DeepSeek room's `room_status` includes `delegate_jobs`: the latest 20 jobs from that room's private ledger with state, usage, and whether one still stops the room's DeepSeek lane, read without any network call. An unresolved delivery failure stops new paid jobs in that room only; resolving it requires the user's own terminal (`deepseek_adapter.py resolve`), never Astra or Fable, and no MCP tool performs it. See [the DeepSeek delegate guide](docs/deepseek.md) for setup, the full state table, routing calibration, export folder semantics, and privacy guarantees.
+
+## Qwen delegation (legacy)
+
+Qwen is the earlier optional delegate provider; a room pins DeepSeek or Qwen (never both) at creation, and DeepSeek above is the newer choice for new rooms. Fable orchestrates whichever provider a room selected without lowering the quality bar. To connect an existing trusted `qwen-local` stdio server during setup:
 
 ```sh
 python3 project_room.py setup --qwen-config /absolute/private/path/to/qwen-config.json
@@ -120,7 +138,7 @@ Run the automated suite:
 python3 -m unittest discover -v
 ```
 
-Tests use fake model executables and fake MCP backends in temporary directories. They make no account, network, paid-model, or GPU requests. CI runs discovery on Linux and macOS with Python 3.11 and 3.12. A passing fake-backend suite does not establish live authentication, Fable access, Qwen health, or complete a real feature implementation. Keep live verification receipts private and describe exactly what they verified.
+Tests use fake model executables and fake MCP backends in temporary directories, including a fake loopback HTTPS/SSE connection and synthetic keys for DeepSeek. They make no account, network, paid-model, or GPU requests. CI runs discovery on Linux and macOS with Python 3.11 and 3.12. A passing fake-backend suite does not establish live authentication, Fable access, Qwen or DeepSeek health, or complete a real feature implementation. Keep live verification receipts private and describe exactly what they verified.
 
 ## Source and private data
 
