@@ -282,6 +282,27 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ao.RoomError, "receipt was modified"):
             self.service.ao_room_accept(self.room, "first")
 
+    def test_crash_orphan_receipt_cannot_bless_a_fabricated_verdict(self):
+        self.bind("reviewer")
+        self.service.ao_room_verify(self.room, str(self.repo))
+        self.send("reviewer")
+        self.fake.finish("reviewer", self.verdict("rejected"))
+        saved = self.state()
+        directory = self.service.root / "rooms" / self.room
+        with patch.object(self.service, "save", side_effect=OSError("simulated crash before registry save")):
+            with self.assertRaises(OSError):
+                self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state(), saved)
+        path = next((directory / "receipts" / "first").glob("*.json"))
+        fabricated = ao.read(path)
+        fabricated["messages"][-1]["text"] = self.verdict("approved")
+        ao.atomic(path, fabricated)
+        with self.assertRaisesRegex(ao.RoomError, "observation was modified"):
+            self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state(), saved)
+        with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+            self.service.ao_room_accept(self.room, "first")
+
     def test_new_checkpoint_makes_previous_review_stale(self):
         self.review()
         self.service.ao_room_verify(self.room, str(self.repo))

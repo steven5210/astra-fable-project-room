@@ -236,6 +236,8 @@ class Service:
         target = directory / relative
         if target.exists():
             receipt = read(target)
+            if not isinstance(receipt, dict) or {k: v for k, v in receipt.items() if k != "observed_at"} != payload:
+                raise RoomError("Existing content-addressed observation was modified; preserve it for diagnosis")
         else:
             receipt = {**payload, "observed_at": time.time()}
             atomic(target, receipt)
