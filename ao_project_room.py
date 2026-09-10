@@ -166,6 +166,9 @@ def usage_receipt(request, snapshot):
         return {"known": False, "reason": "overlap_or_incomplete_history"}
     current = snapshot.get("usage") or {}
     old = request["baseline"]["usage"]
+    # AO retains the preceding turn's totals when the provider omits usage.
+    # Equal Claude totals might be legitimate, but the snapshot cannot prove
+    # that; prefer unknown to charging the previous turn a second time.
     counts = {}
     for field in COUNTERS:
         value = current.get(field)
@@ -180,9 +183,29 @@ def usage_receipt(request, snapshot):
                 return {"known": False, "reason": "missing_or_reset_cumulative_baseline"}
             value -= before
         counts[field] = value
+    if all(current.get(field) == old.get(field) for field in COUNTERS):
+        return {"known": False, "reason": "unchanged_native_counters"}
+    if counts["totalTokens"] <= 0:
+        return {"known": False, "reason": "no_fresh_positive_usage"}
     return {"known": True, "basis": "codex_cumulative_delta" if request["harness"] == "codex" else "claude_turn_snapshot",
             **counts, "context_used": current.get("contextUsed"), "context_window": current.get("contextWindow"),
             "cache_note": "Codex input includes cache; Claude cachedTokens combines cache reads and writes. Do not add cache twice."}
+
+
+def conflicting_reroute(request, snapshot):
+    reroute = snapshot.get("modelReroute")
+    if not isinstance(reroute, dict) or reroute.get("toModel") == request["model"]:
+        return None
+    target = reroute.get("providerTurnId")
+    if target and target != request.get("provider_turn_id"):
+        return None  # A durable reroute for another native turn is historical.
+    # A substitution without turn attribution cannot establish the pinned model.
+    return reroute
+
+
+def native_turn_identity(request):
+    value = request.get("provider_turn_id") or (request.get("observed_turn") or {}).get("providerTurnId")
+    return value if isinstance(value, str) and value.strip() else None
 
 
 class Service:
@@ -207,6 +230,21 @@ class Service:
 
     def save(self, directory, state):
         atomic(directory / "state.json", state)
+
+    def observation(self, directory, request, payload):
+        relative = f"receipts/{request['request_id']}/{digest(payload)}.json"
+        target = directory / relative
+        if target.exists():
+            receipt = read(target)
+        else:
+            receipt = {**payload, "observed_at": time.time()}
+            atomic(target, receipt)
+        history = request.setdefault("receipt_history", [])
+        if request.get("receipt") and request["receipt"] not in history:
+            history.append(request["receipt"])
+        if relative not in history:
+            history.append(relative)
+        request.update(receipt=relative, receipt_sha256=digest(receipt))
 
     def client(self, state):
         return self.client_factory(state["ao_url"])
@@ -238,6 +276,8 @@ class Service:
     def settled(self, state):
         if any(r["state"] not in TERMINAL for r in state["requests"].values()):
             raise RoomError("An owned request is active or uncertain; sync it without resending")
+        if any(not native_turn_identity(r) for r in state["requests"].values()):
+            raise RoomError("A saved terminal result lacks observed native delivery; sync it without resending")
         if any(v["state"] == "running" for v in state["verifications"]):
             raise RoomError("An unfinished verification is recorded; inspect its processes and evidence, never start a second verifier")
 
@@ -401,7 +441,7 @@ class Service:
                          "review (concrete findings/evidence), and these exact identities: " + json.dumps(review, sort_keys=True))
             request = {"request_id": request_id, "key": key, "role": role, **binding, "text": text, "text_sha256": digest(text.encode()),
                        "spec_record_sha256": state["spec_record_sha256"], "review": review, "state": "uncertain",
-                       "client_message_id": str(uuid.uuid4()), "created_at": time.time(),
+                       "client_message_id": str(uuid.uuid4()), "created_at": time.time(), "created_order": len(state["requests"]) + 1,
                        "baseline": {"turn_ids": sorted(turn_ids(snapshot)), "conversation_id": snapshot.get("conversationId"),
                                     "branch_id": snapshot.get("activeBranchId"), "usage": snapshot.get("usage") or {}}}
             state["requests"][request_id] = request
@@ -422,7 +462,14 @@ class Service:
             client = self.client(state)
             for request in state["requests"].values():
                 if request["state"] in TERMINAL:
-                    continue
+                    # Preserve older known receipts rather than recomputing their
+                    # usage from a newer turn's snapshot after an adapter update.
+                    native_id = native_turn_identity(request)
+                    if native_id:
+                        request["provider_turn_id"] = native_id
+                        continue
+                    request["prior_terminal_state"] = request["state"]
+                    request["state"] = "uncertain"
                 snapshot = self.identity(client, state, request)
                 if (snapshot.get("conversationId") != request["baseline"]["conversation_id"]
                         or snapshot.get("activeBranchId") != request["baseline"]["branch_id"]):
@@ -439,15 +486,28 @@ class Service:
                 turn = next((t for t in snapshot.get("turns", []) if t["id"] == turn_id), None)
                 if not turn:
                     continue
-                request["state"] = turn["state"] if turn["state"] in TERMINAL else "running"
                 request["observed_turn"] = turn
-                if request["state"] in TERMINAL:
+                provider_id = turn.get("providerTurnId")
+                delivered = isinstance(provider_id, str) and bool(provider_id.strip())
+                if delivered:
+                    if request.get("provider_turn_id") and request["provider_turn_id"] != provider_id:
+                        raise RoomError("Observed native provider turn identity changed; do not replay")
+                    request["provider_turn_id"] = provider_id
+                request["state"] = turn["state"] if delivered and turn["state"] in TERMINAL else "running"
+                if not delivered and turn["state"] in TERMINAL:
+                    request["state"] = "uncertain"
+                    request["reconciliation"] = "AO saved a terminal result without native providerTurnId; provider dispatch may have occurred. No replay."
+                elif delivered:
+                    request.pop("reconciliation", None)
+                if turn["state"] in TERMINAL:
+                    conflict = conflicting_reroute(request, snapshot)
+                    if conflict:
+                        request["model_reroute"] = conflict
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
-                               "history_truncated": snapshot.get("history_truncated"), "observed_at": time.time()}
-                    relative = f"receipts/{request['request_id']}.json"
-                    atomic(directory / relative, receipt)
-                    request.update(receipt=relative, receipt_sha256=digest(receipt), usage=usage_receipt(request, snapshot))
+                               "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
+                    self.observation(directory, request, receipt)
+                    request["usage"] = usage_receipt(request, snapshot)
             self.save(directory, state)
             return self.summary(directory, state)
 
@@ -463,6 +523,7 @@ class Service:
             if directory.is_relative_to(candidate):
                 raise RoomError("Room state must be outside the candidate")
             before = candidate_snapshot(candidate)
+            after = before
             attempt = "verify-" + uuid.uuid4().hex
             results = []
             state["checkpoint"] = None
@@ -487,14 +548,20 @@ class Service:
                         code = None
                         failure = str(exc)
                         output.write(failure.encode())
+                snapshot_error = None
+                try:
+                    after = candidate_snapshot(candidate)
+                except Exception as exc:
+                    after = None
+                    snapshot_error = str(exc)[:1000]
                 results.append({"argv": argv, "return_code": code, "timed_out": timed_out, "failure": failure,
-                                "log": relative, "log_sha256": digest(log.read_bytes())})
-                if code != 0:
+                                "log": relative, "log_sha256": digest(log.read_bytes()),
+                                "candidate_sha256_after": after["sha256"] if after else None, "snapshot_error": snapshot_error})
+                if code != 0 or after != before:
                     break
-            after = candidate_snapshot(candidate)
             checkpoint = {"id": attempt, "spec_sha256": spec["sha256"], "spec_record_sha256": state["spec_record_sha256"],
                           "candidate_path": str(candidate), "candidate_sha256": before["sha256"], "candidate": before,
-                          "after_sha256": after["sha256"], "gates": results, "timeout_seconds": timeout_seconds,
+                          "after_sha256": after["sha256"] if after else None, "gates": results, "timeout_seconds": timeout_seconds,
                           "passed": len(results) == len(spec["gates"]) and all(r["return_code"] == 0 for r in results) and before == after}
             relative = f"verification/{attempt}/checkpoint.json"
             atomic(directory / relative, checkpoint)
@@ -511,6 +578,18 @@ class Service:
             request = state["requests"].get(identifier(request_id))
             if not request or request["role"] != "reviewer" or request["state"] != "completed":
                 raise RoomError("Acceptance needs a completed independent reviewer request")
+            if not request.get("provider_turn_id"):
+                raise RoomError("Acceptance needs an observed native provider turn identity")
+            current = self.identity(self.client(state), state, request)
+            conflict = request.get("model_reroute") or conflicting_reroute(request, current)
+            if conflict:
+                request["model_reroute"] = conflict
+                relative = f"receipts/{request_id}/reroute-{digest(conflict)}.json"
+                if not (directory / relative).exists():
+                    atomic(directory / relative, conflict)
+                request["reroute_evidence"] = relative
+                self.save(directory, state)
+                raise RoomError("Native model substitution contradicts the pinned reviewer identity; inspect saved reroute evidence")
             expected = {"spec_sha256": checkpoint["spec_sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                         "evidence_sha256": state["checkpoint_sha256"]}
             if request["review"] != expected or request["spec_record_sha256"] != state["spec_record_sha256"]:
@@ -540,14 +619,29 @@ class Service:
             return acceptance | {"accepted": True, "publication": "not performed"}
 
     def request_summary(self, request):
-        fields = ("request_id", "role", "session_id", "model", "state", "turn_id", "created_at", "delivery_error",
+        fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "usage")
-        return {k: request[k] for k in fields if k in request}
+        result = {k: request[k] for k in fields if k in request}
+        if "model" in request:
+            result["configured_model"] = request["model"]
+        if request.get("model_reroute"):
+            result["model_identity"] = "contradicted"
+            result["model_reroute"] = {k: str(v)[:500] for k, v in request["model_reroute"].items()
+                                      if k in ("fromModel", "toModel", "providerTurnId", "reason", "at")}
+        return result
 
     def summary(self, directory, state):
         totals = {field: 0 for field in COUNTERS}
         unknown = []
-        for request in state["requests"].values():
+        creation_order = lambda r: (r.get("created_order", 0), r.get("created_at", 0), r["request_id"])
+        ordered = sorted(state["requests"].values(), key=creation_order)
+        active = [r for r in ordered if r["state"] not in TERMINAL]
+        settled = [r for r in ordered if r["state"] in TERMINAL]
+        # One owned request may be active; reserve its slot even if the wall
+        # clock moved backwards. Never let lexical request IDs hide it.
+        visible = sorted((settled[-max(0, 20 - len(active)):] if len(active) < 20 else []) + active[-20:],
+                         key=creation_order)
+        for request in ordered:
             usage = request.get("usage", {})
             if usage.get("known"):
                 for field in COUNTERS:
@@ -557,7 +651,7 @@ class Service:
         return {"room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
-                "requests": [self.request_summary(r) for r in list(state["requests"].values())[-20:]],
+                "requests": [self.request_summary(r) for r in visible],
                 "requests_truncated": len(state["requests"]) > 20, "checkpoint": state.get("checkpoint"),
                 "latest_verification": state["verifications"][-1] if state["verifications"] else None,
                 "latest_acceptance": state["acceptances"][-1] if state["acceptances"] else None,

@@ -65,7 +65,10 @@ claims. A durable intent with a native `clientMessageId` is written before POST.
 Identical repeated calls read the saved record; they do not POST again. After a
 lost acknowledgement, sync requires a unique exact sent message and matching
 conversation branch before adopting its turn. Missing history is not proof of
-non-delivery. There is no automatic retry, timeout cancellation or worker failover.
+non-delivery. A saved AO failure without an observed native `providerTurnId` remains
+uncertain: AO may have lost the provider's acknowledgement after dispatch. Original
+failed observations remain in the receipt history when later evidence settles the
+turn. There is no automatic retry, timeout cancellation or worker failover.
 
 ## Verify and accept
 
@@ -81,7 +84,9 @@ surviving processes; this initial adapter has no automatic verifier-recovery lan
 Do not erase the record or launch a replacement to bypass the uncertainty.
 
 Verification binds tracked and untracked committable files, deletions, symlinks,
-file modes, the index and HEAD before and after the gates. Ignored files and
+file modes, the index and HEAD before the gates and after **each** gate. Observable
+drift stops the sequence immediately, so another gate cannot conceal it by restoring
+the files. Ignored files and
 external dependencies are outside this fingerprint. A changed candidate or failed
 gate cannot produce an acceptable checkpoint. Commit before final verification
 when a commit is part of the intended candidate; committing afterwards changes
@@ -107,7 +112,10 @@ accepts only an actual completed independent reviewer response with matching
 identities, intact logs and unchanged candidate bytes. There are at most three
 review requests per room across revisions. If exhausted, surface the unresolved
 decision to the user; this initial adapter has no automatic budget-renewal lane.
-Do not create another room/session to bypass that limit.
+Do not create another room/session to bypass that limit. An explicit AO model
+reroute for the reviewer turn is preserved and blocks acceptance if it contradicts
+the pinned model. Acceptance checks for late reroute evidence too. A reroute
+explicitly attributed to another native turn remains historical.
 
 Acceptance does not merge, publish or deploy. Continue authorized integration
 using normal repository tools, preserving unrelated changes and checking that the
@@ -124,11 +132,17 @@ tokens. AO combines Claude cache reads and writes; the adapter does not invent a
 split. Context occupancy is a separate latest-turn value, not total consumption.
 
 Only an observed isolated turn on the same native conversation branch gets a
-known receipt. Missing counters, reset baselines, overlapping external turns or
-truncated history produce **unknown**, not zero. The status total is a subtotal of
+known receipt. Missing or unchanged counters, decreased cumulative baselines,
+overlapping external turns or truncated history produce **unknown**, not zero.
+AO can retain old counters when a provider omits new usage. Identical Claude totals
+may be legitimate, but this snapshot cannot prove freshness, so they remain unknown.
+The status total is a subtotal of
 known primary receipts, excludes delegates, and is neither subscription quota nor
 billing. Configured model/effort is checked through AO, not presented as a provider
-attestation. Native transport receipts remain the source for stronger attribution.
+attestation. Status labels the pinned model as `configured_model` and exposes any
+contradictory native reroute separately. Requests are ordered by durable creation
+order, with active/uncertain work retained within the bounded projection. Native
+transport receipts remain the source for stronger attribution.
 
 The existing DeepSeek adapter and its pinned provider policy remain available and
 unchanged. Reuse them only for work that benefits from delegation and preserves

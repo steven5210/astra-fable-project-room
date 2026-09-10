@@ -42,7 +42,7 @@ class FakeAO:
         self.posts.append((path, payload))
         turn_id = "turn-" + str(len(self.posts))
         snapshot = self.snapshots[name]
-        snapshot["turns"].append({"id": turn_id, "state": "running"})
+        snapshot["turns"].append({"id": turn_id, "providerTurnId": "native-" + turn_id, "state": "running"})
         snapshot["messages"].append({"id": "user-" + turn_id, "role": "user", "text": payload["text"], "turnId": turn_id, "sequence": len(snapshot["messages"]) + 1})
         if self.lose_ack:
             raise ao.RoomError("Simulated lost acknowledgement")
@@ -135,6 +135,58 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.service.ao_room_sync(self.room)["requests"][0]["state"], "uncertain")
         self.assertEqual(len(self.fake.posts), 1)
 
+    def test_native_dispatch_ack_loss_keeps_original_failure_and_blocks_replay(self):
+        self.bind()
+        self.fake.lose_ack = True
+        self.send()
+        turn = self.fake.snapshots["engineer"]["turns"][-1]
+        native_id = turn.pop("providerTurnId")
+        self.fake.finish("engineer", "Dispatch acknowledgement lost", state="failed")
+        turn["error"] = "Provider acknowledgement lost"
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
+        state = self.state(); first_receipt = state["requests"]["first"]["receipt"]
+        original = (self.service.root / "rooms" / self.room / first_receipt).read_bytes()
+        with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+            self.send(request_id="second")
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(len(self.state()["requests"]["first"]["receipt_history"]), 1)
+        turn["providerTurnId"] = native_id
+        self.fake.finish("engineer", "Native completion recovered")
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["state"], "completed")
+        self.assertEqual(len(self.state()["requests"]["first"]["receipt_history"]), 2)
+        self.assertEqual((self.service.root / "rooms" / self.room / first_receipt).read_bytes(), original)
+        self.assertEqual(len(self.fake.posts), 1)
+
+    def test_older_terminal_receipt_keeps_usage_when_native_identity_is_projected(self):
+        self.bind(); self.send(); self.fake.finish("engineer")
+        self.service.ao_room_sync(self.room)
+        with self.service.locked(self.room) as (directory, state):
+            state["requests"]["first"].pop("provider_turn_id")
+            original = copy.deepcopy(state["requests"]["first"])
+            self.service.save(directory, state)
+        self.send(request_id="second")
+        self.service.ao_room_sync(self.room)
+        current = self.state()["requests"]["first"]
+        self.assertEqual(current["usage"], original["usage"])
+        self.assertEqual(current["receipt_sha256"], original["receipt_sha256"])
+        self.assertEqual(current["provider_turn_id"], "native-turn-1")
+
+    def test_older_failed_record_without_native_identity_cannot_authorize_new_work(self):
+        self.bind(); self.send()
+        self.fake.snapshots["engineer"]["turns"][-1].pop("providerTurnId")
+        self.fake.finish("engineer", state="failed")
+        self.service.ao_room_sync(self.room)
+        with self.service.locked(self.room) as (directory, state):
+            state["requests"]["first"]["state"] = "failed"  # Pre-hardening saved state.
+            self.service.save(directory, state)
+        with self.assertRaisesRegex(ao.RoomError, "lacks observed native delivery"):
+            self.send(request_id="second")
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
+        self.assertEqual(len(self.fake.posts), 1)
+
     def test_identity_model_effort_and_branch_changes_block(self):
         self.bind()
         self.fake.snapshots["engineer"]["settings"]["model"] = "another"
@@ -198,6 +250,16 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertNotEqual(result["candidate_sha256"], result["after_sha256"])
 
+    def test_later_gate_cannot_restore_and_hide_an_earlier_mutation(self):
+        mutate = [sys.executable, "-c", "from pathlib import Path; p=Path('feature.txt'); p.write_text('changed'); assert p.read_text()=='changed'"]
+        restore = [sys.executable, "-c", "from pathlib import Path; Path('feature.txt').write_text('verified behavior\\n')"]
+        self.service.ao_room_spec_put(self.room, 2, "Test observable mutation at each gate boundary", [mutate, restore], "Approved")
+        result = self.service.ao_room_verify(self.room, str(self.repo))
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["gates"]), 1)
+        self.assertEqual((self.repo / "feature.txt").read_text(), "changed")
+        self.assertNotEqual(result["gates"][0]["candidate_sha256_after"], result["candidate_sha256"])
+
     def test_timeout_receipt_preserves_failure(self):
         self.service.ao_room_spec_put(self.room, 2, "Timeout fixture", [[sys.executable, "-c", "import time; time.sleep(10)"]], "Approved test")
         result = self.service.ao_room_verify(self.room, str(self.repo), 1)
@@ -235,6 +297,39 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ao.RoomError, "rejected"):
             self.service.ao_room_accept(self.room, "first")
 
+    def test_native_model_reroute_is_preserved_and_cannot_be_accepted(self):
+        self.bind("reviewer")
+        self.service.ao_room_verify(self.room, str(self.repo))
+        self.send("reviewer")
+        self.fake.finish("reviewer", self.verdict())
+        self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "native-turn-1"}
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["configured_model"], "astra")
+        self.assertEqual(result["requests"][0]["model_identity"], "contradicted")
+        request = self.state()["requests"]["first"]
+        receipt = ao.read(self.service.root / "rooms" / self.room / request["receipt"])
+        self.assertEqual(receipt["modelReroute"]["toModel"], "substitute")
+        with self.assertRaisesRegex(ao.RoomError, "substitution"):
+            self.service.ao_room_accept(self.room, "first")
+
+    def test_late_model_reroute_blocks_acceptance_and_preserves_receipt(self):
+        self.review()
+        request = self.state()["requests"]["first"]
+        original = (self.service.root / "rooms" / self.room / request["receipt"]).read_bytes()
+        self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "native-turn-1"}
+        with self.assertRaisesRegex(ao.RoomError, "substitution"):
+            self.service.ao_room_accept(self.room, "first")
+        self.fake.snapshots["reviewer"].pop("modelReroute")
+        with self.assertRaisesRegex(ao.RoomError, "substitution"):
+            self.service.ao_room_accept(self.room, "first")
+        self.assertEqual((self.service.root / "rooms" / self.room / request["receipt"]).read_bytes(), original)
+        self.assertTrue(self.state()["requests"]["first"]["reroute_evidence"])
+
+    def test_historical_reroute_for_another_turn_does_not_taint_this_review(self):
+        self.review()
+        self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "older-turn"}
+        self.assertTrue(self.service.ao_room_accept(self.room, "first")["accepted"])
+
     def test_review_attempts_are_bounded_across_spec_revisions(self):
         self.bind("reviewer")
         for index in range(3):
@@ -267,9 +362,19 @@ class AdapterTests(unittest.TestCase):
         self.fake.finish("claude")
         self.service.ao_room_sync(self.room)
         self.send(request_id="second")
-        self.fake.finish("claude")
+        self.fake.finish("claude", usage={"inputTokens": 150, "cachedTokens": 110, "outputTokens": 15, "totalTokens": 165})
         result = self.service.ao_room_sync(self.room)
-        self.assertEqual(result["usage"]["known_primary_subtotal"]["totalTokens"], 220)
+        self.assertEqual(result["usage"]["known_primary_subtotal"]["totalTokens"], 275)
+
+    def test_unchanged_native_counters_are_unknown_for_both_harnesses(self):
+        old = {"inputTokens": 100, "cachedTokens": 80, "outputTokens": 10, "totalTokens": 110}
+        for harness in ("codex", "claude-code"):
+            request = {"state": "completed", "turn_id": "new", "harness": harness,
+                       "baseline": {"turn_ids": ["old"], "conversation_id": "conversation", "branch_id": "root", "usage": old}}
+            snapshot = {"conversationId": "conversation", "activeBranchId": "root", "usage": old,
+                        "turns": [{"id": "old", "state": "completed"}, {"id": "new", "state": "completed"}]}
+            with self.subTest(harness=harness):
+                self.assertEqual(ao.usage_receipt(request, snapshot), {"known": False, "reason": "unchanged_native_counters"})
 
     def test_overlapping_external_turn_makes_usage_unknown_not_zero(self):
         self.bind()
@@ -328,6 +433,21 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(result["usage"]["unknown_requests"]), 20)
         self.assertEqual(result["usage"]["unknown_request_count"], 50)
         self.assertTrue(result["usage"]["unknown_requests_truncated"])
+
+    def test_status_keeps_new_active_request_after_lexically_later_history(self):
+        self.bind()
+        for i in range(20):
+            self.send(request_id=f"z-{i:02}")
+            self.fake.finish("engineer", usage={"inputTokens": 100 * (i + 1), "cachedTokens": 80 * (i + 1), "outputTokens": 10 * (i + 1), "totalTokens": 110 * (i + 1)})
+            self.service.ao_room_sync(self.room)
+        with patch.object(ao.time, "time", return_value=1):
+            self.send(request_id="a-new-active")
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(len(status["requests"]), 20)
+        self.assertEqual(status["requests"][-1]["request_id"], "a-new-active")
+        self.assertEqual(status["requests"][-1]["created_order"], 21)
+        self.assertEqual(status["requests"][-1]["state"], "submitted")
+        self.assertNotIn("z-00", [r["request_id"] for r in status["requests"]])
 
     def test_room_discovery_is_saved_metadata_only(self):
         with patch.object(self.fake, "request", side_effect=AssertionError("network")):
