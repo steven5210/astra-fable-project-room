@@ -14,6 +14,9 @@ refused. Pass `ao_url` to `ao_room_open`, or save `{"ao_url":"http://127.0.0.1:P
 in `PROJECT_ROOM_HOME/ao/config.json` (default home: `~/.project-room`). The
 `PROJECT_ROOM_AO_URL` environment variable takes precedence over that config.
 Never embed local paths, live IDs or authentication in the distributed plugin.
+When the user chooses AO for new Project Room work, also record
+`"default_backend": "ao"` in that private config. The skill uses this preference;
+the low-level legacy tools remain callable and never migrate a room automatically.
 
 Call `ao_room_open` with the actual project path, stable feature name, existing AO
 project ID and the user's existing implementation authorization. Reopening returns
@@ -21,6 +24,10 @@ the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
 `ao_room_sync` to reconcile active work. Status reads saved facts without network
 access. Sync makes bounded AO GET requests and saves evidence; it never invokes a
 model. AO must be reachable for operations that check whether workers are idle.
+Saved status remains readable while a verification gate holds the mutation lock.
+Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
+with explicit truncation. Check legacy `room_list` before treating an ambiguous
+feature as new. Do not silently replace an existing legacy feature with an AO room.
 
 If the current task still has an older tool inventory, use the installed plugin's
 CLI: `python3 project_room.py call ao_room_status --args-file /absolute/args.json`.
@@ -68,6 +75,10 @@ pinned per-gate timeout, default 120 seconds, maximum 7200. Supply a larger budg
 when the known suite requires it. Gate programs are trusted authorized project
 commands, not a sandbox; do not put model calls or publication commands in them.
 Timed-out process groups are stopped and their failure logs retained.
+If the verifier itself crashes before saving a terminal receipt, its durable
+running record blocks further mutations. Diagnose the saved evidence and any
+surviving processes; this initial adapter has no automatic verifier-recovery lane.
+Do not erase the record or launch a replacement to bypass the uncertainty.
 
 Verification binds tracked and untracked committable files, deletions, symlinks,
 file modes, the index and HEAD before and after the gates. Ignored files and

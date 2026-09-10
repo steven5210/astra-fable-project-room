@@ -7,7 +7,7 @@ description: Use Project Room for versioned specifications, implementation, veri
 
 ## Choose the recorded backend
 
-For an existing `ao-` room, or new work where the user has selected Agent Orchestrator (AO), follow [the AO workflow](references/ao.md). That workflow supports Astra doing the engineering directly and a separate Codex session reviewing the result. Conserve Fable when the user requests it; use Fable only for an actual need. AO rooms use `ao_room_*` tools and separate state; they do not require legacy Fable consensus. Do not apply the legacy role assignments below to an AO room.
+For an existing `ao-` room, or new work where the user has selected Agent Orchestrator (AO), follow [the AO workflow](references/ao.md). A user-approved `default_backend: "ao"` in the private `PROJECT_ROOM_HOME/ao/config.json` (default home `~/.project-room`) also selects AO for new rooms. Use `ao_room_list` and legacy `room_list` when finding existing work; resume its recorded backend first. That workflow supports Astra doing the engineering directly and a separate Codex session reviewing the result. Conserve Fable when the user requests it; use Fable only for an actual need. AO rooms use `ao_room_*` tools and separate state; they do not require legacy Fable consensus. Do not apply the legacy role assignments below to an AO room.
 
 Existing legacy rooms retain their recorded backend, authorization, pending jobs and exact review requirements. Never import or replay unfinished legacy work into AO to bypass a pause, uncertainty or exhausted review budget. If the user has not selected AO, keep the existing legacy workflow below. Backend adoption does not authorize new product scope or publication.
 

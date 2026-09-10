@@ -62,7 +62,7 @@ def handle(message, service):
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status"}
+        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
                                              "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify")}}

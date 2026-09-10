@@ -306,6 +306,36 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("baseline", status["requests"][0])
         self.assertEqual((legacy / "state.json").read_text(), '{"paused": true}')
 
+    def test_status_remains_available_during_gate_and_unfinished_verifier_blocks_mutations(self):
+        self.bind()
+        with self.service.locked(self.room) as (directory, state):
+            state["verifications"].append({"id": "interrupted", "state": "running"})
+            self.service.save(directory, state)
+            # A status call must not try to acquire the gate's exclusive lock.
+            with patch.object(self.service, "locked", side_effect=AssertionError("blocking status lock")):
+                self.assertEqual(self.service.ao_room_status(self.room)["latest_verification"]["state"], "running")
+        with self.assertRaisesRegex(ao.RoomError, "unfinished verification"):
+            self.send()
+        with self.assertRaisesRegex(ao.RoomError, "unfinished verification"):
+            self.service.ao_room_verify(self.room, str(self.repo))
+        self.assertFalse(self.fake.posts)
+
+    def test_unknown_usage_projection_is_bounded_without_losing_count(self):
+        with self.service.locked(self.room) as (directory, state):
+            state["requests"] = {str(i): {"request_id": str(i), "state": "failed"} for i in range(50)}
+            self.service.save(directory, state)
+        result = self.service.ao_room_status(self.room)
+        self.assertEqual(len(result["usage"]["unknown_requests"]), 20)
+        self.assertEqual(result["usage"]["unknown_request_count"], 50)
+        self.assertTrue(result["usage"]["unknown_requests_truncated"])
+
+    def test_room_discovery_is_saved_metadata_only(self):
+        with patch.object(self.fake, "request", side_effect=AssertionError("network")):
+            result = self.service.ao_room_list(str(self.repo))
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["rooms"][0]["room_id"], self.room)
+        self.assertNotIn("authorization", result["rooms"][0])
+
     def test_mcp_dispatch_and_annotations(self):
         service = project_room.Service(self.root / "state")
         with patch.object(project_room.ao_project_room, "Service", return_value=self.service):

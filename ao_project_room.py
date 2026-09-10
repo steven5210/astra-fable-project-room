@@ -238,6 +238,8 @@ class Service:
     def settled(self, state):
         if any(r["state"] not in TERMINAL for r in state["requests"].values()):
             raise RoomError("An owned request is active or uncertain; sync it without resending")
+        if any(v["state"] == "running" for v in state["verifications"]):
+            raise RoomError("An unfinished verification is recorded; inspect its processes and evidence, never start a second verifier")
 
     def quiet(self, state):
         self.settled(state)
@@ -557,13 +559,28 @@ class Service:
                 "requests_truncated": len(state["requests"]) > 20, "checkpoint": state.get("checkpoint"),
                 "latest_verification": state["verifications"][-1] if state["verifications"] else None,
                 "latest_acceptance": state["acceptances"][-1] if state["acceptances"] else None,
-                "usage": {"known_primary_subtotal": totals, "unknown_requests": unknown,
+                "usage": {"known_primary_subtotal": totals, "unknown_requests": unknown[-20:], "unknown_request_count": len(unknown),
+                          "unknown_requests_truncated": len(unknown) > 20,
                           "includes_delegates": False, "is_context_occupancy": False,
                           "limitation": "AO-reported native counters, not subscription quota or billing. Delegate ledgers remain separate."}}
 
     def ao_room_status(self, room_id):
-        with self.locked(room_id) as (directory, state):
-            return self.summary(directory, state)
+        # State is atomically replaced, so status can remain available while a
+        # verifier holds the mutation lock for a long-running gate.
+        directory = self.root / "rooms" / identifier(room_id)
+        if not (directory / "state.json").is_file():
+            raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
+        return self.summary(directory, read(directory / "state.json"))
+
+    def ao_room_list(self, project_path=None):
+        selected = str(globals()["project_path"](project_path)) if project_path is not None else None
+        items = []
+        for path in (self.root / "rooms").glob("*/state.json"):
+            state = read(path)
+            if selected is None or state["project_path"] == selected:
+                items.append({key: state[key] for key in ("room_id", "project_path", "feature", "workflow", "created_at")})
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+        return {"rooms": items[:50], "count": len(items), "truncated": len(items) > 50}
 
 
 def schema(properties, required=None):
@@ -574,6 +591,7 @@ S = {"type": "string"}
 R = {"room_id": S}
 ROLE = {"type": "string", "enum": ["engineer", "reviewer"]}
 TOOL_SCHEMAS = {
+    "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open an Astra-led room bound to an existing local AO project. No inference or legacy migration.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates, and Astra approval using existing authorization; this is not Fable consensus.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Reviewer must be separate. Claude requires the actual reason Fable is needed.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
