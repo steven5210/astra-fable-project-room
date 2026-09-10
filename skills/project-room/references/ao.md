@@ -5,6 +5,39 @@ AO owns native sessions, worktrees and conversations. Project Room keeps specs,
 delivery receipts, verification and acceptance outside the repository and plugin cache.
 It is not an additional scheduler and does not require an AO fork or Paperclip.
 
+## Stable-release check
+
+At the start of each new or resumed AO work session, compare the installed and
+running AO release with the official [latest stable release](https://github.com/Untrivial-ai/agent-orchestrator/releases/latest).
+The machine-readable feed is `https://api.github.com/repos/Untrivial-ai/agent-orchestrator/releases/latest`;
+exclude drafts and prereleases. Do not treat the initial validation version above
+as a permanent pin, or a development branch as a stable update.
+
+Identify the actual daemon through its configured endpoint's `GET /healthz`
+`executablePath`, and inspect that executable's version and installation provenance.
+Some official bundled daemons report `dev`; on macOS, corroborate the containing
+signed app's `CFBundleShortVersionString` with the saved verified release receipt.
+A config string alone does not prove the running version. If AO is stopped, report
+the installed version separately and check the running daemon after startup.
+
+Save the UTC check time, installed/running/latest versions, their evidence, release
+URL and outcome in private `PROJECT_ROOM_HOME/ao/version-check.json`. Fetch failure,
+rate limiting or ambiguous local identity means **unknown**, never "up to date";
+retain the last successful check separately. Warn about a new release, a version
+mismatch or a check failure. Do not prevent read-only status, reconciliation or
+recovery, and do not interrupt active workers to complete this check.
+
+When a newer stable release is available, review its changes and arrange an update
+between jobs. Preserve the existing runtime/state and a consistent backup before
+switching; check adapter compatibility and a read-only daemon smoke test before
+new model work. Follow existing upgrade authorization, escalating only actual
+breaking changes or decisions outside that scope. Never silently switch to a nightly,
+restart active workers, migrate rooms or replay uncertain requests for an update.
+
+AO's packaged desktop app has its own updater; a directly launched bundled daemon
+does not run that desktop updater. A configured daily release monitor supplements
+this per-session check. The skill itself does not install a background service.
+
 ## Setup and resume
 
 Use an already running, trusted local AO daemon with existing native authentication.
