@@ -1111,7 +1111,7 @@ class ProgressMcpTests(unittest.TestCase):
         terminal = fixture.tool("room_job_status", {"job_id": job["id"], "wait_seconds": 15})
         self.assertEqual((terminal["status"], terminal["progress"]["phase"], terminal["progress"]["elapsed_basis"]), ("succeeded", "terminal", "frozen_at_finish"))
         discovered = fixture.request("tools/list")["result"]["tools"]
-        self.assertEqual(len(discovered), 21)
+        self.assertEqual(len(discovered), 23)  # includes room_verification_audit and room_verification_retry
         descriptions = {tool["name"]: tool["description"] for tool in discovered}
         self.assertIn("progress", descriptions["room_job_status"])
         self.assertIn("not an ETA", descriptions["room_job_status"])

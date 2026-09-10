@@ -5,7 +5,7 @@ import recovery
 import room
 
 PHASES = frozenset(('prepared', 'preparing', 'running_model', 'running_gates', 'blocked', 'awaiting_astra_review',
-                    'accepted', 'changes_required', 'correction_pending', 'scope_change', 'recovery_prepared'))
+                    'accepted', 'changes_required', 'correction_pending', 'scope_change', 'recovery_prepared', 'verifying'))
 MAX_GATES = 64
 MAX_LINEAGE = 16
 
@@ -71,7 +71,29 @@ def project(room_id, manifest, state):
                 for index, gate in enumerate(gates[:MAX_GATES]) if isinstance(gate, dict)],
             'gates_truncated': len(gates) > MAX_GATES,
             'lineage': {'active_recovery': edge(active) if active else None,
-                        'history': [edge(item) for item in history[-MAX_LINEAGE:]], 'truncated': len(history) > MAX_LINEAGE}}
+                        'history': [edge(item) for item in history[-MAX_LINEAGE:]], 'truncated': len(history) > MAX_LINEAGE},
+            'verification': verification_block(state)}
+
+
+def verification_block(state):
+    """Allowlisted verification-retry lineage: the active binding and the latest history entries, identifiers validated."""
+    active = state.get('verification') if isinstance(state.get('verification'), dict) else None
+    history = state.get('verification_history') if isinstance(state.get('verification_history'), list) else []
+    def edge(value):
+        value = value if isinstance(value, dict) else {}
+        return {'verification_id': token(value.get('verification_id'), (32,)),
+                'predecessor_job_id': token(value.get('predecessor_job_id'), (32,)),
+                'successor_job_id': token(value.get('successor_job_id'), (32,)),
+                'predecessor_attempt': integer(value.get('predecessor_attempt'), 1),
+                'gate_index': integer(value.get('gate_index'), 1), 'boundary': choice(value.get('boundary'), ('isolated_copy',)),
+                'budget_seconds': integer(value.get('budget_seconds'), 1),
+                'status': choice(value.get('status'), ('dispatched', 'launched', 'consumed', 'interrupted', 'invalidated')),
+                'launch_state': choice(value.get('launch_state'), ('pending', 'running', 'launched')),
+                'gates_passed': value.get('gates_passed') if type(value.get('gates_passed')) is bool else None,
+                'at': timestamp(value.get('at') or value.get('dispatched_at')), 'launched_at': timestamp(value.get('launched_at'))}
+    return {'boundary': 'isolated_copy', 'active': edge(active) if active else None,
+            'history': [edge(item) for item in history[-MAX_LINEAGE:]], 'truncated': len(history) > MAX_LINEAGE,
+            'meaning': 'gate evidence lineage only; acceptance still requires a complete report and Astra review'}
 
 
 def load(room_id, handoff_id, path):

@@ -39,7 +39,7 @@ MAX_STATE_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 4 * 1024 * 1024
 FUTURE_TOLERANCE = dt.timedelta(0)
 MAX_DISCOVERY_ENTRIES = 256
-LIVE_STATE_PHASES = ("running_model", "running_gates")
+LIVE_STATE_PHASES = ("running_model", "running_gates", "verifying")
 FINAL_STATE_PHASES = ("awaiting_astra_review", "blocked", "scope_change")
 CATEGORIES = {"Read": "read", "Glob": "read", "Grep": "read", "LS": "read", "NotebookRead": "read",
               "Edit": "edit", "Write": "edit", "MultiEdit": "edit", "NotebookEdit": "edit",
@@ -796,16 +796,22 @@ def _running_implementation(out, job, now, handoff, limitations, cache):
         _model_stage(out, "pinned_handoff_model_timeout", start, config.get("timeout_seconds"), handoff.get("transcript"),
                      manifest.get("session_id"), manifest.get("worktree_path"), now, limitations, cache,
                      active=owner is None or active.get("kind") == "model")
-    elif phase == "running_gates":
+    elif phase in ("running_gates", "verifying"):
         out["phase"] = "gate"
         gates = manifest.get("gates")
         count = len(gates) if isinstance(gates, list) else None
-        results = state.get("gate_results")
-        done = len(results) if isinstance(results, list) else 0
-        index = done + 1 if count is None else max(1, min(done + 1, count))
+        verifying = phase == "verifying"
+        if verifying:
+            # The verifier reruns every pinned gate under its recorded budget; the countdown uses that budget, never the pinned 300 s.
+            out["phase_detail"] = "verification_retry"
+            index = active.get("index") if _positive(active.get("index")) and active.get("kind") == "gate" else 1
+        else:
+            results = state.get("gate_results")
+            done = len(results) if isinstance(results, list) else 0
+            index = done + 1 if count is None else max(1, min(done + 1, count))
         if active.get("kind") == "gate" and active.get("index") == index:
-            deadline, reason = _deadline("gate", "pinned_handoff_gate_timeout", parse_time(active.get("started_at")),
-                                         config.get("gate_timeout_seconds"), now, limitations)
+            deadline, reason = _deadline("gate", "recorded_verification_budget" if verifying else "pinned_handoff_gate_timeout", parse_time(active.get("started_at")),
+                                         active.get("budget_seconds") if verifying else config.get("gate_timeout_seconds"), now, limitations)
         else:
             deadline, reason = None, "stage_transition" if owner is not None else "gate_start_unavailable_legacy_worker"
         out.update(gate={"index": index, "count": count}, deadline=deadline, deadline_unavailable_reason=reason,
@@ -841,7 +847,7 @@ def job_progress(job, now=None, review=None, handoff=None, cache=None):
             out.update(elapsed_seconds=_elapsed(created, now, limitations), elapsed_basis="job_created_at")
         if kind == "review":
             _running_review(out, now, review, limitations, cache)
-        elif kind == "implementation":
+        elif kind in ("implementation", "verification"):
             _running_implementation(out, job, now, handoff, limitations, cache)
         else:
             _stall(out, "unknown", "unknown_job_kind")

@@ -131,6 +131,13 @@ class Service:
                   invalidated_at TEXT, reason TEXT, record_sha256 TEXT NOT NULL, UNIQUE(room_id,request_key));
                 CREATE UNIQUE INDEX IF NOT EXISTS implementation_recoveries_active
                   ON implementation_recoveries(predecessor_job_id) WHERE status IN ('prepared','dispatched');
+                CREATE TABLE IF NOT EXISTS implementation_verifications(
+                  id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), handoff_id TEXT NOT NULL,
+                  predecessor_job_id TEXT NOT NULL, attempt INTEGER NOT NULL, request_key TEXT NOT NULL, payload TEXT NOT NULL,
+                  status TEXT NOT NULL, created_at TEXT NOT NULL, successor_job_id TEXT, finished_at TEXT, reason TEXT,
+                  record_sha256 TEXT NOT NULL, outcome_sha256 TEXT, UNIQUE(room_id,request_key));
+                CREATE UNIQUE INDEX IF NOT EXISTS implementation_verifications_active
+                  ON implementation_verifications(predecessor_job_id) WHERE status='dispatched';
             """)
         self.process_inspector = None  # Python-only test injection; CLI/MCP callers cannot reach it.
 
@@ -380,9 +387,13 @@ class Service:
         with self.db() as db:
             db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,?,?,?)", (room_id, kind, room.canonical(value), room.now()))
 
-    def _superseded(self, room_id, recovery_id=None):
+    def _superseded(self, room_id, recovery_id=None, verification_for=None):
         """Predecessor jobs exempt from blocking: only verified lineage edges to a registered successor,
-        plus the predecessor of a prepared recovery for the submit that carries that exact recovery_id."""
+        plus the predecessor of a prepared recovery for the submit that carries that exact recovery_id.
+
+        Verification edges exempt their predecessor (and that attempt's earlier interrupted verifier jobs) only while
+        the registered row is dispatched with an active successor, or consumed with its immutable record and outcome
+        still hashing to the registry's digests; `verification_for` names the predecessor whose retry is being dispatched."""
         exempt = {}
         with self.db() as db:
             for row in db.execute("SELECT id,status,predecessor_job_id,successor_job_id FROM implementation_recoveries WHERE room_id=?", (room_id,)):
@@ -394,20 +405,86 @@ class Service:
                         exempt[row["predecessor_job_id"]] = {"recovery_id": row["id"], "successor_job_id": row["successor_job_id"], "status": row["status"]}
                 elif row["status"] == "prepared" and recovery_id is not None and row["id"] == recovery_id:
                     exempt[row["predecessor_job_id"]] = {"recovery_id": row["id"], "successor_job_id": None, "status": row["status"]}
+        exempt.update(self._verification_edges(room_id, verification_for))
         return exempt
 
-    def _blocking_jobs(self, room_id, recovery_id=None):
+    def _verification_edges(self, room_id, verification_for=None):
+        import verification
+        exempt, rows = {}, self._verifications(room_id)
+        interrupted = {}
+        for row in rows:
+            # Earlier verifier jobs of the same predecessor and attempt whose workers ended interrupted or invalidated (for
+            # example a vanished worker whose unregistered outcome was refused) are lineage only through their re-verified record.
+            if row["status"] in ("interrupted", "invalidated") and row["successor_job_id"]:
+                interrupted.setdefault((row["predecessor_job_id"], row["attempt"]), []).append(row)
+        def lineage(row):
+            edge = {"verification_id": row["id"], "successor_job_id": row["successor_job_id"], "status": row["status"]}
+            exempt[row["predecessor_job_id"]] = edge
+            if row["status"] == "consumed" and row.get("reason") == "reconciled":
+                # The verifier's registered, re-verified outcome explains its own vanished worker; the uncertain successor row stays as it is.
+                exempt[row["successor_job_id"]] = {**edge, "reconciled": True}
+            for earlier in interrupted.get((row["predecessor_job_id"], row["attempt"]), []):
+                if validated(earlier) and not active_job(earlier["successor_job_id"]):
+                    exempt[earlier["successor_job_id"]] = {**edge, "earlier_verification_id": earlier["id"]}
+        def active_job(job_id):
+            with self.db() as db:
+                found = db.execute("SELECT status FROM jobs WHERE id=? AND room_id=?", (job_id, room_id)).fetchone()
+            return bool(found) and found["status"] in ACTIVE
+
+        def validated(row):
+            try:
+                successor = self._job(row["successor_job_id"]) if row["successor_job_id"] else None
+            except room.RoomError:
+                return False
+            payload = successor["payload"] if successor and isinstance(successor.get("payload"), dict) else {}
+            if (not successor or successor["kind"] != "verification" or successor["room_id"] != room_id or payload.get("verification_id") != row["id"]
+                    or payload.get("job_id") != row["predecessor_job_id"] or payload.get("handoff_id") != row["handoff_id"]):
+                return False
+            if row["status"] == "consumed":
+                frozen = successor["result"].get("verification") if isinstance(successor.get("result"), dict) and isinstance(successor["result"].get("verification"), dict) else {}
+                if not row["outcome_sha256"]:
+                    return False
+                if row.get("reason") == "reconciled":
+                    if successor["status"] in ACTIVE:
+                        return False  # a reconciled edge exists only because its worker vanished; a live worker contradicts it
+                elif successor["status"] != "succeeded" or frozen.get("result") != "completed" or frozen.get("outcome_sha256") != row["outcome_sha256"]:
+                    return False
+            try:
+                return verification.validate_edge(self._handoff_path(room_id, row["handoff_id"]), row)[0]
+            except room.RoomError:
+                return False
+        for row in rows:
+            if row["status"] == "consumed" and row["successor_job_id"] and validated(row):
+                with self.db() as db:
+                    successor = db.execute("SELECT status FROM jobs WHERE id=? AND room_id=?", (row["successor_job_id"], room_id)).fetchone()
+                if successor and (successor["status"] == "succeeded" or (row.get("reason") == "reconciled" and successor["status"] not in ACTIVE)):
+                    lineage(row)
+            elif row["status"] == "dispatched" and row["successor_job_id"] and validated(row):
+                with self.db() as db:
+                    successor = db.execute("SELECT status FROM jobs WHERE id=? AND room_id=?", (row["successor_job_id"], room_id)).fetchone()
+                if successor and successor["status"] in ACTIVE:
+                    lineage(row)
+        if verification_for is not None:
+            job = self._job(verification_for)
+            exempt[verification_for] = {"verification_id": None, "successor_job_id": None, "status": "dispatching"}
+            attempt = (job.get("result") or {}).get("attempt_count") if isinstance(job.get("result"), dict) else None
+            for earlier in interrupted.get((verification_for, attempt), []):
+                if validated(earlier) and not active_job(earlier["successor_job_id"]):
+                    exempt[earlier["successor_job_id"]] = {"verification_id": earlier["id"], "successor_job_id": earlier["successor_job_id"], "status": "interrupted"}
+        return exempt
+
+    def _blocking_jobs(self, room_id, recovery_id=None, verification_for=None):
         with self.db() as db:
             identifiers = [row[0] for row in db.execute("SELECT id FROM jobs WHERE room_id=? AND status IN ('queued','running')", (room_id,))]
         for identifier in identifiers:
             self._refresh(identifier)
-        exempt = self._superseded(room_id, recovery_id)
+        exempt = self._superseded(room_id, recovery_id, verification_for)
         with self.db() as db:
             rows = db.execute("SELECT id,status FROM jobs WHERE room_id=? AND status IN ('queued','running','uncertain') ORDER BY created_at", (room_id,)).fetchall()
         return [dict(row) for row in rows if row["id"] not in exempt]
 
-    def _guard_idle(self, room_id, recovery_id=None):
-        blocking = self._blocking_jobs(room_id, recovery_id)
+    def _guard_idle(self, room_id, recovery_id=None, verification_for=None):
+        blocking = self._blocking_jobs(room_id, recovery_id, verification_for)
         if blocking:
             active = blocking[0]
             raise room.RoomError(f"Room is blocked by {active['status']} job {active['id']}; inspect its status, do not resubmit")
@@ -416,6 +493,12 @@ class Service:
         with self.db() as db:
             rows = db.execute("SELECT id,handoff_id,predecessor_job_id,successor_job_id,status,created_at,dispatched_at,invalidated_at,reason,record_sha256 "
                               "FROM implementation_recoveries WHERE room_id=? ORDER BY created_at", (room_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _verifications(self, room_id):
+        with self.db() as db:
+            rows = db.execute("SELECT id,room_id,handoff_id,predecessor_job_id,attempt,successor_job_id,status,created_at,finished_at,reason,record_sha256,outcome_sha256 "
+                              "FROM implementation_verifications WHERE room_id=? ORDER BY created_at", (room_id,)).fetchall()
         return [dict(row) for row in rows]
 
     def room_status(self, room_id):
@@ -427,17 +510,20 @@ class Service:
         jobs = [self._refresh(identifier) for identifier in ids]
         exempt = self._superseded(room_id)
         recoveries = self._recoveries(room_id)
+        verifications = self._verifications(room_id)
         for job in jobs:
             edge = exempt.get(job["id"])
             job["superseded_by"] = edge["successor_job_id"] if edge else None
             job["recovery_id"] = next((row["id"] for row in recoveries if job["id"] in (row["predecessor_job_id"], row["successor_job_id"])), None)
+            job["verification_id"] = next((row["id"] for row in verifications if job["id"] in (row["predecessor_job_id"], row["successor_job_id"])), None)
         with self.db() as db:
             issues = [dict(r) for r in db.execute("SELECT * FROM issues WHERE room_id=? ORDER BY rowid", (room_id,))]
             handoffs = [dict(r) for r in db.execute("SELECT * FROM handoffs WHERE room_id=?", (room_id,))]
         for handoff in handoffs:
             try:
                 _, _, state = implementation._load(handoff["path"])
-                handoff["lineage"] = recovery.lineage(state)
+                import verification
+                handoff["lineage"] = {**recovery.lineage(state), **verification.lineage(state)}
             except (implementation.ImplementationError, OSError, ValueError, KeyError, TypeError, AttributeError):
                 handoff["lineage"] = {"error": "handoff integrity check failed"}
         core = room.status_report(review)
@@ -445,7 +531,7 @@ class Service:
         now = progress.clock()
         jobs = [self._with_progress(job, now, (entry, root, review)) for job in jobs]
         return {"room": entry, "review": core, "issues": issues, "jobs": jobs, "handoffs": handoffs,
-                "recoveries": recoveries, "enhancements": self._enhancements(room_id), "delegate_jobs": self._delegate_jobs(room_id, root),
+                "recoveries": recoveries, "verifications": verifications, "enhancements": self._enhancements(room_id), "delegate_jobs": self._delegate_jobs(room_id, root),
                 "ready_for_handoff": core["agreement"] and not any(i["disposition"] == "open" for i in issues) and not blocking}
 
     def _delegate_jobs(self, room_id, root):
@@ -665,7 +751,7 @@ class Service:
                 if job["kind"] == "review":
                     config_dir = self._room_settings(root).get("claude_config_dir")
                     context["review"] = progress.review_context(review, job["request_key"], job["payload"].get("session_transcript"), config_dir)
-                elif job["kind"] == "implementation":
+                elif job["kind"] in ("implementation", "verification"):
                     context["handoff"] = progress.handoff_context(job["payload"].get("handoff_path"), self._progress_cache)
             value = progress.job_progress(job, now, **context)
             execution = None
@@ -708,6 +794,13 @@ class Service:
         _, root, _ = self.paths(room_id)
         encoded = room.canonical(payload)
         with room.lock_room(root / "control"):
+            return self._submit_locked(room_id, kind, request_id, payload, encoded, root)
+
+    def _submit_locked(self, room_id, kind, request_id, payload, encoded, root, verification=None):
+        """Job creation under the room control lock held by the caller. `verification` is the prepared verification
+        (verification_id, record digest, attempt, successor identifier) whose registry row is inserted in the same
+        transaction as its job row, so a crash before that transaction leaves no registered verification."""
+        if True:
             with self.db() as db:
                 old = db.execute("SELECT id,payload FROM jobs WHERE room_id=? AND kind=? AND request_key=?", (room_id, kind, request_id)).fetchone()
             if old:
@@ -717,7 +810,7 @@ class Service:
             recovery_id = payload.get("recovery_id") if kind == "implementation" else None
             if recovery_id is not None:
                 self._prepared_recovery(room_id, payload["handoff_id"], recovery_id)
-            self._guard_idle(room_id, recovery_id)
+            self._guard_idle(room_id, recovery_id, payload.get("job_id") if kind == "verification" else None)
             if kind == "review":
                 review_room = root / "review"
                 with contextlib.closing(room.connect(review_room)) as db:
@@ -732,7 +825,9 @@ class Service:
                     raise room.RoomError("Review exchange limit reached; bring unresolved decisions to the user")
                 room.validate_subscription_environment()
             identifier = uuid.uuid4().hex
-            if kind == "implementation":
+            if kind == "verification":
+                identifier = verification["successor_job_id"]  # pre-generated: the durable record and dispatch note already name it
+            if kind in ("implementation", "verification"):
                 self._ensure_handoff_current(room_id, payload["handoff_id"])
                 if recovery_id is not None:
                     self._dispatch_recovery(room_id, payload["handoff_id"], recovery_id, identifier)
@@ -759,8 +854,17 @@ class Service:
                                              "WHERE id=? AND room_id=? AND status='prepared'", (room.now(), identifier, recovery_id, room_id)).rowcount
                         if changed != 1:
                             raise room.RoomError("Recovery is no longer prepared; audit it again")
+                    if kind == "verification":
+                        db.execute("INSERT INTO implementation_verifications(id,room_id,handoff_id,predecessor_job_id,attempt,request_key,payload,status,created_at,successor_job_id,record_sha256) "
+                                   "VALUES(?,?,?,?,?,?,?,'dispatched',?,?,?)",
+                                   (verification["verification_id"], room_id, payload["handoff_id"], payload["job_id"], verification["attempt"], request_id,
+                                    verification["request_payload"], verification["created_at"], identifier, verification["record_sha256"]))
                 if recovery_id is not None:
                     self._event(room_id, "implementation_recovery_dispatched", {"recovery_id": recovery_id, "successor_job_id": identifier, "handoff_id": payload["handoff_id"]})
+                if kind == "verification":
+                    self._event(room_id, "implementation_verification_dispatched", {"verification_id": verification["verification_id"], "successor_job_id": identifier,
+                                                                                    "handoff_id": payload["handoff_id"], "job_id": payload["job_id"],
+                                                                                    "record_sha256": verification["record_sha256"], "budget_seconds": verification["budget_seconds"]})
                 try:
                     with (path / "worker.log").open("wb") as output:
                         process = subprocess.Popen([sys.executable, str(ROOT / "project_room.py"), "--home", str(self.home), "_worker", identifier,
@@ -778,6 +882,8 @@ class Service:
                         db.execute("UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=?", (room.now(), f"Worker did not start: {exc}", identifier))
                     if recovery_id is not None:
                         self._invalidate_recovery(room_id, recovery_id, "worker_spawn_failure", identifier)
+                    if kind == "verification":
+                        self._invalidate_verification(room_id, verification["verification_id"], "worker_spawn_failure", identifier)
             finally:
                 os.close(lease)  # the spawned worker keeps the inherited lease; the parent's copy is released
             return self._job(identifier)
@@ -943,6 +1049,229 @@ class Service:
             if any(reason in recovery.INVALIDATING for reason in report["reasons"]):
                 self._invalidate_recovery(room_id, recovery_id, ",".join(report["reasons"]))
             raise room.RoomError("Recovery dispatch refused: " + ", ".join(report["reasons"]))
+
+    def _verification_row(self, verification_id):
+        if not isinstance(verification_id, str) or not re.fullmatch(r"[0-9a-f]{32}", verification_id):
+            raise room.RoomError("Invalid verification_id")
+        with self.db() as db:
+            row = db.execute("SELECT * FROM implementation_verifications WHERE id=?", (verification_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _active_verification(self, job_id):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM implementation_verifications WHERE predecessor_job_id=? AND status='dispatched'", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _earlier_gate_pids(self, room_id, handoff_id, job_id):
+        """Pids recorded by earlier verifier gates for this predecessor (spawn and exit receipts under the private verification records)."""
+        pids = set()
+        handoff_dir = Path(self._handoff_path(room_id, handoff_id)).parent
+        with self.db() as db:
+            rows = db.execute("SELECT id FROM implementation_verifications WHERE room_id=? AND predecessor_job_id=?", (room_id, job_id)).fetchall()
+        import recovery
+        for row in rows:
+            for index in range(1, 65):
+                found = False
+                for name in ("process-start.json", "process-result.json"):
+                    receipt = handoff_dir / "verifications" / row["id"] / ("gate-%d" % index) / name
+                    try:
+                        saved = json.loads(recovery.read_owned(receipt, recovery.EVIDENCE_LIMIT, "record", root=handoff_dir))
+                    except (recovery.ObservationError, OSError, ValueError):
+                        continue
+                    found = True
+                    if isinstance(saved, dict) and type(saved.get("pid")) is int:
+                        pids.add(saved["pid"])
+                if not found:
+                    break
+        return pids
+
+    def _invalidate_verification(self, room_id, verification_id, reason, successor_job_id=None):
+        import verification
+        row = self._verification_row(verification_id)
+        if row is None:
+            return
+        with self.db() as db:
+            db.execute("UPDATE implementation_verifications SET status='invalidated',finished_at=?,reason=?,successor_job_id=COALESCE(successor_job_id,?) "
+                       "WHERE id=? AND status='dispatched'", (room.now(), reason, successor_job_id, verification_id))
+        try:
+            verification.invalidate(self._handoff_path(room_id, row["handoff_id"]), verification_id, reason, successor_job_id)
+        except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError):
+            pass  # The registry row is authoritative; the next room_verification_retry completes the projection lazily.
+        self._event(room_id, "implementation_verification_invalidated", {"verification_id": verification_id, "reason": reason, "successor_job_id": successor_job_id})
+
+    def _reconcile_verification(self, room_id, handoff_id):
+        """Mutating-only lazy reconciliation of a verification binding left behind by a crash: no registry row returns the
+        projection to blocked (registration_incomplete); a dispatched row whose verifier is no longer active projects a
+        durable completed outcome only after the outcome chain, gate digests and current candidate re-verify, otherwise it
+        is invalidated (verifier_incomplete). Returns the consumed row when a completion was projected."""
+        import implementation
+        import verification
+        path = self._handoff_path(room_id, handoff_id)
+        _, _, state = implementation._load(path)
+        binding = state.get("verification") if isinstance(state.get("verification"), dict) else None
+        try:
+            if not binding:
+                return self._settle_unbound(room_id, handoff_id, path)
+            if state.get("phase") not in ("blocked", "verifying"):
+                return None
+            row = self._verification_row(binding["verification_id"]) if re.fullmatch(r"[0-9a-f]{32}", str(binding.get("verification_id"))) else None
+            if row is None:
+                verification.invalidate(path, binding["verification_id"], "registration_incomplete")
+                self._event(room_id, "implementation_verification_invalidated", {"verification_id": binding["verification_id"], "reason": "registration_incomplete", "successor_job_id": None})
+                return None
+            if row["status"] in ("invalidated", "interrupted"):
+                verification.invalidate(path, row["id"], row["reason"] or row["status"], row["successor_job_id"])
+                return None
+            successor = self._refresh(row["successor_job_id"]) if row["successor_job_id"] else None
+            if row["status"] == "dispatched" and successor and successor["status"] in ACTIVE:
+                return None  # a live verifier owns the projection
+            if row["status"] != "dispatched":
+                return None  # a settled row never reconciles a stale binding; the audit reports projection_out_of_sync
+            if not row["outcome_sha256"]:
+                # No digest was registered by the owning execution: a planted or unregistered outcome is never adopted, so the
+                # verification is invalidated and the (unchanged) candidate needs a fresh, separately requested retry.
+                self._invalidate_verification(room_id, row["id"], "verifier_incomplete:unregistered_outcome", row["successor_job_id"])
+                return None
+            status, detail = verification.reconcile_completion(path, row["id"], row["outcome_sha256"])
+            return self._settle_row(room_id, row, status, detail)
+        except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+            return None  # The projection stays where it is; the following audit reports projection_out_of_sync instead of guessing.
+
+    def _settle_unbound(self, room_id, handoff_id, path):
+        """Crash after the engine projected its outcome but before the worker recorded it: dispatched rows whose successor is
+        no longer active are settled only from their registered digest re-verified against the outcome chain and the current
+        projection and candidate; anything else is invalidated without touching the projection."""
+        import verification
+        with self.db() as db:
+            stale = [dict(r) for r in db.execute("SELECT * FROM implementation_verifications WHERE room_id=? AND handoff_id=? AND status='dispatched'", (room_id, handoff_id))]
+        settled = None
+        for row in stale:
+            successor = self._refresh(row["successor_job_id"]) if row["successor_job_id"] else None
+            if successor and successor["status"] in ACTIVE:
+                continue
+            if not row["outcome_sha256"]:
+                self._invalidate_verification(room_id, row["id"], "verifier_incomplete:unregistered_outcome", row["successor_job_id"])
+                continue
+            status, detail = verification.settle_projected(path, row["id"], row["outcome_sha256"], row["record_sha256"])
+            settled = self._settle_row(room_id, row, status, detail) or settled
+        if settled is None and not stale:
+            with contextlib.suppress(room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+                if verification.clear_orphan_verifying(path):
+                    self._event(room_id, "implementation_verification_invalidated", {"verification_id": None, "reason": "registration_incomplete", "successor_job_id": None})
+        return settled
+
+    def _settle_row(self, room_id, row, status, detail):
+        if status == "completed":
+            with self.db() as db:
+                db.execute("UPDATE implementation_verifications SET status='consumed',finished_at=COALESCE(finished_at,?),reason='reconciled' "
+                           "WHERE id=? AND status='dispatched' AND outcome_sha256=?", (room.now(), row["id"], detail))
+            self._event(room_id, "implementation_verification_consumed", {"verification_id": row["id"], "successor_job_id": row["successor_job_id"], "reconciled": True})
+            return self._verification_row(row["id"])
+        if status == "interrupted":
+            with self.db() as db:
+                db.execute("UPDATE implementation_verifications SET status='interrupted',finished_at=COALESCE(finished_at,?),reason=? WHERE id=? AND status='dispatched'",
+                           (room.now(), detail, row["id"]))
+            self._event(room_id, "implementation_verification_interrupted", {"verification_id": row["id"], "successor_job_id": row["successor_job_id"], "reason": detail, "reconciled": True})
+            return None
+        self._invalidate_verification(room_id, row["id"], "verifier_incomplete:" + str(detail), row["successor_job_id"])
+        return None
+
+    def _verification_context(self, room_id, handoff_id, job_id):
+        context = self._recovery_context(room_id, handoff_id, job_id)
+        context["earlier_pids"] = self._earlier_gate_pids(room_id, handoff_id, job_id)
+        with self.db() as db:
+            context["earlier_markers"] = [row[0] for row in db.execute("SELECT id FROM implementation_verifications WHERE room_id=? AND predecessor_job_id=?", (room_id, job_id))]
+        return context
+
+    def room_verification_audit(self, room_id, handoff_id, job_id):
+        """Read-only observation of a completed-generation, gate-timeout attempt; runs no model, gate or network call and repairs nothing."""
+        import verification
+        text_value(handoff_id, "handoff_id", 200)
+        context = self._verification_context(room_id, handoff_id, job_id)
+        _, root, _ = self.paths(room_id)
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(room.lock_room(root / "control"))
+            except room.RoomError:
+                return verification.blocked_report(handoff_id, job_id, "cooperating_owner_active")
+            try:
+                report, _ = verification.audit(active_verification=self._active_verification(job_id), **context)
+            except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+                return verification.blocked_report(handoff_id, job_id, "handoff_integrity")
+        return report
+
+    def room_verification_retry(self, room_id, handoff_id, job_id, spec_revision, spec_sha256, candidate_sha256, evidence_digest,
+                                gates_sha256, gate_timeout_seconds, diagnosis, authorization, request_id):
+        import verification
+        text_value(handoff_id, "handoff_id", 200)
+        positive_revision(spec_revision)
+        for name, value in (("spec_sha256", spec_sha256), ("candidate_sha256", candidate_sha256), ("evidence_digest", evidence_digest), ("gates_sha256", gates_sha256)):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise room.RoomError(f"{name} must be a 64-character lowercase hex digest from the audit")
+        if type(gate_timeout_seconds) is not int or gate_timeout_seconds <= 0 or gate_timeout_seconds > verification.BUDGET_MAX:
+            raise room.RoomError("gate_timeout_seconds must be a positive integer of at most %d seconds" % verification.BUDGET_MAX)
+        text_value(diagnosis, "diagnosis")
+        text_value(authorization, "authorization")
+        text_value(request_id, "request_id", 200)
+        supplied = {"spec_revision": spec_revision, "spec_sha256": spec_sha256, "candidate_sha256": candidate_sha256,
+                    "evidence_digest": evidence_digest, "gates_sha256": gates_sha256}
+        payload = {"handoff_id": handoff_id, "job_id": job_id, **supplied, "gate_timeout_seconds": gate_timeout_seconds,
+                   "diagnosis": diagnosis, "authorization": authorization, "boundary": verification.BOUNDARY}
+        encoded = room.canonical(payload)
+        _, root, _ = self.paths(room_id)
+        with room.lock_room(root / "control"):
+            with self.db() as db:
+                old = db.execute("SELECT * FROM implementation_verifications WHERE room_id=? AND request_key=?", (room_id, request_id)).fetchone()
+            if old:
+                if old["payload"] != encoded:
+                    raise room.RoomError("request_id was already used with different content")
+                return self._verification_public(dict(old), duplicate=True)
+            context = self._verification_context(room_id, handoff_id, job_id)
+            reconciled = self._reconcile_verification(room_id, handoff_id)
+            if reconciled is not None:
+                return self._verification_public(reconciled, duplicate=False, reconciled=True)
+            if self._active_verification(job_id):
+                raise room.RoomError("Verification is not eligible: verification_already_exists")
+            verification_id, successor_job_id = uuid.uuid4().hex, uuid.uuid4().hex
+            def on_locked(report, private):
+                return verification.prepare(report, private, verification_id, room_id, request_id, context["job"], supplied, gate_timeout_seconds,
+                                            diagnosis, authorization, self.home, successor_job_id)
+            try:
+                report, prepared = verification.audit(active_verification=None, on_locked=on_locked, **context)
+            except (implementation_error_types(), OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise room.RoomError("Verification is not eligible: handoff_integrity") from exc
+            if not report["eligible"]:
+                raise room.RoomError("Verification is not eligible: " + ", ".join(report["reasons"]))
+            handoff_path = str(context["handoff_path"])
+            job_payload = {"handoff_id": handoff_id, "handoff_path": handoff_path, "job_id": job_id, "verification_id": verification_id}
+            try:
+                job = self._submit_locked(room_id, "verification", request_id, job_payload, room.canonical(job_payload), root,
+                                          verification={"verification_id": verification_id, "successor_job_id": successor_job_id,
+                                                        "record_sha256": prepared["record_sha256"], "created_at": prepared["created_at"], "request_payload": encoded,
+                                                        "attempt": context["job"]["result"]["attempt_count"], "budget_seconds": prepared["budget_seconds"]})
+            except (room.RoomError, sqlite3.Error) as exc:
+                # The record and projection binding exist but no registration happened: return the projection to blocked.
+                try:
+                    verification.invalidate(context["handoff_path"], verification_id, "registration_failed", successor_job_id)
+                except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError):
+                    pass
+                raise room.RoomError("Verification registration failed; the handoff returned to blocked and may be audited again") from exc
+            row = self._verification_row(verification_id)
+            if row is None:
+                raise room.RoomError("Verification registration failed; the handoff returned to blocked and may be audited again")
+            return self._verification_public(row, duplicate=False, report=report, job=job)
+
+    def _verification_public(self, row, duplicate, report=None, job=None, reconciled=False):
+        value = {"verification_id": row["id"], "status": row["status"], "duplicate": duplicate, "reconciled": reconciled, "handoff_id": row["handoff_id"],
+                 "predecessor_job_id": row["predecessor_job_id"], "successor_job_id": row["successor_job_id"], "attempt": row["attempt"],
+                 "created_at": row["created_at"], "finished_at": row["finished_at"], "record_sha256": row["record_sha256"],
+                 "outcome_sha256": row["outcome_sha256"], "reason": row["reason"], "boundary": "isolated_copy",
+                 "next": {"tool": "room_job_status", "job_id": row["successor_job_id"]} if row["status"] == "dispatched" else None}
+        if report is not None:
+            value["audit"] = report
+        if job is not None:
+            value["job"] = {"id": job["id"], "status": job["status"]}
+        return value
 
     def room_review_submit(self, room_id, revision, message, request_id):
         positive_revision(revision)
@@ -1125,6 +1454,25 @@ class Service:
             return implementation.run_implementation(Path(payload["handoff_path"]),
                                                      successor={"recovery_id": recovery_id, "successor_job_id": job_id, "recheck": recheck,
                                                                 "registry": str(self.home)}, owner_job_id=job_id)
+        if job["kind"] == "verification":
+            import verification
+            verification_id = payload.get("verification_id")
+            try:
+                row = self._verification_row(verification_id)
+                if (row is None or row["status"] != "dispatched" or row["successor_job_id"] != job_id
+                        or row["room_id"] != job["room_id"] or row["handoff_id"] != payload["handoff_id"] or row["predecessor_job_id"] != payload.get("job_id")):
+                    return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": "verification_binding_mismatch",
+                            "verification_id": verification_id, "handoff_id": payload["handoff_id"], "gates_launched": False, "model_launched": False}
+                context = self._verification_context(job["room_id"], payload["handoff_id"], row["predecessor_job_id"])
+            except Exception as exc:  # nothing written or spawned yet: a proven pre-launch refusal
+                return {"phase": "refused_before_launch", "status": "refused_before_launch", "reason": "prelaunch_error", "detail": type(exc).__name__,
+                        "verification_id": verification_id, "handoff_id": payload["handoff_id"], "gates_launched": False, "model_launched": False}
+            def recheck():
+                # The handoff lock is already held by verification.run; take only the predecessor's job lock and lease.
+                report, _ = verification.audit(active_verification=row, expect_verification=verification_id, locks=("job", "lease"), **context)
+                return report
+            return verification.run(Path(payload["handoff_path"]), {"verification_id": verification_id, "successor_job_id": job_id, "recheck": recheck,
+                                                                     "registry": str(self.home), "inspector": self.process_inspector})
         raise room.RoomError("Unknown job kind")
 
     @contextlib.contextmanager
@@ -1243,8 +1591,42 @@ class Service:
                         room.record(SimpleNamespace(sender="astra", kind="message", revision=result["spec_revision"], file=str(note)), review_room)
                 recovery_id = job["payload"].get("recovery_id") if job["kind"] == "implementation" else None
                 linkage, link_reason = recovery_linkage(result, status) if recovery_id is not None else (None, None)
+                verification_id = job["payload"].get("verification_id") if job["kind"] == "verification" else None
+                verification_link, verification_reason = (None, None)
+                if verification_id is not None:
+                    import verification
+                    verification_link, verification_reason = verification.linkage(result, status)
                 with self.db() as db:
                     db.execute("UPDATE jobs SET status=?,finished_at=?,result=?,error=? WHERE id=?", (status, room.now(), room.canonical(result) if result is not None else None, error, job_id))
+                    if verification_link in ("consumed", "interrupted", "invalidated"):
+                        outcome_sha = (result.get("verification") or {}).get("outcome_sha256") if isinstance(result, dict) and isinstance(result.get("verification"), dict) else None
+                        if verification_link == "consumed":
+                            # Only the digest the engine registered under its own ownership can be consumed, and only when the
+                            # durable outcome hashing to it records a completed result; a frozen result naming any other digest
+                            # (for example a rewritten stdout file, or a registered interrupted outcome) never consumes.
+                            durable = verification.durable_outcome_result(Path(job["payload"]["handoff_path"]), verification_id, outcome_sha) if outcome_sha else None
+                            changed = 0
+                            if durable == "completed":
+                                changed = db.execute("UPDATE implementation_verifications SET status='consumed',finished_at=?,reason=? "
+                                                     "WHERE id=? AND status='dispatched' AND successor_job_id=? AND outcome_sha256 IS NOT NULL AND outcome_sha256=?",
+                                                     (room.now(), verification_reason, verification_id, job_id, outcome_sha)).rowcount
+                            if changed != 1:
+                                registered = db.execute("SELECT outcome_sha256 FROM implementation_verifications WHERE id=? AND status='dispatched' AND successor_job_id=?",
+                                                        (verification_id, job_id)).fetchone()
+                                if registered and registered[0]:
+                                    # The engine registered a digest but the frozen result could not be trusted or read: the row stays
+                                    # dispatched and is settled below from the registry digest, never from the frozen file.
+                                    verification_link, verification_reason = "unsettled", "consume_deferred"
+                                else:
+                                    verification_link, verification_reason = "invalidated", "verifier_incomplete:unregistered_outcome"
+                                    db.execute("UPDATE implementation_verifications SET status='invalidated',finished_at=?,reason=? WHERE id=? AND status='dispatched' AND successor_job_id=?",
+                                               (room.now(), verification_reason, verification_id, job_id))
+                        else:
+                            db.execute("UPDATE implementation_verifications SET status=?,finished_at=?,reason=? WHERE id=? AND status='dispatched' AND successor_job_id=?",
+                                       (verification_link, room.now(), verification_reason, verification_id, job_id))
+                    if verification_link:
+                        db.execute("INSERT INTO events(room_id,kind,content,created_at) VALUES(?,?,?,?)", (job["room_id"], "implementation_verification_" + verification_link,
+                                   room.canonical({"verification_id": verification_id, "successor_job_id": job_id, "reason": verification_reason}), room.now()))
                     if linkage == "invalidated":
                         db.execute("UPDATE implementation_recoveries SET status='invalidated',invalidated_at=?,reason=? WHERE id=? AND status='dispatched' AND successor_job_id=?",
                                    (room.now(), link_reason, recovery_id, job_id))
@@ -1276,6 +1658,25 @@ class Service:
                         recovery.invalidate(Path(job["payload"]["handoff_path"]), recovery_id, link_reason, job_id)
                     except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
                         pass  # The registry row is authoritative; the next mutating operation completes the projection lazily.
+                if verification_link == "invalidated":
+                    import verification
+                    try:
+                        verification.invalidate(Path(job["payload"]["handoff_path"]), verification_id, verification_reason, job_id)
+                    except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError):
+                        pass  # The registry row is authoritative; the next room_verification_retry completes the projection lazily.
+                if verification_link == "unsettled":
+                    # Settle immediately from the registry digest when the durable chain re-verifies; otherwise the dispatched row
+                    # waits for the next mutating call's reconciliation. A genuine completion is never invalidated here.
+                    import verification
+                    try:
+                        row = self._verification_row(verification_id)
+                        if row and row["status"] == "dispatched" and row["outcome_sha256"]:
+                            settled = self._settle_row(job["room_id"], row, *verification.settle_projected(Path(job["payload"]["handoff_path"]), verification_id,
+                                                                                                          row["outcome_sha256"], row["record_sha256"]))
+                            if settled is None:
+                                self._event(job["room_id"], "implementation_verification_unsettled", {"verification_id": verification_id, "successor_job_id": job_id, "reason": "consume_deferred"})
+                    except (room.RoomError, implementation_error_types(), OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+                        pass
 
     def call(self, name, arguments):
         if name not in TOOL_SCHEMAS:
@@ -1350,6 +1751,8 @@ TOOL_SCHEMAS = {
     "room_implementation_status": ("Read the current saved handoff phase, spec/candidate identity, acceptance, gate digests and recovery lineage. Historical handoffs remain readable. This compact read does not run gates, inspect candidate files, audit recovery or change frozen job outcomes.", schema({**R, "handoff_id": S})),
     "room_implementation_audit": ("Read-only audit of one interrupted implementation job (configured timeout or session-usage limit): identity, stopped-work evidence, boot boundary, current writers, partial candidate and transcript digests. Runs no model/Qwen/network and repairs nothing. Reports restart_required until the host booted after the interruption.", schema({**R, "handoff_id": S, "job_id": S})),
     "room_implementation_recover": ("After Astra's diagnosis and the user's actual authorization, durably prepare one audited continuation of an eligible interrupted implementation. Requires the audit's exact spec revision/hash, candidate sha256 and evidence digest; never adopts new bytes. Idempotent per request_id. Then submit with the returned recovery_id.", schema({**R, "handoff_id": S, "job_id": S, "spec_revision": I, "spec_sha256": S, "candidate_sha256": S, "evidence_digest": S, "diagnosis": S, "remaining_work": S, "authorization": S, "request_id": S})),
+    "room_verification_audit": ("Read-only audit of one implementation job whose model turn completed normally with a valid report before a pinned verification gate hit the pinned gate timeout: original model/report/identity evidence, the identified gate and its receipt, strict transcript equality, candidate identity, evidence digest, stopped-work observation and the isolated-copy boundary's limits. Runs no model, gate or network call and repairs nothing.", schema({**R, "handoff_id": S, "job_id": S})),
+    "room_verification_retry": ("After diagnosis and the user's actual authorization for these specific offline gates, re-audit under locks and dispatch one asynchronous verifier that reruns exactly the pinned gate argv arrays in a fresh private copy of the audited candidate with a private TMPDIR (never the model). Requires the audit's exact spec revision/hash, candidate sha256, evidence digest and gates_sha256, plus an integer gate_timeout_seconds between the original pinned budget and 7200 (900 proposed). Idempotent per request_id; returns the verification and its successor job id to wait on. A passed run is gate evidence only; an incomplete report still needs a normal correction.", schema({**R, "handoff_id": S, "job_id": S, "spec_revision": I, "spec_sha256": S, "candidate_sha256": S, "evidence_digest": S, "gates_sha256": S, "gate_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}, "diagnosis": S, "authorization": S, "request_id": S})),
     "room_implementation_review": ("Record Astra's independent product-outcome verdict against the exact verified candidate. Engineering/delegate verdicts remain Fable's responsibility.", schema({**R, "handoff_id": S, "accepted": {"type": "boolean"}, "review": S})),
     "room_implementation_revise": ("Request a diagnosed correction within the same agreed spec, then submit with a new request_id. Unknown delivery cannot be retried.", schema({**R, "handoff_id": S, "review": S})),
 }

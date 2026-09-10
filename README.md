@@ -87,7 +87,7 @@ Use `room_implementation_status(room_id, handoff_id)` for the handoff's current 
 
 ## CLI fallback
 
-The controller exposes the same 21 operations as MCP. From the plugin directory:
+The controller exposes the same 23 operations as MCP. From the plugin directory:
 
 ```sh
 python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'
@@ -129,6 +129,8 @@ Tool discovery, health, and successful inference are different checks. Installat
 The controller preserves exact spec binding, request IDs, session identity evidence, and durable outcomes. It prevents accidental duplicate model submission and blocks uncertain delivery. Do not delete state, reuse a request ID with changed content, or create a replacement room to evade a blocked attempt. Each review round allows three Fable reviews. If further debate is needed, Astra brings you a focused product decision; recording your answer permits the next bounded round while retaining every prior attempt. Agreement can proceed directly to handoff. See [continuation and recovery](docs/recovery.md).
 
 An implementation job that stopped only from the configured model-invocation timeout or the provider's session-usage-limit error is not silently retried. `room_implementation_audit` observes the stopped job and calls no model; `room_implementation_recover` prepares an immutable continuation record only after every identity and evidence value matches a fresh check; `room_implementation_submit` then dispatches the one authorized successor. Continuation also requires a host restart after the original failure, and nothing is prepared or launched before trusted boot-time evidence postdates it. The successor is a new job: Fable inspects the partial work again, and fresh gates and Astra acceptance still apply. A successor refused before its model process existed frees the interruption for a fresh audit; a successor whose launch cannot be classified stays blocked by design. See [interrupted implementation continuation](docs/recovery.md).
+
+A different failure looks like success followed by a gate problem: the model finished with a valid result and a validated report, the candidate was snapshotted, and only afterward one pinned verification gate hit its own pinned timeout. `room_verification_audit` reads that exact shape without calling a model, and `room_verification_retry`, once every identity and evidence value matches a fresh check and the user has authorized rerunning those specific offline gates, dispatches one verifier job that reruns only the pinned gates — never the model — in an isolated private copy of the candidate with its own private `TMPDIR`. That isolated copy is not an OS sandbox: it does not prove every descendant process stopped, and an invisible survivor affecting shared user-level state is a disclosed residual the user accepted only for this project's identified offline unit tests and local validators. The original job, its evidence, and its error text are preserved unchanged, and a passed rerun is gate evidence only — an incomplete or gap-carrying report is still refused by `room_implementation_review`. See [verification-only retry](docs/recovery.md).
 
 The bundled skill drives Astra's reasoning and independent product review. Automated gates prove their own checks, not every aspect of product quality. Fable's delegate choices and engineering judgments must remain reviewable in its result. The package does not certify model quality, install local inference, or assume every Claude session supports subagents.
 

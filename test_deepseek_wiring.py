@@ -813,7 +813,7 @@ class StatusSurfaceTests(WiringFixture):
         self.assertEqual(initialized["serverInfo"]["version"], "0.3.0")
         self.assertIn("DeepSeek", initialized["instructions"])
         listed = project_room_mcp.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, self.service)["result"]["tools"]
-        self.assertEqual(len(listed), 21)
+        self.assertEqual(len(listed), 23)  # the two verification-retry tools joined the inventory
         descriptions = {tool["name"]: tool["description"] for tool in listed}
         self.assertIn("provider", descriptions["room_implementation_submit"])
         self.assertIn("delegate_jobs", descriptions["room_status"])
