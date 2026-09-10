@@ -248,6 +248,24 @@ class Service:
             history.append(relative)
         request.update(receipt=relative, receipt_sha256=digest(receipt))
 
+    def record_reroute(self, directory, state, request, reroute):
+        relative = f"receipts/{request['request_id']}/reroute-{digest(reroute)}.json"
+        request.setdefault("model_reroute", reroute)
+        request.setdefault("reroute_evidence", relative)
+        history = request.setdefault("reroute_history", [])
+        if relative not in history:
+            history.append(relative)
+        # Persist the contradiction first. If the evidence-file write is
+        # interrupted, the saved raw signal still blocks acceptance and can
+        # reconstruct that file; latest-wins provider metadata cannot erase it.
+        self.save(directory, state)
+        target = directory / relative
+        if target.exists():
+            if read(target) != reroute:
+                raise RoomError("Saved model-reroute evidence was modified")
+        else:
+            atomic(target, reroute)
+
     def client(self, state):
         return self.client_factory(state["ao_url"])
 
@@ -500,6 +518,11 @@ class Service:
                     if request.get("provider_turn_id") and request["provider_turn_id"] != provider_id:
                         raise RoomError("Observed native provider turn identity changed; do not replay")
                     request["provider_turn_id"] = provider_id
+                conflict = conflicting_reroute(request, snapshot)
+                if conflict:
+                    # Record while the request is still in its previous state,
+                    # before a completed state could outlive its final receipt.
+                    self.record_reroute(directory, state, request, conflict)
                 request["state"] = "completed" if delivered and turn["state"] == "completed" else "running"
                 if turn["state"] in TERMINAL and request["state"] != "completed":
                     request["state"] = "uncertain"
@@ -507,9 +530,6 @@ class Service:
                 elif delivered:
                     request.pop("reconciliation", None)
                 if turn["state"] in TERMINAL:
-                    conflict = conflicting_reroute(request, snapshot)
-                    if conflict:
-                        request["model_reroute"] = conflict
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
@@ -590,12 +610,7 @@ class Service:
             current = self.identity(self.client(state), state, request)
             conflict = request.get("model_reroute") or conflicting_reroute(request, current)
             if conflict:
-                request["model_reroute"] = conflict
-                relative = f"receipts/{request_id}/reroute-{digest(conflict)}.json"
-                if not (directory / relative).exists():
-                    atomic(directory / relative, conflict)
-                request["reroute_evidence"] = relative
-                self.save(directory, state)
+                self.record_reroute(directory, state, request, conflict)
                 raise RoomError("Native model substitution contradicts the pinned reviewer identity; inspect saved reroute evidence")
             expected = {"spec_sha256": checkpoint["spec_sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                         "evidence_sha256": state["checkpoint_sha256"]}
@@ -627,7 +642,7 @@ class Service:
 
     def request_summary(self, request):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
-                  "reconciliation", "receipt", "receipt_sha256", "usage")
+                  "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage")
         result = {k: request[k] for k in fields if k in request}
         if request.get("observed_turn"):
             result["ao_turn_state"] = request["observed_turn"].get("state")

@@ -351,6 +351,53 @@ class AdapterTests(unittest.TestCase):
         self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "older-turn"}
         self.assertTrue(self.service.ao_room_accept(self.room, "first")["accepted"])
 
+    def test_running_reroute_survives_later_return_to_pinned_model(self):
+        self.bind("reviewer"); self.service.ao_room_verify(self.room, str(self.repo)); self.send("reviewer")
+        reroute = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "native-turn-1"}
+        self.fake.snapshots["reviewer"]["modelReroute"] = reroute
+        running = self.service.ao_room_sync(self.room)["requests"][0]
+        self.assertEqual((running["state"], running["model_identity"]), ("running", "contradicted"))
+        self.assertEqual(ao.read(self.service.root / "rooms" / self.room / running["reroute_evidence"]), reroute)
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(len(self.state()["requests"]["first"]["reroute_history"]), 1)
+        self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "substitute", "toModel": "astra", "providerTurnId": "native-turn-1"}
+        self.fake.finish("reviewer", self.verdict())
+        self.service.ao_room_sync(self.room)
+        with self.assertRaisesRegex(ao.RoomError, "substitution"):
+            self.service.ao_room_accept(self.room, "first")
+        self.assertEqual(self.state()["requests"]["first"]["model_reroute"], reroute)
+
+    def test_running_reroute_survives_a_crash_before_evidence_file_write(self):
+        self.bind("reviewer"); self.service.ao_room_verify(self.room, str(self.repo)); self.send("reviewer")
+        reroute = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "native-turn-1"}
+        self.fake.snapshots["reviewer"]["modelReroute"] = reroute
+        write = ao.atomic
+        def crash_at_evidence(path, value):
+            if path.name.startswith("reroute-"):
+                raise OSError("simulated crash before evidence write")
+            return write(path, value)
+        with patch.object(ao, "atomic", side_effect=crash_at_evidence), self.assertRaises(OSError):
+            self.service.ao_room_sync(self.room)
+        saved = self.state()["requests"]["first"]
+        self.assertEqual(saved["model_reroute"], reroute)
+        self.assertEqual(saved["state"], "submitted")
+        path = self.service.root / "rooms" / self.room / saved["reroute_evidence"]
+        self.assertFalse(path.exists())
+        self.fake.snapshots["reviewer"].pop("modelReroute")
+        self.fake.finish("reviewer", self.verdict())
+        self.service.ao_room_sync(self.room)
+        with self.assertRaisesRegex(ao.RoomError, "substitution"):
+            self.service.ao_room_accept(self.room, "first")
+        self.assertEqual(ao.read(path), reroute)
+
+    def test_running_historical_reroute_is_not_assigned_to_current_turn(self):
+        self.bind("reviewer"); self.service.ao_room_verify(self.room, str(self.repo)); self.send("reviewer")
+        self.fake.snapshots["reviewer"]["modelReroute"] = {"fromModel": "astra", "toModel": "substitute", "providerTurnId": "older-turn"}
+        self.service.ao_room_sync(self.room)
+        self.assertNotIn("model_reroute", self.state()["requests"]["first"])
+        self.fake.finish("reviewer", self.verdict()); self.service.ao_room_sync(self.room)
+        self.assertTrue(self.service.ao_room_accept(self.room, "first")["accepted"])
+
     def test_review_attempts_are_bounded_across_spec_revisions(self):
         self.bind("reviewer")
         for index in range(3):

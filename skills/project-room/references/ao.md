@@ -118,7 +118,9 @@ review requests per room across revisions. If exhausted, surface the unresolved
 decision to the user; this initial adapter has no automatic budget-renewal lane.
 Do not create another room/session to bypass that limit. An explicit AO model
 reroute for the reviewer turn is preserved and blocks acceptance if it contradicts
-the pinned model. Acceptance checks for late reroute evidence too. A reroute
+the pinned model. Sync persists the contradiction immediately when observed,
+including during a running turn, and retains it even if later metadata names the
+pinned model again. Acceptance checks for late reroute evidence too. A reroute
 explicitly attributed to another native turn remains historical.
 
 Acceptance does not merge, publish or deploy. Continue authorized integration
