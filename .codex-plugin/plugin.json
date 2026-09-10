@@ -1,15 +1,15 @@
 {
   "name": "astra-fable-project-room",
   "version": "0.3.0",
-  "description": "A persistent room where Astra shapes features and Fable reviews and implements them.",
+  "description": "Persistent specifications, verified implementation and acceptance using AO or the legacy Astra/Fable workflow.",
   "author": {
     "name": "steven5210"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Project Room",
-    "shortDescription": "Astra plans. Fable builds. Both review.",
-    "longDescription": "Turn a feature request into a shared specification, reviewed implementation, and durable decision history. Astra handles product planning and final acceptance; Fable handles engineering review and delegate orchestration through your local Claude Code session.",
+    "shortDescription": "Project specs, AO workers, verified acceptance.",
+    "longDescription": "Turn a feature request into a versioned specification, verified implementation and durable acceptance record. Use Agent Orchestrator with Astra-led engineering and a separate native reviewer, or retain the legacy Astra/Fable workflow and pinned delegate providers.",
     "developerName": "steven5210",
     "category": "Productivity",
     "capabilities": [

@@ -1,6 +1,10 @@
 # Project Room
 
-Project Room gives Astra and Fable a shared feature workflow inside Codex. Tell Astra what you want; Astra shapes the requirements, Fable challenges the specification and implements the agreed feature, and Astra independently checks the product outcome. Specs, findings, decisions, jobs, and acceptance stay in a persistent local room.
+Project Room keeps specifications, verification evidence and acceptance in persistent local rooms. It supports an opt-in Agent Orchestrator (AO) backend and the existing Astra/Fable controller inside Codex.
+
+With AO, Astra can do the engineering directly while a separate native Codex worker reviews the exact tested candidate. Fable is used when actually needed. The adapter adds durable sends, per-turn usage receipts and acceptance checks to stock AO; it does not replace AO's worker runtime or require Paperclip. Follow [AO setup and workflow](skills/project-room/references/ao.md). Native Claude compaction and production failure recovery remain separate validation items; the initial adapter does not automatically migrate delegate jobs or unfinished legacy rooms.
+
+The legacy workflow below remains available: Astra shapes the requirements, Fable challenges the specification and implements the agreed feature, and Astra independently checks the product outcome. Existing rooms retain their exact provider pins and rules.
 
 After installing and setting up the plugin, use it in ordinary language:
 
@@ -87,7 +91,7 @@ Use `room_implementation_status(room_id, handoff_id)` for the handoff's current 
 
 ## CLI fallback
 
-The controller exposes the same 23 operations as MCP. From the plugin directory:
+The controller exposes the same operations as MCP, including the `ao_room_*` adapter. From the plugin directory:
 
 ```sh
 python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'
