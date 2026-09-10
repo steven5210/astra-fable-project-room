@@ -22,7 +22,7 @@ From another working directory, replace `project_room.py` with its absolute inst
 
 ## Operations
 
-The plugin exposes these 23 tools:
+The legacy controller exposes these 23 tools. The opt-in AO adapter has separate `ao_room_*` tools described in [the AO workflow](ao.md).
 
 | Tool | Purpose |
 | --- | --- |

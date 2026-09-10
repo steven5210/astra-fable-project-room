@@ -260,7 +260,9 @@ class Service:
         client = self.client_factory(ao_url)
         raw = client.request("GET", "/projects/" + ao_project_id)
         project = raw.get("project", raw)
-        if project.get("id", project.get("projectId")) != ao_project_id or Path(project.get("path", "")).resolve() != path:
+        observed_path = project.get("path")
+        if (project.get("id", project.get("projectId")) != ao_project_id or not isinstance(observed_path, str)
+                or not observed_path or not Path(observed_path).is_absolute() or Path(observed_path).resolve() != path):
             raise RoomError("AO project path/identifier mismatch; add the project in AO first")
         room_id = "ao-" + digest({"path": str(path), "feature": feature})[:24]
         with self.locked():

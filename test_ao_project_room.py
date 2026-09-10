@@ -336,6 +336,12 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["rooms"][0]["room_id"], self.room)
         self.assertNotIn("authorization", result["rooms"][0])
 
+    def test_project_identity_requires_an_explicit_absolute_ao_path(self):
+        for path in ("", ".", "repo"):
+            self.fake.path = path
+            with self.subTest(path=path), self.assertRaisesRegex(ao.RoomError, "path/identifier mismatch"):
+                self.service.ao_room_open(str(self.repo), "new", "project", "Authorized", "http://127.0.0.1:1234")
+
     def test_mcp_dispatch_and_annotations(self):
         service = project_room.Service(self.root / "state")
         with patch.object(project_room.ao_project_room, "Service", return_value=self.service):
