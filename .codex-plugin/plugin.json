@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Project Room",
     "shortDescription": "Project specs, AO workers, verified acceptance.",
-    "longDescription": "Turn a feature request into a versioned specification, verified implementation and durable acceptance record. Use Agent Orchestrator with Astra-led engineering and a separate native reviewer, or retain the legacy Astra/Fable workflow and pinned delegate providers.",
+    "longDescription": "Turn a feature request into a versioned specification, verified implementation and durable acceptance record. The initial Agent Orchestrator adapter supports the tested Astra-led pilot; the full Fable engineering workflow remains pending validation. The existing legacy Astra/Fable workflow and pinned delegate providers remain available.",
     "developerName": "steven5210",
     "category": "Productivity",
     "capabilities": [

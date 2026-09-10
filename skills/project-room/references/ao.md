@@ -5,6 +5,31 @@ AO owns native sessions, worktrees and conversations. Project Room keeps specs,
 delivery receipts, verification and acceptance outside the repository and plugin cache.
 It is not an additional scheduler and does not require an AO fork or Paperclip.
 
+## Role policy and current readiness
+
+The designated normal workflow keeps Astra responsible for product planning,
+specification and independent acceptance, and Fable responsible for engineering
+interpretation, implementation, engineering review and delegates. Preserve the
+existing exact-spec agreement and pinned delegate-provider requirements. A
+temporary request to save Fable usage applies only to the identified task.
+
+The initial adapter was implemented and validated in the temporary Astra-led mode
+below. Its runtime currently records `workflow: "astra_led"` and sends a fixed
+packet saying Astra implements and routine Fable/delegate calls are excluded.
+Its specification record contains Astra approval, not the legacy two-party
+consensus contract. Merely setting private `engineering_preference` to `fable`
+does not change those runtime behaviors.
+
+Before using this adapter for the normal Fable workflow, restore the role-aware
+packets and exact-spec agreement, connect the retained delegate policy/ledger,
+and validate a small Fable-engineering-to-Astra-acceptance cycle. A focused Fable
+review should assess its actual handoff and delegation responsibilities. Do not
+claim the normal workflow is ready, dispatch it under the contradictory pilot
+packet, or silently continue the temporary Astra substitution. Existing saved
+pilot status, evidence and reconciliation remain available; do not alter their
+bindings or receipts to retrofit the corrected preference. Legacy rooms retain
+their original workflow.
+
 ## Stable-release check
 
 At the start of each new or resumed AO work session, compare the installed and
@@ -67,7 +92,7 @@ CLI: `python3 project_room.py call ao_room_status --args-file /absolute/args.jso
 The CLI exposes all `ao_room_*` operations using the same schemas as MCP. A new
 Codex task discovers updated MCP tools after plugin installation.
 
-## Astra-led implementation
+## Temporary Astra-led pilot implementation
 
 1. Ground the spec in the repository. Register exact UTF-8 content, a positive
    revision, explicit Astra approval and nonempty executable gate argument arrays
