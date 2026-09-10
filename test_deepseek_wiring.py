@@ -649,8 +649,7 @@ class LaunchGuardTests(InventoryRefusalTests):
         self.assertEqual(set(implementation._mcp_servers({"extra_args": ["--mcp-config", str(mcp_path)]})), {"deepseek"}, "without a recorded digest the bounded owned read alone applies")
 
     def test_pinned_argument_references_match_after_tilde_expansion(self):
-        home = str(Path.home())
-        source = home + "/servers.json"
+        source = str(Path.home() / "servers.json")
         self.assertEqual(implementation._pinned_arg("~/servers.json", source, "/pinned/0-servers.json"), "/pinned/0-servers.json")
         self.assertEqual(implementation._pinned_arg("--mcp-config=~/servers.json", source, "/pinned/0-servers.json"), "--mcp-config=/pinned/0-servers.json")
         self.assertEqual(implementation._pinned_arg(source, source, "/pinned/0-servers.json"), "/pinned/0-servers.json")
