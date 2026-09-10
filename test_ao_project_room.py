@@ -419,6 +419,29 @@ class AdapterTests(unittest.TestCase):
         self.fake.finish("engineer", state="failed")
         result = self.service.ao_room_sync(self.room)
         self.assertEqual(result["requests"][0]["usage"]["reason"], "non_completed_turn")
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
+        self.assertEqual(result["requests"][0]["ao_turn_state"], "failed")
+        with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+            self.send(request_id="second")
+
+    def test_interrupted_native_turn_cannot_be_replayed_despite_an_assigned_id(self):
+        self.bind(); self.send(); self.fake.finish("engineer", state="interrupted")
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
+        self.assertEqual(result["requests"][0]["provider_turn_id"], "native-turn-1")
+        with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+            self.send(request_id="second")
+
+    def test_old_failed_native_record_is_not_settled_merely_by_its_turn_id(self):
+        self.bind(); self.send(); self.fake.finish("engineer", state="failed")
+        self.service.ao_room_sync(self.room)
+        with self.service.locked(self.room) as (directory, state):
+            state["requests"]["first"]["state"] = "failed"
+            self.service.save(directory, state)
+        with self.assertRaisesRegex(ao.RoomError, "does not prove the native run stopped"):
+            self.send(request_id="second")
+        result = self.service.ao_room_sync(self.room)
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
 
     def test_status_has_no_network_or_transcript_and_legacy_state_untouched(self):
         legacy = self.root / "state" / "rooms" / "legacy"

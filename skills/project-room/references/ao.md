@@ -56,8 +56,8 @@ Codex task discovers updated MCP tools after plugin installation.
    same bound sessions through a second controller while a room request is active.
 5. Call `ao_room_sync` after a turn completes and **before starting another turn**.
    Inspect saved terminal receipts and actual changes; successful process exit is
-   not acceptance. Correct a known completed failure under the existing authorized
-   scope. A new send requires a new request ID. An uncertain turn is never replayed,
+   not acceptance. Correct a rejection reported by a confirmed completed native turn
+   under the existing authorized scope. A new send requires a new request ID. An uncertain turn is never replayed,
    even if a status page appears idle or a POST returned an error.
 
 One adapter-wide filesystem lock serializes local changes and cross-room session
@@ -68,7 +68,11 @@ conversation branch before adopting its turn. Missing history is not proof of
 non-delivery. A saved AO failure without an observed native `providerTurnId` remains
 uncertain: AO may have lost the provider's acknowledgement after dispatch. Original
 failed observations remain in the receipt history when later evidence settles the
-turn. There is no automatic retry, timeout cancellation or worker failover.
+turn. Failed, interrupted and cancelled AO outcomes remain uncertain even when
+they have a turn ID: the native driver can assign that ID before a later transport
+failure. Status exposes the observed `ao_turn_state` separately. This conservative
+initial adapter has no automatic recovery lane for such outcomes; diagnose them
+without resending. There is no automatic retry, timeout cancellation or worker failover.
 
 ## Verify and accept
 

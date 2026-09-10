@@ -280,6 +280,8 @@ class Service:
             raise RoomError("An owned request is active or uncertain; sync it without resending")
         if any(not native_turn_identity(r) for r in state["requests"].values()):
             raise RoomError("A saved terminal result lacks observed native delivery; sync it without resending")
+        if any(r["state"] != "completed" for r in state["requests"].values()):
+            raise RoomError("An AO failure does not prove the native run stopped; sync it without resending")
         if any(v["state"] == "running" for v in state["verifications"]):
             raise RoomError("An unfinished verification is recorded; inspect its processes and evidence, never start a second verifier")
 
@@ -463,13 +465,16 @@ class Service:
         with self.locked(room_id) as (directory, state):
             client = self.client(state)
             for request in state["requests"].values():
-                if request["state"] in TERMINAL:
+                if request["state"] == "completed":
                     # Preserve older known receipts rather than recomputing their
                     # usage from a newer turn's snapshot after an adapter update.
                     native_id = native_turn_identity(request)
                     if native_id:
                         request["provider_turn_id"] = native_id
                         continue
+                    request["prior_terminal_state"] = request["state"]
+                    request["state"] = "uncertain"
+                elif request["state"] in TERMINAL:
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
                 snapshot = self.identity(client, state, request)
@@ -495,10 +500,10 @@ class Service:
                     if request.get("provider_turn_id") and request["provider_turn_id"] != provider_id:
                         raise RoomError("Observed native provider turn identity changed; do not replay")
                     request["provider_turn_id"] = provider_id
-                request["state"] = turn["state"] if delivered and turn["state"] in TERMINAL else "running"
-                if not delivered and turn["state"] in TERMINAL:
+                request["state"] = "completed" if delivered and turn["state"] == "completed" else "running"
+                if turn["state"] in TERMINAL and request["state"] != "completed":
                     request["state"] = "uncertain"
-                    request["reconciliation"] = "AO saved a terminal result without native providerTurnId; provider dispatch may have occurred. No replay."
+                    request["reconciliation"] = "AO did not establish a completed native turn. Failures and interruptions can follow uncertain provider delivery, even with a turn ID. No replay."
                 elif delivered:
                     request.pop("reconciliation", None)
                 if turn["state"] in TERMINAL:
@@ -624,6 +629,8 @@ class Service:
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "usage")
         result = {k: request[k] for k in fields if k in request}
+        if request.get("observed_turn"):
+            result["ao_turn_state"] = request["observed_turn"].get("state")
         if "model" in request:
             result["configured_model"] = request["model"]
         if request.get("model_reroute"):
