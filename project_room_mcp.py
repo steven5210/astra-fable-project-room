@@ -9,8 +9,9 @@ import project_room
 
 MAX_LINE = 3_000_000
 INSTRUCTIONS = (
-    "AO rooms use ao_room_*: AO owns native workers; Astra may implement directly with a separate Codex reviewer. "
-    "Conserve Fable unless actually needed. Pin specs, argv gates and model/effort; send once, sync receipts, verify, "
+    "AO rooms use ao_room_*: Fable owns normal engineering/delegation; Astra owns product/spec and independent acceptance. "
+    "An Astra-led exception requires actual per-task authorization. Prepare private delegates before native Fable launch, "
+    "bind exact roles/models, obtain Fable acceptance of the exact spec, then hand off. Pin gates; send once, sync, verify, "
     "then accept the exact independent reviewer verdict. Usage is an attributable native subtotal, not quota. "
     "The following rules apply to legacy room_* rooms, which never migrate automatically: "
     "Project Room: Astra owns grounded requirements, versioned specs, issue dispositions, and product-outcome review. "

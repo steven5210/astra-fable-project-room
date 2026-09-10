@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Project Room",
     "shortDescription": "Project specs, AO workers, verified acceptance.",
-    "longDescription": "Turn a feature request into a versioned specification, verified implementation and durable acceptance record. The initial Agent Orchestrator adapter supports the tested Astra-led pilot; the full Fable engineering workflow remains pending validation. The existing legacy Astra/Fable workflow and pinned delegate providers remain available.",
+    "longDescription": "Turn a feature request into a versioned specification, Fable engineering with pinned delegates, executable verification and independent Astra acceptance. The stock Agent Orchestrator adapter retains exact native receipts and private room state. Explicit task-scoped Astra exceptions and the legacy controller remain available; live capability and recovery limits are documented.",
     "developerName": "steven5210",
     "category": "Productivity",
     "capabilities": [

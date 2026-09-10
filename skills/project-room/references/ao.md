@@ -13,22 +13,24 @@ interpretation, implementation, engineering review and delegates. Preserve the
 existing exact-spec agreement and pinned delegate-provider requirements. A
 temporary request to save Fable usage applies only to the identified task.
 
-The initial adapter was implemented and validated in the temporary Astra-led mode
-below. Its runtime currently records `workflow: "astra_led"` and sends a fixed
-packet saying Astra implements and routine Fable/delegate calls are excluded.
-Its specification record contains Astra approval, not the legacy two-party
-consensus contract. Merely setting private `engineering_preference` to `fable`
-does not change those runtime behaviors.
+New rooms default to `workflow: "fable_engineering"`. They require completed,
+exact-spec Fable agreement, a prepared native engineer workspace, an immutable
+handoff, a structured engineering result and independent Astra acceptance. The
+adapter reuses the retained DeepSeek policy, provider snapshot and ledger. It
+introduces no scheduler, model-run deadline or provider implementation.
 
-Before using this adapter for the normal Fable workflow, restore the role-aware
-packets and exact-spec agreement, connect the retained delegate policy/ledger,
-and validate a small Fable-engineering-to-Astra-acceptance cycle. A focused Fable
-review should assess its actual handoff and delegation responsibilities. Do not
-claim the normal workflow is ready, dispatch it under the contradictory pilot
-packet, or silently continue the temporary Astra substitution. Existing saved
-pilot status, evidence and reconciliation remain available; do not alter their
-bindings or receipts to retrofit the corrected preference. Legacy rooms retain
-their original workflow.
+Choose `delegate_provider: "deepseek"` from the user's recorded setup, or `"none"`
+only when explicitly intended. Missing selection fails closed. New AO rooms do
+not accept legacy Qwen; existing Qwen rooms remain on their recorded backend.
+A task-specific `workflow: "astra_led"` exception requires actual
+`exception_authorization`; never infer one from a past usage-saving request.
+Existing version-1 pilot rooms remain readable and retain their original meaning.
+
+Offline tests establish adapter contracts. A live normal-role trial must separately
+establish native Fable access, delegate attachment and successful delegate work,
+engineering completion, gates and independent acceptance for the installed setup.
+Report those facts separately. Claude compaction and recovery of interrupted
+in-flight work still require their own validation.
 
 ## Stable-release check
 
@@ -92,31 +94,72 @@ CLI: `python3 project_room.py call ao_room_status --args-file /absolute/args.jso
 The CLI exposes all `ao_room_*` operations using the same schemas as MCP. A new
 Codex task discovers updated MCP tools after plugin installation.
 
-## Temporary Astra-led pilot implementation
+## Normal Fable workflow
 
-1. Ground the spec in the repository. Register exact UTF-8 content, a positive
-   revision, explicit Astra approval and nonempty executable gate argument arrays
-   using `ao_room_spec_put`. All four are immutable. Use a newer revision for a
-   genuine scope change; preserve actual user decisions. Approval means Astra
-   supports this authorized scope, not that Fable reviewed it.
-2. Astra may implement directly in an isolated Git worktree. An AO engineer is
-   optional. If useful, create an ordinary native AO **chat worker**, then bind its
-   exact session ID, configured model and reasoning effort with `ao_room_bind`.
-   AO creates the session; this adapter does not spawn or replace workers.
-3. Use a separate native Codex chat worker for independent review. Configure the
-   requested model and effort in AO, then bind it as `reviewer`. Each session can
-   belong to only one room/role. Bindings cannot be swapped to evade a failure.
-   Claude bindings require `fable_reason` describing why Fable is actually needed.
-   Do not call Fable just to satisfy the legacy workflow's role assignment.
-4. For an AO engineer, send a concise task with `ao_room_send`. Keep the stable
-   `request_id`. The packet includes the exact spec path/hash; reference relevant
-   artifacts rather than copying accumulated transcripts. Do not start work on the
-   same bound sessions through a second controller while a room request is active.
-5. Call `ao_room_sync` after a turn completes and **before starting another turn**.
-   Inspect saved terminal receipts and actual changes; successful process exit is
-   not acceptance. Correct a rejection reported by a confirmed completed native turn
-   under the existing authorized scope. A new send requires a new request ID. An uncertain turn is never replayed,
-   even if a status page appears idle or a POST returned an error.
+1. Register exact UTF-8 content, a positive revision, explicit Astra approval and
+   nonempty executable gate argument arrays using `ao_room_spec_put`. These are
+   immutable. A material scope change needs a newer revision and fresh agreement.
+2. Prepare the native engineer's isolated Git worktree **before Claude launches**.
+   AO's stock `postCreate` project hook can run `python3 /absolute/ao_delegates.py
+   --home /absolute/private-state --room ROOM_ID` from the created worktree. Build
+   that hook using properly quoted fixed argv and preserve unrelated hooks. Scope
+   its installation to creation of the intended engineer, then restore the prior
+   project configuration. A failed preparation must not launch a paid turn.
+   Create the reviewer before installing this room-specific hook, or only after
+   restoring it; otherwise its workspace would receive the engineer preparation.
+   `ao_room_prepare` is idempotent for the exact workspace. A pending preparation
+   is reconciled only from matching observed configuration, never by replaying it.
+3. Create an ordinary AO Claude chat worker without an initial prompt; configure
+   exact `claude-fable-5-1` and `max`, then bind it as `engineer`. Prepare a separate
+   native Codex chat worker at the requested Astra model and `max`, and bind it as
+   `reviewer`. `ao_room_bind` checks AO's actual workspace, project, harness and
+   conversation. Bindings and the engineer workspace cannot be replaced.
+4. Send `ao_room_send` with engineer purpose `spec_review` and a stable request ID.
+   Fable's native final JSON must contain `interpretation`, `findings`, `decision`
+   (`accept` or `changes_required`), `spec_revision` and `spec_sha256`. Findings
+   prefixed `BLOCKER:` prevent agreement. Sync the completed turn before another
+   send. Agreement binds that actual receipt to Astra's exact approved spec.
+   Three spec-review attempts are available across revisions; no automatic renewal.
+5. Call `ao_room_handoff` for the actual bound engineer worktree. It pins the exact
+   agreement, baseline, candidate, authorization, delegate preparation and gates.
+   Send engineer purpose `implementation` once for that handoff. The packet carries
+   the exact spec and retained policy, plus the pinned delegate settings. Fable
+   owns engineering and eligible delegation; it must not publish or start extra
+   AO workers. Native MCP launch evidence is distinct from successful inference.
+6. Sync completion to capture Fable's candidate immediately. Its final JSON must
+   include `outcome` (`completed`, `changes_required` or `scope_change`), boolean
+   `implementation_complete`, lists `changes`, `tests_reported`, `review_findings`,
+   `remaining_gaps`, `backlog`, `routing_log`, and exact `spec_revision`,
+   `spec_sha256`, `baseline_commit`. Each routing entry includes
+   `delegate_job_ids` (empty for native-only work). Acceptance requires completed,
+   true and no remaining gaps. Optional proposals remain proposals until approved.
+7. For a confirmed completed turn, a new `correction` request may repair the
+   implementation or missing/malformed report in the same session. Preserve the
+   previous receipt; this is a new focused turn, never a replay. A `scope_change`
+   report requires a revised agreed spec first. Unknown delivery stays blocked.
+   Commit, if needed, before the final engineering response is captured: later
+   changes to HEAD/index/files invalidate its candidate and need a correction.
+8. Run the gates and independent acceptance below using reviewer purpose
+   `acceptance_review`. Inspect actual delegate ledger facts when assessing
+   Fable's routing report. Native subagent audit coverage remains a separate item.
+
+Claude's local MCP registry is shared by Git worktrees of the same repository.
+Preparation installs one shared, private, content-addressed launcher using
+`claude mcp add-json --scope local`. The launcher selects exactly one pinned room
+by the actual worktree and native `AO_SESSION_ID`, verifies Git identity and
+snapshot hashes, then executes the retained room-specific DeepSeek server.
+Room paths, settings, export directories and model policy never enter candidate
+files. Unrelated MCP entries are preserved; a conflicting `deepseek` entry blocks
+preparation. Do not overwrite it, silently switch providers or relax the pins.
+
+## Explicit Astra exception and historical pilot rooms
+
+Use `workflow: "astra_led"` only for the user's actual task-specific exception.
+Astra may implement directly in an isolated worktree; an AO engineer is optional.
+Bind a separate native Codex reviewer and use the same verification/acceptance
+contract. Omitted send purpose preserves the historical pilot packet. A Claude
+binding requires `fable_reason`. This mode does not establish Fable agreement or
+delegate use, and never changes the default roles for future rooms.
 
 One adapter-wide filesystem lock serializes local changes and cross-room session
 claims. A durable intent with a native `clientMessageId` is written before POST.
@@ -131,11 +174,15 @@ they have a turn ID: the native driver can assign that ID before a later transpo
 failure. Status exposes the observed `ao_turn_state` separately. This conservative
 initial adapter has no automatic recovery lane for such outcomes; diagnose them
 without resending. There is no automatic retry, timeout cancellation or worker failover.
+Primary native turns have no adapter model deadline. The 15-second HTTP waits,
+verification gate timeouts, retained DeepSeek request limits and provider quotas
+still exist; an observation timeout does not prove primary completion or cancel it.
 
 ## Verify and accept
 
 Run `ao_room_verify` on the intended candidate worktree. It must belong to the
-room's Git repository. This runs the spec's argv gates (no implicit shell) with a
+room's Git repository. Normal rooms require the unchanged captured Fable candidate
+in its bound worktree and a complete engineering report. This runs the spec's argv gates (no implicit shell) with a
 pinned per-gate timeout, default 120 seconds, maximum 7200. Supply a larger budget
 when the known suite requires it. Gate programs are trusted authorized project
 commands, not a sandbox; do not put model calls or publication commands in them.
@@ -175,8 +222,8 @@ identities, intact logs and unchanged candidate bytes. There are at most three
 review requests per room across revisions. If exhausted, surface the unresolved
 decision to the user; this initial adapter has no automatic budget-renewal lane.
 Do not create another room/session to bypass that limit. An explicit AO model
-reroute for the reviewer turn is preserved and blocks acceptance if it contradicts
-the pinned model. Sync persists the contradiction immediately when observed,
+reroute is preserved and blocks acceptance if it contradicts the pinned model.
+Normal rooms also audit engineer identity before new dispatch, handoff and acceptance. Sync persists the contradiction immediately when observed,
 including during a running turn, and retains it even if later metadata names the
 pinned model again. Acceptance checks for late reroute evidence too. A reroute
 explicitly attributed to another native turn remains historical.
@@ -208,12 +255,15 @@ contradictory native reroute separately. Requests are ordered by durable creatio
 order, with active/uncertain work retained within the bounded projection. Native
 transport receipts remain the source for stronger attribution.
 
-The existing DeepSeek adapter and its pinned provider policy remain available and
-unchanged. Reuse them only for work that benefits from delegation and preserves
-the configured room/context binding. This initial AO layer does not auto-create a
-DeepSeek room, transfer its provider pins, or merge delegate usage into primary
-totals. Inspect an existing delegate room's `room_status.delegate_jobs` separately;
-never relabel its usage as an AO primary turn or bypass its context-path guard.
+Normal AO rooms snapshot the selected retained DeepSeek adapter, policy and
+configuration at creation; no key contents are copied or exposed. Private
+`delegate.attachment` distinguishes configured attachment, observed native MCP
+launch and unverified evidence. `delegate.jobs` exposes the existing bounded
+ledger projection, with usage separate from primary totals. Admission checks use
+the **full** room ledger: an old unresolved job still blocks even outside the
+latest 20 displayed records. Active or unresolved delegate jobs prevent another
+phase or acceptance. Only the user's own supported terminal action can resolve
+uncertain DeepSeek delivery; neither agent may self-resolve or replay it.
 
 Compact spec/evidence packets limit repeated context. Native compaction remains
 owned by AO/the provider and is not automatically triggered by this adapter.

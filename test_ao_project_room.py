@@ -69,7 +69,7 @@ class AdapterTests(unittest.TestCase):
         self.commit()
         self.fake = FakeAO(self.repo)
         self.service = ao.Service(self.root / "state", lambda base: self.fake)
-        self.room = self.service.ao_room_open(str(self.repo), "test", "project", "User authorized Astra implementation", "http://127.0.0.1:1234")["room_id"]
+        self.room = self.service.ao_room_open(str(self.repo), "test", "project", "User authorized Astra implementation", "http://127.0.0.1:1234", workflow="astra_led", exception_authorization="User approved this task-scoped Astra exception")["room_id"]
         self.gates = [[sys.executable, "-c", "from pathlib import Path; assert Path('feature.txt').read_text() == 'verified behavior\\n'"]]
         self.service.ao_room_spec_put(self.room, 1, "Verify exact behavior and independent review.", self.gates, "Astra approves the authorized scope")
 
@@ -205,7 +205,7 @@ class AdapterTests(unittest.TestCase):
             self.bind("reviewer", "engineer")
         with self.assertRaisesRegex(ao.RoomError, "immutable"):
             self.bind("engineer", "reviewer")
-        other = self.service.ao_room_open(str(self.repo), "other", "project", "Authorized", "http://127.0.0.1:1234")["room_id"]
+        other = self.service.ao_room_open(str(self.repo), "other", "project", "Authorized", "http://127.0.0.1:1234", workflow="astra_led", exception_authorization="User approved this task-scoped Astra exception")["room_id"]
         with self.assertRaisesRegex(ao.RoomError, "already bound"):
             self.service.ao_room_bind(other, "reviewer", "engineer", "astra", "max")
 

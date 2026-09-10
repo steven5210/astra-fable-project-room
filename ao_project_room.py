@@ -24,6 +24,8 @@ import uuid
 
 from implementation import candidate_snapshot
 from room import RoomError
+import ao_delegates
+import ao_workflow
 
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
@@ -197,7 +199,23 @@ def conflicting_reroute(request, snapshot):
     if not isinstance(reroute, dict) or reroute.get("toModel") == request["model"]:
         return None
     target = reroute.get("providerTurnId")
-    if target and target != request.get("provider_turn_id"):
+    observed_provider = request.get("provider_turn_id")
+    if target and not observed_provider:
+        # The first sync may see changed settings before saving native identity.
+        # Attribute only an exact owned message on the original branch, also
+        # agreeing with the acknowledgement when one was received.
+        baseline = request["baseline"]
+        if (snapshot.get("conversationId") == baseline["conversation_id"]
+                and snapshot.get("activeBranchId") == baseline["branch_id"]):
+            matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
+                       and digest(m.get("text", "").encode()) == request["text_sha256"]]
+            if len(matches) == 1 and matches[0].get("turnId"):
+                turn_id = matches[0]["turnId"]
+                if not request.get("turn_id") or request["turn_id"] == turn_id:
+                    turns = [t for t in snapshot.get("turns", []) if t.get("id") == turn_id]
+                    if len(turns) == 1:
+                        observed_provider = turns[0].get("providerTurnId")
+    if target and target != observed_provider:
         return None  # A durable reroute for another native turn is historical.
     # A substitution without turn attribution cannot establish the pinned model.
     return reroute
@@ -284,6 +302,13 @@ class Service:
                 or session.get("harness") != binding["harness"] or session.get("mode") != "chat" or session.get("kind") != "worker"):
             raise RoomError("AO session/project/harness identity mismatch")
         snapshot = client.conversation(binding["session_id"])
+        if ao_workflow.normal(state):
+            for request in state["requests"].values():
+                if request["session_id"] == binding["session_id"]:
+                    conflict = request.get("model_reroute") or conflicting_reroute(request, snapshot)
+                    if conflict:
+                        self.record_reroute(self.root / "rooms" / state["room_id"], state, request, conflict)
+                        raise RoomError("Native model substitution contradicts the pinned engineer/reviewer identity")
         settings = snapshot.get("settings") or {}
         if (snapshot.get("sessionId") != binding["session_id"] or settings.get("model") != binding["model"]
                 or settings.get("reasoningEffort") != binding["reasoning_effort"]):
@@ -294,6 +319,8 @@ class Service:
         return snapshot
 
     def settled(self, state):
+        if ao_workflow.normal(state) and any(r.get("model_reroute") for r in state["requests"].values()):
+            raise RoomError("Native model substitution contradicts this room; preserve the failure, never replay")
         if any(r["state"] not in TERMINAL for r in state["requests"].values()):
             raise RoomError("An owned request is active or uncertain; sync it without resending")
         if any(not native_turn_identity(r) for r in state["requests"].values()):
@@ -310,7 +337,8 @@ class Service:
             if busy(self.identity(client, state, binding)):
                 raise RoomError("A bound AO conversation has active work")
 
-    def ao_room_open(self, project_path, feature, ao_project_id, authorization, ao_url=None):
+    def ao_room_open(self, project_path, feature, ao_project_id, authorization, ao_url=None,
+                     workflow=None, exception_authorization=None, delegate_provider=None):
         path = globals()["project_path"](project_path)
         feature = nonempty(feature, "feature", 256)
         authorization = nonempty(authorization, "authorization")
@@ -333,11 +361,39 @@ class Service:
                 state = read(directory / "state.json")
                 if state["ao_project_id"] != ao_project_id or state["ao_url"] != ao_url.rstrip("/"):
                     raise RoomError("Existing room has another AO endpoint/project; it cannot be silently replaced")
+                if workflow is not None and workflow != state["workflow"]:
+                    raise RoomError("Existing room workflow is immutable")
+                if delegate_provider is not None and delegate_provider != state.get("delegate", {}).get("provider", "none" if state.get("version", 1) >= 2 and state["workflow"] == "astra_led" else None):
+                    raise RoomError("Existing room delegate provider is immutable")
+                if exception_authorization is not None and exception_authorization != state.get("exception_authorization"):
+                    raise RoomError("Existing room exception authorization is immutable")
             else:
-                state = {"version": 1, "room_id": room_id, "project_path": str(path), "git_common_dir": str(common_dir(path)),
+                preferences = read(self.root / "config.json") if (self.root / "config.json").exists() else {}
+                if workflow is None:
+                    if preferences.get("engineering_preference", "fable") not in ("fable", "fable_engineering"):
+                        raise RoomError("A saved Astra engineering default is not a task-scoped exception")
+                    workflow = "fable_engineering"
+                if workflow not in ("fable_engineering", "astra_led"):
+                    raise RoomError("workflow must be fable_engineering or astra_led")
+                if workflow == "astra_led":
+                    nonempty(exception_authorization, "exception_authorization: actual per-task user decision")
+                    if delegate_provider not in (None, "none"):
+                        raise RoomError("The Astra-led exception does not attach Fable delegates")
+                elif exception_authorization is not None:
+                    raise RoomError("Exception authorization belongs only to an Astra-led task")
+                if workflow == "fable_engineering" and delegate_provider is None:
+                    config = self.root.parent / "config.json"
+                    delegate_provider = read(config).get("delegate_provider") if config.exists() else None
+                if workflow == "fable_engineering" and delegate_provider not in ("deepseek", "none"):
+                    raise RoomError("Choose deepseek or explicit none for new AO rooms; missing selection cannot downgrade silently")
+                state = {"version": 2, "room_id": room_id, "project_path": str(path), "git_common_dir": str(common_dir(path)),
                          "feature": feature, "ao_project_id": ao_project_id, "ao_url": ao_url.rstrip("/"),
-                         "workflow": "astra_led", "authorization": authorization, "bindings": {}, "requests": {},
+                         "workflow": workflow, "authorization": authorization, "bindings": {}, "requests": {},
+                         "exception_authorization": exception_authorization,
                          "verifications": [], "acceptances": [], "created_at": time.time()}
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if ao_workflow.normal(state):
+                    ao_delegates.initialize(self, directory, state, delegate_provider)
                 self.save(directory, state)
             return self.summary(directory, state)
 
@@ -356,7 +412,7 @@ class Service:
             nonempty(gate[0], "gate executable")
         with self.locked(room_id) as (directory, state):
             spec = {"revision": revision, "content": content, "sha256": digest(content.encode()), "gates": gates,
-                    "approval": approval, "approver": "astra", "workflow": "astra_led"}
+                    "approval": approval, "approver": "astra", "workflow": state["workflow"]}
             relative = f"specs/{revision}.json"
             target = directory / relative
             if target.exists():
@@ -387,7 +443,13 @@ class Service:
             harness = session.get("harness")
             if harness not in ("codex", "claude-code"):
                 raise RoomError("Only native Codex or Claude chat sessions are supported")
-            if harness == "claude-code":
+            if ao_workflow.normal(state):
+                if reasoning_effort != "max" or (role == "engineer" and (harness != "claude-code" or model != ao_workflow.FABLE_MODEL)) or (role == "reviewer" and harness != "codex"):
+                    raise RoomError("Normal roles require native Fable engineer and independent Codex/Astra reviewer at max effort")
+                if role == "engineer":
+                    fable_reason = fable_reason or "Designated Fable engineering role"
+                    ao_delegates.validate_preparation(directory, state, session_id)
+            elif harness == "claude-code":
                 nonempty(fable_reason, "fable_reason: why Fable is actually needed")
             binding = {"session_id": session_id, "model": model, "reasoning_effort": reasoning_effort,
                        "harness": harness, "fable_reason": fable_reason, "identity_basis": "AO configured settings; not provider attestation"}
@@ -407,8 +469,24 @@ class Service:
                 raise RoomError("AO conversation/branch identity is unavailable")
             binding.update(conversation_id=snapshot["conversationId"], branch_id=snapshot["activeBranchId"])
             state["bindings"][role] = binding
+            if ao_workflow.normal(state) and role == "engineer":
+                ao_workflow.workspace(self, directory, state)
             self.save(directory, state)
             return binding
+
+    def ao_room_prepare(self, room_id, worktree_path):
+        with self.locked(room_id) as (directory, state):
+            self.quiet(state)
+            if not ao_workflow.normal(state):
+                raise RoomError("Delegate preparation is for normal Fable rooms")
+            return ao_delegates.prepare(self, directory, state, worktree_path)
+
+    def ao_room_handoff(self, room_id, worktree_path):
+        with self.locked(room_id) as (directory, state):
+            self.quiet(state)
+            if not ao_workflow.normal(state):
+                raise RoomError("An agreed engineering handoff is for normal Fable rooms")
+            return ao_workflow.handoff(self, directory, state, worktree_path)
 
     def checkpoint(self, directory, state):
         self.spec(directory, state)
@@ -426,11 +504,14 @@ class Service:
             raise RoomError("Candidate changed after verification; verify and review the new candidate")
         return checkpoint
 
-    def ao_room_send(self, room_id, role, message, request_id):
+    def ao_room_send(self, room_id, role, message, request_id, purpose=None):
         identifier(request_id)
         nonempty(message, "message", 6000)
         with self.locked(room_id) as (directory, state):
-            key = digest({"role": role, "message": message, "request_id": request_id})
+            payload = {"role": role, "message": message, "request_id": request_id}
+            if purpose is not None:
+                payload["purpose"] = purpose
+            key = digest(payload)
             if request_id in state["requests"]:
                 previous = state["requests"][request_id]
                 if previous["key"] != key:
@@ -453,9 +534,18 @@ class Service:
                 checkpoint = self.checkpoint(directory, state)
                 review = {"spec_sha256": spec["sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                           "evidence_sha256": state["checkpoint_sha256"]}
+            if ao_workflow.normal(state):
+                purpose = purpose or ("acceptance_review" if role == "reviewer" else None)
+                framed = ao_workflow.packet(self, directory, state, role, purpose, message)
+            else:
+                if purpose not in (None, "implementation", "correction", "acceptance_review"):
+                    raise RoomError("Astra-led rooms do not claim Fable specification consensus")
+                framed = None
             text = (f"[Project Room {room_id} request {request_id}]\nWorkflow: Astra-led. "
                     "Astra implements; a separate reviewer assesses evidence. No routine Fable or delegate calls.\n"
                     f"Exact spec: {directory / state['spec']}\nSpec SHA256: {spec['sha256']}\n" + message)
+            if framed is not None:
+                text = f"[Project Room {room_id} request {request_id}]\n" + framed
             if review:
                 text += (f"\nRead-only review of candidate {checkpoint['candidate_path']}. Do not modify it or delegate. "
                          f"Verification evidence: {directory / state['checkpoint']}. Inspect the actual diff and evidence. "
@@ -466,6 +556,10 @@ class Service:
                        "client_message_id": str(uuid.uuid4()), "created_at": time.time(), "created_order": len(state["requests"]) + 1,
                        "baseline": {"turn_ids": sorted(turn_ids(snapshot)), "conversation_id": snapshot.get("conversationId"),
                                     "branch_id": snapshot.get("activeBranchId"), "usage": snapshot.get("usage") or {}}}
+            if ao_workflow.normal(state):
+                request["purpose"] = purpose
+                if purpose in ("implementation", "correction"):
+                    request["handoff_sha256"] = state["handoff_sha256"]
             state["requests"][request_id] = request
             self.save(directory, state)  # Persist intent BEFORE any request may reach AO.
             try:
@@ -489,13 +583,24 @@ class Service:
                     native_id = native_turn_identity(request)
                     if native_id:
                         request["provider_turn_id"] = native_id
+                        if ao_workflow.normal(state):
+                            self.identity(client, state, request)  # also audits late native reroutes
                         continue
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
                 elif request["state"] in TERMINAL:
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
-                snapshot = self.identity(client, state, request)
+                try:
+                    snapshot = self.identity(client, state, request)
+                except RoomError:
+                    # AO may change configured model alongside a native reroute.
+                    # Preserve that contradiction even when identity() refuses it.
+                    if ao_workflow.normal(state):
+                        conflict = conflicting_reroute(request, client.conversation(request["session_id"]))
+                        if conflict:
+                            self.record_reroute(directory, state, request, conflict)
+                    raise
                 if (snapshot.get("conversationId") != request["baseline"]["conversation_id"]
                         or snapshot.get("activeBranchId") != request["baseline"]["branch_id"]):
                     raise RoomError("Native conversation branch changed; do not reattribute or replay this request")
@@ -535,6 +640,8 @@ class Service:
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
                     self.observation(directory, request, receipt)
                     request["usage"] = usage_receipt(request, snapshot)
+                    if request["state"] == "completed" and request.get("purpose") in ("implementation", "correction"):
+                        ao_workflow.capture_engineering(directory, state, request)
             self.save(directory, state)
             return self.summary(directory, state)
 
@@ -549,6 +656,10 @@ class Service:
                 raise RoomError("Candidate must belong to the room's Git repository")
             if directory.is_relative_to(candidate):
                 raise RoomError("Room state must be outside the candidate")
+            if ao_workflow.normal(state):
+                ao_workflow.engineering_ready(self, directory, state)
+                if str(candidate) != ao_workflow.handoff_record(directory, state)["worktree"]:
+                    raise RoomError("Verify only the bound engineer candidate")
             before = candidate_snapshot(candidate)
             after = before
             attempt = "verify-" + uuid.uuid4().hex
@@ -601,6 +712,8 @@ class Service:
     def ao_room_accept(self, room_id, request_id):
         with self.locked(room_id) as (directory, state):
             self.quiet(state)
+            if ao_workflow.normal(state):
+                ao_workflow.engineering_ready(self, directory, state)
             checkpoint = self.checkpoint(directory, state)
             request = state["requests"].get(identifier(request_id))
             if not request or request["role"] != "reviewer" or request["state"] != "completed":
@@ -633,7 +746,7 @@ class Service:
                 raise RoomError("Reviewer rejected or did not approve the exact identities; inspect its saved receipt")
             nonempty(verdict.get("review"), "review", 30000)
             acceptance = {**expected, "request_id": request_id, "reviewer_session": request["session_id"],
-                          "reviewer_model": request["model"], "workflow": "astra_led", "review": verdict["review"],
+                          "reviewer_model": request["model"], "workflow": state["workflow"], "review": verdict["review"],
                           "receipt_sha256": request["receipt_sha256"]}
             if acceptance not in state["acceptances"]:
                 state["acceptances"].append(acceptance)
@@ -642,7 +755,8 @@ class Service:
 
     def request_summary(self, request):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
-                  "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage")
+                  "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose",
+                  "result_candidate_sha256", "engineering_error")
         result = {k: request[k] for k in fields if k in request}
         if request.get("observed_turn"):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -672,7 +786,16 @@ class Service:
                     totals[field] += usage[field]
             else:
                 unknown.append(request["request_id"])
-        return {"room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
+        extra = {"exception_authorization": state.get("exception_authorization")}
+        if ao_workflow.normal(state):
+            try:
+                agreed = ao_workflow.agreement(self, directory, state)
+            except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+                agreed = {"agreed": False, "reason": str(exc)}
+            extra.update(agreement=agreed, handoff=state.get("handoff"),
+                         delegate=ao_delegates.status(self.root.parent, directory, state),
+                         spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered))
+        return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
                 "requests": [self.request_summary(r) for r in visible],
@@ -712,10 +835,12 @@ R = {"room_id": S}
 ROLE = {"type": "string", "enum": ["engineer", "reviewer"]}
 TOOL_SCHEMAS = {
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
-    "ao_room_open": ("Open an Astra-led room bound to an existing local AO project. No inference or legacy migration.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
-    "ao_room_spec_put": ("Pin immutable spec, argv gates, and Astra approval using existing authorization; this is not Fable consensus.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
-    "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Reviewer must be separate. Claude requires the actual reason Fable is needed.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
-    "ao_room_send": ("Send one compact spec-bound packet with durable clientMessageId. Repeat same request_id only to read its receipt; uncertain work is never replayed. Reviewer requires passed candidate evidence; maximum three review requests per room.", schema({**R, "role": ROLE, "message": S, "request_id": S})),
+    "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}}, ["project_path", "feature", "ao_project_id", "authorization"])),
+    "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
+    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace; invokes Claude configuration only, never inference. No candidate files are written.", schema({**R, "worktree_path": S})),
+    "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Normal roles require Claude/Fable engineer and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
+    "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
+    "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
