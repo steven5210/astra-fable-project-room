@@ -30,6 +30,9 @@ import ao_workflow
 
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
+# AO can recover historical turns without a portable outcome. They are no
+# longer active, but an owned recovered result must still settle as uncertain.
+NATIVE_TERMINAL = TERMINAL | {"recovered"}
 COUNTERS = ("inputTokens", "outputTokens", "cachedTokens", "totalTokens")
 MAX_REVIEW_ATTEMPTS = 3
 
@@ -155,7 +158,7 @@ def turn_ids(snapshot):
 
 
 def busy(snapshot):
-    return any(t.get("state") not in TERMINAL for t in snapshot.get("turns", []))
+    return any(t.get("state") not in NATIVE_TERMINAL for t in snapshot.get("turns", []))
 
 
 def usage_receipt(request, snapshot):
@@ -630,12 +633,12 @@ class Service:
                     # before a completed state could outlive its final receipt.
                     self.record_reroute(directory, state, request, conflict)
                 request["state"] = "completed" if delivered and turn["state"] == "completed" else "running"
-                if turn["state"] in TERMINAL and request["state"] != "completed":
+                if turn["state"] in NATIVE_TERMINAL and request["state"] != "completed":
                     request["state"] = "uncertain"
                     request["reconciliation"] = "AO did not establish a completed native turn. Failures and interruptions can follow uncertain provider delivery, even with a turn ID. No replay."
                 elif delivered:
                     request.pop("reconciliation", None)
-                if turn["state"] in TERMINAL:
+                if turn["state"] in NATIVE_TERMINAL:
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
