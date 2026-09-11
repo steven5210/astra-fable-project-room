@@ -109,6 +109,9 @@ Codex task discovers updated MCP tools after plugin installation.
    restoring it; otherwise its workspace would receive the engineer preparation.
    `ao_room_prepare` is idempotent for the exact workspace. A pending preparation
    is reconciled only from matching observed configuration, never by replaying it.
+   The same preparation writes the worktree-scoped native routing files described
+   below into already-ignored paths and refuses before writing anything when a
+   path is tracked, unignored, symlinked or conflicting.
 3. Create an ordinary AO Claude chat worker without an initial prompt; configure
    exact `claude-fable-5-1` and `max`, then bind it as `engineer`. Prepare a separate
    native Codex chat worker at the requested Astra model and `max`, and bind it as
@@ -151,6 +154,103 @@ snapshot hashes, then executes the retained room-specific DeepSeek server.
 Room paths, settings, export directories and model policy never enter candidate
 files. Unrelated MCP entries are preserved; a conflicting `deepseek` entry blocks
 preparation. Do not overwrite it, silently switch providers or relax the pins.
+
+## Native delegation routing
+
+Newly prepared normal rooms route Fable's native delegation deliberately. The
+postCreate preparation writes three worktree-scoped files into paths the
+repository must already ignore: `.claude/settings.local.json`,
+`.claude/agents/pr-sonnet.md` and `.claude/agents/pr-opus.md`. It runs
+`git check-ignore` and a tracked-file check for each path first, refuses
+tracked, unignored, symlinked or conflicting files before writing either agent
+file, never edits `.gitignore` or shared Git exclusions, and preserves unrelated
+keys of an existing local settings file. The definitions pin `pr-sonnet`
+(`claude-sonnet-5`, effort max, mechanical implementation and tests, no skills)
+and `pr-opus` (`claude-opus-5`, effort max, bounded judgment/review plus the
+pinned browser skill when the AO browser capability is present); both refuse
+further delegation, workflows and messaging, and both disallow the inherited
+MCP submission routes (the `mcp__deepseek`, `mcp__qwen-local` and
+`mcp__project-room` servers, plus the DeepSeek submit and ask tools by name) so
+a native worker cannot submit delegate or room work while the root Fable
+engineer keeps its pinned provider access. Their frontmatter scalars are quoted
+so Claude's own YAML loader reads them. The local settings carry
+`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`, `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2`,
+`CLAUDE_CODE_DISABLE_WORKFLOWS=1`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1`,
+deny rules for `Workflow` and the automated review skills, and a `PreToolUse`
+hook running a private, content-addressed, deny-only guard from
+`PROJECT_ROOM_HOME/ao/launchers`. The guard permits `Agent` only for the two
+pinned types without model, isolation, resume or other overrides, refuses any
+nested dispatch (an event carrying `agent_id` or `agent_type`), workflows,
+teams, `SendMessage` continuation routes, every skill except the pinned
+browser skill inside an event whose `agent_type` is exactly `pr-opus`, and any
+`mcp__deepseek__*`, `mcp__qwen-local__*` or `mcp__project-room__*` call made
+inside a native worker (the root engineer's own calls take no decision). It never
+grants a permission; a guard error, a missing interpreter or a missing script
+exits 2, so the call is blocked.
+
+Preparation snapshots the file digests, guard digest, interpreter, knobs, the
+pinned browser skill name (`claude-in-chrome`, a constant that no private
+configuration can override), bounded Claude executable identity (configured
+absolute path, size, mtime and the reported `--version` line; no inference), and
+the AO project rules it observed through the project API: the inline
+`agentRules` digest, verbatim presence of the authorized Project Room delegation
+clause, an `agentRulesFile` digest when one is configured, preserved fields
+(worker harness, model and permissions, container reap, default branch) and the
+routing-related project `env`. The Claude configuration directory is resolved
+once from the room or controller settings (the override key and the recorded
+directory must agree). It refuses to prepare when the clause is absent, when
+user, managed, project or existing local settings disable hooks, allow managed
+hooks only (`allowManagedHooksOnly`, which would suppress the local guard), set
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, change the depth/concurrency values, define
+`modelOverrides`, or restrict `availableModels` without both pinned models, when
+those settings files exist but cannot be read, when a same-named `pr-sonnet` or
+`pr-opus` definition exists in the user-level `agents` directory, or when the AO
+project `env` does the same. Every refusal writes `routing-error-*.json` in the
+room directory and leaves the room unprepared, so the postCreate hook fails and
+AO does not launch the worker.
+
+Only delegation-capable steps re-validate offline (engineer bind, handoff,
+and implementation or correction dispatch): pinned file digests and parsed
+definitions, ignore status, guard digest, interpreter, executable identity and
+the surrounding settings. Fable's read-only specification review and Astra's
+acceptance review are allowed without revalidating routing, while delegating
+implementation or correction remains blocked by pre-dispatch validation; after
+drift, a running session's effective enforcement is not certified.
+Implementation and correction packets also re-read the AO project rules and
+refuse when the clause is missing, the rules digest, a preserved field or the
+routing-related env changed, or the rules cannot be read (the failure is
+recorded). `ao_room_sync` records the latest observation without refusing on
+drift or an unreadable AO, but it does refuse when the content-addressed
+observation receipt it would reuse has been modified. Observation evidence is
+re-verified before status relies on it. `ao_room_status` stays offline:
+`delegate.routing.status` is `not_configured` for rooms prepared before this
+mechanism (readable, never relabeled), `configured` after preparation or while
+executable version evidence is missing, `verified` once a later dispatch or sync
+observed consistent rules with that evidence present, and `unverified` with the
+reason on any local drift, contradictory settings, damaged evidence or
+inconsistent observation. None of these states
+proves native enforcement, the served model or effort, the concurrency/depth
+caps, resumption paths or compaction; workflow, resume and fork paths outside
+the `Agent` tool are not covered by the guard, and the worker's actual process
+environment is set by AO and is not observable at preparation time.
+
+Adoption procedure for a future session: (1) confirm the repository ignores
+`.claude/` (or those three paths) and that the user/managed Claude settings do
+not disable hooks, force subagent models or restrict the pinned models;
+(2) install the authorized delegation clause in the AO project `agentRules`
+through stock AO configuration, preserving the existing fields; (3) install the
+scoped postCreate hook, create the engineer, restore the hook; (4) bind, agree,
+hand off and dispatch as usual; (5) after offline acceptance, the Astra operator
+runs the separately recorded smoke test with at most one `pr-sonnet` and one
+`pr-opus` task, reading the native subagent transcript model/effort evidence and
+Fable's verdict. The stock AO worker prompt keeps its generic prohibition on
+native subagents; the project clause is explicit task authorization, not
+enforcement. If `pr-opus` cannot use the pinned browser skill, report it as
+unvalidated and keep the existing explicit AO Opus browser route. Existing
+legacy rooms keep their recorded backend, policy and planning state; nothing
+here migrates or relabels them. A repository that does not ignore the required
+paths is not adopted by this mechanism: adding its ignore rule is a deliberate,
+separately authorized setup step, and preparation refuses until it exists.
 
 ## Explicit Astra exception and historical pilot rooms
 

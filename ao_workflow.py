@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import ao_delegates
+import ao_routing
 from implementation import candidate_snapshot, ImplementationError
 from room import RoomError
 
@@ -73,12 +74,12 @@ def agreement(service, directory, state):
             "request_id": request["request_id"], "receipt_sha256": request["receipt_sha256"], "astra_approval": spec["approval"]}
 
 
-def workspace(service, directory, state):
+def workspace(service, directory, state, check_routing=True):
     from ao_project_room import common_dir, project_path
     binding = state["bindings"].get("engineer")
     if not binding:
         raise RoomError("Bind the prepared native Fable engineer first")
-    prepared = ao_delegates.validate_preparation(directory, state, binding["session_id"])
+    prepared = ao_delegates.validate_preparation(directory, state, binding["session_id"], check_routing=check_routing)
     raw = service.client(state).request("GET", "/desktop/sessions/" + binding["session_id"] + "/workspace")
     path = raw.get("workspacePath")
     if (raw.get("sessionId") != binding["session_id"] or not isinstance(path, str) or not Path(path).is_absolute()
@@ -156,7 +157,7 @@ def capture_engineering(directory, state, request):
 def engineering_ready(service, directory, state):
     from ao_project_room import digest, read
     agreement(service, directory, state)
-    actual = workspace(service, directory, state)
+    actual = workspace(service, directory, state, check_routing=False)  # acceptance never delegates
     ao_delegates.assert_settled(service.root.parent, state)
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
@@ -175,8 +176,11 @@ def engineering_ready(service, directory, state):
 
 def packet(service, directory, state, role, purpose, message):
     spec = service.spec(directory, state)
-    ao_delegates.validate_preparation(directory, state, state.get("bindings", {}).get("engineer", {}).get("session_id"))
-    workspace(service, directory, state)
+    # Routing gates only delegation-capable turns; spec review and acceptance review stay read-only.
+    delegating = role == "engineer" and purpose in ("implementation", "correction")
+    prepared = ao_delegates.validate_preparation(directory, state, state.get("bindings", {}).get("engineer", {}).get("session_id"),
+                                                 check_routing=delegating)
+    workspace(service, directory, state, check_routing=delegating)
     ao_delegates.assert_settled(service.root.parent, state)
     if role == "reviewer":
         if purpose != "acceptance_review":
@@ -207,6 +211,7 @@ def packet(service, directory, state, role, purpose, message):
             if isinstance(prior, dict) and prior.get("outcome") == "scope_change":
                 raise RoomError("Engineering discovered a scope change; revise and agree the specification first")
         policy = ao_delegates.validate_provider(directory, state)
+        ao_routing.before_dispatch(service, directory, state, prepared, purpose)
         instruction = ("Fable owns implementation, engineering review and eligible delegation in " + handoff["worktree"] + ". "
                        "Astra will independently accept the current candidate. Do not publish or start extra AO workers. "
                        "Do not change unrelated sessions or weaken the supplied tests. Return one final JSON object with: "
@@ -217,7 +222,8 @@ def packet(service, directory, state, role, purpose, message):
                        "Baseline commit: " + handoff["baseline_commit"] + "\n" + policy["policy"]
                        + "\nPinned delegate settings: " + json.dumps(policy["delegate_settings"], sort_keys=True)
                        + "\nThere is no adapter-imposed native model-run deadline. Status/HTTP waits are observation bounds. "
-                       "Use bounded deepseek_result chunks; private export file access is not required. Never replay uncertain work.")
+                       "Use bounded deepseek_result chunks; private export file access is not required. Never replay uncertain work.\n"
+                       + ao_routing.packet_text(prepared))
     else:
         raise RoomError("Normal engineer purpose must be spec_review, implementation or correction")
     return ("Workflow: Fable engineering with independent Astra acceptance.\n" + instruction

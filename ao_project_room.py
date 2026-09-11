@@ -25,6 +25,7 @@ import uuid
 from implementation import candidate_snapshot
 from room import RoomError
 import ao_delegates
+import ao_routing
 import ao_workflow
 
 
@@ -643,6 +644,8 @@ class Service:
                     if request["state"] == "completed" and request.get("purpose") in ("implementation", "correction"):
                         ao_workflow.capture_engineering(directory, state, request)
             self.save(directory, state)
+            if ao_workflow.normal(state):
+                ao_routing.observe_on_sync(self, directory, state)  # bounded GET; never refuses the sync
             return self.summary(directory, state)
 
     def ao_room_verify(self, room_id, candidate_path, timeout_seconds=120):
@@ -837,7 +840,7 @@ TOOL_SCHEMAS = {
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
-    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace; invokes Claude configuration only, never inference. No candidate files are written.", schema({**R, "worktree_path": S})),
+    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes the ignored worktree-scoped native routing files (pr-sonnet/pr-opus, local settings, private guard) and snapshots them; invokes Claude configuration only, never inference. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Normal roles require Claude/Fable engineer and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),

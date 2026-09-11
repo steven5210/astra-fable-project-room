@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import ao_project_room as ao
+import ao_routing
 import project_room
 import project_room_mcp
 
@@ -18,9 +19,16 @@ class FakeAO:
     def __init__(self, path):
         self.path = path
         self.posts = []
+        self.gets = 0
         self.lose_ack = False
+        self.fail_projects = False
         self.sessions = {}
         self.snapshots = {}
+        # Stock AO project configuration as an operator would leave it: the authorized
+        # Project Room delegation clause plus the fields preparation must see preserved.
+        self.config = {"defaultBranch": "main", "agentRules": ao_routing.CLAUSE,
+                       "worker": {"agent": "claude-code", "agentConfig": {"model": "claude-fable-5-1", "permissions": "auto"}},
+                       "containerReap": {"disabled": True}}
         self.add("engineer")
         self.add("reviewer")
 
@@ -34,8 +42,12 @@ class FakeAO:
         return copy.deepcopy(self.snapshots[name])
 
     def request(self, method, path, payload=None):
+        if method == "GET":
+            self.gets += 1
         if path == "/projects/project":
-            return {"project": {"id": "project", "path": str(self.path)}}
+            if self.fail_projects:
+                raise ao.RoomError("Simulated AO outage while reading the project")
+            return {"project": {"id": "project", "path": str(self.path), "config": copy.deepcopy(self.config)}}
         name = path.split("/")[2]
         if method == "GET":
             return {"session": copy.deepcopy(self.sessions[name])}

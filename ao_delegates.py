@@ -11,6 +11,7 @@ import sys
 from ao_delegate_launcher import owned_bytes
 from implementation import POLICIES, verify_provider_inventory, _pinned_delegate_settings
 from room import RoomError
+import ao_routing
 
 
 def initialize(service, directory, state, provider):
@@ -84,7 +85,7 @@ def preparation(directory, state):
         raise RoomError("Prepared delegate/workspace receipt is unreadable") from exc
 
 
-def validate_preparation(directory, state, session_id=None):
+def validate_preparation(directory, state, session_id=None, check_routing=True):
     from ao_project_room import digest
     validate_provider(directory, state)
     prepared = preparation(directory, state)
@@ -106,6 +107,8 @@ def validate_preparation(directory, state, session_id=None):
                     or observed.get("worktree") != prepared["worktree"]
                     or (session_id is not None and observed.get("session_id") != session_id)):
                 raise RoomError("Native delegate launch contradicts the prepared engineer")
+    if check_routing:
+        ao_routing.validate_local(prepared)
     return prepared
 
 
@@ -168,6 +171,9 @@ def prepare(service, directory, state, worktree_path):
         server = {**server, "env": {"PROJECT_ROOM_WORKTREE": str(worktree)}}
         prepared.update(launcher_path=str(launcher), launcher_sha256=launcher_hash, registry_path=str(registry),
                         registry_project=project, registration=registration, server=server)
+    # Native routing files are written and snapshotted before the record exists,
+    # so a refused routing setup leaves the room unprepared and the spawn aborted.
+    ao_routing.prepare(service, directory, state, worktree, prepared)
     atomic(directory / "preparation.json", prepared)
     state.update(preparation="preparation.json", preparation_sha256=digest(prepared), preparation_status="pending")
     service.save(directory, state)
@@ -216,16 +222,26 @@ def status(home, directory, state):
     jobs = controller._delegate_jobs(state["room_id"], directory)
     attachment = "not_prepared"
     error = None
+    routing = ao_routing.status(None, state)
     if state.get("preparation"):
+        session_id = state.get("bindings", {}).get("engineer", {}).get("session_id")
         try:
-            validate_preparation(directory, state, state.get("bindings", {}).get("engineer", {}).get("session_id"))
+            prepared = validate_preparation(directory, state, session_id, check_routing=False)
             attachment = "configuration_verified"
             if (directory / "delegate-launch.json").exists():
                 attachment = "native_mcp_launch_observed"
         except (RoomError, OSError, ValueError, TypeError, KeyError) as exc:
             attachment, error = "unverified", str(exc)
+            try:
+                prepared = preparation(directory, state)
+            except (RoomError, OSError, ValueError, TypeError, KeyError):
+                prepared = None
+        # Offline only: pinned local files and the last observed rules evidence.
+        routing = ao_routing.status(prepared, state, directory) if prepared is not None else {
+            "status": "unverified", "error": error, "meaning": ao_routing.MEANING}
     return {"provider": state["delegate"]["provider"], "attachment": attachment, "error": error,
-            "meaning": "Configuration/launch evidence is not successful inference or native subagent accounting", "jobs": jobs}
+            "meaning": "Configuration/launch evidence is not successful inference or native subagent accounting",
+            "jobs": jobs, "routing": routing}
 
 
 def main():

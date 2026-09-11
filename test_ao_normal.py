@@ -13,6 +13,8 @@ from unittest.mock import patch
 import ao_project_room as ao
 import ao_delegates
 import ao_delegate_launcher as launcher
+import ao_routing
+import ao_routing_guard as routing_guard
 import ao_workflow
 import deepseek_adapter
 import project_room
@@ -42,9 +44,16 @@ class Fixture(unittest.TestCase):
         for args in (('init',), ('config', 'user.name', 'Test'), ('config', 'user.email', 'fixture@example.invalid')):
             subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
         (self.repo / 'feature.txt').write_text('start\n')
+        (self.repo / '.gitignore').write_text('.claude/\n')  # the canonical repository ignores Claude runtime configuration
         subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True, capture_output=True)
         subprocess.run(['git', '-C', str(self.repo), 'commit', '-m', 'fixture'], check=True, capture_output=True)
         self.home = self.root / 'state'
+        # Hermetic Claude user settings and no inherited subagent knobs from the test host.
+        self.claude_env = self.root / 'claude-env'; self.claude_env.mkdir()
+        patcher = patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.claude_env)}); patcher.start(); self.addCleanup(patcher.stop)
+        for key in list(os.environ):
+            if key in ao_routing.RECORDED_ENV:
+                del os.environ[key]
         self.fake = NativeFake(self.repo)
         self.service = ao.Service(self.home, lambda url: self.fake)
         self.gates = [[sys.executable, '-c', "from pathlib import Path; assert Path('feature.txt').read_text() == 'implemented\\n'"]]
@@ -301,6 +310,8 @@ class DelegatePreparationTests(Fixture):
         self.fake_cli.write_text('#!' + sys.executable + '\n' + '''import json,os,subprocess,sys
 from pathlib import Path
 args=sys.argv[1:]
+if args==['--version']:
+    print('0.0-fake (Claude Code)'); sys.exit(0)
 assert args[:3]==['mcp','add-json','deepseek'] and args[-2:]==['--scope','local']
 p=Path(os.environ['CLAUDE_CONFIG_DIR'])/'.claude.json'
 project=subprocess.check_output(['git','worktree','list','--porcelain'],text=True).splitlines()[0][9:]
@@ -388,6 +399,16 @@ p.write_text(json.dumps(value))
         Path(prepared['launcher_path']).write_text('# drift')
         with self.assertRaisesRegex(ao.RoomError, 'launcher changed'): self.prepare()
 
+    def test_old_deepseek_room_without_routing_stays_readable(self):
+        self.prepare()
+        prepared = ao.read(self.directory() / 'preparation.json'); prepared.pop('routing')
+        ao.atomic(self.directory() / 'preparation.json', prepared)
+        state = self.state(); state['preparation_sha256'] = ao.digest(prepared); ao.atomic(self.directory() / 'state.json', state)
+        shutil.rmtree(self.repo / '.claude')
+        delegate = self.service.ao_room_status(self.room)['delegate']
+        self.assertEqual((delegate['attachment'], delegate['routing']['status']), ('configuration_verified', 'not_configured'))
+        self.service.ao_room_bind(self.room, 'engineer', 'engineer', ao_workflow.FABLE_MODEL, 'max')
+
     def test_entire_ledger_blocks_even_when_stop_is_outside_latest_twenty(self):
         self.prepare()
         ledger = deepseek_adapter.Ledger(self.home)
@@ -405,3 +426,426 @@ p.write_text(json.dumps(value))
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RoutingTests(Fixture):
+    """Native delegation routing: generated files, guard decisions, drift, old rooms and prelaunch refusal."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_claude = self.root / 'fake-claude-version'
+        self.fake_claude.write_text('#!' + sys.executable + '\nimport sys\nprint("0.0-fake (Claude Code)" if sys.argv[1:] == ["--version"] else "unexpected")\n')
+        self.fake_claude.chmod(0o700)
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude), 'claude_config_dir': str(self.claude_env)})
+        self.room = self.open(provider='none'); self.spec()
+
+    def prepared(self):
+        return ao.read(self.directory() / 'preparation.json')
+
+    def routing(self):
+        return self.service.ao_room_status(self.room)['delegate']['routing']
+
+    def decide(self, event):
+        return routing_guard.decide(event)
+
+    def commit(self, message):
+        # Stage only tracked changes so an ignore-rule edit never silently tracks the runtime files.
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-q', '-a', '-m', message], check=True, capture_output=True)
+
+    def test_prepare_writes_ignored_pinned_files_and_snapshot(self):
+        before = ao.candidate_snapshot(self.repo)
+        ignore_before = (self.repo / '.gitignore').read_bytes()
+        exclude = self.repo / '.git' / 'info' / 'exclude'
+        exclude_before = exclude.read_bytes() if exclude.exists() else None
+        (self.claude_env / 'settings.json').write_text('{"permissions": {"defaultMode": "auto"}}')
+        prepared = self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertEqual(before, ao.candidate_snapshot(self.repo))  # ignored paths never enter the candidate
+        self.assertEqual((self.repo / '.gitignore').read_bytes(), ignore_before)
+        self.assertEqual(exclude.read_bytes() if exclude.exists() else None, exclude_before)
+        self.assertEqual((self.claude_env / 'settings.json').read_text(), '{"permissions": {"defaultMode": "auto"}}')
+        routing = prepared['routing']
+        self.assertEqual(routing['agents'], {'pr-sonnet': 'claude-sonnet-5', 'pr-opus': 'claude-opus-5'})
+        self.assertEqual(routing['browser_skill'], 'claude-in-chrome')
+        self.assertEqual(routing['claude']['version'], '0.0-fake (Claude Code)')
+        self.assertEqual(routing['claude']['path'], str(self.fake_claude))
+        for name in ('pr-sonnet', 'pr-opus'):
+            text = (self.repo / '.claude' / 'agents' / (name + '.md')).read_text()
+            fields = ao_routing.parse_definition(text)
+            self.assertEqual((fields['model'], fields['effort']), (ao_routing.MODELS[name], 'max'))
+            self.assertIn('Agent', fields['disallowedTools'])
+            try:
+                import yaml
+            except ImportError:
+                yaml = None
+            if yaml is not None:  # the frontmatter must also be valid YAML for Claude's own loader
+                self.assertEqual(yaml.safe_load(text[4:text.find('\n---\n', 4)]), fields)
+        self.assertNotIn('Skill', ao_routing.parse_definition((self.repo / '.claude' / 'agents' / 'pr-opus.md').read_text())['disallowedTools'])
+        settings = json.loads((self.repo / '.claude' / 'settings.local.json').read_text())
+        self.assertEqual(settings['env']['CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH'], '1')
+        self.assertEqual(settings['env']['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '2')
+        self.assertIn('Skill(code-review)', settings['permissions']['deny']); self.assertIn('Workflow', settings['permissions']['deny'])
+        entry = settings['hooks']['PreToolUse'][0]
+        self.assertEqual(entry['matcher'], 'Agent|Workflow|Task|Skill|SendMessage|Team.*|mcp__deepseek__.*|mcp__qwen-local__.*|mcp__project-room__.*')
+        for name in ('pr-sonnet', 'pr-opus'):
+            tools = ao_routing.parse_definition((self.repo / '.claude' / 'agents' / (name + '.md')).read_text())['disallowedTools']
+            for denied in ('mcp__deepseek', 'mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__qwen-local', 'mcp__project-room'):
+                self.assertIn(denied, tools)
+        command = entry['hooks'][0]['command']
+        self.assertIn(routing['guard_path'], command); self.assertTrue(command.endswith('exit 2')); self.assertNotIn('--browser-skill', command)
+        self.assertEqual(Path(routing['guard_path']).read_bytes(), Path(routing_guard.__file__).read_bytes())
+        self.assertTrue(routing['rules']['clause_present'])
+        self.assertEqual(routing['rules']['preserved_fields']['worker.model'], 'claude-fable-5-1')
+        self.assertEqual(self.routing()['status'], 'configured')
+        self.assertEqual(prepared, self.service.ao_room_prepare(self.room, str(self.repo)))  # idempotent
+        self.assertEqual(self.state()['preparation_status'], 'configured')
+
+    def test_status_is_offline(self):
+        self.bind()
+        gets = self.fake.gets
+        self.service.ao_room_status(self.room)
+        self.assertEqual(self.fake.gets, gets)
+
+    def test_unignored_tracked_or_symlinked_paths_refuse_before_writing(self):
+        (self.repo / '.gitignore').write_text(''); self.commit('drop ignore')
+        with self.assertRaisesRegex(ao.RoomError, 'not ignored'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertFalse((self.repo / '.claude').exists())
+        self.assertTrue(list(self.directory().glob('routing-error-*.json')))
+        self.assertIsNone(self.state().get('preparation'))
+        self.assertEqual(self.routing()['status'], 'not_configured')
+        helper = subprocess.run([sys.executable, str(Path(ao_delegates.__file__)), '--home', str(self.home), '--room', self.room],
+                                cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(helper.returncode, 1); self.assertIn('not ignored', helper.stderr)  # the postCreate hook fails, so AO aborts the spawn
+        (self.repo / '.gitignore').write_text('.claude/\n'); self.commit('restore ignore')
+        (self.repo / '.claude' / 'agents').mkdir(parents=True)
+        (self.repo / '.claude' / 'agents' / 'pr-sonnet.md').write_text('tracked')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '-f', '.claude/agents/pr-sonnet.md'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-q', '-m', 'track a routing path'], check=True, capture_output=True)
+        with self.assertRaisesRegex(ao.RoomError, 'tracked'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        subprocess.run(['git', '-C', str(self.repo), 'rm', '-q', '-f', '.claude/agents/pr-sonnet.md'], check=True, capture_output=True)
+        self.commit('untrack')
+        outside = self.root / 'outside'; outside.mkdir()
+        shutil.rmtree(self.repo / '.claude', ignore_errors=True)
+        (self.repo / '.claude').symlink_to(outside)
+        with self.assertRaisesRegex(ao.RoomError, 'symlink'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertEqual(list(outside.iterdir()), [])
+        (self.repo / '.claude').unlink(); (self.repo / '.claude').mkdir()
+        (self.repo / '.claude' / 'agents').symlink_to(outside)
+        with self.assertRaisesRegex(ao.RoomError, 'symlink'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_conflicting_definition_is_refused_before_any_file_is_written(self):
+        (self.repo / '.claude' / 'agents').mkdir(parents=True)
+        (self.repo / '.claude' / 'agents' / 'pr-opus.md').write_text('---\nname: pr-opus\nmodel: inherit\n---\n')
+        with self.assertRaisesRegex(ao.RoomError, 'differs'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertFalse((self.repo / '.claude' / 'agents' / 'pr-sonnet.md').exists())
+        self.assertFalse((self.repo / '.claude' / 'settings.local.json').exists())
+
+    def test_guard_decisions_and_fail_closed_exit(self):
+        allow = {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet', 'prompt': 'apply', 'description': 'x'}}
+        self.assertIsNone(self.decide(allow))
+        self.assertIsNone(self.decide({'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-opus', 'prompt': 'review', 'run_in_background': False}}))
+        self.assertIsNone(self.decide({**allow, 'agent_type': None}))
+        denied = [
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet', 'model': 'fable'}},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet', 'isolation': 'remote'}},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-opus', 'resume': 'agent-1'}},
+            {'tool_name': 'Agent', 'tool_input': {'prompt': 'no type'}},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'general-purpose'}},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'fork'}},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_type': 'pr-opus'},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_id': 'existing-child'},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_type': ''},
+            {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_id': ''},
+            {'tool_name': 'Workflow', 'tool_input': {'script': 'x'}},
+            {'tool_name': 'Task', 'tool_input': {'prompt': 'legacy'}},
+            {'tool_name': 'TeamCreate', 'tool_input': {}},
+            {'tool_name': 'TeamMessage', 'tool_input': {'to': 'x'}},
+            {'tool_name': 'SendMessage', 'tool_input': {'to': 'pr-opus-unrelated', 'model': 'fable', 'message': 'x'}},
+            {'tool_name': 'SendMessage', 'tool_input': {'to': 'pr-opus', 'message': 'x'}},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'code-review'}},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_id': 'child'},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_type': ''},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_type': 'pr-sonnet'},
+            {'tool_name': 'Skill', 'tool_input': {'skill': 'simplify'}, 'agent_type': 'pr-opus'},
+            {'tool_name': 'mcp__deepseek__deepseek_submit', 'tool_input': {'task': 'x', 'request_id': 'r'}, 'agent_type': 'pr-sonnet'},
+            {'tool_name': 'mcp__deepseek__deepseek_ask', 'tool_input': {'question': 'x'}, 'agent_type': 'pr-opus'},
+            {'tool_name': 'mcp__deepseek__deepseek_status', 'tool_input': {'job_id': 'j'}, 'agent_id': 'child'},
+            {'tool_name': 'mcp__qwen-local__qwen_submit', 'tool_input': {'task': 'x'}, 'agent_type': 'pr-sonnet'},
+            {'tool_name': 'mcp__project-room__room_implementation_submit', 'tool_input': {}, 'agent_type': 'pr-opus'},
+            {'tool_name': 'mcp__project-room__ao_room_send', 'tool_input': {}, 'agent_id': 'child'},
+        ]
+        for event in denied:
+            self.assertIsNotNone(self.decide(event), event)
+        self.assertIsNone(self.decide({'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_type': 'pr-opus', 'agent_id': 'child'}))
+        self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}}))
+        self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}, 'agent_type': 'pr-sonnet'}))
+        self.assertIsNone(self.decide({'tool_name': 'TaskOutput', 'tool_input': {'task_id': 'x'}}))
+        for root_tool in ('mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__deepseek__deepseek_result', 'mcp__project-room__ao_room_status'):
+            self.assertIsNone(self.decide({'tool_name': root_tool, 'tool_input': {'task': 'x'}}))  # root Fable keeps its pinned provider access
+        for bad in ({'tool_name': 'Agent', 'tool_input': []}, {'tool_input': {}}, {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_type': 5}, 'text'):
+            with self.assertRaises(ValueError):
+                self.decide(bad)
+        script = Path(routing_guard.__file__)
+        run = lambda payload, *args: subprocess.run([sys.executable, str(script), *args], input=payload, capture_output=True, text=True)
+        refused = run(json.dumps({'tool_name': 'Agent', 'tool_input': {'subagent_type': 'general-purpose'}}))
+        self.assertEqual(refused.returncode, 0)
+        self.assertEqual(json.loads(refused.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        allowed = run(json.dumps(allow)); self.assertEqual((allowed.returncode, allowed.stdout), (0, ''))
+        self.assertEqual(run('not json').returncode, 2)
+        self.assertEqual(run(json.dumps(allow), '--browser-skill', 'code-review').returncode, 2)  # no arguments are accepted
+        command = ao_routing.hook_command(str(self.root / 'missing-python'), str(script))
+        wrapped = subprocess.run(['sh', '-c', command], input=json.dumps(allow), capture_output=True, text=True)
+        self.assertEqual(wrapped.returncode, 2)
+        command = ao_routing.hook_command(sys.executable, str(script))
+        wrapped = subprocess.run(['sh', '-c', command], input='not json', capture_output=True, text=True)
+        self.assertEqual(wrapped.returncode, 2)
+        wrapped = subprocess.run(['sh', '-c', command], input=json.dumps(allow), capture_output=True, text=True)
+        self.assertEqual((wrapped.returncode, wrapped.stdout), (0, ''))
+
+    def test_definition_validation_rejects_omitted_inherit_and_fable_models(self):
+        text = ao_routing.agent_definition('pr-sonnet')
+        ao_routing.validate_definition('pr-sonnet', text)
+        tools_line = 'disallowedTools: ' + json.dumps(ao_routing.parse_definition(text)['disallowedTools'])
+        cases = [('"claude-sonnet-5"', '"inherit"', 'inherits'), ('"claude-sonnet-5"', '"claude-fable-5-1"', 'Fable'),
+                 ('model: "claude-sonnet-5"\n', '', 'omits'), ('"claude-sonnet-5"', '"claude-opus-5"', 'pinned mapping'),
+                 ('effort: "max"', 'effort: "high"', 'effort'),
+                 (tools_line, 'disallowedTools: "Skill"', 'delegate'),
+                 (tools_line, 'disallowedTools: "Agent, Workflow, SendMessage, ' + ao_routing.CHILD_DENIED + '"', 'skills'),
+                 (tools_line, 'disallowedTools: "Agent, Workflow, Task, Skill, SendMessage, TeamCreate"', 'inherited MCP'),
+                 (tools_line, 'disallowedTools: "Agent, Workflow, Task, Skill, SendMessage, TeamCreate, mcp__deepseek, mcp__qwen-local, mcp__project-room"', 'inherited MCP')]
+        for old, new, message in cases:
+            self.assertIn(old, text)
+            with self.assertRaisesRegex(ao.RoomError, message):
+                ao_routing.validate_definition('pr-sonnet', text.replace(old, new))
+        with self.assertRaisesRegex(ao.RoomError, 'frontmatter'):
+            ao_routing.validate_definition('pr-sonnet', 'no frontmatter')
+
+    def test_local_drift_blocks_delegation_but_never_read_only_review(self):
+        self.bind()
+        self.assertEqual(self.routing()['status'], 'configured')
+        path = self.repo / '.claude' / 'agents' / 'pr-opus.md'; original = path.read_bytes()
+        drifted = original.replace(b'"claude-opus-5"', b'"inherit"')
+        path.write_bytes(drifted)
+        status = self.routing(); self.assertEqual(status['status'], 'unverified'); self.assertIn('changed', status['error'])
+        self.assertEqual(self.service.ao_room_status(self.room)['delegate']['attachment'], 'configuration_verified')
+        self.agree()  # Fable's read-only spec review is never blocked by routing drift
+        with self.assertRaisesRegex(ao.RoomError, 'routing file changed'):
+            self.service.ao_room_handoff(self.room, str(self.repo))
+        path.write_bytes(original)
+        self.assertEqual(self.routing()['status'], 'verified')  # the spec-review sync observed consistent rules
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        path.write_bytes(drifted)
+        with self.assertRaisesRegex(ao.RoomError, 'routing file changed'):
+            self.send('implementation')
+        self.assertNotIn('implementation', self.state()['requests'])
+        path.write_bytes(original)
+        self.implement()
+        path.write_bytes(drifted)
+        self.review()  # Astra's read-only acceptance review is never blocked either
+        self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+        with self.assertRaisesRegex(ao.RoomError, 'routing file changed'):
+            self.send('correction')
+        path.write_bytes(original)
+        (self.repo / '.gitignore').write_text(''); self.commit('drop ignore after preparation')
+        self.assertIn('not ignored', self.routing()['error'])
+        (self.repo / '.gitignore').write_text('.claude/\n'); self.commit('restore ignore')
+        for content, message in (({'env': {'CLAUDE_CODE_SUBAGENT_MODEL_FORCE': 'claude-fable-5-1'}}, 'override'),
+                                 ({'availableModels': ['claude-fable-5-1', 'claude-sonnet-5']}, 'availableModels'),
+                                 ({'modelOverrides': {'claude-opus-5': 'claude-fable-5-1'}}, 'modelOverrides'),
+                                 ({'disableAllHooks': True}, 'disable hooks')):
+            (self.claude_env / 'settings.json').write_text(json.dumps(content))
+            self.assertIn(message, self.routing()['error'])
+        (self.claude_env / 'settings.json').unlink()
+        (self.claude_env / 'agents').mkdir(); (self.claude_env / 'agents' / 'pr-opus.md').write_text('---\nname: pr-opus\n---\n')
+        self.assertIn('user-level agent definition', self.routing()['error'])
+        shutil.rmtree(self.claude_env / 'agents')
+        managed = self.root / 'managed-settings.json'
+        managed.write_text(json.dumps({'env': {'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS': '9'}}))
+        with patch.dict(os.environ, {'CLAUDE_CODE_MANAGED_SETTINGS_PATH': str(managed)}):
+            self.assertIn('managed', self.routing()['error'])
+        (self.repo / '.claude' / 'settings.json').write_text(json.dumps({'disableAllHooks': True}))
+        self.assertIn('project', self.routing()['error'])
+        (self.repo / '.claude' / 'settings.json').unlink()
+        self.assertEqual(self.routing()['status'], 'verified')
+        self.fake_claude.write_text(self.fake_claude.read_text() + '# changed\n')
+        self.assertIn('executable changed', self.routing()['error'])
+        with self.assertRaisesRegex(ao.RoomError, 'executable changed'):
+            self.send('correction', 'again')
+        self.assertNotIn('again', self.state()['requests'])
+
+    def test_rules_drift_blocks_implementation_and_sync_records_last_observation(self):
+        self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo))
+        self.fake.config['agentRules'] = 'Project Room rules without the clause'
+        with self.assertRaisesRegex(ao.RoomError, 'rules changed'):
+            self.send('implementation')
+        rules = self.state()['routing_rules']
+        self.assertEqual((rules['source'], rules['consistent'], rules['clause_present']), ('dispatch', False, False))
+        self.assertTrue((self.directory() / rules['evidence']).exists())
+        self.assertEqual(self.routing()['status'], 'unverified')
+        self.service.ao_room_sync(self.room)  # a drifted sync still returns and records the inconsistency
+        self.assertEqual((self.state()['routing_rules']['source'], self.state()['routing_rules']['consistent']), ('sync', False))
+        self.fake.config['agentRules'] = ao_routing.CLAUSE + ' plus an edit'
+        with self.assertRaisesRegex(ao.RoomError, 'rules changed'):
+            self.send('implementation', 'impl-2')
+        self.fake.config['agentRules'] = ao_routing.CLAUSE
+        self.fake.config['worker']['agentConfig'].pop('model')
+        with self.assertRaisesRegex(ao.RoomError, 'rules changed'):
+            self.send('implementation', 'impl-3')
+        self.fake.config['worker']['agentConfig']['model'] = 'claude-fable-5-1'
+        self.fake.config['env'] = {'CLAUDE_CODE_SUBAGENT_MODEL_FORCE': 'claude-fable-5-1'}
+        with self.assertRaisesRegex(ao.RoomError, 'rules changed'):
+            self.send('implementation', 'impl-4')
+        self.fake.config['env'] = {'CLAUDE_CODE_SUBAGENT_MODEL': 'claude-fable-5-1'}  # recorded env drift is drift too
+        with self.assertRaisesRegex(ao.RoomError, 'rules changed'):
+            self.send('implementation', 'impl-5')
+        del self.fake.config['env']
+        self.fake.fail_projects = True
+        with self.assertRaisesRegex(ao.RoomError, 'could not be read'):
+            self.send('implementation', 'impl-6')
+        self.assertIn('outage', self.state()['routing_rules']['error'])
+        self.service.ao_room_sync(self.room)
+        self.assertIn('outage', self.state()['routing_rules']['error'])
+        self.assertEqual(self.routing()['status'], 'unverified')
+        self.fake.fail_projects = False
+        self.assertNotIn('implementation', self.state()['requests'])
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.routing()['status'], 'verified')
+        evidence = self.directory() / self.state()['routing_rules']['evidence']
+        saved = evidence.read_bytes()
+        evidence.write_text('{"clause_present": true}')
+        self.assertIn('evidence', self.routing()['error'])
+        with self.assertRaisesRegex(ao.RoomError, 'modified'):
+            self.service.ao_room_sync(self.room)  # a tampered receipt is an explicit refusal, not silent reuse
+        evidence.unlink()
+        self.assertEqual(self.routing()['status'], 'unverified')
+        evidence.write_bytes(saved)
+        self.assertEqual(self.routing()['status'], 'verified')
+        self.implement()
+        request = self.state()['requests']['implementation']
+        self.assertIn('pr-sonnet (claude-sonnet-5', request['text']); self.assertIn('pr-opus (claude-opus-5', request['text'])
+        self.review()
+        self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+
+    def test_missing_clause_refuses_preparation_and_wrapped_clause_counts(self):
+        self.fake.config['agentRules'] = 'no clause'
+        with self.assertRaisesRegex(ao.RoomError, 'delegation clause'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertFalse((self.repo / '.claude').exists())
+        self.assertTrue(list(self.directory().glob('routing-error-*.json')))
+        self.fake.config['agentRules'] = 'Existing rules.\n' + ao_routing.CLAUSE.replace(' ', '\n', 5)
+        self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertEqual(self.routing()['status'], 'configured')
+
+    def test_contradictory_settings_refuse_and_unrelated_local_settings_are_preserved(self):
+        (self.claude_env / 'settings.json').write_text(json.dumps({'disableAllHooks': True}))
+        with self.assertRaisesRegex(ao.RoomError, 'disable hooks'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        (self.claude_env / 'settings.json').write_text('{')
+        with self.assertRaisesRegex(ao.RoomError, 'not valid JSON'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        (self.claude_env / 'settings.json').write_text(json.dumps({'permissions': {'defaultMode': 'auto'}, 'model': 'fable[1m]'}))
+        if os.geteuid() != 0:
+            (self.claude_env / 'settings.json').chmod(0)
+            with self.assertRaisesRegex(ao.RoomError, 'unreadable'):
+                self.service.ao_room_prepare(self.room, str(self.repo))
+            (self.claude_env / 'settings.json').chmod(0o600)
+        (self.claude_env / 'agents').mkdir(); (self.claude_env / 'agents' / 'pr-sonnet.md').write_text('---\nname: pr-sonnet\n---\n')
+        with self.assertRaisesRegex(ao.RoomError, 'user-level agent definition'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        shutil.rmtree(self.claude_env / 'agents')
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude), 'claude_config_dir': str(self.claude_env),
+                                              'claude_config_dir_override': str(self.root / 'elsewhere')})
+        with self.assertRaisesRegex(ao.RoomError, 'disagree'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude), 'claude_config_dir': str(self.claude_env)})
+        local = self.repo / '.claude' / 'settings.local.json'; local.parent.mkdir()
+        local.write_text(json.dumps({'unrelated': {'keep': True}, 'env': {'FOO': 'bar'}, 'permissions': {'allow': ['Bash(ls)']},
+                                     'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'true'}]}]}}))
+        user_settings = (self.claude_env / 'settings.json').read_bytes()
+        self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertEqual((self.claude_env / 'settings.json').read_bytes(), user_settings)
+        merged = json.loads(local.read_text())
+        self.assertEqual(merged['unrelated'], {'keep': True}); self.assertEqual(merged['env']['FOO'], 'bar')
+        self.assertEqual(merged['permissions']['allow'], ['Bash(ls)'])
+        self.assertEqual([entry['matcher'] for entry in merged['hooks']['PreToolUse']], ['Bash', ao_routing.MATCHER])
+        self.assertEqual(self.routing()['status'], 'configured')
+        other = self.root / 'worktree-two'
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-q', '-b', 'second', str(other)], check=True, capture_output=True)
+        (other / '.claude').mkdir()
+        (other / '.claude' / 'settings.local.json').write_text(json.dumps({'env': {'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS': '8'}}))
+        second = self.open(feature='second', provider='none')
+        with self.assertRaisesRegex(ao.RoomError, 'override'):
+            self.service.ao_room_prepare(second, str(other))
+        self.assertEqual(json.loads((other / '.claude' / 'settings.local.json').read_text()), {'env': {'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS': '8'}})
+
+    def test_old_prepared_rooms_stay_readable_and_not_configured(self):
+        self.bind()
+        prepared = self.prepared(); prepared.pop('routing')  # a record written before native routing existed
+        ao.atomic(self.directory() / 'preparation.json', prepared)
+        state = self.state(); state['preparation_sha256'] = ao.digest(prepared); ao.atomic(self.directory() / 'state.json', state)
+        shutil.rmtree(self.repo / '.claude')
+        delegate = self.service.ao_room_status(self.room)['delegate']
+        self.assertEqual(delegate['attachment'], 'configuration_verified'); self.assertEqual(delegate['routing']['status'], 'not_configured')
+        self.agree(); self.service.ao_room_handoff(self.room, str(self.repo)); self.send('implementation')
+        self.assertIn('not configured', self.state()['requests']['implementation']['text'])
+        self.service.ao_room_sync(self.room)
+        self.assertNotIn('routing_rules', self.state())
+        self.assertEqual(self.routing()['status'], 'not_configured')
+
+    def test_rooms_without_executable_evidence_never_reach_verified(self):
+        (self.home / 'config.json').unlink()
+        self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assertIsNone(self.prepared()['routing']['claude']['path'])
+        self.service.ao_room_sync(self.room)
+        status = self.routing()
+        self.assertEqual(status['status'], 'configured'); self.assertIn('version evidence is missing', status['note'])
+
+    def test_managed_hooks_only_refuses_preparation_and_delegation_but_not_review(self):
+        managed = self.root / 'managed-settings.json'
+        managed.write_text(json.dumps({'allowManagedHooksOnly': True}))
+        with patch.dict(os.environ, {'CLAUDE_CODE_MANAGED_SETTINGS_PATH': str(managed)}):
+            with self.assertRaisesRegex(ao.RoomError, 'managed hooks only'):
+                self.service.ao_room_prepare(self.room, str(self.repo))
+            self.assertFalse((self.repo / '.claude').exists())
+        (self.claude_env / 'settings.json').write_text(json.dumps({'allowManagedHooksOnly': True}))
+        with self.assertRaisesRegex(ao.RoomError, 'managed hooks only'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        (self.claude_env / 'settings.json').unlink()
+        (self.repo / '.claude').mkdir(); (self.repo / '.claude' / 'settings.local.json').write_text(json.dumps({'allowManagedHooksOnly': True}))
+        with self.assertRaisesRegex(ao.RoomError, 'suppress local hooks'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        (self.repo / '.claude' / 'settings.local.json').unlink()
+        self.bind()
+        self.assertEqual(self.routing()['status'], 'configured')
+        with patch.dict(os.environ, {'CLAUDE_CODE_MANAGED_SETTINGS_PATH': str(managed)}):
+            status = self.routing()
+            self.assertEqual(status['status'], 'unverified'); self.assertIn('managed hooks only', status['error'])
+            self.agree()  # read-only specification review is still allowed
+            with self.assertRaisesRegex(ao.RoomError, 'managed hooks only'):
+                self.service.ao_room_handoff(self.room, str(self.repo))
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        with patch.dict(os.environ, {'CLAUDE_CODE_MANAGED_SETTINGS_PATH': str(managed)}):
+            with self.assertRaisesRegex(ao.RoomError, 'managed hooks only'):
+                self.send('implementation')
+            self.assertNotIn('implementation', self.state()['requests'])
+        self.implement()
+        with patch.dict(os.environ, {'CLAUDE_CODE_MANAGED_SETTINGS_PATH': str(managed)}):
+            self.review()  # read-only acceptance review is still allowed
+            self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+
+    def test_failed_version_probe_is_recorded_and_caps_status(self):
+        self.fake_claude.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1)\n')
+        self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo))
+        claude = self.prepared()['routing']['claude']
+        self.assertEqual((claude['version'], claude['error']), (None, 'version probe exit 1'))
+        self.service.ao_room_sync(self.room)
+        status = self.routing()
+        self.assertEqual(status['status'], 'configured'); self.assertIn('version probe exit 1', status['note'])
+        ao.atomic(self.home / 'config.json', {'claude_bin': 'claude', 'claude_config_dir': str(self.claude_env)})
+        self.assertEqual(ao_routing.claude_evidence('claude')['error'], 'claude_bin is not an absolute path')
