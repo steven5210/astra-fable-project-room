@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """DeepSeek text delegate for Project Room: a self-contained stdio MCP adapter with durable bounded jobs.
 
-The adapter sends chat completions only to https://api.deepseek.com with the exact configured model and the
-pinned deep-lane settings. It is a text delegate, not an agentic runtime: it returns proposed code, tests,
-reviews and reasoning summaries, and never executes returned code, shell or tool calls. Every ledger, job,
-export, probe and default secret path derives from the controller home passed as --home. Nothing here imports
+The adapter sends chat completions only to the one fixed backend its key-free configuration selects deliberately:
+the official DeepSeek API (https://api.deepseek.com) or DeepInfra's hosted OpenAI-compatible endpoint
+(https://api.deepinfra.com/v1/openai), always with the exact configured model and the pinned deep-lane settings,
+never through a proxy, redirect or fallback. It is a text delegate, not an agentic runtime: it returns proposed
+code, tests, reviews and reasoning summaries, and never executes returned code, shell or tool calls. Every ledger,
+job, export, probe and default secret path derives from the controller home passed as --home. Nothing here imports
 the controller modules; the small owned-descriptor primitives are duplicated on purpose so that a room's
 provider snapshot is exactly this file plus its key-free configuration.
 """
@@ -32,19 +34,43 @@ import uuid
 
 VERSION = "0.3.0"
 SERVER_NAME = "deepseek-delegate"
-EXACT_BASE_URL = "https://api.deepseek.com"
-API_HOST = "api.deepseek.com"
-API_PORT = 443
-API_PATH = "/chat/completions"
+# Exactly two fixed transports. Each pins the TLS host, port and path that is ever connected to, the request syntax the
+# body builder speaks, its own default private key file name and the shape of its model identifiers. The configuration
+# selects one deliberately through `backend`; there is no arbitrary endpoint, proxy, redirect or fallback provider.
+BACKENDS = {
+    "official": {"label": "DeepSeek official API", "key_label": "DeepSeek", "base_url": "https://api.deepseek.com",
+                 "host": "api.deepseek.com", "port": 443, "path": "/chat/completions", "request_syntax": "deepseek_thinking",
+                 "key_name": "deepseek-api-key", "namespaced_model": False},
+    "deepinfra": {"label": "DeepInfra hosted OpenAI-compatible endpoint", "key_label": "DeepInfra", "base_url": "https://api.deepinfra.com/v1/openai",
+                  "host": "api.deepinfra.com", "port": 443, "path": "/v1/openai/chat/completions", "request_syntax": "openai_reasoning_effort",
+                  "key_name": "deepinfra-api-key", "namespaced_model": True},
+}
+DEFAULT_BACKEND = "official"
+EXACT_BASE_URL = BACKENDS["official"]["base_url"]  # the official transport keeps its historical names
+API_HOST = BACKENDS["official"]["host"]
+API_PORT = BACKENDS["official"]["port"]
+API_PATH = BACKENDS["official"]["path"]
 DEFAULT_MODEL = "deepseek-v4.1-flash-expires-on-0910"
+DEEPINFRA_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
+DEEPINFRA_MAX_TOKENS = 131072        # the user's explicit output selection for new DeepInfra rooms; DeepInfra's public max_output_tokens
+DEEPINFRA_CONTEXT_TOKENS = 1048576   # DeepInfra's public max_tokens (context) for the hosted model; advertised, not measured here
 DEFAULTS = {
-    "base_url": EXACT_BASE_URL, "model": DEFAULT_MODEL, "api_key_file": None,
+    "backend": DEFAULT_BACKEND, "base_url": EXACT_BASE_URL, "model": DEFAULT_MODEL, "api_key_file": None,
     "reasoning_effort": "max", "max_tokens": 393216, "context_tokens": 1048576, "context_basis": "provisional_v4_family",
     "ask_max_tokens": 8192, "ask_effort": "low", "max_input_bytes": 614400,
     "min_tokens_per_second": 40, "connect_margin_seconds": 60, "request_timeout_seconds": 9891, "read_idle_seconds": 120,
     "max_concurrent_per_room": 1, "max_concurrent_per_host": 2, "max_context_files": 16, "max_context_file_bytes": 262144,
     "max_content_bytes": 8388608, "max_reasoning_bytes": 8388608, "max_wire_bytes": 134217728, "max_wire_tail_bytes": 65536,
     "max_metadata_bytes": 1048576, "max_sse_line_bytes": 1048576, "max_retained_bytes": 1073741824, "max_jobs": 10000,
+}
+# Backend-specific defaults layered over DEFAULTS before the explicit configuration: a DeepInfra configuration pins the
+# namespaced hosted model, the user-selected 131,072-token output cap, the advertised context and the timeout the
+# validator's own sizing rule derives for that cap (ceil(131072/40)+60). Every value can still be set explicitly and
+# every explicit value is validated the same way; nothing here lowers or substitutes a value a configuration pins.
+BACKEND_DEFAULTS = {
+    "official": {},
+    "deepinfra": {"model": DEEPINFRA_MODEL, "max_tokens": DEEPINFRA_MAX_TOKENS, "context_tokens": DEEPINFRA_CONTEXT_TOKENS,
+                  "context_basis": "deepinfra_public_metadata", "request_timeout_seconds": 3337},
 }
 INTEGER_FIELDS = ("max_tokens", "context_tokens", "ask_max_tokens", "max_input_bytes", "min_tokens_per_second",
                   "connect_margin_seconds", "request_timeout_seconds", "read_idle_seconds", "max_concurrent_per_room",
@@ -67,14 +93,16 @@ ERROR_CLASSES = frozenset({
     "not_found_error", "model_not_found", "not_found", "rate_limit_error", "rate_limit_reached", "rate_limit_exceeded",
     "context_length_exceeded", "tokens_exceeded_error", "content_filter", "content_policy_violation",
     "server_error", "internal_error", "internal_server_error", "api_error", "overloaded_error", "server_overloaded",
+    "engine_overloaded", "rate_limited",  # DeepInfra's documented busy/rate-limit codes inside its OpenAI-style envelope
     "service_unavailable", "timeout", "request_timeout", "gateway_timeout", "bad_gateway", "unknown_error"})
 USAGE_FIELDS = frozenset({"prompt_tokens", "completion_tokens", "total_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"})
 USAGE_DETAIL_FIELDS = {"prompt_tokens_details": frozenset({"cached_tokens", "audio_tokens"}),
                        "completion_tokens_details": frozenset({"reasoning_tokens", "audio_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"})}
 # 4xx statuses whose validated JSON error envelope proves the request was refused before generation: DeepSeek documents
-# 400/401/402/422/429 as such refusals and the others are HTTP-level refusals of the request itself. Every other 4xx
-# (for example 408 request timeout or 409 conflict) is ambiguous: the request may have been processed, so it stays
-# possibly billed and is never replayed automatically.
+# 400/401/402/422/429 as such refusals, DeepInfra documents 429 busy/rate-limit refusals in the same OpenAI-style
+# envelope, and the others are HTTP-level refusals of the request itself. Every other 4xx (for example 408 request
+# timeout or 409 conflict) is ambiguous: the request may have been processed, so it stays possibly billed and is never
+# replayed automatically.
 DEFINITE_REJECTIONS = frozenset({400, 401, 402, 403, 404, 405, 413, 414, 415, 422, 429, 431})
 # Per-job metadata records are bounded on their ENCODED bytes (JSON escaping expands a control character sixfold), and
 # the reserve is the sum of those bounds, so it holds by construction rather than by assumption: request.json is checked
@@ -94,6 +122,9 @@ REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,200}")
 JOB_ID = re.compile(r"[0-9a-f]{32}")
 ROOM_ID = re.compile(r"[A-Za-z0-9._-]{1,200}")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+# A hosted namespaced identifier: exactly one organisation/name separator, each side an exact printable token. The
+# served model is still compared for byte equality against the configured string; the pattern only shapes what may be pinned.
+NAMESPACED_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 KEY_LIMIT = 4097
 MAX_CONFIG_BYTES = 1048576
@@ -354,7 +385,12 @@ def ensure_private_directory(path):
 # ---------------------------------------------------------------------------------------------------------------
 
 def validate_config(raw, home):
-    """Normalize a key-free provider configuration; every bound must be a finite positive integer and consistent."""
+    """Normalize a key-free provider configuration; every bound must be a finite positive integer and consistent.
+
+    `backend` selects exactly one fixed transport (official by default, deepinfra deliberately). Its base_url, model
+    shape and default key file are backend-specific: a base_url belonging to another backend, a model identifier of
+    the other backend's shape, or a key file named after the other backend's default are contradictions and are
+    refused rather than reconciled, so one backend's credential or endpoint is never reused for the other by accident."""
     if not isinstance(raw, dict):
         raise AdapterError("config_invalid", "Provider configuration must be a JSON object")
     unknown = sorted(set(raw) - set(DEFAULTS))
@@ -362,16 +398,29 @@ def validate_config(raw, home):
         raise AdapterError("config_invalid", "Unknown provider configuration fields: " + ", ".join(unknown))
     if any("key" in name.lower() and name != "api_key_file" for name in raw):
         raise AdapterError("config_invalid", "Credential material does not belong in provider configuration")
-    config = {**DEFAULTS, **raw}
-    if config["base_url"] != EXACT_BASE_URL:
-        raise AdapterError("config_invalid", "base_url must be exactly " + EXACT_BASE_URL)
-    if not isinstance(config["model"], str) or not MODEL_ID.fullmatch(config["model"]):
-        raise AdapterError("config_invalid", "model must be an exact printable model identifier")
+    backend = raw.get("backend", DEFAULT_BACKEND)
+    if not isinstance(backend, str) or backend not in BACKENDS:
+        raise AdapterError("config_invalid", "backend must be one of: " + ", ".join(BACKENDS))
+    transport = BACKENDS[backend]
+    config = {**DEFAULTS, **BACKEND_DEFAULTS[backend], **raw}
+    if "base_url" not in raw:
+        config["base_url"] = transport["base_url"]
+    if config["base_url"] != transport["base_url"]:
+        raise AdapterError("config_invalid", f"base_url must be exactly {transport['base_url']} for the {backend} backend; "
+                           "a transport is selected deliberately with backend, never by URL")
+    model = config["model"]
+    if transport["namespaced_model"]:
+        if not isinstance(model, str) or not NAMESPACED_MODEL_ID.fullmatch(model):
+            raise AdapterError("config_invalid", f"model must be the exact namespaced organisation/name identifier of the {backend} backend")
+    elif not isinstance(model, str) or not MODEL_ID.fullmatch(model):
+        raise AdapterError("config_invalid", f"model must be an exact printable model identifier without a namespace for the {backend} backend")
     key_file = config["api_key_file"]
     if key_file is None:
-        config["api_key_file"] = str(Path(home) / "secrets" / "deepseek-api-key")
+        config["api_key_file"] = str(Path(home) / "secrets" / transport["key_name"])
     elif not isinstance(key_file, str) or not key_file or "\0" in key_file or not os.path.isabs(key_file):
         raise AdapterError("config_invalid", "api_key_file must be null or an absolute path")
+    if any(Path(config["api_key_file"]).name == other["key_name"] for name, other in BACKENDS.items() if name != backend):
+        raise AdapterError("config_invalid", f"api_key_file names another backend's default key file; the {backend} backend keeps its own separate private key")
     if config["reasoning_effort"] not in EFFORTS:
         raise AdapterError("config_invalid", "reasoning_effort must be low, high or max")
     if config["ask_effort"] not in ASK_EFFORTS:
@@ -564,7 +613,7 @@ def read_api_key(path):
     return key
 
 
-def set_key(home, path, rotate=False, reader=None, interactive=None):
+def set_key(home, path, rotate=False, reader=None, interactive=None, label=None):
     """Store a key entered at a user TTY: 0700 directories, 0600 file, exclusive temporary plus rename, never echoed.
 
     The root-to-leaf owned traversal that guards every read also guards this write: a symlinked, foreign-owned or
@@ -593,7 +642,8 @@ def set_key(home, path, rotate=False, reader=None, interactive=None):
         if reader is None:
             import getpass
             reader = lambda prompt: getpass.getpass(prompt)
-        first = reader("DeepSeek API key (input hidden): ")
+        label = label or BACKENDS[DEFAULT_BACKEND]["key_label"]
+        first = reader(label + " API key (input hidden): ")
         second = reader("Repeat the key: ")
         if first != second:
             raise AdapterError("key_mismatch", "The two entries differ; nothing was written")
@@ -603,7 +653,7 @@ def set_key(home, path, rotate=False, reader=None, interactive=None):
         write_below(parent_fd, path.name, key.encode("ascii") + b"\n", 0o600)
     finally:
         os.close(parent_fd)
-    return {"saved": True, "path": str(path), "rotated": rotate}
+    return {"saved": True, "path": str(path), "rotated": rotate, "key_label": label}
 
 
 def redact(data, key):
@@ -799,10 +849,21 @@ def lane_parameters(config, lane, effort=None):
 
 
 def build_body(config, parameters, user_text):
+    """The request for one lane on the configured backend. Both transports receive the same framing, the exact
+    configured model, streaming and the pinned output cap; only the reasoning syntax differs, so the lane semantics
+    (thinking enabled at the pinned effort, or disabled for effort none) are identical on either backend."""
     body = {"model": config["model"], "messages": [{"role": "system", "content": FRAMING}, {"role": "user", "content": user_text}],
-            "stream": True, "max_tokens": parameters["max_tokens"], "thinking": {"type": parameters["thinking"]}}
-    if parameters["reasoning_effort"]:
-        body["reasoning_effort"] = parameters["reasoning_effort"]
+            "stream": True, "max_tokens": parameters["max_tokens"]}
+    if BACKENDS[config["backend"]]["request_syntax"] == "deepseek_thinking":
+        body["thinking"] = {"type": parameters["thinking"]}
+        if parameters["reasoning_effort"]:
+            body["reasoning_effort"] = parameters["reasoning_effort"]
+    else:
+        # DeepInfra's hosted Chat Completions schema: reasoning_effort carries the pinned effort (its published enum
+        # includes max) and "none" disables reasoning entirely; stream usage is requested explicitly instead of relying
+        # on the schema default. No cache-retention, webhook, batch or sampling parameter is ever sent.
+        body["reasoning_effort"] = parameters["reasoning_effort"] if parameters["thinking"] == "enabled" else "none"
+        body["stream_options"] = {"include_usage": True}
     return body
 
 
@@ -920,6 +981,8 @@ class _Stream:
 
     def __init__(self, config, artifacts_fd, key, outcome):
         self.config, self.fd, self.key, self.outcome = config, artifacts_fd, key, outcome
+        # The generic OpenAI-style backend may name its reasoning delta `reasoning`; DeepSeek's own is `reasoning_content`.
+        self.openai_reasoning = BACKENDS[config["backend"]]["request_syntax"] != "deepseek_thinking"
         self.content = os.fdopen(create_below(artifacts_fd, "content"), "wb")
         try:
             self.reasoning = os.fdopen(create_below(artifacts_fd, "reasoning"), "wb")
@@ -1014,6 +1077,8 @@ class _Stream:
                 self.fail(FAILED_AFTER_SEND, "unsupported_tool_calls")
                 return
             text, reasoning = delta.get("content"), delta.get("reasoning_content")
+            if reasoning is None and self.openai_reasoning:
+                reasoning = delta.get("reasoning")  # kept apart from content exactly like reasoning_content; never exposed
             if (text is not None and not isinstance(text, str)) or (reasoning is not None and not isinstance(reasoning, str)):
                 self.fail(FAILED_AFTER_SEND, "malformed_stream")
                 return
@@ -1121,6 +1186,7 @@ def execute_request(config, key, body, artifacts_fd, deadline, should_cancel=Non
 
 
 def _execute(config, key, body, artifacts_fd, deadline, should_cancel, tick, on_response, outcome):
+    transport = BACKENDS[config["backend"]]  # the one fixed host, port and path this configuration may ever reach
     payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "Accept": "text/event-stream",
                "User-Agent": SERVER_NAME + "/" + VERSION, "Content-Length": str(len(payload))}
@@ -1131,7 +1197,7 @@ def _execute(config, key, body, artifacts_fd, deadline, should_cancel, tick, on_
             outcome.update(state=NOT_STARTED, error_code=unsent, remote_outcome="not_sent", possibly_billed=False)
             return
         try:
-            connection = _open_connection(API_HOST, API_PORT, tls_context(), _stage_timeout(config, deadline))
+            connection = _open_connection(transport["host"], transport["port"], tls_context(), _stage_timeout(config, deadline))
             connection.connect()
         except Exception as exc:  # TCP or TLS failure: no application byte was sent
             outcome.update(state=NOT_STARTED, error_code="transport_connect_failed", detail=type(exc).__name__,
@@ -1145,7 +1211,7 @@ def _execute(config, key, body, artifacts_fd, deadline, should_cancel, tick, on_
         try:
             if sock is not None:  # sending is bounded by the same fixed deadline
                 sock.settimeout(_stage_timeout(config, deadline))
-            connection.request("POST", API_PATH, body=payload, headers=headers)
+            connection.request("POST", transport["path"], body=payload, headers=headers)
         except Exception as exc:
             outcome.update(state=UNKNOWN, error_code="transport_send_failed", detail=type(exc).__name__)
             return
@@ -1271,6 +1337,7 @@ def _consume(response, connection, config, key, artifacts_fd, deadline, should_c
 def run_probe(adapter, prompt="Reply with exactly the single word OK and nothing else.", expected="OK"):
     """One tiny paid synthetic request with the pinned deep settings; writes a credential-free private receipt."""
     config = adapter.config
+    transport = BACKENDS[config["backend"]]
     parameters = lane_parameters(config, "deep")
     user_text = assemble(prompt, None, [])
     body = build_body(config, parameters, user_text)
@@ -1294,13 +1361,18 @@ def run_probe(adapter, prompt="Reply with exactly the single word OK and nothing
             os.close(artifacts_fd)
         del key
         receipt = {"kind": "deepseek_probe", "adapter_version": VERSION, "recorded_at": now(), "room_id": adapter.room_id,
-                   "requested": {"model": config["model"], **parameters}, "input_bytes": input_bytes,
+                   "backend": config["backend"], "endpoint": {"host": transport["host"], "path": transport["path"], "base_url": config["base_url"]},
+                   "requested": {"backend": config["backend"], "model": config["model"], "request_syntax": transport["request_syntax"], **parameters},
+                   "input_bytes": input_bytes,
                    "observed_model": outcome["observed_model"], "http_status": outcome["http_status"], "state": outcome["state"],
                    "finish_reason": outcome["finish_reason"], "usage": outcome["usage"], "usage_source": outcome["usage_source"],
                    "elapsed_seconds": elapsed, "content_bytes": outcome["content_bytes"], "reasoning_bytes": outcome["reasoning_bytes"],
                    "content_sha256": outcome["content_sha256"], "expected_answer_matched": matched, "error_code": outcome["error_code"],
                    "error_type": outcome["error_type"], "availability": outcome["availability"], "artifacts": name,
-                   "meaning": "verifies endpoint, credential and accepted parameters for this tiny request only; not capacity, throughput or quality"}
+                   "meaning": "Records one probe attempt: state, http_status, observed_model, finish_reason and expected_answer_matched "
+                              "describe its observed outcome. An unsuccessful or unknown outcome does not establish credential or "
+                              "parameter acceptance. This tiny request does not measure how the hosted model applies the requested "
+                              "effort, nor capacity, throughput, retention or quality"}
         write_json_below(probes_fd, name + ".json", receipt)
     finally:
         os.close(probes_fd)
@@ -1308,7 +1380,7 @@ def run_probe(adapter, prompt="Reply with exactly the single word OK and nothing
 
 
 PROBE_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}\.json")
-PROBE_FIELDS = ("kind", "adapter_version", "recorded_at", "room_id", "requested", "input_bytes", "observed_model", "http_status", "state",
+PROBE_FIELDS = ("kind", "adapter_version", "recorded_at", "room_id", "backend", "endpoint", "requested", "input_bytes", "observed_model", "http_status", "state",
                 "finish_reason", "usage", "usage_source", "elapsed_seconds", "content_bytes", "reasoning_bytes", "content_sha256",
                 "expected_answer_matched", "error_code", "error_type", "availability", "meaning")
 
@@ -1634,6 +1706,7 @@ class Adapter:
             elapsed = None
         value = {"job_id": row["id"], "request_id": row["request_id"], "room_id": row["room_id"], "lane": row["lane"], "state": state,
                  "terminal": table["terminal"], "complete": state == COMPLETED, "requested_model": row["requested_model"],
+                 "backend": self.config["backend"],  # this room's pinned transport; the ledger row itself names only the exact model
                  "observed_model": row["observed_model"], "thinking": row["thinking"], "reasoning_effort": row["reasoning_effort"],
                  "max_tokens": row["max_tokens"], "created_at": row["created_at"], "submitting_at": row["submitting_at"],
                  "streaming_at": row["streaming_at"], "finished_at": row["finished_at"], "deadline_at": row["deadline_at"],
@@ -1704,7 +1777,8 @@ class Adapter:
         # the metadata record never embeds it, so JSON escaping of NUL, newline, quote or backslash characters cannot
         # inflate what is retained past the reservation or past what the worker may read back.
         request_record = {"job_id": job_id, "room_id": self.room_id, "request_id": request_id, "lane": lane, "parameters": parameters,
-                          "model": self.config["model"], "payload_sha256": digest, "input_bytes": input_bytes, "worktree": worktree,
+                          "model": self.config["model"], "backend": self.config["backend"], "base_url": self.config["base_url"],
+                          "payload_sha256": digest, "input_bytes": input_bytes, "worktree": worktree,
                           "files": payload["files"], "user_text_bytes": len(text_bytes), "user_text_sha256": sha(text_bytes),
                           "diagnosis": diagnosis, "created_at": now()}
         record_bytes = (json.dumps(request_record, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
@@ -1917,7 +1991,11 @@ class Adapter:
         config = self.config
         storage = self.ledger.storage()
         stops = self.ledger.stopping_jobs(self.room_id)
+        transport = BACKENDS[config["backend"]]
         return {"provider": "deepseek", "adapter_version": VERSION, "room_id": self.room_id, "model": config["model"], "base_url": config["base_url"],
+                "backend": config["backend"], "backend_label": transport["label"], "request_syntax": transport["request_syntax"],
+                "endpoint": {"host": transport["host"], "port": transport["port"], "path": transport["path"]},
+                "backend_meaning": "provider names the delegate tool family; backend names the one fixed transport this configuration pins",
                 "deep_lane": lane_parameters(config, "deep"), "ask_lane": {"effort": config["ask_effort"], **lane_parameters(config, "ask")},
                 "context_tokens": config["context_tokens"], "context_basis": config["context_basis"], "input_limit": input_estimate(config),
                 "bounds": {**{name: config[name] for name in INTEGER_FIELDS}, "worker_log_bytes": worker_log_limit(config)},
@@ -2032,6 +2110,7 @@ class Adapter:
             content_path, export_reason = self._publish(job_fd, job_id, outcome["content_sha256"])
         finished = now()
         meta = {"job_id": job_id, "execution_id": execution_id, "worker_pid": os.getpid(), "finished_at": finished, "content_path": content_path,
+                "backend": self.config["backend"], "requested_model": self.config["model"],
                 "export_reason": export_reason, **{key: outcome[key] for key in ("state", "error_code", "error_type", "detail", "http_status", "observed_model",
                 "finish_reason", "usage", "usage_source", "content_bytes", "reasoning_bytes", "wire_bytes", "content_sha256", "remote_outcome",
                 "possibly_billed", "availability")}}
@@ -2211,7 +2290,8 @@ def resolve_job(home, room_id, job_id, note, interactive=None):
 
 S = {"type": "string"}
 TOOLS = {
-    "deepseek_submit": ("Submit one self-contained deep task to the exact configured DeepSeek model with the pinned deep settings "
+    "deepseek_submit": ("Submit one self-contained deep task to the exact configured model on this room's pinned backend (the official "
+                        "DeepSeek API or DeepInfra, named by deepseek_health) with the pinned deep settings "
                         "(thinking enabled, configured reasoning_effort, pinned max_tokens; none can be lowered here). Returns a durable "
                         "job_id; identical request_id/payload reuses the job and an identical payload under a new request_id is refused, so "
                         "never resubmit to poll. context_path names explicit files beneath the verified worktree only. Text only: nothing "
@@ -2237,11 +2317,12 @@ TOOLS = {
     "deepseek_cancel": ("Ask the owning worker to close its connection. The provider may still finish and bill the request; the job records "
                         "abandoned_cancelled with remote_outcome unknown, never a remote cancellation.",
                        {"type": "object", "additionalProperties": False, "required": ["job_id"], "properties": {"job_id": S}}),
-    "deepseek_health": ("Read configuration, integrity, key-file metadata (never contents), export directory, storage, admission counts, room "
+    "deepseek_health": ("Read the pinned backend and endpoint, configuration, integrity, key-file metadata (never contents), export directory, storage, admission counts, room "
                         "stop state with the user-run resolve syntax, and the latest probe facts. No network, no model call.",
                        {"type": "object", "additionalProperties": False, "properties": {}}),
 }
-INSTRUCTIONS = ("DeepSeek text delegate for Fable. Submit self-contained tasks with a stable request_id, keep the returned job_id, wait with "
+INSTRUCTIONS = ("DeepSeek-model text delegate for Fable on this room's one pinned backend (official DeepSeek API or DeepInfra; deepseek_health names "
+                "it). Submit self-contained tasks with a stable request_id, keep the returned job_id, wait with "
                 "deepseek_status in bounded calls, read completed answers with deepseek_result or the exported content file after validating "
                 "its digest. Deep effort and output budgets are pinned; nothing returned is executed; unknown delivery stops this room's "
                 "lane until the user resolves it at their terminal.")
@@ -2372,7 +2453,9 @@ def main(argv=None):
             command.add_argument("--lease-fd", type=int, required=True)
     key = commands.add_parser("set-key")
     key.add_argument("--home", required=True)
-    key.add_argument("--config")
+    target = key.add_mutually_exclusive_group()
+    target.add_argument("--config", help="absolute path of the key-free provider configuration whose backend and api_key_file the key is for")
+    target.add_argument("--backend", choices=sorted(BACKENDS), help="store the key at this backend's default private file under --home (default: official)")
     key.add_argument("--rotate", action="store_true")
     resolve = commands.add_parser("resolve")
     for name in ("home", "room", "job", "note-file"):
@@ -2383,8 +2466,13 @@ def main(argv=None):
             home = Path(args.home)
             if not home.is_absolute():
                 raise AdapterError("home_invalid", "--home must be absolute")
-            path = load_config(args.config, home)[0]["api_key_file"] if args.config else str(home / "secrets" / "deepseek-api-key")
-            result = set_key(home, path, rotate=args.rotate)
+            if args.config:
+                config = load_config(args.config, home)[0]
+                path, backend = config["api_key_file"], config["backend"]
+            else:
+                backend = args.backend or DEFAULT_BACKEND
+                path = str(home / "secrets" / BACKENDS[backend]["key_name"])
+            result = {"backend": backend, **set_key(home, path, rotate=args.rotate, label=BACKENDS[backend]["key_label"])}
         elif args.command == "resolve":
             note_path = Path(args.note_file)
             if not note_path.is_absolute():

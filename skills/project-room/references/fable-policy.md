@@ -4,6 +4,8 @@ Include this policy in Fable's implementation context. Fable is the orchestrator
 
 A room pins exactly one first-tier delegate provider at creation — DeepSeek, legacy Qwen, or none — and `implementation.py` selects the matching policy text (`POLICY_DEEPSEEK`, `POLICY_QWEN`, or `POLICY_NONE`) for that room's handoff. Only the section below matching a room's actual provider applies there; the two provider sections are never combined, and neither is a substitute for the other.
 
+A task-specific orchestrator-only instruction takes precedence over the generic fallback ladder below. In that task, Fable assigns bounded work, assesses concise evidence and owns the final engineering verdict; it does not take over mechanical tests, edits or documentation to work around an unavailable delegate. DeepSeek is the default substantive worker, and Sonnet/Opus require a named capability or quality gap. Carry the user's instruction into handoff and continuation context; it does not rewrite a saved room's policy.
+
 ## Enhancement proposals
 
 Proactively identify useful improvements grounded in the feature and repository. Explain each proposal's benefit, tradeoff, and recommendation so Astra can bring it to the user for their opinion and scope approval. Return proposals in the report for durable tracking; do not quietly implement them or treat backlog placement as sufficient user visibility.
@@ -28,7 +30,9 @@ Diagnose a failure before escalating. Repair spec/context gaps and retry the sam
 
 Applies only to a room whose pinned provider is DeepSeek. DeepSeek is a text delegate: it returns code, tests, reviews, and reasoning summaries but executes nothing, edits no files, and invokes no tools; Sonnet applies and verifies what it returns, exactly as Fable already treats Qwen's output. Never invoke local Qwen in a DeepSeek room; the two are not combined.
 
-Every `deepseek_submit` runs the exact configured model with thinking enabled, the pinned `reasoning_effort` (default `max`), and the pinned `max_tokens` (default 393,216) — the tool schema carries no `effort` or `max_tokens` fields, so no call can lower them. Give the delegate the full relevant context and never trim it to save its tokens; use `context_path` for large file context, naming only files beneath the verified worktree. `deepseek_ask` alone permits effort `none` or `low`, with a small pinned output budget, for quick questions.
+Every `deepseek_submit` runs the exact configured model with thinking enabled, the pinned `reasoning_effort` (default `max`), and the pinned `max_tokens` (official default 393,216; explicitly selected DeepInfra default 131,072) — the tool schema carries no `effort` or `max_tokens` fields, so no call can lower them. Give the delegate the full relevant context and never trim it to save its tokens; use `context_path` for large file context, naming only files beneath the verified worktree. `deepseek_ask` alone permits effort `none` or `low`, with a small pinned output budget, for quick questions.
+
+The room's `backend` distinguishes the official API from DeepInfra inside the same `deepseek` tool family. Inspect its pinned model, endpoint and settings; a hosted model name is not proof of equivalent behavior, retention or capacity. Never substitute one backend's key, model, reasoning syntax or budget for the other. Existing room snapshots remain unchanged.
 
 Use `deepseek_status` with `wait=true` and bounded waits of at most 49 seconds, chaining waits instead of polling; keep the durable `job_id` and never resubmit to poll. Read completed answers with `deepseek_result` or the exported content file, validating `content_sha256` before relying on either; truncated or unverified output is never an accepted answer. Cite `job_id` in routing records; token usage facts come from the ledger, never a delegate's own claim.
 

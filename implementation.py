@@ -367,7 +367,12 @@ def _pinned_delegate_settings(inventory, verified):
         return None, "config_unparsable:" + Path(chosen).name
     if not isinstance(snapshot, dict) or any(key not in snapshot for key in DELEGATE_SETTING_KEYS):
         return None, "config_incomplete:" + Path(chosen).name
-    return {key: snapshot[key] for key in DELEGATE_SETTING_KEYS}, None
+    settings = {key: snapshot[key] for key in DELEGATE_SETTING_KEYS}
+    # The packet names the pinned transport explicitly so no delegate settings imply an official DeepSeek request. Snapshots
+    # written before transport selection existed carry no backend field and could only ever have been official.
+    settings["backend"] = snapshot.get("backend", "official")
+    settings["base_url"] = snapshot.get("base_url")
+    return settings, None
 
 
 def resolve_provider(config_path, config):

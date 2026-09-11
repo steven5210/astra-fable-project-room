@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import stat
@@ -30,6 +31,11 @@ FAULT = os.environ.get("DEEPSEEK_FIXTURE_FAULT")
 class Fake(http.client.HTTPConnection):
     def __init__(self, host, port=None, timeout=None, context=None, **kw):
         super().__init__("127.0.0.1", int(PORT), timeout=timeout)
+        self.fixture_target = "%s:%s" % (host, port)  # the exact host and port the adapter asked for, echoed to the fake server
+    def request(self, method, url, body=None, headers=None, **kw):
+        headers = dict(headers or {})
+        headers["X-Fixture-Target"] = self.fixture_target
+        return super().request(method, url, body=body, headers=headers, **kw)
     def connect(self):
         if FAULT == "log_spam":  # a chatty worker: about 1.8 MB through whatever sys.stderr is at that moment
             sys.stderr.write("spam " * 360000 + "\\n")
@@ -180,8 +186,9 @@ class FakeDeepSeek:
             return
         yield b": keep-alive\n\n"
         yield b"\n"
-        yield chunk({"role": "assistant", "content": "", "reasoning_content": ""}, model=model)
-        yield chunk({"reasoning_content": "PRIVATE_REASONING_MUST_NOT_LEAK "}, model=model)
+        reasoning_key = scenario.get("reasoning_key", "reasoning_content")  # DeepInfra's OpenAI-style stream may say `reasoning`
+        yield chunk({"role": "assistant", "content": "", reasoning_key: ""}, model=model)
+        yield chunk({reasoning_key: scenario.get("reasoning_value", "PRIVATE_REASONING_MUST_NOT_LEAK ")}, model=model)
         if scenario.get("error_in_stream"):
             yield b"data: " + json.dumps({"error": {"message": "PROVIDER_PROSE_MUST_NOT_LEAK", "type": scenario.get("error_type", "server_error")}}).encode() + b"\n\n"
             return
@@ -208,7 +215,8 @@ class FakeDeepSeek:
         if scenario.get("content_after_finish"):
             yield chunk({"content": "late"}, model=model)
         if placement == "separate":
-            value = {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 1757000000, "model": model, "choices": [], "usage": USAGE}
+            value = {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 1757000000, "model": model, "choices": [],
+                     "usage": scenario.get("usage_value", USAGE)}
             yield b"data: " + json.dumps(value).encode() + b"\n\n"
         if not scenario.get("omit_done"):
             yield b"data: [DONE]\n\n"
@@ -218,6 +226,10 @@ def fake_connection(port):
     class Fake(http.client.HTTPConnection):
         def __init__(self, host, port_=None, timeout=None, context=None, **kwargs):
             super().__init__("127.0.0.1", port, timeout=timeout)
+            self.fixture_target = f"{host}:{port_}"  # the exact host and port the adapter asked for, echoed to the fake server
+
+        def request(self, method, url, body=None, headers=None, **kwargs):
+            return super().request(method, url, body=body, headers={**(headers or {}), "X-Fixture-Target": self.fixture_target}, **kwargs)
     return Fake
 
 
@@ -252,9 +264,14 @@ class AdapterFixture(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"PROJECT_ROOM_WORKTREE": str(self.worktree)})
         self.env.start()
         self.addCleanup(self.env.stop)
-        # Every in-process request and every spawned worker goes to the loopback fake, never to the network.
-        self.connection = mock.patch.object(adapter, "_open_connection",
-                                            lambda host, port, context, timeout: fake_connection(self.fake.port)(host, port, timeout=timeout))
+        # Every in-process request and every spawned worker goes to the loopback fake, never to the network. The exact
+        # host and port the adapter asked for are recorded here in-process and echoed in a header by workers as well.
+        self.connections = []
+
+        def open_fake(host, port, context, timeout):
+            self.connections.append((host, port))
+            return fake_connection(self.fake.port)(host, port, timeout=timeout)
+        self.connection = mock.patch.object(adapter, "_open_connection", open_fake)
         self.connection.start()
         self.addCleanup(self.connection.stop)
         self.command = mock.patch.object(adapter, "worker_command", lambda: [sys.executable, str(self.boot), str(self.fake.port), ADAPTER])
@@ -298,6 +315,7 @@ class TransportContractTests(AdapterFixture):
         self.assertEqual(terminal["state"], "completed", terminal)
         request = self.fake.requests[0]
         self.assertEqual(request["path"], "/chat/completions")
+        self.assertEqual(request["headers"]["X-Fixture-Target"], "api.deepseek.com:443", "the official transport keeps its fixed host")
         self.assertEqual(request["headers"]["Authorization"], "Bearer " + SYNTHETIC_KEY)
         body = request["body"]
         self.assertEqual(body["model"], adapter.DEFAULT_MODEL)
