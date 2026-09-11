@@ -713,7 +713,9 @@ class RecoveryTests(ProjectFixture):
         terminal = self.interrupt("interrupt-timeout")
         self.backdate()
         prepared = self.recover(terminal["id"], self.audit(terminal["id"]))
-        queued = self.register_successor(prepared, "implement-2", worker_pid=1)  # a real registered worker that is not our parent
+        # A live registered worker that can never be this process's parent: our own pid. (PID 1 is the parent under an init
+        # process such as the CI container's docker-init, which would satisfy the parent check this test must violate.)
+        queued = self.register_successor(prepared, "implement-2", worker_pid=os.getpid())
         claimed = {"recovery_id": prepared["recovery_id"], "successor_job_id": queued["id"], "registry": str(self.service.home),
                    "recheck": lambda: {"eligible": True, "reasons": []}}
         with self.held_lease(queued["id"]), mock.patch.object(implementation, "_run_child", side_effect=RuntimeError("launch reached")) as launch:
