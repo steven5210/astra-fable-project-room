@@ -120,7 +120,9 @@ Codex task discovers updated MCP tools after plugin installation.
    exact `claude-fable-5-1` and `max`, then bind it as `engineer`. Prepare a separate
    native Codex chat worker at the requested Astra model and `max`, and bind it as
    `reviewer`. `ao_room_bind` checks AO's actual workspace, project, harness and
-   conversation. Bindings and the engineer workspace cannot be replaced.
+   conversation. Bindings and the engineer workspace cannot be replaced through
+   ordinary binding. The narrowly audited unused-reviewer exception below is the
+   only reviewer replacement operation.
 4. Send `ao_room_send` with engineer purpose `spec_review` and a stable request ID.
    Fable's native final JSON must contain `interpretation`, `findings`, `decision`
    (`accept` or `changes_required`), `spec_revision` and `spec_sha256`. Findings
@@ -158,6 +160,43 @@ snapshot hashes, then executes the retained room-specific DeepSeek server.
 Room paths, settings, export directories and model policy never enter candidate
 files. Unrelated MCP entries are preserved; a conflicting `deepseek` entry blocks
 preparation. Do not overwrite it, silently switch providers or relax the pins.
+
+## Recovery of a reviewer that has never been used
+
+A Codex Chat session can receive a thread UUID before its first message creates
+a resumable rollout. If an unused reviewer is stopped, stock AO may then fail
+resume with “no rollout found for thread id.” Diagnose the actual lifecycle error;
+do not retry a model request, edit a room binding or substitute a new room.
+
+`ao_room_reviewer_recovery_audit(room_id)` checks the current exact specification,
+passed candidate/gate evidence and normal engineering report, plus the original
+reviewer's identity, separate Git workspace and positively empty native root
+history. It requires a stopped Codex reviewer at MAX, explicit zero sequence and
+fork sequence, empty messages/turns/activities, no usage contradiction, and
+complete native history. Each reviewer's final eligibility observation uses the
+raw AO response with explicit array fields, without normalizing missing fields;
+the audit and receipt retain that raw evidence. Any prior reviewer request of any purpose or state,
+acceptance, uncertainty, missing evidence or earlier recovery refuses. The audit
+saves private content-addressed evidence; it makes only AO GETs and no model call.
+
+After the user's actual authorization for this recovery, prepare a separate ready
+Codex reviewer in the same repository with the same model/MAX and no native work.
+Call `ao_room_reviewer_recover` with the audit's exact `audit_sha256`, the
+`replacement_session_id`, a concrete `diagnosis`, the actual `authorization` and a
+stable `request_id`. It rechecks the room and both native identities under the
+global lock, then atomically commits the new binding with its audit reference.
+The original binding and observations stay in an immutable receipt, and the old
+reviewer remains reserved. No specification, handoff, provider pin, request,
+verification or review counter is reset. At most one recovery is allowed per room.
+An identical call reads its verified saved result even after the new reviewer has
+been used; changed input, damaged evidence or an uncommitted receipt refuses.
+
+Proceed with the original room's normal first acceptance request. This exception
+never replaces a failed, interrupted, uncertain, exhausted or previously used
+reviewer. Recovery makes no lifecycle POST, creates no worker and sends no model
+message. The checks do not lock native AO sessions against outside interaction;
+keep both reviewers idle throughout the operation. Create the replacement close
+to its first authorized request so it is not stopped while still unmaterialized.
 
 ## Native delegation routing
 
