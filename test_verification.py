@@ -32,7 +32,7 @@ FAKE = (RECOVERY_FAKE
 assert FAKE != RECOVERY_FAKE and "notes.txt" in FAKE
 
 GATE = r'''
-import os, subprocess, sys, time
+import os, subprocess, sys, tempfile, time
 from pathlib import Path
 flag = Path(sys.argv[1])
 with open(str(flag) + ".runs", "a") as runs:
@@ -45,7 +45,7 @@ if mode == "survivor":
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd="/", start_new_session=True,
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("SLEEPER=%d" % sleeper.pid, flush=True)
-scratch = Path(os.environ.get("TMPDIR", ".")) / "gate-scratch.txt"
+scratch = Path(tempfile.gettempdir()) / "gate-scratch.txt"  # the private TMPDIR when the lane sets one; never the candidate when the host leaves TMPDIR unset
 scratch.write_text("scratch")
 print("TMPDIR=" + os.environ.get("TMPDIR", ""), flush=True)
 print("MARKER=" + os.environ.get("PROJECT_ROOM_VERIFICATION_ID", ""), flush=True)
@@ -700,6 +700,48 @@ class VerificationDurabilityTests(VerificationFixture):
         self.assertEqual(len(self.impl_calls()), 1)
 
 
+class VerificationMarkerScanTests(unittest.TestCase):
+    """The environment-marker scan stays fail-closed: an unreadable same-user process refuses the observation."""
+
+    def test_incomplete_marker_scan_refuses_the_gate_observation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="verification-marker-") as temp:
+            worktree, root = Path(temp) / "worktree", Path(temp) / "verifications"
+            worktree.mkdir(); root.mkdir()
+            inspector = fixed_inspector(boot=int(time.time()) - 5)
+            for incomplete in (1, 0):
+                with mock.patch.object(verification, "marker_processes", return_value={"method": "fixture", "matched": [], "incomplete": incomplete, "skipped": 0}):
+                    observation = verification.observe_gate(room.now(), set(), "session-fixture", worktree, root, inspector=inspector, markers=["a" * 32])
+                self.assertEqual("inspection_incomplete" in observation["reasons"], bool(incomplete), observation)
+                self.assertEqual(observation["incomplete_count"], incomplete)
+                self.assertEqual(observation["gate_processes"], [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.geteuid() != 0, "Linux /proc environ ownership as a non-root user")
+    def test_same_user_zombie_is_incomplete_until_reaped(self):
+        # A zombie keeps a same-user /proc/<pid> directory, but its environ is root-owned, so the bounded read is denied:
+        # the scan counts it as incomplete rather than proving it carries no marker. Reaping restores a complete scan,
+        # which is why the CI container runs under an init process.
+        import signal
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if Path("/proc/%d/stat" % child.pid).read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("the killed child never became a zombie")
+            before = verification.marker_processes(["a" * 32])
+            self.assertEqual(before["method"], "/proc environ")
+            self.assertGreaterEqual(before["incomplete"], 1, before)
+        finally:
+            child.wait()
+        after = verification.marker_processes(["a" * 32])
+        self.assertLess(after["incomplete"], before["incomplete"], (before, after))
+
+
 class VerificationBoundsTests(unittest.TestCase):
     """The verifier's own read bounds hold for every visited byte of the copy and for every captured listing."""
 
@@ -742,7 +784,10 @@ class VerificationBoundsTests(unittest.TestCase):
                     mock.patch.object(verification, "_check_ignore", return_value={"cache-one.tmp", "cache-two.tmp"}):
                 observed = verification._verify_copy(root, pinned, root)
             self.assertEqual(observed["reason"], "copy_bounds_exceeded", observed)
-            self.assertEqual(observed["detail"], ["cache-two.tmp"])
+            # Directory enumeration order is unspecified: the first 12-byte file fits the remaining aggregate budget (16 bytes
+            # shared with the 1-byte tracked file) and whichever file is visited second trips it, so exactly one is reported.
+            self.assertEqual(len(observed["detail"]), 1, observed)
+            self.assertIn(observed["detail"][0], ("cache-one.tmp", "cache-two.tmp"))
             (root / "cache-two.tmp").unlink()
             (root / "cache-one.tmp").write_bytes(b"x" * 5)
             with mock.patch.object(verification, "COPY_FILE_LIMIT", 16), mock.patch.object(verification, "COPY_TOTAL_LIMIT", 16), \

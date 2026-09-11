@@ -1,122 +1,186 @@
 # Project Room
 
-Project Room keeps specifications, verification evidence and acceptance in persistent local rooms. It supports an opt-in Agent Orchestrator (AO) backend and the existing Astra/Fable controller inside Codex.
+Project Room turns a feature request into a versioned specification, an engineering handoff, executable verification evidence and an independent acceptance record, all kept in persistent private rooms outside the repository. It runs on two layers:
 
-The AO adapter supports the normal designated roles: Fable reviews the exact spec, owns engineering and uses the room's pinned delegates; Astra handles product planning and independent acceptance. It adds durable sends, private delegate preparation, worktree-scoped native routing (pinned `pr-sonnet`/`pr-opus` agents behind a deny-only guard), per-turn usage receipts and candidate-bound acceptance checks to stock AO. Task-specific Astra implementation exceptions remain explicit. See [AO readiness and workflow](skills/project-room/references/ao.md) for setup and validation boundaries. It does not require Paperclip or an AO fork. Native Claude compaction and interrupted-run recovery remain separate validation items; unfinished legacy rooms keep their original backend.
+- **Stock [Agent Orchestrator](https://github.com/Untrivial-ai/agent-orchestrator) (AO)** is the recommended native session and worktree layer. AO owns the Claude Code and Codex chat workers, their isolated Git worktrees, conversations, project hooks and project rules. No AO fork and no Paperclip are required.
+- **Project Room** is the specification, handoff, evidence and acceptance layer. Its `ao_room_*` tools pin immutable spec revisions and gates, send each request once with a durable identity, prepare private delegates before the engineer launches, archive per-turn usage receipts, run the agreed gates against the exact candidate, and accept only an independent reviewer verdict that names the same spec, candidate and evidence hashes.
 
-The legacy workflow below remains available: Astra shapes the requirements, Fable challenges the specification and implements the agreed feature, and Astra independently checks the product outcome. Existing rooms retain their exact provider pins and rules.
+The earlier Astra/Fable controller inside Codex (the `room_*` tools and `project_room.py` CLI) remains available as the legacy backend. Existing legacy rooms keep their recorded backend, exact revisions, session identity and pinned delegate provider; nothing migrates automatically. See [Legacy controller](#legacy-controller) below.
 
-After installing and setting up the plugin, use it in ordinary language:
+After installing and configuring the plugin, ask for the work in ordinary language:
 
 > Use Project Room for this feature: let users save and name their search filters.
 
-The bundled skill supplies the roles and handoff workflow. You do not need to paste an orchestration prompt each time. A request to build a feature carries through implementation; a planning-only request stops at the agreed specification. Existing authorization carries forward.
-
-Version 0.3.0 adds an explicit DeepSeek delegate provider for Fable's implementation sessions (configured key-free, entered separately at your own terminal) alongside the existing legacy Qwen provider, plus a worker-lease fix so a slow-to-start job is never mistaken for a vanished one. Existing rooms and their pinned provider are unaffected.
+The bundled [skill](skills/project-room/SKILL.md) supplies the roles and workflow; you do not paste an orchestration prompt each time. A request to build a feature carries through implementation; a planning-only request stops at the agreed specification. Existing authorization carries forward, and merge, publication and deployment stay outside the room unless you asked for them.
 
 ## What each participant owns
 
 | Participant | Responsibility |
 | --- | --- |
-| You | Product intent, priorities, and meaningful tradeoffs. |
-| Astra | Brainstorming, requirements, acceptance criteria, decisions, and independent product outcome review. |
-| Fable | Technical interpretation, engineering design, implementation planning, delegate orchestration, and engineering verdicts. |
-| DeepSeek / Qwen (legacy) / Sonnet / Opus | Bounded delegated work, with output checked by Fable. A room pins exactly one first-tier provider (DeepSeek or legacy Qwen) at creation, plus the Claude subagent tiers; a prepared AO room exposes them only as the pinned `pr-sonnet` (`claude-sonnet-5`) and `pr-opus` (`claude-opus-5`) native agents. Availability depends on your setup. |
+| You | Product intent, priorities, meaningful tradeoffs, and the authorization that each handoff binds. |
+| Astra (Codex, native reviewer) | Requirements, the exact specification revision, dispositions of findings, enhancement proposals, and independent acceptance of the exact candidate. |
+| Fable (Claude Code, `claude-fable-5-1` at `max`, the engineering director) | Engineering interpretation and agreement on the exact spec, implementation, delegation under the pinned policy, engineering review, and the final engineering verdict. |
+| DeepSeek (configured first-tier delegate) | Self-contained implementation, test and review text for Fable. The adapter is text-only: it returns code, tests, reviews and reasoning summaries, but it cannot browse, edit files or execute tools, and upstream image or video capability does not establish adapter support. |
+| `pr-sonnet` and `pr-opus` (pinned native agents) | `pr-sonnet` pins `claude-sonnet-5` for mechanical implementation and named test runs; `pr-opus` pins `claude-opus-5` for bounded judgment, review and the pinned browser skill when the AO browser capability is present. Fable verifies everything they return. |
+| Qwen (legacy) | The earlier optional delegate provider for legacy rooms only; see [Qwen delegation (legacy)](#qwen-delegation-legacy). |
 
-Astra and Fable review the same immutable spec revision and digest. Findings receive explicit dispositions and reasons. Both agents actively suggest useful enhancements; Astra brings you the benefit, tradeoff, and a project GitHub issue link for your opinion and approval. Proposals remain tracked in the room, and filing is reported as pending if no tracker is available. An enhancement enters implementation only after you approve its scope and the revised spec is agreed. Consensus permits handoff when implementation is within your request. Fable then works against executable gates, and Astra records acceptance only after inspecting the delivered behavior and evidence. See [the workflow](docs/workflow.md).
+Both agents review the same immutable spec revision and SHA-256. Findings receive explicit dispositions; a finding prefixed `BLOCKER:` prevents agreement. Both agents may propose enhancements, which Astra brings to you with the benefit, tradeoff and an issue link for your opinion and scope approval; an enhancement enters implementation only after you approve its scope and the revised spec is agreed. See [the workflow](docs/workflow.md) and [Fable's delegation policy](skills/project-room/references/fable-policy.md).
 
-## Install and configure
+## Prerequisites
 
-Requirements:
+- Python 3.10 or newer on macOS or Linux. The runtime uses POSIX locks, process groups and `/proc` or `ps` inspection; native Windows is not supported. CI exercises Python 3.11 and 3.12.
+- Git, with the project you want to work on cloned locally and clean at the commit that will become the handoff baseline.
+- Claude Code with its normal saved subscription login and access to `claude-fable-5-1`. A signed-in Claude Desktop tab does not necessarily authenticate the standalone CLI.
+- Codex with local plugin and MCP support for Astra and for the legacy controller.
+- For AO work: a running, trusted local AO daemon at the official latest stable release, reachable on a loopback address, with the same native authentication AO already uses for its workers. Installing the daemon, adding a project and creating chat workers follow [AO's own documentation](https://github.com/Untrivial-ai/agent-orchestrator). The adapter was initially exercised against AO 0.12.12; that is a validation fact, not a pin.
+- Optional: a DeepSeek account key, entered only at your own terminal, for the first-tier delegate. Docker is only needed to run the Linux CI container locally.
 
-- Python 3.10 or newer on macOS or Linux. Runtime uses POSIX locks and process groups; native Windows is not supported.
-- Codex with local plugin/MCP support for the integrated experience, or a terminal for the controller CLI.
-- Claude Code with access to the configured primary model. The default is Fable 5.1 (`claude-fable-5-1`) at maximum effort.
-- Claude Code's normal saved subscription authentication. A signed-in Claude Desktop Code tab does not necessarily authenticate the standalone CLI.
+## Install and authenticate
 
-Clone or obtain this repository, then ask Codex to install it as a local plugin using the `plugin-creator` workflow. Keep the folder name `astra-fable-project-room`. That workflow can register a personal marketplace entry and install the bundle. Local marketplace distribution is separate from publication in a public plugin directory. The source repository is [steven5210/astra-fable-project-room](https://github.com/steven5210/astra-fable-project-room).
+Clone or obtain this repository and ask Codex to install it as a local plugin through its `plugin-creator` workflow, keeping the folder name `astra-fable-project-room`. That workflow can register a personal marketplace entry and install the bundle; local marketplace distribution is separate from publication in a public plugin directory. The source repository is [steven5210/astra-fable-project-room](https://github.com/steven5210/astra-fable-project-room). The plugin manifest is `.codex-plugin/plugin.json` (currently version 0.3.0) and the bundled MCP server is started from `.mcp.json` as `python3 ./project_room_mcp.py` with `cwd: "."`; it needs no hosted room server or listening port.
 
-From the plugin checkout, run setup once:
+From the plugin checkout, run setup once and check the result:
 
 ```sh
 python3 project_room.py setup
 python3 project_room.py doctor
 ```
 
-If Claude is not found, pass its actual executable path:
+If Claude is not found, pass its executable path:
 
 ```sh
 python3 project_room.py setup --claude-bin /absolute/path/to/claude
 ```
 
-To use the DeepSeek delegate provider, pass a private key-free provider configuration, select it explicitly, and store the key at your own terminal. The one-request live probe is an explicit paid CLI action, not an interactive step: Astra runs it after independent acceptance and installation, and you may run it yourself too.
+`setup` accepts `--claude-bin`, `--qwen-config`, `--deepseek-config` and `--delegate-provider deepseek|qwen|none`. Authenticate through Claude Code's standard login flow when needed, then rerun `doctor`. The controller uses the CLI's saved login and preserves its original `CLAUDE_CONFIG_DIR` override; it never asks for an API key, extracts credentials or silently switches providers. Model calls still count toward the account's applicable usage. After installing or updating, open a new Codex task so the current skill and tool definitions load; an existing task keeps its older tool inventory and can continue through the [CLI fallback](#cli-fallback).
+
+## Configure the private AO backend
+
+All AO configuration lives in the private data directory, never in the plugin or the repository.
+
+1. **Endpoint.** Add the actual Git project in AO. Then either pass `ao_url` to `ao_room_open` or save it in `PROJECT_ROOM_HOME/ao/config.json`:
+
+   ```json
+   {"ao_url": "http://127.0.0.1:PORT", "default_backend": "ao"}
+   ```
+
+   The URL must be an explicit loopback IP and port; remote hosts, proxies, credentials in URLs and redirects are refused. The `PROJECT_ROOM_AO_URL` environment variable takes precedence over the file. `default_backend: "ao"` tells the skill to use AO for new Project Room work; the legacy tools stay callable and never migrate a room.
+
+2. **Delegate provider.** Record the first-tier provider for new rooms with the controller's setup command, which AO and legacy rooms share; new AO rooms accept `deepseek` or an explicit `none`, and a missing selection fails closed rather than downgrading silently:
+
+   ```sh
+   python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepseek-provider.json --delegate-provider deepseek
+   python3 deepseek_adapter.py set-key --home ~/.project-room
+   ```
+
+   The provider file is key-free (see [examples/deepseek-provider.example.json](examples/deepseek-provider.example.json)); the key is entered interactively at your terminal and read only when a job sends its request or when you run the explicit paid `probe`. A room snapshots the adapter, policy and configuration when it opens, so rerunning setup never changes an existing room. See [the DeepSeek delegate guide](docs/deepseek.md).
+
+3. **Repository ignore rule.** The engineer's repository must already ignore `.claude/` (or the three routing paths `.claude/settings.local.json`, `.claude/agents/pr-sonnet.md` and `.claude/agents/pr-opus.md`). Preparation refuses tracked, unignored, symlinked or conflicting paths and never edits ignore rules itself; adding the rule is a deliberate setup change that your existing AO setup authorization covers when it applies, not a fresh permission question for each routine ignore rule.
+
+4. **AO project rules.** Through stock AO project configuration, add the authorized Project Room delegation clause to the project `agentRules`, preserving the existing fields. Preparation snapshots the rules digest and refuses when the clause is absent; implementation and correction packets re-read the rules and refuse on drift. AO's generic worker prompt still forbids native subagents; the clause is the explicit task authorization for the two pinned agents.
+
+5. **Engineer preparation hook.** AO's stock `postCreate` project hook can run the preparation from the created worktree with fixed, quoted argv:
+
+   ```sh
+   python3 /absolute/path/to/ao_delegates.py --home /absolute/private/project-room-home --room ROOM_ID
+   ```
+
+   Install it only for the creation of the intended engineer, create the Astra reviewer before installing it or after restoring the previous configuration, and restore the prior hook afterwards. A failed preparation leaves the room unprepared and AO does not launch the paid worker. The full procedure, including the user and managed Claude settings that must not disable hooks or force subagent models, is in [Native delegation routing](skills/project-room/references/ao.md#native-delegation-routing).
+
+## Roles, agreement and delegation
+
+New AO rooms use `workflow: "fable_engineering"`. Astra writes and approves the exact specification; Fable reviews it read-only and returns an `accept` or `changes_required` verdict for those exact bytes; only then can Astra record the handoff. A material scope change needs a newer revision and fresh agreement. A task-specific `workflow: "astra_led"` exception, in which Astra implements directly in an isolated worktree, requires the actual per-task `exception_authorization`, attaches no Fable delegates, and never changes the default roles for later rooms.
+
+Fable's delegation is deliberate and bounded:
+
+- **DeepSeek** is the configured first-tier delegate for self-contained work. Only the root Fable engineer can submit to the room's pinned DeepSeek lane, at the room's pinned reasoning effort and output budget that no tool call can lower. Its jobs are room-scoped rows in the private per-home DeepSeek ledger, and an unresolved delivery failure stops that room's lane until you resolve it at your own terminal.
+- **Native delegation** is one layer with at most two simultaneous children. The prepared local settings set `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` and `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2`; those are concurrency limits, not a two-task total and not an intrinsic AO limit, and a launch rejected at capacity is not queued automatically. A private deny-only guard permits `Agent` only for `pr-sonnet` and `pr-opus` without model, isolation, resume or other overrides, and refuses nested dispatch, workflows, teams, messaging routes, every skill except the pinned browser skill inside `pr-opus`, and every DeepSeek, Qwen or room MCP call made from inside a child. Children therefore cannot delegate further or submit DeepSeek work.
+- **Older rooms and workers** do not acquire this routing silently. Rooms prepared before the mechanism report `delegate.routing.status` as `not_configured`; only a fresh preparation writes the routing files, and only a later dispatch or sync can move a room to `verified`. None of these states proves native enforcement, the served model or effort, or compaction behavior.
+
+The pinned delegate ladder, verification duties at every tier, and the fixed DeepSeek and Qwen operating parameters are in [Fable's policy](skills/project-room/references/fable-policy.md).
+
+## Normal workflow on AO
+
+The skill walks Astra through these steps; the tool names are the `ao_room_*` MCP tools, which the CLI exposes with the same schemas.
+
+1. `ao_room_open` with the actual project path, a stable feature name, the existing AO project ID, your implementation authorization and `delegate_provider` set to `deepseek` (or an intentionally selected `none`). A normal room without a usable selection is refused rather than downgraded; only a provider that `setup --delegate-provider` recorded deliberately fills in an omitted argument, so pass it explicitly. Reopening returns the same room. Save its `room_id`. An Astra-led exception passes `workflow: "astra_led"` and the per-task `exception_authorization` here; see [the exception and delivery rules](skills/project-room/references/ao.md#explicit-astra-exception-and-historical-pilot-rooms).
+2. `ao_room_spec_put` with the exact UTF-8 spec content, a positive revision, Astra's approval text and nonempty argv gate arrays, for example `[["python3", "-m", "unittest", "discover", "-v"]]`. Revisions are immutable.
+3. Prepare the engineer worktree before Claude launches (the hook above, or `ao_room_prepare` for the exact workspace). Create an ordinary AO Claude chat worker without an initial prompt, configure `claude-fable-5-1` at `max`, and `ao_room_bind` it as `engineer`. Bind a separate native Codex chat worker at the requested Astra model and `max` as `reviewer`. Bindings and the engineer workspace cannot be replaced.
+4. `ao_room_send` to the engineer with purpose `spec_review` and a stable `request_id`; `ao_room_sync` the completed turn. Fable's final JSON must carry `interpretation`, `findings`, `decision`, `spec_revision` and `spec_sha256`. Three spec reviews are available per room across revisions.
+5. `ao_room_handoff` for the bound engineer worktree pins the agreement, baseline commit, candidate, authorization, delegate preparation and gates. Send purpose `implementation` once for that handoff; Fable implements, delegates under the policy, leaves the candidate uncommitted unless a commit is part of the intended candidate, and returns a structured engineering report (`outcome`, `implementation_complete`, `changes`, `tests_reported`, `review_findings`, `remaining_gaps`, `backlog`, `routing_log` with `delegate_job_ids`, and the exact spec and baseline identity). Sync promptly so the candidate is captured. A confirmed completed turn may receive focused `correction` requests in the same session, each a new turn rather than a replay; a `scope_change` report returns to the spec.
+6. `ao_room_verify` runs the pinned gates on the candidate worktree and binds the logs to the exact Git candidate before and after each gate.
+7. `ao_room_send` to the reviewer with purpose `acceptance_review`; sync its terminal response; `ao_room_accept` records it only when the completed verdict names the unchanged spec, candidate and evidence hashes. Three acceptance reviews are available per room.
+
+Every step refuses rather than guesses: unknown delivery is never replayed, an AO failure without an observed native turn ID stays uncertain, an active or unresolved delegate job blocks the next phase, and exhausted review budgets surface the decision to you instead of opening another room. The full contract, including the exact result fields and the historical pilot rooms, is in [Project Room on Agent Orchestrator](skills/project-room/references/ao.md).
+
+### CLI fallback
+
+The installed plugin's controller exposes every `ao_room_*` and legacy `room_*` operation with the MCP schemas, which lets an existing task with an older tool inventory continue a room without a new conversation:
 
 ```sh
-python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepseek-provider.json --delegate-provider deepseek
-python3 deepseek_adapter.py set-key --home ~/.project-room
-python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/rooms/ROOM_ID --config ~/.project-room/rooms/ROOM_ID/profiles/deepseek.json
+python3 project_room.py call ao_room_status --args '{"room_id":"ROOM_ID"}'
+python3 project_room.py call ao_room_open --args-file /absolute/private/path/to/open-arguments.json
+python3 project_room.py call ao_room_list --args '{}'
 ```
 
-`--delegate-provider` accepts `deepseek`, `qwen`, or `none`. A provider chosen with that flag is recorded and kept until another explicit flag replaces it; without any recorded choice the legacy inference applies (`qwen` when a Qwen config is configured, else `none`), so a plain `setup` followed by `setup --qwen-config ...` enables Qwen for new rooms exactly as before. Selecting DeepSeek is always explicit: supplying `--deepseek-config` with no recorded choice is refused before anything is written, asking for `--delegate-provider deepseek` (or `qwen`/`none` to store the file unselected). Setup validates only a configuration supplied in the same run or a provider explicitly reselected in it, so a stored provider file that is missing or on an unmounted volume never blocks unrelated changes such as `--claude-bin`. The probe's `--config` must be the absolute path of the room's pinned snapshot; relative paths are refused. Only rooms opened after this setup snapshot the selected provider; existing rooms keep their pinned provider and are never migrated silently. See [the DeepSeek delegate guide](docs/deepseek.md) for the configuration reference, the key file, what the probe actually verifies, and the post-install calibration order (probe, two bounded deep calibration tasks, actual Read-access proof, Fable adjudication, Astra acceptance).
+Replace `ROOM_ID` with the `room_id` returned by `ao_room_open`; AO room IDs already start with `ao-`. From another directory, use the absolute path of `project_room.py`. Prefer `--args-file` for multiline specs and review notes. `python3 project_room.py transcript-audit --room ROOM_ID --handoff HANDOFF_ID --attempt N` is a read-only tool-use count of one legacy implementation attempt's exact session transcript. The complete legacy tool reference is in [operations](skills/project-room/references/operations.md).
 
-Authenticate through Claude Code's standard login flow when needed, then rerun doctor. The controller uses the CLI's saved login and preserves its original configuration-directory override; it does not ask for an API key, extract credentials, or silently switch providers. Model calls still count toward the account's applicable usage. Setup and doctor are distinct from making a model request. See [authentication recovery](docs/recovery.md) if a saved job failed before reaching the model.
+## Operate: status, sync, usage and version checks
 
-The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use a different private directory. It contains `config.json`, `registry.sqlite3`, and `rooms/<id>/`. Keep it outside the source repository and installed plugin cache so reinstalling the plugin does not replace your rooms.
+- `ao_room_status` reads saved facts offline: bindings, the agreement, request states, verification and acceptance records, the primary usage subtotal, the configured model and any contradictory native reroute, delegate attachment, the bounded delegate job ledger and the routing state. `ao_room_list` returns at most 50 room records with explicit truncation. Historical acceptance in status does not attest current filesystem bytes.
+- `ao_room_sync` makes bounded AO GET requests to reconcile owned turns and archive per-turn usage; it never invokes a model. Receipts are known only for an observed isolated turn on the same native conversation branch; anything else is reported as unknown, never zero. The usage total is a subtotal of known primary receipts, excludes delegates, and is neither subscription quota nor billing.
+- **Stable-release check.** At the start of each new or resumed AO session, before the first model dispatch, compare the installed and running AO daemon with the official latest stable release, identify the actual daemon through its endpoint's `/healthz` executable path, and save the UTC time, versions, evidence and outcome privately in `PROJECT_ROOM_HOME/ao/version-check.json`. A fetch failure, rate limit or ambiguous local identity is recorded as unknown, never as up to date. A newer release is applied between jobs, with a backup and a read-only daemon smoke test, without restarting active workers, migrating rooms or replaying uncertain requests. The skill installs no background updater; AO's desktop app has its own updater, and any daily release monitor is something you configure separately. Details: [stable-release check](skills/project-room/references/ao.md#stable-release-check).
 
-The plugin starts a local stdio MCP server with `python3 ./project_room_mcp.py` and `cwd: "."`. This follows the portable pattern in OpenAI's [bundled local MCP example](https://github.com/openai/plugins/blob/main/plugins/openai-developers/.mcp.json). It requires no hosted room server or exposed listening port. After installing or updating, test in a new Codex task so the current skill and tool definitions load. Existing tasks and room history remain available; use the CLI fallback below to continue an existing room when that task still has older tool definitions.
+## Verification and acceptance versus publication
 
-## Use the room
+Verification runs the spec's argv gates directly, without a shell, with a pinned per-gate timeout (default 120 seconds, maximum 7200), in the candidate worktree. Gate programs are trusted project commands, not a sandbox; keep model calls and publication commands out of them. The fingerprint covers tracked and untracked committable files, deletions, symlinks, file modes, the index and HEAD, and is taken before the gates and after each gate, so a gate that changes candidate content invalidates the evidence immediately. Ignored files and external dependencies are outside it. Commit before final verification when a commit is part of the intended candidate; committing afterwards changes HEAD and needs fresh verification and review.
 
-Astra opens or reuses one room for the project path and feature, records intent, writes a spec, and submits Fable's independent review. Review and implementation calls return job IDs promptly. Bounded status waits follow the job; the room retains results across process restarts.
+Acceptance validates an independent reviewer's completed JSON verdict against the unchanged spec, candidate and gate evidence. It does not merge, publish or deploy. Integration continues through normal repository tools under the scope you authorized, preserving unrelated changes and checking that the reviewed bytes are the ones integrated. A verifier that crashes before saving its receipt leaves a durable running record that blocks further mutation until you diagnose it; the adapter has no automatic verifier-recovery lane and never launches a replacement to bypass the uncertainty.
 
-Continue in the Astra task where you are shaping the feature to keep its conversation history. Astra reads Fable's results from the saved room there. Another task can resume that room when you deliberately hand work over. There is no central Astra task or automatic forwarding between conversations.
+## Current validation limits
 
-Separate feature rooms can run concurrently, including separate worktrees of the same repository. A blocked job blocks its own room. Keep one active owner for a particular room and use its saved room/job IDs when resuming. Claude account limits and local inference capacity remain shared resources.
+State what the evidence shows and no more:
 
-Implementation requires a clean Git checkout with a commit to use as its baseline. Preserve existing changes deliberately before handoff; the plugin does not automatically commit or discard them. It creates an isolated `codex/implementation-*` worktree and leaves the candidate uncommitted for review. Acceptance records the reviewed candidate; that controller operation does not merge, push, deploy, or apply it to another checkout. When you requested a finished feature, the Astra skill continues integration through normal repository tools, preserving unrelated changes and verifying the integrated result. Publishing follows the scope you authorized.
-
-Once the exact current spec is accepted by both agents and blocking findings are resolved, Astra records a handoff with the user's existing authorization and executable validation gates. Fable implements and owns engineering review. A material scope discovery creates a blocking issue that requires a newer spec revision and renewed agreement before handoff. Astra checks the result and records either acceptance or actionable rejection.
-
-The worker can continue after the MCP connection closes. The plugin does **not** wake an idle Astra conversation: ask to resume the room, and Astra reads its saved status and history. A background job finishing is distinct from gates passing and Astra accepting the result. Gates run independently in the implementation worktree, and acceptance binds the candidate content they checked. A gate that changes candidate files invalidates that evidence; use verification commands that leave source unchanged.
-
-## Observe job progress
-
-Each job in `room_status` and `room_job_status` includes a read-only `progress` object: the lifecycle phase (queued, starting, model, gate, finalizing, awaiting review, terminal, or unknown), elapsed seconds, the category and time of the last observed activity, delegates that were requested, still pending, launched in the background, or completed (with an attributable child session's model and last activity where the evidence allows), and a countdown of seconds remaining until the pinned model or gate timeout. Astra can therefore say that Fable is waiting on a delegate whose last observed action was a shell operation at a given time, with a given elapsed time and remaining budget, through the existing status tools.
-
-The countdown is a deadline, never an estimate of completion, and observing it never cancels, replays, or extends a job. Activity comes from a bounded scan of the exact owned session transcript for the current attempt, with only allowlisted metadata (categories, timestamps, counts, validated model IDs); no thinking, prose, tool inputs, results, paths, or raw identifiers are exposed. Missing evidence is reported as unavailable with a reason code, never inferred as a stall or as completion. Workers started before this version remain readable with null timing where the saved evidence is insufficient. See [progress](docs/progress.md) for the exact schema, limits, and how Astra uses it.
-
-Existing app conversations retain their own history. Rooms start dedicated Claude sessions and resume their saved UUIDs; they do not automatically import or synchronize your exact Codex/Claude Desktop transcripts. Relevant decisions and context are recorded explicitly in the room.
-
-Use `room_implementation_status(room_id, handoff_id)` for the handoff's current saved phase after acceptance or a correction request. Earlier job results remain frozen. The `progress.heartbeat` field reports only when the owning worker last wrote a liveness record, while `progress.recent_activity` shows up to five observed category transitions. Neither is proof of useful work or completion. See [status and heartbeat details](docs/status-followups.md).
-
-## CLI fallback
-
-The controller exposes the same operations as MCP, including the `ao_room_*` adapter. From the plugin directory:
-
-```sh
-python3 project_room.py call room_open --args '{"project_path":"/absolute/path/to/project","feature":"Saved filters"}'
-python3 project_room.py call room_list --args '{}'
-python3 project_room.py call room_status --args '{"room_id":"ROOM_ID"}'
-python3 project_room.py call room_history --args '{"room_id":"ROOM_ID"}'
-```
-
-Replace `ROOM_ID` with the value returned by `room_open`. From another directory, use the absolute path to `project_room.py`. Prefer structured MCP arguments or `call TOOL --args-file /absolute/private/path/to/arguments.json` for multiline specs and review notes. The complete tool reference is in [operations](skills/project-room/references/operations.md).
+- Offline tests establish the adapter contracts with fake model and MCP backends.
+- Live local evidence on the installed AO setup has established the normal Fable/DeepSeek engineering workflow, independent Astra acceptance, and a native `pr-sonnet` plus `pr-opus` routing probe with no fallback and no nesting.
+- A manual Claude `/compact` and one controlled interrupted-turn native stop and resume were validated separately on the installed AO setup: the same native session and candidate state, Fable at `max` retained, partial work retained, and the continuation applied exactly once.
+- Those checks do not establish threshold-triggered automatic compaction, OS or daemon crash recovery, reconciliation of arbitrary or paid delegate interruptions, native-child Chrome access, or automatic Project Room recovery. Project Room has no audited continuation operation for interrupted or uncertain AO requests; diagnose them from `ao_room_status` and `ao_room_sync` without resending, following [the delivery and uncertainty rules](skills/project-room/references/ao.md#explicit-astra-exception-and-historical-pilot-rooms).
+- Routing states describe local configuration and observation, not enforcement. The prepared engineer's settings deny the automated review skills, and its guard refuses every other skill dispatch except the pinned browser skill inside `pr-opus`.
+- A smaller context reading does not restore subscription quota; live receipts stay private and describe exactly what they verified.
 
 ## DeepSeek delegate
 
-A DeepSeek room routes self-contained implementation, test, and review work to the exact configured DeepSeek model over `https://api.deepseek.com`, at a pinned deep-lane reasoning effort and output budget that no tool call can lower. DeepSeek is a text delegate: it returns code, tests, reviews, and reasoning summaries, but executes nothing, edits no files, and calls no tools; Sonnet applies and verifies what it returns, the same way Fable already treats Qwen's output.
+The DeepSeek lane serves AO rooms and legacy rooms alike: a DeepSeek room routes self-contained implementation, test and review work to the exact configured model over `https://api.deepseek.com`, with thinking enabled at the pinned reasoning effort and output budget. The adapter is a text delegate: it executes nothing, edits no files and calls no tools; Fable, or `pr-sonnet` under Fable's instructions, applies and verifies what it returns. Each room's status includes the latest 20 jobs from its private ledger, and admission checks use the full ledger. The one-request live probe is an explicit paid CLI action that takes the room's own snapshot directory. For a legacy room:
 
-Each DeepSeek room's `room_status` includes `delegate_jobs`: the latest 20 jobs from that room's private ledger with state, usage, and whether one still stops the room's DeepSeek lane, read without any network call. An unresolved delivery failure stops new paid jobs in that room only; resolving it requires the user's own terminal (`deepseek_adapter.py resolve`), never Astra or Fable, and no MCP tool performs it. See [the DeepSeek delegate guide](docs/deepseek.md) for setup, the full state table, routing calibration, export folder semantics, and privacy guarantees.
+```sh
+python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/rooms/ROOM_ID --config ~/.project-room/rooms/ROOM_ID/profiles/deepseek.json
+```
 
-## Qwen delegation (legacy)
+For an AO room, whose `ROOM_ID` already starts with `ao-`, the snapshot lives under the AO state directory:
 
-Qwen is the earlier optional delegate provider; a room pins DeepSeek or Qwen (never both) at creation, and DeepSeek above is the newer choice for new rooms. Fable orchestrates whichever provider a room selected without lowering the quality bar. To connect an existing trusted `qwen-local` stdio server during setup:
+```sh
+python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/ao/rooms/ROOM_ID --config ~/.project-room/ao/rooms/ROOM_ID/profiles/deepseek.json
+```
+
+An unresolved delivery failure stops new paid jobs in that room only; `deepseek_adapter.py resolve` at your own terminal is the only way to clear it, and no MCP tool or agent performs it. Setup, the key file, the state table, calibration order, export folders and privacy guarantees are in [the DeepSeek delegate guide](docs/deepseek.md).
+
+## Legacy controller
+
+The Codex Astra/Fable controller predates the AO adapter and remains fully supported for existing rooms and for users without AO. Keep its properties separate from AO's:
+
+- **Setup and use.** `python3 project_room.py setup` and `doctor` as above, then `room_open`, `room_spec_put`, `room_review_submit`, `room_handoff`, `room_implementation_submit`, `room_implementation_review` and the other `room_*` tools drive the same spec, review, handoff and acceptance loop. Review and implementation calls return job IDs promptly; follow them with bounded `room_job_status` waits, and resume from saved status and history after a disconnect. Implementation needs a clean Git checkout, creates an isolated `codex/implementation-*` worktree, and leaves the candidate uncommitted. See [operations](skills/project-room/references/operations.md).
+- **Status and progress.** Each job carries a read-only `progress` object (phase, elapsed time, last observed activity, delegates, and a countdown to the pinned model or gate timeout) plus a worker heartbeat and recent activity; none of it is proof of useful work or completion. See [progress](docs/progress.md) and [status and heartbeat details](docs/status-followups.md).
+- **Timeouts.** The legacy controller pins a model-invocation timeout and gate timeouts per job. AO adds no Project Room primary model-run deadline: a native turn runs until it finishes or AO stops it, while verification gate timeouts, DeepSeek request limits, provider and account limits and the model's context window still apply.
+- **Recovery.** Legacy audit and recovery lanes handle two exact shapes. For a job stopped only by the model-invocation timeout or the provider's session-usage-limit error, `room_implementation_audit` and `room_implementation_recover` call no model and prepare an immutable continuation record only after a host restart that postdates the original failure; `room_implementation_submit` then launches the one authorized Fable successor, a new job that still faces fresh gates and Astra acceptance. For a completed model result followed by a gate timeout, `room_verification_audit` calls no model and `room_verification_retry` reruns only the pinned gates, never the model, in an isolated copy with a private `TMPDIR`, and requires your separate explicit authorization to rerun those exact gates. Both lanes require every identity and evidence value to match a fresh check and keep the original job unchanged. Each review round allows three Fable reviews, continued by a recorded user decision. See [continuation and recovery](docs/recovery.md).
+- **Rooms and tasks.** Existing legacy rooms keep their backend, exact revisions, session identity and pinned provider. A Codex fork copies conversation history but is not an AO room migration; a deliberate handoff to another task, or from legacy to AO for genuinely new work, must preserve the recorded decisions, authorization and review requirements. Updated tools load in a new task, or the installed CLI operates on an existing room from an existing task.
+
+### Qwen delegation (legacy)
+
+Qwen is the earlier optional delegate provider. A room pins DeepSeek or Qwen at creation, never both; new AO rooms do not accept Qwen, and existing Qwen rooms keep their ladder. To connect an existing trusted `qwen-local` stdio server for new legacy rooms:
 
 ```sh
 python3 project_room.py setup --qwen-config /absolute/private/path/to/qwen-config.json
 ```
-
-Use the server's existing configuration. Do not commit credentials or machine-specific paths to the plugin. The Qwen guard can consume either one `{command, args, env}` server definition or a full configuration containing `mcpServers.qwen-local`.
 
 | Tool | Guard policy |
 | --- | --- |
@@ -124,30 +188,22 @@ Use the server's existing configuration. Do not commit credentials or machine-sp
 | `qwen_ask` | Effort `none` or `low`; default `low`. |
 | `qwen_status` | `wait=true`; positive finite timeout no greater than 49 seconds; default 45. |
 
-The intended Qwen3.8-27B server window is 262,144 tokens: 131,072 for prompt/context/system and 131,072 for thinking plus answer. The upstream server owns the prompt-size precheck; the guard does not tokenize inputs or set the server window. Use `context_path` for large context and chain bounded status waits. The complete [Fable policy](skills/project-room/references/fable-policy.md) specifies routing, diagnosis, escalation, and verification.
+The intended Qwen3.8-27B server window is 262,144 tokens, split between prompt and thinking plus answer; the upstream server owns the prompt-size precheck. Tool discovery, health and successful inference are different checks; report the actual evidence and never weaken the guard settings or claim a delegate ran when it did not.
 
-Tool discovery, health, and successful inference are different checks. Installation does not prove an upstream server is reachable or has the intended model/window. If a configured endpoint is unavailable, report the actual evidence and apply the routing policy; do not weaken Qwen's settings or claim a delegate ran when it did not.
+## Private state
 
-## Reliability and verification limits
+The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use another private directory and keep it outside the source checkout and the installed plugin cache so reinstalling never replaces your rooms. It holds `config.json`, `registry.sqlite3` and `rooms/<id>/` for the legacy controller; `ao/config.json`, `ao/rooms/<id>/`, `ao/launchers/` (the content-addressed DeepSeek launcher and routing guard) and `ao/version-check.json` for AO; and, for the DeepSeek delegate, `deepseek/` (the shared `ledger.sqlite3` with room-scoped rows, per-job artifacts, per-room `exports/` and probe receipts) plus the default key file `secrets/deepseek-api-key`. Room directories contain spec revisions, receipts, verification logs and acceptance records. A room's export directory holds one answer file per job, named by job ID and checked against its recorded digest on every read.
 
-The controller preserves exact spec binding, request IDs, session identity evidence, and durable outcomes. It prevents accidental duplicate model submission and blocks uncertain delivery. Do not delete state, reuse a request ID with changed content, or create a replacement room to evade a blocked attempt. Each review round allows three Fable reviews. If further debate is needed, Astra brings you a focused product decision; recording your answer permits the next bounded round while retaining every prior attempt. Agreement can proceed directly to handoff. See [continuation and recovery](docs/recovery.md).
+Never publish local paths, session UUIDs, transcripts, receipts, keys or usage material from that directory. The distributable source is the controller, MCP server, adapter, skill, guards, tests and templates; `.gitignore` excludes the common private forms, and staged changes should be inspected before sharing.
 
-An implementation job that stopped only from the configured model-invocation timeout or the provider's session-usage-limit error is not silently retried. `room_implementation_audit` observes the stopped job and calls no model; `room_implementation_recover` prepares an immutable continuation record only after every identity and evidence value matches a fresh check; `room_implementation_submit` then dispatches the one authorized successor. Continuation also requires a host restart after the original failure, and nothing is prepared or launched before trusted boot-time evidence postdates it. The successor is a new job: Fable inspects the partial work again, and fresh gates and Astra acceptance still apply. A successor refused before its model process existed frees the interruption for a fresh audit; a successor whose launch cannot be classified stays blocked by design. See [interrupted implementation continuation](docs/recovery.md).
+## Development and testing
 
-A different failure looks like success followed by a gate problem: the model finished with a valid result and a validated report, the candidate was snapshotted, and only afterward one pinned verification gate hit its own pinned timeout. `room_verification_audit` reads that exact shape without calling a model, and `room_verification_retry`, once every identity and evidence value matches a fresh check and the user has authorized rerunning those specific offline gates, dispatches one verifier job that reruns only the pinned gates — never the model — in an isolated private copy of the candidate with its own private `TMPDIR`. That isolated copy is not an OS sandbox: it does not prove every descendant process stopped, and an invisible survivor affecting shared user-level state is a disclosed residual the user accepted only for this project's identified offline unit tests and local validators. The original job, its evidence, and its error text are preserved unchanged, and a passed rerun is gate evidence only — an incomplete or gap-carrying report is still refused by `room_implementation_review`. See [verification-only retry](docs/recovery.md).
-
-The bundled skill drives Astra's reasoning and independent product review. Automated gates prove their own checks, not every aspect of product quality. Fable's delegate choices and engineering judgments must remain reviewable in its result. The package does not certify model quality, install local inference, or assume every Claude session supports subagents.
-
-Run the automated suite:
+Run the automated suite from the checkout:
 
 ```sh
 python3 -m unittest discover -v
 ```
 
-Tests use fake model executables and fake MCP backends in temporary directories, including a fake loopback HTTPS/SSE connection and synthetic keys for DeepSeek. They make no account, network, paid-model, or GPU requests. CI runs discovery on Linux and macOS with Python 3.11 and 3.12. A passing fake-backend suite does not establish live authentication, Fable access, Qwen or DeepSeek health, or complete a real feature implementation. Keep live verification receipts private and describe exactly what they verified.
+Tests use fake model executables and fake MCP backends in temporary directories, including a fake loopback HTTPS/SSE DeepSeek connection with synthetic keys and a fake AO transport; they make no account, network, paid-model or GPU requests. CI runs the suite on macOS natively and on Linux inside a restricted `python:3.11-bookworm` and `python:3.12-bookworm` container with no network, a read-only root and source, no capabilities, a non-root user and a tmpfs `/tmp`. The container runs with `--init` because the verification lane's process inspection is fail-closed: without an init process, orphaned test processes become zombies whose `/proc/<pid>/environ` is root-owned, and the marker scan correctly refuses to launch anything. To reproduce locally, run the same `docker run` line from `.github/workflows/tests.yml` against a `git archive` of the candidate.
 
-## Source and private data
-
-The distributable source includes the controller, MCP server, skill, policy guard, tests, and templates. Runtime configuration, databases, attempts, transcripts, worktrees, session paths, and review receipts belong in private local state. `.gitignore` excludes common forms; inspect staged changes before sharing.
-
-`room.py` supplies the low-level spec-review engine, including audited identity reconciliation and recovery for proven local authentication failures. Its `examples/config.example.json`, `examples/policy.example.md`, and related review fixtures describe that engine's read-only review session, not the full plugin's implementation workflow. Use `project_room.py setup` for normal plugin setup; consult [architecture](docs/architecture.md) when developing or diagnosing the underlying engine.
+A passing fake-backend suite does not establish live authentication, Fable access, DeepSeek or Qwen health, AO reachability, or a real feature implementation. Validate a changed skill or manifest with the Codex plugin validator before installing it. The module map is in [architecture](docs/architecture.md); `room.py` is the low-level review engine whose `examples/config.example.json` and `examples/policy.example.md` describe that engine's read-only review session rather than the full plugin workflow.

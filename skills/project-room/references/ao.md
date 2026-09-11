@@ -26,11 +26,15 @@ A task-specific `workflow: "astra_led"` exception requires actual
 `exception_authorization`; never infer one from a past usage-saving request.
 Existing version-1 pilot rooms remain readable and retain their original meaning.
 
-Offline tests establish adapter contracts. A live normal-role trial must separately
-establish native Fable access, delegate attachment and successful delegate work,
-engineering completion, gates and independent acceptance for the installed setup.
-Report those facts separately. Claude compaction and recovery of interrupted
-in-flight work still require their own validation.
+Offline tests establish adapter contracts. Live local evidence on the installed
+setup has established the normal Fable/DeepSeek engineering workflow, independent
+acceptance, a native `pr-sonnet` plus `pr-opus` routing probe with no fallback or
+nesting, a manual Claude `/compact`, and one controlled interrupted-turn native
+stop/resume that kept the same native session, candidate state and Fable MAX and
+applied the continuation once. Those checks do not establish threshold-triggered
+automatic compaction, OS or daemon crash recovery, reconciliation of arbitrary or
+paid delegate interruptions, native-child Chrome access, or automatic Project Room recovery.
+Report each fact separately and keep the underlying receipts private.
 
 ## Stable-release check
 
@@ -249,8 +253,9 @@ enforcement. If `pr-opus` cannot use the pinned browser skill, report it as
 unvalidated and keep the existing explicit AO Opus browser route. Existing
 legacy rooms keep their recorded backend, policy and planning state; nothing
 here migrates or relabels them. A repository that does not ignore the required
-paths is not adopted by this mechanism: adding its ignore rule is a deliberate,
-separately authorized setup step, and preparation refuses until it exists.
+paths is not adopted by this mechanism: adding its ignore rule is a deliberate
+setup change under the user's existing setup authorization, and preparation
+refuses until it exists.
 
 ## Explicit Astra exception and historical pilot rooms
 
@@ -367,6 +372,7 @@ uncertain DeepSeek delivery; neither agent may self-resolve or replay it.
 
 Compact spec/evidence packets limit repeated context. Native compaction remains
 owned by AO/the provider and is not automatically triggered by this adapter.
-Claude native compaction and production failure recovery still require their own
-live validation. Do not claim a smaller context window reading proves lower total
-usage or recovered subscription budget.
+Manual Claude compaction and a controlled native stop/resume are validated only
+as described under readiness above; automatic compaction thresholds and crash
+recovery still require their own live validation. Do not claim a smaller context
+window reading proves lower total usage or recovered subscription budget.
