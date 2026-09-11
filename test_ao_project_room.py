@@ -122,6 +122,96 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.send()["state"], "completed")
         self.assertEqual(len(self.fake.posts), 1)
 
+    def test_recovered_history_permits_new_work_without_replaying_it(self):
+        self.bind()
+        self.bind("reviewer")
+        self.send()
+        self.fake.finish("engineer")
+        self.service.ao_room_sync(self.room)
+        historical = {"id": "imported-history", "providerTurnId": "acp-history-turn:synthetic",
+                      "state": "recovered", "completedAt": "2026-09-11T09:00:00Z"}
+        for role in ("engineer", "reviewer"):
+            self.fake.snapshots[role]["turns"].append(copy.deepcopy(historical))
+        result = self.send(request_id="second")
+        self.assertEqual(result, self.send(request_id="second"))
+        self.assertEqual(len(self.fake.posts), 2)
+        self.assertIn(historical["id"], self.state()["requests"]["second"]["baseline"]["turn_ids"])
+        for role in ("engineer", "reviewer"):
+            observed = next(t for t in self.fake.snapshots[role]["turns"] if t["id"] == historical["id"])
+            self.assertEqual(observed, historical)
+        self.fake.finish("engineer", usage={"inputTokens": 150, "cachedTokens": 110, "outputTokens": 15, "totalTokens": 165})
+        completed = self.service.ao_room_sync(self.room)["requests"][-1]
+        self.assertEqual(completed["state"], "completed")
+        self.assertTrue(completed["usage"]["known"])
+        self.assertEqual(completed["usage"]["totalTokens"], 55)
+
+    def test_owned_recovered_turn_stays_uncertain_and_preserves_evidence(self):
+        self.bind()
+        self.send()
+        self.fake.finish("engineer", "A historical answer is not a proven outcome", state="recovered")
+        retained = {}
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                turn = self.fake.snapshots["engineer"]["turns"][-1]
+                if delivered:
+                    turn["providerTurnId"] = "native-turn-1"
+                else:
+                    turn.pop("providerTurnId")
+                result = self.service.ao_room_sync(self.room)["requests"][0]
+                self.assertEqual(result["state"], "uncertain")
+                self.assertFalse(result["usage"]["known"])
+                request = self.state()["requests"]["first"]
+                receipt_path = self.service.root / "rooms" / self.room / request["receipt"]
+                retained[receipt_path] = receipt_path.read_bytes()
+                self.assertEqual(json.loads(retained[receipt_path])["turn"]["state"], "recovered")
+                self.service.ao_room_sync(self.room)
+                self.assertEqual(self.send()["state"], "uncertain")
+                for operation in (lambda: self.send(request_id="second"),
+                                  lambda: self.service.ao_room_verify(self.room, str(self.repo)),
+                                  lambda: self.service.ao_room_accept(self.room, "first")):
+                    with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+                        operation()
+                self.assertEqual(len(self.fake.posts), 1)
+        for path, original in retained.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn("second", self.state()["requests"])
+
+    def test_recovered_reviewer_cannot_accept_a_claimed_approval(self):
+        self.bind("reviewer")
+        self.service.ao_room_verify(self.room, str(self.repo))
+        self.send("reviewer")
+        self.fake.finish("reviewer", self.verdict(), state="recovered")
+        result = self.service.ao_room_sync(self.room)["requests"][0]
+        self.assertEqual(result["state"], "uncertain")
+        with self.assertRaisesRegex(ao.RoomError, "active or uncertain"):
+            self.service.ao_room_accept(self.room, "first")
+        self.assertEqual(len(self.fake.posts), 1)
+        self.assertEqual(self.state()["acceptances"], [])
+
+    def test_recovered_history_does_not_hide_active_or_unknown_turns(self):
+        self.bind()
+        for state in ("queued", "running", "unrecognized", None):
+            with self.subTest(state=state):
+                active = {"id": "other"}
+                if state is not None:
+                    active["state"] = state
+                self.fake.snapshots["engineer"]["turns"] = [
+                    {"id": "historical", "state": "recovered"}, active]
+                with self.assertRaisesRegex(ao.RoomError, "active work"):
+                    self.send()
+                self.assertEqual(self.fake.posts, [])
+                self.assertEqual(self.state()["requests"], {})
+
+    def test_history_recovered_during_a_turn_keeps_usage_unknown(self):
+        self.bind()
+        self.send()
+        self.fake.finish("engineer")
+        self.fake.snapshots["engineer"]["turns"].append({"id": "late-history", "state": "recovered"})
+        result = self.service.ao_room_sync(self.room)["requests"][0]
+        self.assertEqual(result["state"], "completed")
+        self.assertFalse(result["usage"]["known"])
+        self.assertEqual(result["usage"]["reason"], "overlap_or_incomplete_history")
+
     def test_lost_ack_reconciles_after_restart_without_replay(self):
         self.bind()
         self.fake.lose_ack = True

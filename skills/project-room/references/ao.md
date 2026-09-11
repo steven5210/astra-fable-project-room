@@ -279,6 +279,10 @@ they have a turn ID: the native driver can assign that ID before a later transpo
 failure. Status exposes the observed `ao_turn_state` separately. This conservative
 initial adapter has no automatic recovery lane for such outcomes; diagnose them
 without resending. There is no automatic retry, timeout cancellation or worker failover.
+AO may import historical turns as `recovered`: those turns are no longer active,
+but their success or failure is unknown. Unrelated recovered history does not
+block a new authorized request. An owned request with a recovered outcome remains
+`uncertain`, retains its receipt and prevents further dispatch or acceptance.
 Primary native turns have no adapter model deadline. The 15-second HTTP waits,
 verification gate timeouts, retained DeepSeek request limits and provider quotas
 still exist; an observation timeout does not prove primary completion or cancel it.
