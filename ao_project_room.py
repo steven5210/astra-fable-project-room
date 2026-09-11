@@ -323,6 +323,8 @@ class Service:
         return snapshot
 
     def settled(self, state):
+        from ao_reviewer_recovery import validate
+        validate(self, state)
         if ao_workflow.normal(state) and any(r.get("model_reroute") for r in state["requests"].values()):
             raise RoomError("Native model substitution contradicts this room; preserve the failure, never replay")
         if any(r["state"] not in TERMINAL for r in state["requests"].values()):
@@ -463,9 +465,9 @@ class Service:
                 return state["bindings"][role]
             for other in (self.root / "rooms").glob("*/state.json"):
                 other_state = read(other)
-                for bound in other_state["bindings"].values():
-                    if bound["session_id"] == session_id and other_state["ao_url"] == state["ao_url"]:
-                        raise RoomError("AO session is already bound; engineer and reviewer require distinct sessions")
+                from ao_reviewer_recovery import claims
+                if other_state["ao_url"] == state["ao_url"] and session_id in claims(self, other_state):
+                    raise RoomError("AO session is already bound or retired; engineer and reviewer require distinct sessions")
             snapshot = self.identity(self.client(state), state, binding)
             if busy(snapshot):
                 raise RoomError("Bind only an idle native conversation")
@@ -477,6 +479,14 @@ class Service:
                 ao_workflow.workspace(self, directory, state)
             self.save(directory, state)
             return binding
+
+    def ao_room_reviewer_recovery_audit(self, room_id):
+        from ao_reviewer_recovery import audit
+        return audit(self, room_id)
+
+    def ao_room_reviewer_recover(self, room_id, audit_sha256, replacement_session_id, diagnosis, authorization, request_id):
+        from ao_reviewer_recovery import recover
+        return recover(self, room_id, audit_sha256, replacement_session_id, diagnosis, authorization, request_id)
 
     def ao_room_prepare(self, room_id, worktree_path):
         with self.locked(room_id) as (directory, state):
@@ -775,6 +785,7 @@ class Service:
         return result
 
     def summary(self, directory, state):
+        from ao_reviewer_recovery import summary as recovery_summary
         totals = {field: 0 for field in COUNTERS}
         unknown = []
         creation_order = lambda r: (r.get("created_order", 0), r.get("created_at", 0), r["request_id"])
@@ -804,6 +815,7 @@ class Service:
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
+                "reviewer_recovery": recovery_summary(self, state),
                 "requests": [self.request_summary(r) for r in visible],
                 "requests_truncated": len(state["requests"]) > 20, "checkpoint": state.get("checkpoint"),
                 "latest_verification": state["verifications"][-1] if state["verifications"] else None,
@@ -845,6 +857,8 @@ TOOL_SCHEMAS = {
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
     "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes the ignored worktree-scoped native routing files (pr-sonnet/pr-opus, local settings, private guard) and snapshots them; invokes Claude configuration only, never inference. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Normal roles require Claude/Fable engineer and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
+    "ao_room_reviewer_recovery_audit": ("Inspect one stopped, never-used native Codex reviewer against complete empty history and current passed spec/candidate/gate evidence. Saves a private audit digest, not a binding change. Bounded AO GETs only; no model, lifecycle or worker creation.", schema(R)),
+    "ao_room_reviewer_recover": ("With the exact audit and actual user authorization, recover one never-used reviewer into a separate ready native Codex reviewer at the same model/MAX. Preserves the original binding claim, all evidence and review limits. Refuses any prior reviewer request, missing history or uncertainty. One recovery per room; identical request reads the saved result. No model dispatch or AO POST.", schema({**R, "audit_sha256": S, "replacement_session_id": S, "diagnosis": S, "authorization": S, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),

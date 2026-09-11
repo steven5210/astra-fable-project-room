@@ -257,7 +257,8 @@ class Service:
             try:
                 import deepseek_adapter
                 provider = self._deepseek_config(config["deepseek_config"])
-                result["deepseek"] = {"model": provider["model"], "deep_lane": deepseek_adapter.lane_parameters(provider, "deep"),
+                result["deepseek"] = {"model": provider["model"], "backend": provider["backend"], "base_url": provider["base_url"],
+                                      "deep_lane": deepseek_adapter.lane_parameters(provider, "deep"),
                                       "key_file": deepseek_adapter.key_diagnostics(provider["api_key_file"]),
                                       "latest_probe": deepseek_adapter.latest_probe(self.home / "deepseek" / "probes"),
                                       "meaning": "metadata only: the key is never read here and no probe or model call is made"}
@@ -537,8 +538,9 @@ class Service:
     def _delegate_jobs(self, room_id, root):
         """Bounded read-only summary of this room's provider jobs from the private ledger: allowlisted facts only, no network,
         no lease probe and no relabelling; token counts are provider usage from the ledger, never model assertions."""
-        value = {"provider": None, "items": [], "truncated": False, "unavailable_reason": None,
-                 "meaning": "latest ledger facts for this room's delegate jobs; usage is provider-reported or unknown"}
+        value = {"provider": None, "backend": None, "model": None, "items": [], "truncated": False, "unavailable_reason": None,
+                 "meaning": "latest ledger facts for this room's delegate jobs; usage is provider-reported or unknown; backend and model come "
+                            "from this room's own pinned snapshot, never from the shared ledger"}
         try:
             settings = self._room_settings(root)
             if not isinstance(settings, dict):
@@ -550,6 +552,14 @@ class Service:
         if value["provider"] != "deepseek":
             value["unavailable_reason"] = "provider_not_deepseek"
             return value
+        try:
+            import deepseek_adapter as pinned_adapter
+            pinned = pinned_adapter.load_config(root / "profiles" / "deepseek.json", self.home)[0]  # key-free, no network
+            value.update(backend=pinned["backend"], model=pinned["model"])
+        except ImportError:
+            pass  # reported as adapter_unavailable below
+        except Exception:  # noqa: BLE001 - an unreadable or older snapshot leaves backend/model null; status stays read-only and available
+            pass
         ledger = self.home / "deepseek" / "ledger.sqlite3"
         if not ledger.is_file():
             value["unavailable_reason"] = "ledger_missing"

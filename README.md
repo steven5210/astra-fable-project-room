@@ -19,8 +19,8 @@ The bundled [skill](skills/project-room/SKILL.md) supplies the roles and workflo
 | --- | --- |
 | You | Product intent, priorities, meaningful tradeoffs, and the authorization that each handoff binds. |
 | Astra (Codex, native reviewer) | Requirements, the exact specification revision, dispositions of findings, enhancement proposals, and independent acceptance of the exact candidate. |
-| Fable (Claude Code, `claude-fable-5-1` at `max`, the engineering director) | Engineering interpretation and agreement on the exact spec, implementation, delegation under the pinned policy, engineering review, and the final engineering verdict. |
-| DeepSeek (configured first-tier delegate) | Self-contained implementation, test and review text for Fable. The adapter is text-only: it returns code, tests, reviews and reasoning summaries, but it cannot browse, edit files or execute tools, and upstream image or video capability does not establish adapter support. |
+| Fable (Claude Code, `claude-fable-5-1` at `max`, the engineering director) | Engineering interpretation and agreement on the exact spec, direction of implementation and delegation under the pinned policy, engineering review, and the final engineering verdict. |
+| DeepSeek (configured first-tier delegate) | Self-contained analysis, implementation, tests, documentation and review text for Fable through the selected official or DeepInfra backend. The adapter is text-only: it returns code, tests, reviews and reasoning summaries, but it cannot browse, edit files or execute tools, and upstream image or video capability does not establish adapter support. |
 | `pr-sonnet` and `pr-opus` (pinned native agents) | `pr-sonnet` pins `claude-sonnet-5` for mechanical implementation and named test runs; `pr-opus` pins `claude-opus-5` for bounded judgment, review and the pinned browser skill when the AO browser capability is present. Fable verifies everything they return. |
 | Qwen (legacy) | The earlier optional delegate provider for legacy rooms only; see [Qwen delegation (legacy)](#qwen-delegation-legacy). |
 
@@ -33,7 +33,7 @@ Both agents review the same immutable spec revision and SHA-256. Findings receiv
 - Claude Code with its normal saved subscription login and access to `claude-fable-5-1`. A signed-in Claude Desktop tab does not necessarily authenticate the standalone CLI.
 - Codex with local plugin and MCP support for Astra and for the legacy controller.
 - For AO work: a running, trusted local AO daemon at the official latest stable release, reachable on a loopback address, with the same native authentication AO already uses for its workers. Installing the daemon, adding a project and creating chat workers follow [AO's own documentation](https://github.com/Untrivial-ai/agent-orchestrator). The adapter was initially exercised against AO 0.12.12; that is a validation fact, not a pin.
-- Optional: a DeepSeek account key, entered only at your own terminal, for the first-tier delegate. Docker is only needed to run the Linux CI container locally.
+- Optional: a separate key for the selected DeepInfra or official DeepSeek backend, entered only at your own terminal, for the first-tier delegate. Docker is only needed to run the Linux CI container locally.
 
 ## Install and authenticate
 
@@ -69,11 +69,11 @@ All AO configuration lives in the private data directory, never in the plugin or
 2. **Delegate provider.** Record the first-tier provider for new rooms with the controller's setup command, which AO and legacy rooms share; new AO rooms accept `deepseek` or an explicit `none`, and a missing selection fails closed rather than downgrading silently:
 
    ```sh
-   python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepseek-provider.json --delegate-provider deepseek
-   python3 deepseek_adapter.py set-key --home ~/.project-room
+   python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepinfra-provider.json --delegate-provider deepseek
+   python3 deepseek_adapter.py set-key --home ~/.project-room --backend deepinfra
    ```
 
-   The provider file is key-free (see [examples/deepseek-provider.example.json](examples/deepseek-provider.example.json)); the key is entered interactively at your terminal and read only when a job sends its request or when you run the explicit paid `probe`. A room snapshots the adapter, policy and configuration when it opens, so rerunning setup never changes an existing room. See [the DeepSeek delegate guide](docs/deepseek.md).
+   Start the private provider file from [examples/deepinfra-provider.example.json](examples/deepinfra-provider.example.json) to select `backend: "deepinfra"`, `deepseek-ai/DeepSeek-V4.1-Flash`, reasoning effort `max` and 131,072 output tokens. The tool family stays named `deepseek`. The [official example](examples/deepseek-provider.example.json) retains `backend: "official"` and its 393,216-token budget; use `set-key --backend official` for that separate key. Both provider files are key-free; the key is entered interactively at your terminal and read only when a job sends its request or when you run the explicit paid `probe`. A room snapshots the adapter, policy and configuration when it opens, so rerunning setup never changes an existing room. See [the DeepSeek delegate guide](docs/deepseek.md).
 
 3. **Repository ignore rule.** The engineer's repository must already ignore `.claude/` (or the three routing paths `.claude/settings.local.json`, `.claude/agents/pr-sonnet.md` and `.claude/agents/pr-opus.md`). Preparation refuses tracked, unignored, symlinked or conflicting paths and never edits ignore rules itself; adding the rule is a deliberate setup change that your existing AO setup authorization covers when it applies, not a fresh permission question for each routine ignore rule.
 
@@ -99,13 +99,15 @@ Fable's delegation is deliberate and bounded:
 
 The pinned delegate ladder, verification duties at every tier, and the fixed DeepSeek and Qwen operating parameters are in [Fable's policy](skills/project-room/references/fable-policy.md).
 
+When you request an orchestrator-only Fable workflow, carry that instruction into the handoff and continuation packets: DeepSeek handles substantive work, Fable assigns bounded tasks, assesses concise evidence and gives the final verdict, and Sonnet or Opus is used only for a named capability or quality gap. Applying patches, executing tests and authenticated browsing can require a native worker because this adapter returns text only. That task instruction supersedes the generic fallback to Fable doing worker tasks; it does not rewrite an older room's pinned policy or add a new routing mode.
+
 ## Normal workflow on AO
 
 The skill walks Astra through these steps; the tool names are the `ao_room_*` MCP tools, which the CLI exposes with the same schemas.
 
 1. `ao_room_open` with the actual project path, a stable feature name, the existing AO project ID, your implementation authorization and `delegate_provider` set to `deepseek` (or an intentionally selected `none`). A normal room without a usable selection is refused rather than downgraded; only a provider that `setup --delegate-provider` recorded deliberately fills in an omitted argument, so pass it explicitly. Reopening returns the same room. Save its `room_id`. An Astra-led exception passes `workflow: "astra_led"` and the per-task `exception_authorization` here; see [the exception and delivery rules](skills/project-room/references/ao.md#explicit-astra-exception-and-historical-pilot-rooms).
 2. `ao_room_spec_put` with the exact UTF-8 spec content, a positive revision, Astra's approval text and nonempty argv gate arrays, for example `[["python3", "-m", "unittest", "discover", "-v"]]`. Revisions are immutable.
-3. Prepare the engineer worktree before Claude launches (the hook above, or `ao_room_prepare` for the exact workspace). Create an ordinary AO Claude chat worker without an initial prompt, configure `claude-fable-5-1` at `max`, and `ao_room_bind` it as `engineer`. Bind a separate native Codex chat worker at the requested Astra model and `max` as `reviewer`. Bindings and the engineer workspace cannot be replaced.
+3. Prepare the engineer worktree before Claude launches (the hook above, or `ao_room_prepare` for the exact workspace). Create an ordinary AO Claude chat worker without an initial prompt, configure `claude-fable-5-1` at `max`, and `ao_room_bind` it as `engineer`. Bind a separate native Codex chat worker at the requested Astra model and `max` as `reviewer`. Ordinary bindings and the engineer workspace are immutable. A [single audited recovery](skills/project-room/references/ao.md#recovery-of-a-reviewer-that-has-never-been-used) is available only for a stopped reviewer that has never received a request; it preserves the original binding and review limits.
 4. `ao_room_send` to the engineer with purpose `spec_review` and a stable `request_id`; `ao_room_sync` the completed turn. Fable's final JSON must carry `interpretation`, `findings`, `decision`, `spec_revision` and `spec_sha256`. Three spec reviews are available per room across revisions.
 5. `ao_room_handoff` for the bound engineer worktree pins the agreement, baseline commit, candidate, authorization, delegate preparation and gates. Send purpose `implementation` once for that handoff; Fable implements, delegates under the policy, leaves the candidate uncommitted unless a commit is part of the intended candidate, and returns a structured engineering report (`outcome`, `implementation_complete`, `changes`, `tests_reported`, `review_findings`, `remaining_gaps`, `backlog`, `routing_log` with `delegate_job_ids`, and the exact spec and baseline identity). Sync promptly so the candidate is captured. A confirmed completed turn may receive focused `correction` requests in the same session, each a new turn rather than a replay; a `scope_change` report returns to the spec.
 6. `ao_room_verify` runs the pinned gates on the candidate worktree and binds the logs to the exact Git candidate before and after each gate.
@@ -150,7 +152,11 @@ State what the evidence shows and no more:
 
 ## DeepSeek delegate
 
-The DeepSeek lane serves AO rooms and legacy rooms alike: a DeepSeek room routes self-contained implementation, test and review work to the exact configured model over `https://api.deepseek.com`, with thinking enabled at the pinned reasoning effort and output budget. The adapter is a text delegate: it executes nothing, edits no files and calls no tools; Fable, or `pr-sonnet` under Fable's instructions, applies and verifies what it returns. Each room's status includes the latest 20 jobs from its private ledger, and admission checks use the full ledger. The one-request live probe is an explicit paid CLI action that takes the room's own snapshot directory. For a legacy room:
+The DeepSeek lane serves AO rooms and legacy rooms alike. Its key-free configuration selects exactly one fixed TLS transport: `official` uses `https://api.deepseek.com/chat/completions`; `deepinfra` uses `https://api.deepinfra.com/v1/openai/chat/completions`. There are no arbitrary endpoints, redirects or automatic provider/model fallbacks. New DeepInfra profiles default to `deepseek-ai/DeepSeek-V4.1-Flash`, `max` effort, 131,072 output tokens and an advertised 1,048,576 context window. Health and probe receipts distinguish the backend, endpoint, requested settings and observed model; hosted capacity, reasoning behavior and quality require their own evidence. Existing rooms retain their recorded settings.
+
+DeepInfra's [data policy](https://docs.deepinfra.com/account/data-privacy) says inference data is not used for training and inputs/outputs are normally deleted after processing, with exceptions for debugging or security logging. This is not an unconditional zero-retention guarantee. The adapter sends no batch, webhook or explicit prompt-retention option; [automatic provider caching](https://docs.deepinfra.com/chat/prompt-cache-retention) is a separate behavior.
+
+The adapter executes nothing, edits no files and calls no tools; the designated native worker applies and verifies its proposed changes under Fable's direction. Each room's status includes the latest 20 jobs from its private ledger, and admission checks use the full ledger. The one-request live probe is an explicit paid CLI action that takes the room's own snapshot directory. For a legacy room:
 
 ```sh
 python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/rooms/ROOM_ID --config ~/.project-room/rooms/ROOM_ID/profiles/deepseek.json
@@ -162,7 +168,7 @@ For an AO room, whose `ROOM_ID` already starts with `ao-`, the snapshot lives un
 python3 deepseek_adapter.py probe --home ~/.project-room --room ROOM_ID --room-root ~/.project-room/ao/rooms/ROOM_ID --config ~/.project-room/ao/rooms/ROOM_ID/profiles/deepseek.json
 ```
 
-An unresolved delivery failure stops new paid jobs in that room only; `deepseek_adapter.py resolve` at your own terminal is the only way to clear it, and no MCP tool or agent performs it. Setup, the key file, the state table, calibration order, export folders and privacy guarantees are in [the DeepSeek delegate guide](docs/deepseek.md).
+An unresolved delivery failure stops new paid jobs in that room only; `deepseek_adapter.py resolve` at your own terminal is the only way to clear it, and no MCP tool or agent performs it. Setup, the key file, the state table, calibration order, export folders and privacy limits are in [the DeepSeek delegate guide](docs/deepseek.md).
 
 ## Legacy controller
 
@@ -192,7 +198,7 @@ The intended Qwen3.8-27B server window is 262,144 tokens, split between prompt a
 
 ## Private state
 
-The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use another private directory and keep it outside the source checkout and the installed plugin cache so reinstalling never replaces your rooms. It holds `config.json`, `registry.sqlite3` and `rooms/<id>/` for the legacy controller; `ao/config.json`, `ao/rooms/<id>/`, `ao/launchers/` (the content-addressed DeepSeek launcher and routing guard) and `ao/version-check.json` for AO; and, for the DeepSeek delegate, `deepseek/` (the shared `ledger.sqlite3` with room-scoped rows, per-job artifacts, per-room `exports/` and probe receipts) plus the default key file `secrets/deepseek-api-key`. Room directories contain spec revisions, receipts, verification logs and acceptance records. A room's export directory holds one answer file per job, named by job ID and checked against its recorded digest on every read.
+The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use another private directory and keep it outside the source checkout and the installed plugin cache so reinstalling never replaces your rooms. It holds `config.json`, `registry.sqlite3` and `rooms/<id>/` for the legacy controller; `ao/config.json`, `ao/rooms/<id>/`, `ao/launchers/` (the content-addressed DeepSeek launcher and routing guard) and `ao/version-check.json` for AO; and, for the DeepSeek delegate, `deepseek/` (the shared `ledger.sqlite3` with room-scoped rows, per-job artifacts, per-room `exports/` and probe receipts) plus the separate default key files `secrets/deepseek-api-key` and `secrets/deepinfra-api-key`. Room directories contain spec revisions, receipts, verification logs and acceptance records. A room's export directory holds one answer file per job, named by job ID and checked against its recorded digest on every read.
 
 Never publish local paths, session UUIDs, transcripts, receipts, keys or usage material from that directory. The distributable source is the controller, MCP server, adapter, skill, guards, tests and templates; `.gitignore` excludes the common private forms, and staged changes should be inspected before sharing.
 
