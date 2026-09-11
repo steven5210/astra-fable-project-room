@@ -37,10 +37,13 @@ jobs:
         run: |
           # Hosted runner services can deny same-user /proc reads. Keep that
           # production refusal intact and inspect only this test container's processes.
+          # --init supplies an init process that reaps orphaned test processes: without
+          # one, a same-user zombie keeps a root-owned /proc/<pid>/environ, and the
+          # fail-closed marker scan correctly refuses to launch anything.
           docker pull "$PROJECT_ROOM_TEST_IMAGE"
           project_room_candidate="$(mktemp -d "${RUNNER_TEMP}/project-room-tests.XXXXXX")"
           git archive HEAD | tar -x -C "$project_room_candidate"
-          docker run --rm --pull never --network none --read-only \
+          docker run --rm --init --pull never --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=1g,mode=1777 \

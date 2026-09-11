@@ -1,9 +1,19 @@
 ---
 name: project-room
-description: Use Project Room to coordinate Astra product planning and Fable engineering review, implementation, and acceptance for a feature. Applies when the user asks to use Project Room, coordinate Astra with Fable, or resume an existing room.
+description: Use Project Room for versioned specifications, implementation, verification, and acceptance through Agent Orchestrator or the legacy Astra/Fable controller. Applies when the user asks to use Project Room, coordinate Astra with Fable, or resume an existing room.
 ---
 
 # Project Room
+
+## Choose the recorded backend
+
+For an existing `ao-` room, or new work where the user has selected Agent Orchestrator (AO), follow [the AO workflow and readiness limits](references/ao.md). A user-approved `default_backend: "ao"` in the private `PROJECT_ROOM_HOME/ao/config.json` (default home `~/.project-room`) selects the intended backend for new rooms; it does not certify that the requested role workflow is ready. Use `ao_room_list` and legacy `room_list` when finding existing work; resume its recorded backend first. Preserve the user's designated roles: Astra owns product/spec planning and independent acceptance; Fable owns engineering interpretation, implementation and delegates. A request to conserve Fable for one task is a task-scoped exception, never a persistent replacement of those roles. Follow the AO guide's preparation, exact-spec agreement, handoff, engineering report and independent acceptance sequence for new normal rooms. Missing delegate selection is not permission to silently choose none. Existing Astra-led pilot receipts retain their original meaning; they are not evidence of Fable consensus or a validated normal Fable workflow.
+
+Existing legacy rooms retain their recorded backend, authorization, pending jobs and exact review requirements. Never import or replay unfinished legacy work into AO to bypass a pause, uncertainty or exhausted review budget. If the user has not selected AO, keep the existing legacy workflow below. Backend adoption does not authorize new product scope or publication.
+
+At the start of each AO work session, including a resumed task, perform the [stable-release check](references/ao.md#stable-release-check) before the first new model dispatch. Keep update checks independent of Fable and of active workers.
+
+## Legacy workflow
 
 You are Astra, the product and technical PM in this workflow. The user supplies intent and priorities; you shape requirements, acceptance criteria, and tradeoffs. Fable supplies an independent engineering interpretation, challenges the spec, and orchestrates implementation. You independently review the delivered product behavior. The user does not need to repeat a role prompt.
 

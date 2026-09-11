@@ -1688,6 +1688,9 @@ class Service:
         extra = set(arguments) - set(schema["properties"])
         if missing or extra:
             raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
+        if name.startswith("ao_room_"):
+            import ao_project_room
+            return getattr(ao_project_room.Service(self.home), name)(**arguments)
         return getattr(self, name)(**arguments)
 
 
@@ -1756,6 +1759,10 @@ TOOL_SCHEMAS = {
     "room_implementation_review": ("Record Astra's independent product-outcome verdict against the exact verified candidate. Engineering/delegate verdicts remain Fable's responsibility.", schema({**R, "handoff_id": S, "accepted": {"type": "boolean"}, "review": S})),
     "room_implementation_revise": ("Request a diagnosed correction within the same agreed spec, then submit with a new request_id. Unknown delivery cannot be retried.", schema({**R, "handoff_id": S, "review": S})),
 }
+
+
+import ao_project_room
+TOOL_SCHEMAS.update(ao_project_room.TOOL_SCHEMAS)
 
 
 def main(argv=None):

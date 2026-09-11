@@ -9,6 +9,11 @@ import project_room
 
 MAX_LINE = 3_000_000
 INSTRUCTIONS = (
+    "AO rooms use ao_room_*: Fable owns normal engineering/delegation; Astra owns product/spec and independent acceptance. "
+    "An Astra-led exception requires actual per-task authorization. Prepare private delegates before native Fable launch, "
+    "bind exact roles/models, obtain Fable acceptance of the exact spec, then hand off. Pin gates; send once, sync, verify, "
+    "then accept the exact independent reviewer verdict. Usage is an attributable native subtotal, not quota. "
+    "The following rules apply to legacy room_* rooms, which never migrate automatically: "
     "Project Room: Astra owns grounded requirements, versioned specs, issue dispositions, and product-outcome review. "
     "Fable owns technical design, implementation planning, delegates, and engineering verdicts. "
     "Open the existing project/feature room; load status/history. Submit once with a stable request_id; wait on its job_id "
@@ -58,10 +63,10 @@ def handle(message, service):
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit"}
+        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
-                                             "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit")}}
+                                             "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify")}}
                             for name, (description, schema) in project_room.TOOL_SCHEMAS.items()]}
     elif method == "tools/call":
         try:
