@@ -165,6 +165,15 @@ Codex task discovers updated MCP tools after plugin installation.
    first. Unknown delivery stays blocked. Commit, if needed, before the final
    engineering response is captured: later changes to HEAD/index/files invalidate
    its candidate and need a correction.
+   A completed epoch-2 partial report that incorrectly names audited epoch-1
+   jobs can also receive a correction after the controller verifies the unchanged
+   completed result, transition evidence and complete ledger. Every original
+   captured job row must remain unchanged, and reported jobs are checked against
+   their own verified profiles. The original report remains rejected; this admits
+   only a new correction, with its proof recorded in controller metadata and no
+   extra context sent to Fable. Active, uncertain, foreign, missing, changed or
+   unaudited provider evidence still refuses. See the
+   [historical-report correction boundary](../../../docs/provider-transition.md#historical-report-correction).
 8. Run the gates and independent acceptance below using reviewer purpose
    `acceptance_review`. Inspect actual delegate ledger facts when assessing
    Fable's routing report. Native subagent audit coverage remains a separate item.

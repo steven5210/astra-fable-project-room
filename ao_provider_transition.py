@@ -830,6 +830,64 @@ def report_state(directory, state, request):
     return {**state, "delegate": audit["evidence"]["delegate"]["record"]}
 
 
+def historical_correction(service, directory, state, request, report, snapshot):
+    """Admit correction of a completed partial report, never capture or accept its historical claims.
+
+    The saved transition supplies the original profile and captured ledger rows. Current routing prose
+    supplies no authority. The caller still runs the ordinary native/routing dispatch gates afterwards.
+    """
+    if (request.get("provider_epoch") != EPOCH or request.get("role") != "engineer"
+            or request.get("purpose") not in ("implementation", "correction")
+            or request.get("handoff_sha256") != state.get("handoff_sha256")
+            or report.get("outcome") != "changes_required" or report.get("implementation_complete") is not False):
+        raise RoomError("Historical provider correction requires a completed partial report on the current handoff")
+    receipt = ao_workflow.completed_receipt(directory, request)
+    if ao_workflow.engineering_report(directory, state, request) != report:
+        raise RoomError("Historical provider correction differs from the saved engineering report")
+    ao_workflow.completion_candidate(directory, state, request)  # validate the old evidence; never recapture later edits
+    turns = [t for t in snapshot.get("turns", []) if t.get("id") == request["turn_id"]]
+    messages = [m for m in snapshot.get("messages", []) if m.get("turnId") == request["turn_id"]]
+    if (snapshot.get("history_truncated") or len(turns) != 1 or turns[0].get("state") != "completed"
+            or turns[0].get("providerTurnId") != ao.native_turn_identity(request)
+            or messages != receipt.get("messages") or not ao.sent_message(request, snapshot)):
+        raise RoomError("Historical provider correction requires the unchanged completed native result")
+    committed = validate(service, state)
+    if committed is None:
+        raise RoomError("Historical provider correction requires a verified committed transition")
+    _, epoch = committed
+    audit = _saved_audit(directory, epoch["audit_sha256"])
+    original = audit["evidence"]["ledger"]
+    ao_delegates.assert_settled(service.root.parent, dict(state), directory)
+    present, rows = _ledger_rows(service.root.parent, state["room_id"])
+    _ledger_check(rows)  # also refuses unreported abandoned or unrecognized rows beyond the status window
+    old_rows = {row["id"]: row for row in original["rows"]}
+    current_rows = {row["id"]: row for row in rows}
+    if (not present or not original["present"] or original["count"] != len(old_rows)
+            or any(current_rows.get(job_id) != row for job_id, row in old_rows.items())):
+        raise RoomError("Historical provider correction requires unchanged captured transition-ledger rows")
+    for row in rows:
+        if row["id"] not in old_rows and (row["profile_sha256"] != epoch["target"]["profile_sha256"]
+                                         or row["requested_model"] != epoch["target"]["model"]):
+            raise RoomError("Historical provider correction found an unaudited provider job")
+    ids = ao_delegates.report_job_ids(report)
+    historical_ids = [job_id for job_id in ids if job_id in old_rows]
+    if not historical_ids:
+        raise RoomError("The rejected report names no audited historical provider jobs")
+    source_state = {**state, "delegate": audit["evidence"]["delegate"]["record"]}
+    def claims(job_ids):
+        return {"routing_log": [{"delegate_job_ids": job_ids}]}
+    # All original jobs must retain their captured rows and verifiable content, including unreported jobs.
+    original_evidence = ao_delegates.verify_delegation(service.root.parent, directory, source_state, claims(list(old_rows)))
+    current_evidence = ao_delegates.verify_delegation(service.root.parent, directory, state,
+                                                    claims([job_id for job_id in ids if job_id not in old_rows]))
+    return {"kind": "historical_provider_correction", "admission_only": True,
+            "prior_request_id": request["request_id"], "prior_receipt_sha256": request["receipt_sha256"],
+            "prior_report_sha256": ao.digest(report), "provider_transition_sha256": state["provider_transition"]["receipt_sha256"],
+            "audit_sha256": epoch["audit_sha256"], "owning_ledger_sha256": ao.digest(rows),
+            "historical_jobs": [item for item in original_evidence if item["job_id"] in historical_ids],
+            "current_jobs": current_evidence}
+
+
 def summary(service, directory, state, delegate_status):
     try:
         result = validate(service, state, allow_pending=True)

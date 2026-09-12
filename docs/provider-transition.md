@@ -132,6 +132,50 @@ ownership; historical registered rooms also count as conflicts in this version.
 
 ## Evidence and failure boundaries
 
+### Historical-report correction
+
+A completed epoch-2 engineering report may accidentally include real epoch-1
+jobs in its routing claims. Capture and acceptance still require the current
+provider profile. The operator must preserve the rejected report and request a
+new same-session `correction`; it cannot edit the native report or normalize
+already-valid JSON into a different result.
+
+For a partial `changes_required` report with `implementation_complete: false`,
+correction admission can verify those historical references separately. It
+requires the exact completed native result and immutable completion-candidate
+evidence, the verified committed provider transition, and the complete owning
+ledger. Every job captured in the original transition audit must still exist
+with those captured row fields unchanged, including unreported jobs. Added jobs
+must use the current pinned profile. Reported current jobs and original jobs are
+verified against their respective pinned profiles, including completed-content
+digests. Active, unresolved, abandoned, unrecognized, foreign, missing or
+unaudited provider evidence refuses; routing prose cannot establish provenance.
+
+The new request records the admission's prior receipt/report digests, transition
+and ledger digests, and verified job classifications in its `carried` metadata.
+These are controller audit data, not extra native prompt text. No old report,
+error, candidate, receipt or review counter is rewritten, and no model is called
+by the admission check itself. The admitted correction remains a normal new model
+request with current native/routing checks. Fable must supply its own corrected
+report; capture, gates and independent acceptance remain unchanged.
+
+Operator persistence after a completed response belongs to the next candidate.
+It never changes the original candidate-at-completion evidence. A scope change,
+claimed-complete report, unknown native delivery or corrupted evidence does not
+qualify for this narrow historical-report path.
+
+"Captured row fields" means the ledger projection saved by the transition audit,
+not every database column. All original jobs receive content verification; added
+current jobs receive content verification when reported. Admission metadata is
+informational and becomes receipt-bound at completed sync; it never authorizes
+capture or acceptance. The helper's result is insufficient for dispatch by itself:
+the normal native, routing and provider gates must also pass.
+
+The existing correction path for known-completed malformed reports is unchanged.
+It does not gain historical-provider authority or make the old report acceptable.
+
+### Native witness and launcher limits
+
 The witness is a separate versioned stdlib process in the room. It relays MCP
 bytes to the exact retained child server and checks pinned provider files before
 starting that child. It reads no key and does not call inference. Its startup

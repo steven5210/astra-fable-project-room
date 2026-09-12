@@ -401,6 +401,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     # turns; every transitioned engineer turn separately requires the native attachment gate below.
     delegating = role == "engineer" and purpose in ("implementation", "correction")
     epoch = None
+    correction_admission = None
     binding = state.get("bindings", {}).get("engineer", {})
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
@@ -441,7 +442,15 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
                 if state.get("provider_transition"):
                     from ao_provider_transition import report_state
                     prior_state = report_state(directory, state, last)
-                ao_delegates.verify_delegation(service.root.parent, directory, prior_state, prior)
+                try:
+                    ao_delegates.verify_delegation(service.root.parent, directory, prior_state, prior)
+                except RoomError:
+                    if purpose != "correction" or not state.get("provider_transition") or last.get("provider_epoch") != 2:
+                        raise
+                    from ao_provider_transition import historical_correction
+                    if snapshot is None:
+                        snapshot = service.identity(service.client(state), state, binding)
+                    correction_admission = historical_correction(service, directory, state, last, prior, snapshot)
     else:
         raise RoomError("Normal engineer purpose must be spec_review, implementation or correction")
     # Every new engineer turn belongs to the active epoch, including read-only specification review.
@@ -458,6 +467,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
+    if correction_admission is not None:
+        carried["correction_admission"] = correction_admission  # audit metadata only, never appended to the native prompt
     for name in PARTS:
         if name not in held["parts"]:
             sections.append(texts[name])
