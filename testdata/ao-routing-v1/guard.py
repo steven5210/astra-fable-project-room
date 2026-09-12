@@ -18,13 +18,6 @@ AGENT_KEYS = frozenset({"description", "prompt", "subagent_type", "run_in_backgr
 DENIED_TOOLS = ("Workflow", "Task", "SendMessage")
 # MCP servers that submit delegate or room work; only the root engineer may use them.
 SUBMISSION_PREFIXES = ("mcp__deepseek__", "mcp__qwen-local__", "mcp__project-room__")
-# Fable directs and reviews; execution belongs to the assigned operator or pinned workers.
-# Enumerating root capabilities also closes alternate shell/notebook/browser/MCP execution routes.
-ROOT_TOOLS = frozenset({"Read", "Glob", "Grep", "ToolSearch", "TaskOutput", "TodoWrite",
-                        "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "AskUserQuestion"})
-DEEPSEEK_TOOLS = frozenset("mcp__deepseek__" + name for name in
-                         ("deepseek_health", "deepseek_submit", "deepseek_ask", "deepseek_status",
-                          "deepseek_result", "deepseek_cancel"))
 MAX_EVENT_BYTES = 1_000_000
 
 
@@ -52,11 +45,9 @@ def decide(event):
         raise ValueError("tool_input must be a JSON object")
     agent_type = _identity(event, "agent_type")
     agent_id = _identity(event, "agent_id")
-    # A main session launched with --agent may also have agent_type. Only a
-    # nonempty agent_id together with a pinned type identifies an execution worker.
-    # Any partial identity remains ambiguous and must never gain worker tools.
+    # Any present identity field proves the event fired inside a native worker;
+    # an id without a usable type is ambiguous nested dispatch and stays denied.
     inside = agent_type is not None or agent_id is not None
-    worker = bool(agent_id and agent_id.strip()) and agent_type in PINNED_AGENTS
     if tool == "Agent":
         if inside:
             return "native workers cannot delegate further (one layer)"
@@ -69,19 +60,11 @@ def decide(event):
     if tool in DENIED_TOOLS or tool.startswith("Team"):
         return tool + " routes (workflows, teams, continuation or messaging) are not authorized in this bounded routing configuration"
     if tool == "Skill":
-        if worker and agent_type == BROWSER_AGENT and params.get("skill") == BROWSER_SKILL:
+        if inside and agent_type == BROWSER_AGENT and params.get("skill") == BROWSER_SKILL:
             return None
         return "skill dispatch is refused except the pinned browser skill inside pr-opus"
     if inside and tool.startswith(SUBMISSION_PREFIXES):
         return "native workers cannot submit delegate or room work; only the root engineer uses the pinned provider tools"
-    if inside:
-        if not worker:
-            return "execution requires an identified pinned pr-sonnet or pr-opus worker; ambiguous worker identity is refused"
-        return None
-    if tool not in ROOT_TOOLS and tool not in DEEPSEEK_TOOLS:
-        return ("Fable orchestrates and reviews; shell commands, edits, tests, browser work and other execution "
-                "belong to the assigned operator or pinned workers. Delegate the bounded task when authorized; "
-                "do not retry through another tool or treat verification as permission to take over execution")
     return None
 
 

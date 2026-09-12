@@ -211,14 +211,11 @@ def conflicting_reroute(request, snapshot):
         baseline = request["baseline"]
         if (snapshot.get("conversationId") == baseline["conversation_id"]
                 and snapshot.get("activeBranchId") == baseline["branch_id"]):
-            matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
-                       and digest(m.get("text", "").encode()) == request["text_sha256"]]
-            if len(matches) == 1 and matches[0].get("turnId"):
-                turn_id = matches[0]["turnId"]
-                if not request.get("turn_id") or request["turn_id"] == turn_id:
-                    turns = [t for t in snapshot.get("turns", []) if t.get("id") == turn_id]
-                    if len(turns) == 1:
-                        observed_provider = turns[0].get("providerTurnId")
+            match = sent_message(request, snapshot)
+            if match:
+                turns = [t for t in snapshot.get("turns", []) if t.get("id") == match["turnId"]]
+                if len(turns) == 1:
+                    observed_provider = turns[0].get("providerTurnId")
     if target and target != observed_provider:
         return None  # A durable reroute for another native turn is historical.
     # A substitution without turn attribution cannot establish the pinned model.
@@ -228,6 +225,16 @@ def conflicting_reroute(request, snapshot):
 def native_turn_identity(request):
     value = request.get("provider_turn_id") or (request.get("observed_turn") or {}).get("providerTurnId")
     return value if isinstance(value, str) and value.strip() else None
+
+
+def sent_message(request, snapshot):
+    """The one user message this request delivered: exact bytes on a turn that did not exist before the send
+    (identical caller bytes legitimately recur across turns) and, once acknowledged, on the acknowledged turn."""
+    earlier = set(request["baseline"]["turn_ids"])
+    matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
+               and digest(m.get("text", "").encode()) == request["text_sha256"] and m.get("turnId") not in earlier
+               and (not request.get("turn_id") or m.get("turnId") == request["turn_id"])]
+    return matches[0] if len(matches) == 1 and matches[0].get("turnId") else None
 
 
 class Service:
@@ -548,9 +555,10 @@ class Service:
                 checkpoint = self.checkpoint(directory, state)
                 review = {"spec_sha256": spec["sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                           "evidence_sha256": state["checkpoint_sha256"]}
+            carried = None
             if ao_workflow.normal(state):
                 purpose = purpose or ("acceptance_review" if role == "reviewer" else None)
-                framed = ao_workflow.packet(self, directory, state, role, purpose, message)
+                framed, carried = ao_workflow.packet(self, directory, state, role, purpose, message)
             else:
                 if purpose not in (None, "implementation", "correction", "acceptance_review"):
                     raise RoomError("Astra-led rooms do not claim Fable specification consensus")
@@ -559,7 +567,9 @@ class Service:
                     "Astra implements; a separate reviewer assesses evidence. No routine Fable or delegate calls.\n"
                     f"Exact spec: {directory / state['spec']}\nSpec SHA256: {spec['sha256']}\n" + message)
             if framed is not None:
-                text = f"[Project Room {room_id} request {request_id}]\n" + framed
+                # A retained engineer session receives only what the controller has not delivered yet; the request
+                # identity stays in this record and the durable clientMessageId, never in the message bytes.
+                text = framed if role == "engineer" else f"[Project Room {room_id} request {request_id}]\n" + framed
             if review:
                 text += (f"\nRead-only review of candidate {checkpoint['candidate_path']}. Do not modify it or delegate. "
                          f"Verification evidence: {directory / state['checkpoint']}. Inspect the actual diff and evidence. "
@@ -574,6 +584,8 @@ class Service:
                 request["purpose"] = purpose
                 if purpose in ("implementation", "correction"):
                     request["handoff_sha256"] = state["handoff_sha256"]
+                if carried is not None:
+                    request["carried"] = carried  # what this packet delivered; derived later, never claimed by the agent
             state["requests"][request_id] = request
             self.save(directory, state)  # Persist intent BEFORE any request may reach AO.
             try:
@@ -618,12 +630,11 @@ class Service:
                 if (snapshot.get("conversationId") != request["baseline"]["conversation_id"]
                         or snapshot.get("activeBranchId") != request["baseline"]["branch_id"]):
                     raise RoomError("Native conversation branch changed; do not reattribute or replay this request")
-                matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
-                           and digest(m.get("text", "").encode()) == request["text_sha256"]]
-                if len(matches) != 1 or not matches[0].get("turnId"):
+                match = sent_message(request, snapshot)
+                if not match:
                     request["reconciliation"] = "No unique exact sent message observed; absence does not prove non-delivery"
                     continue
-                turn_id = matches[0]["turnId"]
+                turn_id = match["turnId"]
                 if request.get("turn_id") and request["turn_id"] != turn_id:
                     raise RoomError("AO acknowledgement/message turn identity mismatch")
                 request["turn_id"] = turn_id
@@ -652,10 +663,12 @@ class Service:
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
+                    if "carried" in request:
+                        receipt["carried_sha256"] = digest(request["carried"])
                     self.observation(directory, request, receipt)
                     request["usage"] = usage_receipt(request, snapshot)
                     if request["state"] == "completed" and request.get("purpose") in ("implementation", "correction"):
-                        ao_workflow.capture_engineering(directory, state, request)
+                        ao_workflow.capture_engineering(self.root.parent, directory, state, request)
             self.save(directory, state)
             if ao_workflow.normal(state):
                 ao_routing.observe_on_sync(self, directory, state)  # bounded GET; never refuses the sync
@@ -725,6 +738,13 @@ class Service:
             self.save(directory, state)
             return {k: v for k, v in checkpoint.items() if k != "candidate"} | {"evidence_sha256": digest(checkpoint), "path": str(directory / relative)}
 
+    def ao_room_response_normalize(self, room_id, request_id, receipt_sha256, final_text_sha256,
+                                   json_start, json_end, astra_review, confirm_no_additional_verdict):
+        from ao_response_normalization import normalize
+        with self.locked(room_id) as (directory, state):
+            return normalize(self, directory, state, request_id, receipt_sha256, final_text_sha256,
+                             json_start, json_end, astra_review, confirm_no_additional_verdict)
+
     def ao_room_accept(self, room_id, request_id):
         with self.locked(room_id) as (directory, state):
             self.quiet(state)
@@ -748,15 +768,10 @@ class Service:
             receipt = read(directory / request["receipt"])
             if digest(receipt) != request["receipt_sha256"]:
                 raise RoomError("Review receipt was modified")
-            finals = [m for m in receipt["messages"] if m.get("role") == "assistant" and not m.get("streaming") and m.get("text", "").strip()]
-            if not finals:
-                raise RoomError("Reviewer has no final response")
-            text = finals[-1]["text"].strip()
-            if text.startswith("```json\n") and text.endswith("\n```"):
-                text = text[8:-4]
+            from ao_response_normalization import ResponseFormatError
             try:
-                verdict = json.loads(text)
-            except ValueError as exc:
+                verdict = ao_workflow.final_json(directory, request)
+            except ResponseFormatError as exc:
                 raise RoomError("Reviewer final response must be one JSON verdict") from exc
             if not isinstance(verdict, dict) or verdict.get("decision") != "approved" or any(verdict.get(k) != v for k, v in expected.items()):
                 raise RoomError("Reviewer rejected or did not approve the exact identities; inspect its saved receipt")
@@ -772,7 +787,8 @@ class Service:
     def request_summary(self, request):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose",
-                  "result_candidate_sha256", "engineering_error")
+                  "result_candidate_sha256", "engineering_error", "normalization_capture_error",
+                  "response_normalization", "response_normalization_sha256")
         result = {k: request[k] for k in fields if k in request}
         if request.get("observed_turn"):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -811,7 +827,8 @@ class Service:
                 agreed = {"agreed": False, "reason": str(exc)}
             extra.update(agreement=agreed, handoff=state.get("handoff"),
                          delegate=ao_delegates.status(self.root.parent, directory, state),
-                         spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered))
+                         spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
+                         engineer_context=ao_workflow.context_summary(state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
@@ -864,5 +881,6 @@ TOOL_SCHEMAS = {
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
+    "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
     "ao_room_accept": ("Validate an independent AO reviewer's completed JSON approval against the unchanged spec, candidate and gate evidence. Never merges or publishes.", schema({**R, "request_id": S})),
 }

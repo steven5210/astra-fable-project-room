@@ -170,10 +170,13 @@ class NormalWorkflowTests(Fixture):
         self.implement(); self.review()
         result = self.service.ao_room_accept(self.room, 'acceptance_review')
         self.assertTrue(result['accepted']); self.assertEqual(result['workflow'], 'fable_engineering')
-        packet = self.state()['requests']['implementation']['text']
-        self.assertIn('Fable owns implementation', packet)
-        self.assertNotIn('No routine Fable', packet)
-        self.assertIn('Fable is the implementation orchestrator', packet)
+        # The one-time workflow parts reach the session with its first packet; implementation carries only the caller's bytes.
+        initial = ao_workflow.latest(self.state(), {'spec_review'})['text']
+        self.assertIn('Fable directs implementation, delegates execution', initial)
+        self.assertIn('with no preamble, Markdown fence or trailing prose', initial)
+        self.assertNotIn('No routine Fable', initial)
+        self.assertIn('Fable is the implementation orchestrator', initial)
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.assertEqual(self.service.ao_room_status(self.room)['delegate']['provider'], 'none')
         self.assertFalse(self.service.ao_room_status(self.room)['usage']['includes_delegates'])
 
@@ -302,7 +305,7 @@ class NormalWorkflowTests(Fixture):
         self.assertIsNone(ao.conflicting_reroute(request, snapshot))
 
 
-class DelegatePreparationTests(Fixture):
+class DelegateFixture(Fixture):
     def setUp(self):
         super().setUp()
         self.claude_config = self.root / 'claude-config'; self.claude_config.mkdir()
@@ -329,6 +332,8 @@ p.write_text(json.dumps(value))
     def prepare(self, path=None):
         return self.service.ao_room_prepare(self.room, str(path or self.repo))
 
+
+class DelegatePreparationTests(DelegateFixture):
     def test_private_setup_is_idempotent_and_does_not_touch_candidate(self):
         before = ao.candidate_snapshot(self.repo)
         first = self.prepare(); self.assertEqual(first, self.prepare())
@@ -464,6 +469,7 @@ class RoutingTests(Fixture):
         self.assertEqual(exclude.read_bytes() if exclude.exists() else None, exclude_before)
         self.assertEqual((self.claude_env / 'settings.json').read_text(), '{"permissions": {"defaultMode": "auto"}}')
         routing = prepared['routing']
+        self.assertEqual((routing['version'], routing['execution_policy']), (2, 'orchestrator'))
         self.assertEqual(routing['agents'], {'pr-sonnet': 'claude-sonnet-5', 'pr-opus': 'claude-opus-5'})
         self.assertEqual(routing['browser_skill'], 'claude-in-chrome')
         self.assertEqual(routing['claude']['version'], '0.0-fake (Claude Code)')
@@ -485,7 +491,7 @@ class RoutingTests(Fixture):
         self.assertEqual(settings['env']['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '2')
         self.assertIn('Skill(code-review)', settings['permissions']['deny']); self.assertIn('Workflow', settings['permissions']['deny'])
         entry = settings['hooks']['PreToolUse'][0]
-        self.assertEqual(entry['matcher'], 'Agent|Workflow|Task|Skill|SendMessage|Team.*|mcp__deepseek__.*|mcp__qwen-local__.*|mcp__project-room__.*')
+        self.assertEqual(entry['matcher'], '.*')
         for name in ('pr-sonnet', 'pr-opus'):
             tools = ao_routing.parse_definition((self.repo / '.claude' / 'agents' / (name + '.md')).read_text())['disallowedTools']
             for denied in ('mcp__deepseek', 'mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__qwen-local', 'mcp__project-room'):
@@ -584,9 +590,9 @@ class RoutingTests(Fixture):
             self.assertIsNotNone(self.decide(event), event)
         self.assertIsNone(self.decide({'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_type': 'pr-opus', 'agent_id': 'child'}))
         self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}}))
-        self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}, 'agent_type': 'pr-sonnet'}))
+        self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}, 'agent_type': 'pr-sonnet', 'agent_id': 'child'}))
         self.assertIsNone(self.decide({'tool_name': 'TaskOutput', 'tool_input': {'task_id': 'x'}}))
-        for root_tool in ('mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__deepseek__deepseek_result', 'mcp__project-room__ao_room_status'):
+        for root_tool in ('mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__deepseek__deepseek_result'):
             self.assertIsNone(self.decide({'tool_name': root_tool, 'tool_input': {'task': 'x'}}))  # root Fable keeps its pinned provider access
         for bad in ({'tool_name': 'Agent', 'tool_input': []}, {'tool_input': {}}, {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet'}, 'agent_type': 5}, 'text'):
             with self.assertRaises(ValueError):
@@ -607,6 +613,66 @@ class RoutingTests(Fixture):
         self.assertEqual(wrapped.returncode, 2)
         wrapped = subprocess.run(['sh', '-c', command], input=json.dumps(allow), capture_output=True, text=True)
         self.assertEqual((wrapped.returncode, wrapped.stdout), (0, ''))
+
+    def test_execution_ownership_blocks_root_probes_and_alternate_tools_but_keeps_worker_hands(self):
+        # The live failure was an extra Python validation probe; its purpose or contents must not exempt it.
+        events = [
+            {'tool_name': 'Bash', 'tool_input': {'command': 'python3 verify_vectors.py'}},
+            {'tool_name': 'Bash', 'tool_input': {'command': 'git diff --check'}},
+            {'tool_name': 'Write', 'tool_input': {'file_path': 'report.json', 'content': '{}'}},
+            {'tool_name': 'Edit', 'tool_input': {}},
+            {'tool_name': 'NotebookEdit', 'tool_input': {}},
+            {'tool_name': 'mcp__claude-in-chrome__navigate', 'tool_input': {}},
+            {'tool_name': 'mcp__alternate__execute_code', 'tool_input': {}},
+            {'tool_name': 'FutureExecutionTool', 'tool_input': {}},
+        ]
+        for event in events:
+            with self.subTest(tool=event['tool_name']):
+                self.assertIn('Fable orchestrates', self.decide(event))
+                for identity in ('pr-sonnet', 'pr-opus'):
+                    self.assertIsNone(self.decide({**event, 'agent_type': identity, 'agent_id': 'worker'}))
+                for identity in ({'agent_id': 'worker'}, {'agent_type': ''}, {'agent_type': 'unknown'},
+                                 {'agent_type': 'pr-opus'}, {'agent_type': 'pr-sonnet'},
+                                 {'agent_type': 'pr-opus', 'agent_id': ''}, {'agent_type': 'pr-opus', 'agent_id': ' '}):
+                    self.assertIn('identified pinned', self.decide({**event, **identity}))
+        for identity in ({'agent_type': 'pr-opus'}, {'agent_type': 'pr-opus', 'agent_id': ''},
+                         {'agent_type': 'pr-opus', 'agent_id': ' '}):
+            self.assertIsNotNone(self.decide({'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, **identity}))
+        for tool in ('Read', 'Grep', 'Glob', 'ToolSearch', 'TaskCreate', 'TaskUpdate', 'TaskOutput'):
+            self.assertIsNone(self.decide({'tool_name': tool, 'tool_input': {}}))
+        for tool in ('mcp__project-room__ao_room_status', 'mcp__deepseek__change_profile', 'mcp__qwen-local__qwen_submit'):
+            self.assertIsNotNone(self.decide({'tool_name': tool, 'tool_input': {}}))
+        self.bind()
+        routing = self.prepared()['routing']
+        settings = json.loads((self.repo / '.claude/settings.local.json').read_text())
+        hook = next(h for h in settings['hooks']['PreToolUse'] if h['matcher'] == '.*')
+        for event in (events[0], {**events[0], 'agent_type': 'pr-sonnet', 'agent_id': 'worker'}):
+            run = subprocess.run(['sh', '-c', hook['hooks'][0]['command']], input=json.dumps(event), capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0)
+            if 'agent_type' in event:
+                self.assertEqual(run.stdout, '')  # ordinary worker permissions still decide
+            else:
+                self.assertEqual(json.loads(run.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertEqual(self.routing()['execution_policy'], 'orchestrator')
+        self.assertEqual(Path(routing['guard_path']).read_bytes(), Path(routing_guard.__file__).read_bytes())
+
+    def test_routing_v2_refuses_policy_drift_and_v1_is_not_relabelled(self):
+        self.bind()
+        prepared = self.prepared()
+        original = json.dumps(prepared, sort_keys=True)
+        for field, value in (('execution_policy', 'unrestricted'), ('matcher', 'Agent'), ('version', 3), ('version', True)):
+            changed = json.loads(original)
+            changed['routing'][field] = value
+            with self.assertRaises(ao.RoomError):
+                ao_routing.validate_local(changed)
+        historical = json.loads(original)
+        historical['routing']['version'] = 1
+        historical['routing'].pop('execution_policy')
+        # Frozen old rooms keep their recorded evidence, never acquire a new policy label or prompt.
+        before = json.dumps(historical, sort_keys=True)
+        self.assertEqual(ao_routing.status(historical, {})['execution_policy'], 'historical_unrestricted_root')
+        self.assertNotIn('Fable is the orchestrator:', ao_routing.packet_text(historical))
+        self.assertEqual(json.dumps(historical, sort_keys=True), before)
 
     def test_definition_validation_rejects_omitted_inherit_and_fable_models(self):
         text = ao_routing.agent_definition('pr-sonnet')
@@ -727,8 +793,9 @@ class RoutingTests(Fixture):
         evidence.write_bytes(saved)
         self.assertEqual(self.routing()['status'], 'verified')
         self.implement()
-        request = self.state()['requests']['implementation']
-        self.assertIn('pr-sonnet (claude-sonnet-5', request['text']); self.assertIn('pr-opus (claude-opus-5', request['text'])
+        initial = ao_workflow.latest(self.state(), {'spec_review'})['text']  # routing text is delivered once, with the first packet
+        self.assertIn('pr-sonnet (claude-sonnet-5', initial); self.assertIn('pr-opus (claude-opus-5', initial)
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.review()
         self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
@@ -793,7 +860,8 @@ class RoutingTests(Fixture):
         delegate = self.service.ao_room_status(self.room)['delegate']
         self.assertEqual(delegate['attachment'], 'configuration_verified'); self.assertEqual(delegate['routing']['status'], 'not_configured')
         self.agree(); self.service.ao_room_handoff(self.room, str(self.repo)); self.send('implementation')
-        self.assertIn('not configured', self.state()['requests']['implementation']['text'])
+        self.assertIn('not configured', ao_workflow.latest(self.state(), {'spec_review'})['text'])  # delivered once, first packet
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.service.ao_room_sync(self.room)
         self.assertNotIn('routing_rules', self.state())
         self.assertEqual(self.routing()['status'], 'not_configured')
