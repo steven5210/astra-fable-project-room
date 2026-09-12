@@ -82,6 +82,16 @@ When the user chooses AO for new Project Room work, also record
 `"default_backend": "ao"` in that private config. The skill uses this preference;
 the low-level legacy tools remain callable and never migrate a room automatically.
 
+Every fresh normal AO engineer preparation enables native automatic compaction
+with a 250,000-token window, independent of the feature or delegate provider.
+Optional `auto_compact_window` in that same private AO config selects an integer
+from 100,000 to 1,000,000 for future preparations only. The preparation records
+the chosen window and pins it in ignored local Claude settings before launch.
+Conflicting disable or override settings refuse preparation or dispatch. Older
+preparations retain their exact snapshots. Follow [context compaction](../../../docs/context-compaction.md)
+for the safe existing-session procedure and live validation; do not rewrite room
+evidence, repeat retained instructions, or lower Fable MAX to reduce context.
+
 Call `ao_room_open` with the actual project path, stable feature name, existing AO
 project ID and the user's existing implementation authorization. Reopening returns
 the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
@@ -518,8 +528,7 @@ missing ledger block continuation, verification and acceptance. Only the user's 
 supported terminal action can resolve uncertain DeepSeek delivery; neither agent may
 self-resolve or replay it.
 
-A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. Native compaction remains
-owned by AO/the provider and is not automatically triggered by this adapter.
+A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. New preparations configure the native automatic-compaction window. Claude owns the actual compaction; the adapter never sends a compaction prompt or replays a turn to trigger it.
 Manual Claude compaction and a controlled native stop/resume are validated only
 as described under readiness above; automatic compaction thresholds and crash
 recovery still require their own live validation. Do not claim a smaller context

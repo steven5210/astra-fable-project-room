@@ -57,6 +57,10 @@ MEANING = ("Configured worktree files, executable identity and observed AO proje
 NOT_CONFIGURED = ("Prepared before native routing or not prepared: no native delegation protection exists for this "
                   "worker and none is claimed; the room stays readable and is never relabeled.")
 MAX_SETTINGS_BYTES = 4_000_000
+COMPACTION_DEFAULT = 250_000
+COMPACTION_KEY = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+COMPACTION_OVERRIDES = ("DISABLE_COMPACT", "DISABLE_AUTO_COMPACT",
+                        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE")
 
 
 def _normalized(text):
@@ -214,6 +218,14 @@ def check_settings(settings, routing):
              for hook in (entry.get("hooks") or []) if isinstance(hook, dict)]
     if not any(hook.get("type") == "command" and hook.get("command") == routing["hook_command"] for hook in hooks):
         raise RoomError("Local settings no longer run the routing guard")
+    if "compaction" in routing:
+        policy = _compaction_policy(routing["compaction"])
+        if (settings.get("autoCompactEnabled") is not True
+                or type(settings.get("autoCompactWindow")) is not int
+                or settings["autoCompactWindow"] != policy["window"]
+                or env.get(COMPACTION_KEY) != str(policy["window"])
+                or routing["env"].get(COMPACTION_KEY) != str(policy["window"])):
+            raise RoomError("Local settings no longer pin the prepared compaction window")
 
 
 def managed_settings_path(environ):
@@ -267,6 +279,53 @@ def contradictions(config_dir, worktree=None, environ=None):
         bad = _contradictory_env({key: environ[key] for key in environ if key in ENV or key in CONTRADICTORY_ENV})
         if bad:
             raise RoomError("Process environment overrides native routing knobs: " + ", ".join(bad))
+
+
+def _compaction_policy(value):
+    if (not isinstance(value, dict) or set(value) != {"version", "window"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or type(value["window"]) is not int or not 100_000 <= value["window"] <= 1_000_000):
+        raise RoomError("Compaction window must be an integer from 100000 to 1000000")
+    return value
+
+
+def compaction_policy(service):
+    """Select a default only for a fresh preparation; never reread defaults for an existing room."""
+    config = _settings_file(service.root / "config.json") or {}
+    return _compaction_policy({"version": 1, "window": config.get("auto_compact_window", COMPACTION_DEFAULT)})
+
+
+def _compaction_env(policy, value, label):
+    env = _mapping(value, label + " env")
+    if any(env.get(key) not in (None, "") for key in COMPACTION_OVERRIDES):
+        raise RoomError(label + " overrides or disables automatic compaction")
+    if COMPACTION_KEY in env and env[COMPACTION_KEY] != str(policy["window"]):
+        raise RoomError(label + " conflicts with the prepared compaction window")
+
+
+def _compaction_sources(policy, config_dir, worktree, environ):
+    _compaction_policy(policy)
+    sources = (("user", Path(config_dir) / "settings.json"),
+               ("managed", managed_settings_path(environ)),
+               ("project", Path(worktree) / ".claude/settings.json"),
+               ("local", Path(worktree) / ".claude/settings.local.json"))
+    for label, path in sources:
+        data = _settings_file(path)
+        if data is None:
+            continue
+        if "autoCompactEnabled" in data and data["autoCompactEnabled"] is not True:
+            raise RoomError(label + " settings disable automatic compaction")
+        _compaction_env(policy, data.get("env"), label + " settings")
+    _compaction_env(policy, dict(environ), "Process environment")
+
+
+def _compaction_project(client, state, policy):
+    raw = client.request("GET", "/projects/" + state["ao_project_id"])
+    project = raw.get("project", raw) if isinstance(raw, dict) else {}
+    if not isinstance(project, dict) or project.get("id", project.get("projectId")) != state["ao_project_id"]:
+        raise RoomError("AO project identity mismatch while checking compaction")
+    config = _mapping(project.get("config"), "AO project configuration")
+    _compaction_env(policy, config.get("env"), "AO project environment")
 
 
 def _lookup(config, path):
@@ -421,6 +480,9 @@ def prepare(service, directory, state, worktree, prepared):
             _require_ignored(worktree, relative)
         stage = "settings"
         contradictions(settings["claude_config_dir"], worktree, os.environ)
+        compaction = compaction_policy(service)
+        _compaction_sources(compaction, settings["claude_config_dir"], worktree, os.environ)
+        _compaction_project(service.client(state), state, compaction)
         stage = "rules"
         rules = observe_rules(service.client(state), state)
         if not rules["clause_present"]:
@@ -452,6 +514,10 @@ def prepare(service, directory, state, worktree, prepared):
         existing_bytes = owned_bytes(settings_path) if settings_path.exists() else None
         existing = json.loads(existing_bytes) if existing_bytes is not None else None
         merged = settings_document(existing, command)
+        # Only fresh preparations receive this default. The unchanged renderer is
+        # also used to reproduce immutable historical routing-adoption bundles.
+        merged.update(autoCompactEnabled=True, autoCompactWindow=compaction["window"])
+        merged["env"][COMPACTION_KEY] = str(compaction["window"])
         documents[".claude/settings.local.json"] = (json.dumps(merged, indent=2, sort_keys=True) + "\n").encode()
         stage = "preflight"
         plan = []
@@ -470,7 +536,8 @@ def prepare(service, directory, state, worktree, prepared):
         prepared["routing"] = {
             "version": 2, "execution_policy": EXECUTION_POLICY,
             "files": files, "guard_path": str(guard), "guard_sha256": guard_hash, "hook_command": command,
-            "python": settings["python"], "agents": dict(MODELS), "effort": EFFORT, "env": dict(ENV), "deny": list(DENY),
+            "python": settings["python"], "agents": dict(MODELS), "effort": EFFORT,
+            "env": {**ENV, COMPACTION_KEY: str(compaction["window"])}, "compaction": compaction, "deny": list(DENY),
             "matcher": MATCHER, "browser_skill": BROWSER_SKILL, "claude_config_dir": settings["claude_config_dir"],
             "claude": claude, "rules": rules,
             "prepare_environment": {key: os.environ[key] for key in sorted(os.environ) if key in RECORDED_ENV},
@@ -512,6 +579,8 @@ def validate_local(prepared):
             raise RoomError("Routing guard interpreter is unavailable")
         check_claude(routing.get("claude") or {})
         contradictions(routing["claude_config_dir"], worktree)
+        if "compaction" in routing:
+            _compaction_sources(routing["compaction"], routing["claude_config_dir"], worktree, os.environ)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         raise RoomError("Native routing evidence is unreadable or inconsistent: " + str(exc)) from exc
     return routing
@@ -536,9 +605,13 @@ def record_observation(service, directory, state, observed, source, consistent):
 def before_dispatch(service, directory, state, prepared, purpose):
     """Local validation for every engineer dispatch; live rules check before implementation/correction."""
     routing = validate_local(prepared)
-    if routing is None or purpose not in ("implementation", "correction"):
+    if routing is None:
         return routing
     try:
+        if "compaction" in routing:
+            _compaction_project(service.client(state), state, routing["compaction"])
+        if purpose not in ("implementation", "correction"):
+            return routing
         observed = observe_rules(service.client(state), state)
     except RoomError as exc:
         state["routing_rules"] = {"observed_at": time.time(), "source": "dispatch", "consistent": False, "error": str(exc)[:1000]}
@@ -564,6 +637,8 @@ def observe_on_sync(service, directory, state):
     if not routing:
         return
     try:
+        if "compaction" in routing:
+            _compaction_project(service.client(state), state, routing["compaction"])
         observed = observe_rules(service.client(state), state)
     except RoomError as exc:
         state["routing_rules"] = {"observed_at": time.time(), "source": "sync", "consistent": False, "error": str(exc)[:1000]}
@@ -582,6 +657,9 @@ def status(prepared, state, directory=None):
                "browser_skill": routing["browser_skill"], "files": routing["files"], "guard_sha256": routing["guard_sha256"],
                "claude": claude, "rules_snapshot": routing["rules"], "last_observed_rules": state.get("routing_rules"),
                "meaning": MEANING}
+    if "compaction" in routing:
+        summary["compaction"] = routing["compaction"]
+        summary["compaction_meaning"] = "Configured native window; actual compaction, continuity, quality and usage need observation."
     try:
         validate_local(prepared)
     except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
