@@ -39,27 +39,29 @@ def completed_receipt(directory, request):
     return receipt
 
 
-def final_text(directory, request, allow_missing=False):
+def raw_final_text(directory, request, allow_missing=False):
     receipt = completed_receipt(directory, request)
     finals = [m for m in receipt["messages"] if m.get("role") == "assistant" and not m.get("streaming") and m.get("text", "").strip()]
     if not finals:
         if allow_missing:
             return ""
         raise RoomError("Native result has no final response")
-    text = finals[-1]["text"].strip()
+    return finals[-1]["text"]
+
+
+def final_text(directory, request, allow_missing=False):
+    text = raw_final_text(directory, request, allow_missing=allow_missing).strip()
     if text.startswith("```json\n") and text.endswith("\n```"):
         text = text[8:-4]
     return text
 
 
-def final_json(directory, request):
-    try:
-        value = json.loads(final_text(directory, request))
-    except ValueError as exc:
-        raise RoomError("Native final response must be one JSON object") from exc
-    if not isinstance(value, dict):
-        raise RoomError("Native final response must be one JSON object")
-    return value
+def final_json(directory, request, allow_missing=False):
+    from ao_response_normalization import load_result, strict_object
+    raw = raw_final_text(directory, request, allow_missing=allow_missing)
+    if "response_normalization" in request or "response_normalization_sha256" in request:
+        return load_result(directory, request, raw)
+    return strict_object(raw)
 
 
 def latest(state, purposes):
@@ -136,10 +138,11 @@ def handoff(service, directory, state, worktree_path):
     return value
 
 
-def engineering_report(directory, state, request):
+def engineering_report(directory, state, request, report=None):
     """Pure shape validation of the saved final JSON; delegate evidence is verified at the lifecycle boundaries."""
     record = handoff_record(directory, state)
-    report = final_json(directory, request)
+    if report is None:
+        report = final_json(directory, request)
     if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
             or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
@@ -152,14 +155,43 @@ def engineering_report(directory, state, request):
     return report
 
 
-def capture_engineering(home, directory, state, request):
+def completion_candidate(directory, state, request, capture=False):
+    """Bind a candidate to the first completed observation, even when report formatting is invalid."""
+    from ao_project_room import atomic, digest, read
+    handoff = handoff_record(directory, state)
+    relative = request.get("completion_candidate")
+    if relative:
+        value = read(directory / relative)
+        if (digest(value) != request.get("completion_candidate_sha256")
+                or value.get("receipt_sha256") != request["receipt_sha256"]
+                or value.get("handoff_sha256") != request.get("handoff_sha256")
+                or value.get("handoff_sha256") != state["handoff_sha256"]):
+            raise RoomError("Completion candidate evidence was modified or belongs to another result")
+        return value["candidate"]
+    if not capture or request.get("completion_capture_attempted"):
+        raise RoomError("No immutable candidate-at-completion evidence; do not recapture historical work")
+    request["completion_capture_attempted"] = True
+    candidate = candidate_snapshot(handoff["worktree"])
+    value = {"candidate": candidate, "receipt_sha256": request["receipt_sha256"], "handoff_sha256": state["handoff_sha256"]}
+    relative = "completion-candidates/" + request["request_id"] + ".json"
+    if (directory / relative).exists():
+        raise RoomError("Unclaimed completion candidate evidence exists; preserve it for diagnosis")
+    atomic(directory / relative, value)
+    request.update(completion_candidate=relative, completion_candidate_sha256=digest(value))
+    return candidate
+
+
+def capture_engineering(home, directory, state, request, capture_completion=True):
     from ao_project_room import atomic, digest
     try:
+        completed_candidate = completion_candidate(directory, state, request, capture=capture_completion)
         report = engineering_report(directory, state, request)
         # The claim is recorded before verification so a ledger lost afterwards still counts as recorded delegation.
         request["reported_delegate_job_ids"] = ao_delegates.report_job_ids(report)
         evidence = ao_delegates.verify_delegation(home, directory, state, report)
         candidate = candidate_snapshot(handoff_record(directory, state)["worktree"])
+        if candidate != completed_candidate:
+            raise RoomError("Candidate changed after the completed native result")
         relative = "engineering/" + request["request_id"] + ".json"
         record = {"candidate": candidate, "report_sha256": digest(report), "receipt_sha256": request["receipt_sha256"],
                   "delegation": evidence}
@@ -167,7 +199,9 @@ def capture_engineering(home, directory, state, request):
         request.update(engineering_record=relative, engineering_record_sha256=digest(record), result_candidate_sha256=candidate["sha256"],
                        delegate_job_ids=[item["job_id"] for item in evidence])
     except (RoomError, ImplementationError, OSError, ValueError, KeyError, TypeError) as exc:
-        request["engineering_error"] = str(exc)[:1000]
+        # A derived-envelope capture is a separate observation, not permission to erase the initial failure.
+        field = "normalization_capture_error" if not capture_completion else "engineering_error"
+        request[field] = str(exc)[:1000]
 
 
 def engineering_ready(service, directory, state):
@@ -196,7 +230,7 @@ def engineering_ready(service, directory, state):
 
 def part_texts(prepared, policy):
     """The pinned one-time workflow parts for this room, keyed by stable part name."""
-    return {
+    parts = {
         "review_contract": ("Workflow: Fable engineering with independent Astra acceptance.\nSpecification review turns: Fable owns "
                             "engineering interpretation. Review the exact specification delivered to this session read-only, without "
                             "implementation or delegates; a later revision arrives as its changes only. Finish with one JSON object: "
@@ -219,6 +253,18 @@ def part_texts(prepared, policy):
         "baseline_rule": ("baseline_commit in the engineering report is the bound worktree HEAD at the start of the implementation "
                           "turn, before any commit of your own; corrections for the same handoff report that same baseline."),
     }
+    if (prepared.get("routing") or {}).get("version") == 2:
+        parts["report_contract"] = parts["report_contract"].replace(
+            "Fable owns implementation, engineering review and eligible delegation",
+            "Fable directs implementation, delegates execution, reviews evidence and owns the engineering verdict")
+        parts["report_contract"] += (
+            " Execution ownership includes validation probes and tests: use the assigned operator or pinned workers, "
+            "and request missing evidence instead of running their work yourself. Use the supplied spec and baseline "
+            "identifiers; the controller checks their integrity. Keep the engineering verdict grounded in the complete "
+            "evidence, without reconstructing delegate work just to report it.")
+        for name in ("review_contract", "report_contract"):
+            parts[name] += " The entire final response must be that JSON object, with no preamble, Markdown fence or trailing prose."
+    return parts
 
 
 def carried_by(request):
@@ -364,10 +410,10 @@ def packet(service, directory, state, role, purpose, message):
             raise RoomError("Use implementation once per handoff, then correction only for known completed work")
         if previous:
             last = max(previous, key=lambda r: r["created_order"])
-            previous_text = final_text(directory, last, allow_missing=True)
+            from ao_response_normalization import ResponseFormatError
             try:
-                prior = json.loads(previous_text)
-            except ValueError:
+                prior = final_json(directory, last, allow_missing=True)
+            except ResponseFormatError:
                 prior = None  # known completion may need a report-only correction
             if isinstance(prior, dict) and prior.get("outcome") == "scope_change":
                 raise RoomError("Engineering discovered a scope change; revise and agree the specification first")

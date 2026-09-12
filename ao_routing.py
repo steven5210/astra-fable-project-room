@@ -31,7 +31,9 @@ ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_
 CONTRADICTORY_ENV = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE",)
 RECORDED_ENV = tuple(ENV) + ("CLAUDE_CODE_SUBAGENT_MODEL",) + CONTRADICTORY_ENV
 DENY = ["Workflow", "Skill(code-review)", "Skill(simplify)", "Skill(security-review)"]
-MATCHER = "Agent|Workflow|Task|Skill|SendMessage|Team.*|mcp__deepseek__.*|mcp__qwen-local__.*|mcp__project-room__.*"
+# Every root route must reach the ownership guard, including future/unknown execution tools.
+MATCHER = ".*"
+EXECUTION_POLICY = "orchestrator"
 # Native workers inherit the parent session's MCP tools; these servers submit delegate or room work.
 SUBMISSION_SERVERS = ("mcp__deepseek", "mcp__qwen-local", "mcp__project-room")
 SUBMISSION_TOOLS = ("mcp__deepseek__deepseek_submit", "mcp__deepseek__deepseek_ask")
@@ -466,7 +468,8 @@ def prepare(service, directory, state, worktree, prepared):
             _write(worktree, relative, content, existing_bytes if relative == ".claude/settings.local.json" else None)
         files = {relative: digest(owned_bytes(worktree / relative)) for relative in FILES}
         prepared["routing"] = {
-            "version": 1, "files": files, "guard_path": str(guard), "guard_sha256": guard_hash, "hook_command": command,
+            "version": 2, "execution_policy": EXECUTION_POLICY,
+            "files": files, "guard_path": str(guard), "guard_sha256": guard_hash, "hook_command": command,
             "python": settings["python"], "agents": dict(MODELS), "effort": EFFORT, "env": dict(ENV), "deny": list(DENY),
             "matcher": MATCHER, "browser_skill": BROWSER_SKILL, "claude_config_dir": settings["claude_config_dir"],
             "claude": claude, "rules": rules,
@@ -486,6 +489,11 @@ def validate_local(prepared):
     if not routing:
         return None
     try:
+        version = routing.get("version", 1)
+        if type(version) is not int or version not in (1, 2):
+            raise RoomError("Unsupported native routing version")
+        if version == 2 and (routing.get("execution_policy") != EXECUTION_POLICY or routing.get("matcher") != MATCHER):
+            raise RoomError("Native routing no longer pins orchestration ownership for every tool")
         worktree = Path(prepared["worktree"])
         for relative, expected in routing["files"].items():
             _require_ignored(worktree, relative)
@@ -570,6 +578,7 @@ def status(prepared, state, directory=None):
     routing = prepared["routing"]
     claude = routing.get("claude") or {}
     summary = {"agents": routing["agents"], "effort": routing["effort"], "env": routing["env"], "deny": routing["deny"],
+               "execution_policy": routing.get("execution_policy") if routing.get("version") == 2 else "historical_unrestricted_root",
                "browser_skill": routing["browser_skill"], "files": routing["files"], "guard_sha256": routing["guard_sha256"],
                "claude": claude, "rules_snapshot": routing["rules"], "last_observed_rules": state.get("routing_rules"),
                "meaning": MEANING}
@@ -598,7 +607,17 @@ def status(prepared, state, directory=None):
 def packet_text(prepared):
     if prepared and prepared.get("routing"):
         agents = prepared["routing"]["agents"]
-        return ("Native delegation routing is configured for this worktree: launch only the pinned native agents pr-sonnet ("
+        ownership = ("Fable is the orchestrator: inspect evidence with Read/Grep/Glob, direct the pinned provider and "
+                     "native workers, adjudicate results and give the final engineering verdict. The guard denies root "
+                     "shell commands, edits, tests, browser work and unknown execution tools. Routine implementation "
+                     "and checks belong to the assigned operator or delegates, including probes used for verification. "
+                     "If a check is assigned to Astra, request its result and wait; do not duplicate it or reassign it "
+                     "without an actual task change. Do not reconstruct specifications or hashes: the controller "
+                     "checks exact source, native identity and candidate evidence; use the supplied identities. "
+                     "Choose Sonnet or Opus when needed for full quality; judgment remains yours. If the authorized "
+                     "tools cannot achieve the quality bar, report the capability gap instead of bypassing the guard. "
+                     if prepared["routing"].get("version") == 2 else "")
+        return (ownership + "Native delegation routing is configured for this worktree: launch only the pinned native agents pr-sonnet ("
                 + agents["pr-sonnet"] + ", mechanical implementation and tests) and pr-opus (" + agents["pr-opus"]
                 + ", bounded judgment/review and the pinned browser skill when the AO browser capability is present); "
                 "one layer, at most two concurrent, no model overrides, built-in agent types, forks, isolation, resume, "

@@ -215,6 +215,39 @@ message. The checks do not lock native AO sessions against outside interaction;
 keep both reviewers idle throughout the operation. Create the replacement close
 to its first authorized request so it is not stopped while still unmaterialized.
 
+## Completed response formatting recovery
+
+Prefer one final JSON object with no surrounding prose. If a known completed result
+contains one otherwise valid object surrounded by prose, the Astra operator may use
+`ao_room_response_normalize` without another model call. First read the **complete
+untrimmed final assistant text** in the saved receipt, including all prose outside
+the object. This is semantic review by Astra, not a parser guessing intent.
+
+Supply `room_id`, `request_id`, the recorded `receipt_sha256`,
+`final_text_sha256` of the exact untrimmed UTF-8 text, `json_start` and `json_end`
+as Unicode-character offsets, a substantive `astra_review`, and
+`confirm_no_additional_verdict: true`. That confirmation means the outside prose
+adds no contradictory or additional verdict, blocker or requirement; if it does,
+normalization is unsuitable. Do not repair JSON content, invent fields, extract a
+nested verdict or ignore a rejection. The command also works through the ordinary
+CLI `call` interface with `--args-file`.
+
+The operation records immutable derived evidence, including the selected span and
+all outside text, while keeping the raw receipt, original failure, request ID and
+review budgets unchanged. It refuses multiple objects, unsupported wrappers,
+duplicate keys, non-finite numbers, incomplete or mismatched native evidence,
+stale specs/candidates/gates, or changed normalization inputs. Identical retries
+are idempotent while their evidence remains current. Subsequent agreement,
+correction, verification and acceptance recheck the derived evidence and retain
+all blocker, scope-change and rejection semantics. Normalization never accepts a
+candidate; independent review and acceptance still run normally.
+
+Engineering completion now captures the candidate before attempting to parse its
+report. A malformed historical result without original candidate-at-completion
+evidence cannot be normalized by snapshotting today's worktree. Preserve that
+failure and resolve it through the existing workflow. A later sync must not be
+used to replace missing original evidence.
+
 ## Native delegation routing
 
 Newly prepared normal rooms route Fable's native delegation deliberately. The
@@ -244,9 +277,13 @@ nested dispatch (an event carrying `agent_id` or `agent_type`), workflows,
 teams, `SendMessage` continuation routes, every skill except the pinned
 browser skill inside an event whose `agent_type` is exactly `pr-opus`, and any
 `mcp__deepseek__*`, `mcp__qwen-local__*` or `mcp__project-room__*` call made
-inside a native worker (the root engineer's own calls take no decision). It never
+inside a native worker. New routing preparations use version 2 and match every tool (`.*`). The root engineer may inspect with Read/Grep/Glob, plan, use the explicitly listed DeepSeek tools and launch the pinned workers. Shell commands, edits, tests, browser tools, controller calls and unknown execution routes are denied at the root. Only a nonempty subagent-only `agent_id` together with a pinned `agent_type` retains execution tools; type alone can also describe a main session started with `--agent` and is refused as ambiguous. It never
 grants a permission; a guard error, a missing interpreter or a missing script
 exits 2, so the call is blocked.
+
+New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable retains read-only inspection, planning, pinned DeepSeek tools and pinned native delegation; root shell commands, edits, tests, browser actions and other execution tools are denied. The assigned operator or native worker runs probes and gates, including checks Fable requests for its verdict. Fable does not duplicate work assigned to Astra. A capability gap is reported for resolution, never worked around through another tool. This keeps necessary Fable judgment and final review while requiring execution to remain delegated; it does not change MAX or delegate budgets. Older preparations retain their original guard and report `historical_unrestricted_root` instead of claiming this protection.
+
+The guard uses [Claude Code PreToolUse decisions](https://code.claude.com/docs/en/hooks); an allowed path still faces ordinary permissions. This is workflow enforcement, not a security sandbox against a malicious worker.
 
 Preparation snapshots the file digests, guard digest, interpreter, knobs, the
 pinned browser skill name (`claude-in-chrome`, a constant that no private
@@ -290,8 +327,8 @@ observed consistent rules with that evidence present, and `unverified` with the
 reason on any local drift, contradictory settings, damaged evidence or
 inconsistent observation. None of these states
 proves native enforcement, the served model or effort, the concurrency/depth
-caps, resumption paths or compaction; workflow, resume and fork paths outside
-the `Agent` tool are not covered by the guard, and the worker's actual process
+caps, resumption paths or compaction; external session management is outside
+this worktree tool hook, and the worker's actual process
 environment is set by AO and is not observable at preparation time.
 
 Adoption procedure for a future session: (1) confirm the repository ignores

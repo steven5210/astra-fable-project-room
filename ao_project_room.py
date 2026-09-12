@@ -738,6 +738,13 @@ class Service:
             self.save(directory, state)
             return {k: v for k, v in checkpoint.items() if k != "candidate"} | {"evidence_sha256": digest(checkpoint), "path": str(directory / relative)}
 
+    def ao_room_response_normalize(self, room_id, request_id, receipt_sha256, final_text_sha256,
+                                   json_start, json_end, astra_review, confirm_no_additional_verdict):
+        from ao_response_normalization import normalize
+        with self.locked(room_id) as (directory, state):
+            return normalize(self, directory, state, request_id, receipt_sha256, final_text_sha256,
+                             json_start, json_end, astra_review, confirm_no_additional_verdict)
+
     def ao_room_accept(self, room_id, request_id):
         with self.locked(room_id) as (directory, state):
             self.quiet(state)
@@ -761,15 +768,10 @@ class Service:
             receipt = read(directory / request["receipt"])
             if digest(receipt) != request["receipt_sha256"]:
                 raise RoomError("Review receipt was modified")
-            finals = [m for m in receipt["messages"] if m.get("role") == "assistant" and not m.get("streaming") and m.get("text", "").strip()]
-            if not finals:
-                raise RoomError("Reviewer has no final response")
-            text = finals[-1]["text"].strip()
-            if text.startswith("```json\n") and text.endswith("\n```"):
-                text = text[8:-4]
+            from ao_response_normalization import ResponseFormatError
             try:
-                verdict = json.loads(text)
-            except ValueError as exc:
+                verdict = ao_workflow.final_json(directory, request)
+            except ResponseFormatError as exc:
                 raise RoomError("Reviewer final response must be one JSON verdict") from exc
             if not isinstance(verdict, dict) or verdict.get("decision") != "approved" or any(verdict.get(k) != v for k, v in expected.items()):
                 raise RoomError("Reviewer rejected or did not approve the exact identities; inspect its saved receipt")
@@ -785,7 +787,8 @@ class Service:
     def request_summary(self, request):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose",
-                  "result_candidate_sha256", "engineering_error")
+                  "result_candidate_sha256", "engineering_error", "normalization_capture_error",
+                  "response_normalization", "response_normalization_sha256")
         result = {k: request[k] for k in fields if k in request}
         if request.get("observed_turn"):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -878,5 +881,6 @@ TOOL_SCHEMAS = {
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
+    "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
     "ao_room_accept": ("Validate an independent AO reviewer's completed JSON approval against the unchanged spec, candidate and gate evidence. Never merges or publishes.", schema({**R, "request_id": S})),
 }
