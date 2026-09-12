@@ -690,10 +690,13 @@ CREATE INDEX IF NOT EXISTS resolutions_room ON resolutions(room_id);
 
 
 class Ledger:
-    def __init__(self, home):
+    def __init__(self, home, initialize=True):
         self.home = Path(home)
-        self.root = ensure_private_directory(self.home / "deepseek")
+        self.readonly = not initialize
+        self.root = ensure_private_directory(self.home / "deepseek") if initialize else self.home / "deepseek"
         self.path = self.root / "ledger.sqlite3"
+        if self.readonly:
+            return  # Observation must not create a lost database or repair a damaged/missing schema.
         if not self.path.exists():
             os.close(os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
         db = self.connect()
@@ -703,7 +706,7 @@ class Ledger:
             db.close()
 
     def connect(self, readonly=False):
-        if readonly:
+        if readonly or self.readonly:
             db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=10, isolation_level=None)
         else:
             db = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)

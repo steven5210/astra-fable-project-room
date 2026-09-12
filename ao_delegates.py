@@ -1,9 +1,11 @@
 """Preparation and validation of retained delegates for native AO workers."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -197,20 +199,177 @@ def prepare(service, directory, state, worktree_path):
     return validate_preparation(directory, state)
 
 
-def assert_settled(home, state):
+CONTENT_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def delegation_recorded(directory, state):
+    """Evidence that this room's delegate lane was used: an observed ledger, a native MCP launch, or a report naming jobs."""
+    if state.get("delegate_ledger_observed"):
+        return True
+    if directory is not None and (Path(directory) / "delegate-launch.json").exists():
+        return True
+    return any(r.get("reported_delegate_job_ids") or r.get("delegate_job_ids") for r in state.get("requests", {}).values())
+
+
+def assert_no_lost_job_rows(home, ledger, room_id):
+    """Old pinned adapters can recreate an empty ledger. Retained request metadata must not lose its ledger row.
+    Inspect metadata only for orphan directories; normal known jobs need no artifact reads, and other rooms' jobs
+    do not block this room. Evidence is never deleted automatically by the adapter."""
+    import deepseek_adapter
+    jobs = Path(home) / "deepseek" / "jobs"
+    if not jobs.exists():
+        return
+    if jobs.is_symlink():
+        raise RoomError("Delegate job evidence directory is unsafe")
+    with ledger.reading() as db:
+        known = {r[0] for r in db.execute("SELECT id FROM jobs")}
+    for path in jobs.iterdir():
+        if not deepseek_adapter.JOB_ID.fullmatch(path.name) or path.name in known:
+            continue
+        try:
+            record = json.loads(owned_bytes(path / "request.json", deepseek_adapter.MAX_REQUEST_RECORD_BYTES))
+        except (OSError, ValueError) as exc:
+            raise RoomError("Orphan delegate job evidence is unreadable; ledger completeness cannot be established") from exc
+        if (not isinstance(record, dict) or record.get("job_id") != path.name
+                or not isinstance(record.get("room_id"), str) or not record["room_id"]):
+            raise RoomError("Orphan delegate job evidence is inconsistent; ledger completeness cannot be established")
+        if record["room_id"] == room_id:
+            raise RoomError("Delegate ledger lost a recorded job; restore its private evidence before any mutation, never replay it")
+
+
+def assert_settled(home, state, directory=None):
     """Full-ledger admission check, independent of the latest-20 status display."""
     if state["delegate"]["provider"] != "deepseek":
         return
     import deepseek_adapter
     ledger_path = Path(home) / "deepseek" / "ledger.sqlite3"
     if not ledger_path.exists():
+        if delegation_recorded(directory, state):
+            raise RoomError("Delegate ledger is missing after recorded delegation; restore the private ledger before any "
+                            "mutation, never recreate or replay it")
         return  # No delegate has yet created a ledger.
     try:
-        ledger = deepseek_adapter.Ledger(home)
+        ledger = deepseek_adapter.Ledger(home, initialize=False)
+        assert_no_lost_job_rows(home, ledger, state["room_id"])
         if ledger.active(state["room_id"]) or ledger.stopping_jobs(state["room_id"]):
             raise RoomError("Active or unresolved delegate jobs stop this room; observe them, never replay or self-resolve")
     except (OSError, sqlite3.Error, deepseek_adapter.AdapterError) as exc:
         raise RoomError("Delegate ledger is unavailable; completion cannot be established") from exc
+    state["delegate_ledger_observed"] = True  # a later missing ledger is loss, never a fresh room
+
+
+def report_job_ids(report):
+    """Ordered unique delegate job IDs an already-parsed engineering report names; pure, no IO."""
+    seen, ids = set(), []
+    entries = report.get("routing_log", [])
+    if not isinstance(entries, list):
+        return []  # A known-completed malformed report may receive a report-only correction.
+    for entry in entries:
+        jobs = entry.get("delegate_job_ids", []) if isinstance(entry, dict) else []
+        if not isinstance(jobs, list):
+            continue
+        for job_id in jobs:
+            if isinstance(job_id, str) and job_id not in seen:
+                seen.add(job_id)
+                ids.append(job_id)
+    return ids
+
+
+def expected_profile(inventory):
+    """profile_sha256 that the pinned adapter snapshot and configuration produce, exactly as the adapter derives it."""
+    files = (inventory or {}).get("files", {})
+    adapter = [d for p, d in files.items() if Path(str(p)).name == "deepseek_adapter.py"]
+    config = [d for p, d in files.items() if Path(str(p)).name == "deepseek.json"]
+    if len(adapter) != 1 or len(config) != 1 or not all(isinstance(d, str) for d in adapter + config):
+        raise RoomError("Pinned provider inventory does not identify one adapter snapshot and one configuration")
+    return hashlib.sha256((adapter[0] + config[0]).encode("ascii")).hexdigest()
+
+
+def verify_content(home, room_id, export_dir, row, maximum):
+    """A claimed completed answer must still exist with exactly its recorded digest, read owned and bounded."""
+    import deepseek_adapter
+    job_id, expected = row["id"], row["content_sha256"]
+    if not isinstance(expected, str) or not CONTENT_DIGEST.fullmatch(expected):
+        raise RoomError("Completed delegate job " + job_id + " has no recorded content digest")
+    name = job_id + ".md"
+    if row["content_path"]:
+        path = Path(row["content_path"])
+        allowed = {home / "deepseek" / "exports" / room_id / name}
+        if isinstance(export_dir, str) and export_dir:
+            allowed.add(Path(export_dir) / name)
+        if path not in allowed:
+            raise RoomError("Completed delegate job " + job_id + " records a content path outside this room's export directory")
+        candidates = [path]
+    else:
+        candidates = [home / "deepseek" / "jobs" / job_id / "content", home / "deepseek" / "exports" / room_id / name]
+    for path in candidates:
+        if not (path.exists() or path.is_symlink()):
+            continue
+        try:
+            data = owned_bytes(path, maximum)
+        except (OSError, ValueError) as exc:
+            raise RoomError("Completed delegate job " + job_id + " content is unreadable or unsafe") from exc
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise RoomError("Completed delegate job " + job_id + " content does not match its recorded digest")
+        return
+    raise RoomError("Completed delegate job " + job_id + " has no verifiable content")
+
+
+def verify_delegation(home, directory, state, report):
+    """Report-named delegate jobs must be this room's own jobs on the pinned provider configuration and terminal:
+    a digest-verified completed answer, a user-resolved failure (never a result) or a non-result. Anything else
+    refuses. Runs at engineering capture and readiness, never inside the pure report parser."""
+    ids = report_job_ids(report)
+    if state["delegate"]["provider"] != "deepseek":
+        if ids:
+            raise RoomError("Engineering report names delegate jobs, but this room has no delegate provider")
+        return []
+    if not ids:
+        return []
+    import deepseek_adapter
+    home = Path(home)
+    if not (home / "deepseek" / "ledger.sqlite3").exists():
+        raise RoomError("Delegate ledger is missing after recorded delegation; the reported delegate jobs cannot be verified "
+                        "and nothing is recreated or replayed")
+    settings = validate_provider(directory, state)["delegate_settings"]
+    inventory = state["delegate"]["inventory"]
+    profile = expected_profile(inventory)
+    evidence = []
+    try:
+        config_path = next(p for p in inventory["files"] if Path(p).name == "deepseek.json")
+        config, config_hash = deepseek_adapter.load_config(config_path, home)
+        if config_hash != inventory["files"][config_path]:
+            raise RoomError("Pinned delegate configuration changed during evidence verification")
+        ledger = deepseek_adapter.Ledger(home, initialize=False)
+        for job_id in ids:
+            if not deepseek_adapter.JOB_ID.fullmatch(job_id):
+                raise RoomError("Engineering report names a malformed delegate job identifier")
+            try:
+                row = ledger.job(job_id, state["room_id"])
+            except deepseek_adapter.AdapterError as exc:
+                raise RoomError("Engineering report names an unknown or foreign delegate job " + job_id) from exc
+            if row["requested_model"] != settings["model"] or row["profile_sha256"] != profile:
+                raise RoomError("Delegate job " + job_id + " was not produced by this room's pinned provider configuration")
+            job_state = row["state"]
+            if job_state in deepseek_adapter.ACTIVE_STATES:
+                raise RoomError("Delegate job " + job_id + " is still active; its result cannot be claimed")
+            if job_state in deepseek_adapter.STOP_STATES:
+                if not ledger.resolved(job_id):
+                    raise RoomError("Delegate job " + job_id + " has unresolved delivery; the user must resolve it before its report is evaluated")
+                classification = "resolved_failure"
+            elif job_state == deepseek_adapter.COMPLETED:
+                verify_content(home, state["room_id"], (inventory or {}).get("export_dir"), row, config["max_content_bytes"])
+                classification = "completed"
+            elif job_state in deepseek_adapter.TERMINAL_STATES:
+                classification = "non_result"
+            else:
+                raise RoomError("Delegate job " + job_id + " has an unknown state")
+            evidence.append({"job_id": job_id, "state": job_state, "classification": classification,
+                             "content_sha256": row["content_sha256"] if classification == "completed" else None,
+                             "requested_model": row["requested_model"], "profile_sha256": row["profile_sha256"]})
+    except (OSError, sqlite3.Error, deepseek_adapter.AdapterError) as exc:
+        raise RoomError("Delegate ledger is unavailable; reported delegate jobs cannot be verified") from exc
+    return evidence
 
 
 def status(home, directory, state):

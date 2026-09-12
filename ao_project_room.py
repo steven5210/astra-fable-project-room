@@ -211,14 +211,11 @@ def conflicting_reroute(request, snapshot):
         baseline = request["baseline"]
         if (snapshot.get("conversationId") == baseline["conversation_id"]
                 and snapshot.get("activeBranchId") == baseline["branch_id"]):
-            matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
-                       and digest(m.get("text", "").encode()) == request["text_sha256"]]
-            if len(matches) == 1 and matches[0].get("turnId"):
-                turn_id = matches[0]["turnId"]
-                if not request.get("turn_id") or request["turn_id"] == turn_id:
-                    turns = [t for t in snapshot.get("turns", []) if t.get("id") == turn_id]
-                    if len(turns) == 1:
-                        observed_provider = turns[0].get("providerTurnId")
+            match = sent_message(request, snapshot)
+            if match:
+                turns = [t for t in snapshot.get("turns", []) if t.get("id") == match["turnId"]]
+                if len(turns) == 1:
+                    observed_provider = turns[0].get("providerTurnId")
     if target and target != observed_provider:
         return None  # A durable reroute for another native turn is historical.
     # A substitution without turn attribution cannot establish the pinned model.
@@ -228,6 +225,16 @@ def conflicting_reroute(request, snapshot):
 def native_turn_identity(request):
     value = request.get("provider_turn_id") or (request.get("observed_turn") or {}).get("providerTurnId")
     return value if isinstance(value, str) and value.strip() else None
+
+
+def sent_message(request, snapshot):
+    """The one user message this request delivered: exact bytes on a turn that did not exist before the send
+    (identical caller bytes legitimately recur across turns) and, once acknowledged, on the acknowledged turn."""
+    earlier = set(request["baseline"]["turn_ids"])
+    matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
+               and digest(m.get("text", "").encode()) == request["text_sha256"] and m.get("turnId") not in earlier
+               and (not request.get("turn_id") or m.get("turnId") == request["turn_id"])]
+    return matches[0] if len(matches) == 1 and matches[0].get("turnId") else None
 
 
 class Service:
@@ -548,9 +555,10 @@ class Service:
                 checkpoint = self.checkpoint(directory, state)
                 review = {"spec_sha256": spec["sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                           "evidence_sha256": state["checkpoint_sha256"]}
+            carried = None
             if ao_workflow.normal(state):
                 purpose = purpose or ("acceptance_review" if role == "reviewer" else None)
-                framed = ao_workflow.packet(self, directory, state, role, purpose, message)
+                framed, carried = ao_workflow.packet(self, directory, state, role, purpose, message)
             else:
                 if purpose not in (None, "implementation", "correction", "acceptance_review"):
                     raise RoomError("Astra-led rooms do not claim Fable specification consensus")
@@ -559,7 +567,9 @@ class Service:
                     "Astra implements; a separate reviewer assesses evidence. No routine Fable or delegate calls.\n"
                     f"Exact spec: {directory / state['spec']}\nSpec SHA256: {spec['sha256']}\n" + message)
             if framed is not None:
-                text = f"[Project Room {room_id} request {request_id}]\n" + framed
+                # A retained engineer session receives only what the controller has not delivered yet; the request
+                # identity stays in this record and the durable clientMessageId, never in the message bytes.
+                text = framed if role == "engineer" else f"[Project Room {room_id} request {request_id}]\n" + framed
             if review:
                 text += (f"\nRead-only review of candidate {checkpoint['candidate_path']}. Do not modify it or delegate. "
                          f"Verification evidence: {directory / state['checkpoint']}. Inspect the actual diff and evidence. "
@@ -574,6 +584,8 @@ class Service:
                 request["purpose"] = purpose
                 if purpose in ("implementation", "correction"):
                     request["handoff_sha256"] = state["handoff_sha256"]
+                if carried is not None:
+                    request["carried"] = carried  # what this packet delivered; derived later, never claimed by the agent
             state["requests"][request_id] = request
             self.save(directory, state)  # Persist intent BEFORE any request may reach AO.
             try:
@@ -618,12 +630,11 @@ class Service:
                 if (snapshot.get("conversationId") != request["baseline"]["conversation_id"]
                         or snapshot.get("activeBranchId") != request["baseline"]["branch_id"]):
                     raise RoomError("Native conversation branch changed; do not reattribute or replay this request")
-                matches = [m for m in snapshot.get("messages", []) if m.get("role") == "user"
-                           and digest(m.get("text", "").encode()) == request["text_sha256"]]
-                if len(matches) != 1 or not matches[0].get("turnId"):
+                match = sent_message(request, snapshot)
+                if not match:
                     request["reconciliation"] = "No unique exact sent message observed; absence does not prove non-delivery"
                     continue
-                turn_id = matches[0]["turnId"]
+                turn_id = match["turnId"]
                 if request.get("turn_id") and request["turn_id"] != turn_id:
                     raise RoomError("AO acknowledgement/message turn identity mismatch")
                 request["turn_id"] = turn_id
@@ -652,10 +663,12 @@ class Service:
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
+                    if "carried" in request:
+                        receipt["carried_sha256"] = digest(request["carried"])
                     self.observation(directory, request, receipt)
                     request["usage"] = usage_receipt(request, snapshot)
                     if request["state"] == "completed" and request.get("purpose") in ("implementation", "correction"):
-                        ao_workflow.capture_engineering(directory, state, request)
+                        ao_workflow.capture_engineering(self.root.parent, directory, state, request)
             self.save(directory, state)
             if ao_workflow.normal(state):
                 ao_routing.observe_on_sync(self, directory, state)  # bounded GET; never refuses the sync
@@ -811,7 +824,8 @@ class Service:
                 agreed = {"agreed": False, "reason": str(exc)}
             extra.update(agreement=agreed, handoff=state.get("handoff"),
                          delegate=ao_delegates.status(self.root.parent, directory, state),
-                         spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered))
+                         spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
+                         engineer_context=ao_workflow.context_summary(state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],

@@ -124,30 +124,47 @@ Codex task discovers updated MCP tools after plugin installation.
    ordinary binding. The narrowly audited unused-reviewer exception below is the
    only reviewer replacement operation.
 4. Send `ao_room_send` with engineer purpose `spec_review` and a stable request ID.
-   Fable's native final JSON must contain `interpretation`, `findings`, `decision`
-   (`accept` or `changes_required`), `spec_revision` and `spec_sha256`. Findings
-   prefixed `BLOCKER:` prevent agreement. Sync the completed turn before another
-   send. Agreement binds that actual receipt to Astra's exact approved spec.
-   Three spec-review attempts are available across revisions; no automatic renewal.
+   The first packet a session receives carries the one-time workflow parts (both
+   contracts, pinned delegate policy and settings, native routing text, baseline
+   rule) plus the complete spec with revision, SHA256 and gates; a later revision
+   arrives as a zero-context diff of its changes only, with the new revision and
+   SHA256, and gates only if they changed; a repeat review of an unchanged revision
+   carries no body. Fable's native final JSON must contain `interpretation`,
+   `findings`, `decision` (`accept` or `changes_required`), `spec_revision` and
+   `spec_sha256`. Findings prefixed `BLOCKER:` prevent agreement. Sync the completed
+   turn before another send. Agreement binds that actual receipt to Astra's exact
+   approved spec. Three spec-review attempts are available across revisions; no
+   automatic renewal.
 5. Call `ao_room_handoff` for the actual bound engineer worktree. It pins the exact
    agreement, baseline, candidate, authorization, delegate preparation and gates.
-   Send engineer purpose `implementation` once for that handoff. The packet carries
-   the exact spec and retained policy, plus the pinned delegate settings. Fable
-   owns engineering and eligible delegation; it must not publish or start extra
-   AO workers. Native MCP launch evidence is distinct from successful inference.
+   Send engineer purpose `implementation` once for that handoff. Once the session
+   holds the one-time workflow parts and the current spec, the implementation
+   message is exactly the caller's instruction; an older session missing some of
+   those parts receives only the ones it never received, once. Fable owns
+   engineering and eligible delegation; it must not publish or start extra AO
+   workers. Native MCP launch evidence is distinct from successful inference.
 6. Sync completion to capture Fable's candidate immediately. Its final JSON must
    include `outcome` (`completed`, `changes_required` or `scope_change`), boolean
    `implementation_complete`, lists `changes`, `tests_reported`, `review_findings`,
    `remaining_gaps`, `backlog`, `routing_log`, and exact `spec_revision`,
-   `spec_sha256`, `baseline_commit`. Each routing entry includes
-   `delegate_job_ids` (empty for native-only work). Acceptance requires completed,
-   true and no remaining gaps. Optional proposals remain proposals until approved.
+   `spec_sha256`, `baseline_commit`. Each routing entry includes `delegate_job_ids`
+   (empty for native-only work), and each named job is verified at capture and again
+   before continuation, verification and acceptance: it must be this room's own terminal ledger
+   job under the pinned provider configuration, with a completed job's content
+   re-hashed against its recorded digest; a resolved unknown or failed job is
+   recorded as a resolved failure, a truncated, rejected or abandoned job as a
+   non-result, and an unresolved, active or foreign job refuses. Acceptance requires
+   completed, true and no remaining gaps. Optional proposals remain proposals until
+   approved.
 7. For a confirmed completed turn, a new `correction` request may repair the
-   implementation or missing/malformed report in the same session. Preserve the
-   previous receipt; this is a new focused turn, never a replay. A `scope_change`
-   report requires a revised agreed spec first. Unknown delivery stays blocked.
-   Commit, if needed, before the final engineering response is captured: later
-   changes to HEAD/index/files invalidate its candidate and need a correction.
+   implementation or missing/malformed report in the same session. The correction
+   message is exactly the caller's new instruction, `Continue.` when there is
+   nothing else; three or more consecutive identical corrections still reconcile
+   normally, one turn each. Preserve the previous receipt; this is a new focused
+   turn, never a replay. A `scope_change` report requires a revised agreed spec
+   first. Unknown delivery stays blocked. Commit, if needed, before the final
+   engineering response is captured: later changes to HEAD/index/files invalidate
+   its candidate and need a correction.
 8. Run the gates and independent acceptance below using reviewer purpose
    `acceptance_review`. Inspect actual delegate ledger facts when assessing
    Fable's routing report. Native subagent audit coverage remains a separate item.
@@ -307,10 +324,12 @@ delegate use, and never changes the default roles for future rooms.
 
 One adapter-wide filesystem lock serializes local changes and cross-room session
 claims. A durable intent with a native `clientMessageId` is written before POST.
-Identical repeated calls read the saved record; they do not POST again. After a
-lost acknowledgement, sync requires a unique exact sent message and matching
-conversation branch before adopting its turn. Missing history is not proof of
-non-delivery. A saved AO failure without an observed native `providerTurnId` remains
+Identical repeated calls read the saved record; they do not POST again. After a lost
+acknowledgement, sync requires the exact sent message on a turn that did not exist
+before the send and, when acknowledged, on that acknowledged turn and matching conversation branch before
+adopting its turn (identical caller bytes may recur across turns). Missing history
+is not proof of non-delivery. A saved AO failure without an observed native
+`providerTurnId` remains
 uncertain: AO may have lost the provider's acknowledgement after dispatch. Original
 failed observations remain in the receipt history when later evidence settles the
 turn. Failed, interrupted and cancelled AO outcomes remain uncertain even when
@@ -406,14 +425,41 @@ transport receipts remain the source for stronger attribution.
 Normal AO rooms snapshot the selected retained DeepSeek adapter, policy and
 configuration at creation; no key contents are copied or exposed. Private
 `delegate.attachment` distinguishes configured attachment, observed native MCP
-launch and unverified evidence. `delegate.jobs` exposes the existing bounded
-ledger projection, with usage separate from primary totals. Admission checks use
-the **full** room ledger: an old unresolved job still blocks even outside the
-latest 20 displayed records. Active or unresolved delegate jobs prevent another
-phase or acceptance. Only the user's own supported terminal action can resolve
-uncertain DeepSeek delivery; neither agent may self-resolve or replay it.
+launch and unverified evidence. `delegate.jobs` exposes the existing bounded ledger
+projection, with usage separate from primary totals. Admission checks use the
+**full** room ledger: an old unresolved job still blocks even outside the latest 20
+displayed records. Active or unresolved delegate jobs prevent another phase or
+acceptance. For a DeepSeek room, a missing or unreadable ledger after recorded
+delegation (an observed ledger, a native MCP launch record, or a report naming
+delegate jobs) refuses handoff, dispatch, verification and acceptance instead of
+being treated as a fresh room; a never-launched room may still lack a ledger, and a
+room with provider `none` is unchanged. Read-only inspection never initializes a
+database or repairs its schema. If a frozen older adapter recreates a lost ledger,
+surviving request metadata without its ledger row still blocks the affected room;
+unreadable orphan metadata refuses instead of implying that no work was sent.
+If the orphan's owner cannot be determined, every DeepSeek room sharing that
+controller home refuses admission until the evidence is restored; a well-formed
+orphan belonging to another room does not block this room.
+Every `delegate_job_ids` entry in an
+engineering report is verified when the completed turn is captured during sync and
+again before continuation, verification and acceptance, never inside the pure report parser: the
+job must be this room's own ledger job (an unknown or other-room ID refuses),
+produced under the pinned provider configuration (requested model and
+adapter/configuration profile digest), and terminal; a completed job's content must
+still hash to its recorded digest; a user-resolved unknown or failed job may be
+named but is recorded as a resolved failure, never a result; a truncated, rejected
+or abandoned job is recorded as a non-result; an unresolved or active job refuses.
+The full-ledger check over the room's active or unresolved jobs still applies
+whether or not a report names them. Verified job facts are stored with the captured
+engineering record; acceptance re-verifies live, and a record captured before this
+evidence existed is verified live without being rewritten. A missing ledger at
+capture leaves a durable engineering error when the report names delegate jobs.
+With no named jobs, capture may succeed, but recorded delegation still makes a
+missing ledger block continuation, verification and acceptance. Only the user's own
+supported terminal action can resolve uncertain DeepSeek delivery; neither agent may
+self-resolve or replay it.
 
-Compact spec/evidence packets limit repeated context. Native compaction remains
+A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. Native compaction remains
 owned by AO/the provider and is not automatically triggered by this adapter.
 Manual Claude compaction and a controlled native stop/resume are validated only
 as described under readiness above; automatic compaction thresholds and crash

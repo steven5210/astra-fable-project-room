@@ -170,10 +170,12 @@ class NormalWorkflowTests(Fixture):
         self.implement(); self.review()
         result = self.service.ao_room_accept(self.room, 'acceptance_review')
         self.assertTrue(result['accepted']); self.assertEqual(result['workflow'], 'fable_engineering')
-        packet = self.state()['requests']['implementation']['text']
-        self.assertIn('Fable owns implementation', packet)
-        self.assertNotIn('No routine Fable', packet)
-        self.assertIn('Fable is the implementation orchestrator', packet)
+        # The one-time workflow parts reach the session with its first packet; implementation carries only the caller's bytes.
+        initial = ao_workflow.latest(self.state(), {'spec_review'})['text']
+        self.assertIn('Fable owns implementation', initial)
+        self.assertNotIn('No routine Fable', initial)
+        self.assertIn('Fable is the implementation orchestrator', initial)
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.assertEqual(self.service.ao_room_status(self.room)['delegate']['provider'], 'none')
         self.assertFalse(self.service.ao_room_status(self.room)['usage']['includes_delegates'])
 
@@ -302,7 +304,7 @@ class NormalWorkflowTests(Fixture):
         self.assertIsNone(ao.conflicting_reroute(request, snapshot))
 
 
-class DelegatePreparationTests(Fixture):
+class DelegateFixture(Fixture):
     def setUp(self):
         super().setUp()
         self.claude_config = self.root / 'claude-config'; self.claude_config.mkdir()
@@ -329,6 +331,8 @@ p.write_text(json.dumps(value))
     def prepare(self, path=None):
         return self.service.ao_room_prepare(self.room, str(path or self.repo))
 
+
+class DelegatePreparationTests(DelegateFixture):
     def test_private_setup_is_idempotent_and_does_not_touch_candidate(self):
         before = ao.candidate_snapshot(self.repo)
         first = self.prepare(); self.assertEqual(first, self.prepare())
@@ -727,8 +731,9 @@ class RoutingTests(Fixture):
         evidence.write_bytes(saved)
         self.assertEqual(self.routing()['status'], 'verified')
         self.implement()
-        request = self.state()['requests']['implementation']
-        self.assertIn('pr-sonnet (claude-sonnet-5', request['text']); self.assertIn('pr-opus (claude-opus-5', request['text'])
+        initial = ao_workflow.latest(self.state(), {'spec_review'})['text']  # routing text is delivered once, with the first packet
+        self.assertIn('pr-sonnet (claude-sonnet-5', initial); self.assertIn('pr-opus (claude-opus-5', initial)
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.review()
         self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
@@ -793,7 +798,8 @@ class RoutingTests(Fixture):
         delegate = self.service.ao_room_status(self.room)['delegate']
         self.assertEqual(delegate['attachment'], 'configuration_verified'); self.assertEqual(delegate['routing']['status'], 'not_configured')
         self.agree(); self.service.ao_room_handoff(self.room, str(self.repo)); self.send('implementation')
-        self.assertIn('not configured', self.state()['requests']['implementation']['text'])
+        self.assertIn('not configured', ao_workflow.latest(self.state(), {'spec_review'})['text'])  # delivered once, first packet
+        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
         self.service.ao_room_sync(self.room)
         self.assertNotIn('routing_rules', self.state())
         self.assertEqual(self.routing()['status'], 'not_configured')
