@@ -307,6 +307,13 @@ class Service:
         return spec
 
     def identity(self, client, state, binding):
+        if (state.get("provider_transition")
+                and binding.get("session_id") == state.get("bindings", {}).get("engineer", {}).get("session_id")):
+            # Keep raw completeness/lifecycle evidence for the retained engineer.
+            # Ordinary normalization can erase missing or contradictory fields.
+            from ao_provider_transition import _CompleteClient
+            if not isinstance(client, _CompleteClient):
+                client = _CompleteClient(client)
         raw = client.request("GET", "/sessions/" + binding["session_id"])
         session = raw.get("session", raw)
         if (session.get("id") != binding["session_id"] or session.get("projectId") != state["ao_project_id"]
@@ -329,9 +336,13 @@ class Service:
             raise RoomError("AO conversation branch changed from its binding; do not replace or replay it")
         return snapshot
 
-    def settled(self, state):
+    def settled(self, state, pending_transition=False):
         from ao_reviewer_recovery import validate
         validate(self, state)
+        from ao_provider_transition import validate as transition_validate
+        transition_validate(self, state, allow_pending=pending_transition)
+        from ao_routing_adoption import pending_gate
+        pending_gate(self, state)
         if ao_workflow.normal(state) and any(r.get("model_reroute") for r in state["requests"].values()):
             raise RoomError("Native model substitution contradicts this room; preserve the failure, never replay")
         if any(r["state"] not in TERMINAL for r in state["requests"].values()):
@@ -495,6 +506,26 @@ class Service:
         from ao_reviewer_recovery import recover
         return recover(self, room_id, audit_sha256, replacement_session_id, diagnosis, authorization, request_id)
 
+    def ao_room_provider_transition_audit(self, room_id, target_profile):
+        from ao_provider_transition import audit
+        return audit(self, room_id, target_profile)
+
+    def ao_room_provider_transition(self, room_id, audit_sha256, diagnosis, authorization, request_id, native_stop_record):
+        from ao_provider_transition import transition
+        return transition(self, room_id, audit_sha256, diagnosis, authorization, request_id, native_stop_record)
+
+    def ao_room_routing_adoption_audit(self, room_id):
+        from ao_routing_adoption import audit
+        return audit(self, room_id)
+
+    def ao_room_routing_adoption_stage(self, room_id, audit_sha256, authorization, diagnosis, request_id):
+        from ao_routing_adoption import stage
+        return stage(self, room_id, audit_sha256, authorization, diagnosis, request_id)
+
+    def ao_room_routing_adoption_activate(self, room_id, request_id):
+        from ao_routing_adoption import activate
+        return activate(self, room_id, request_id)
+
     def ao_room_prepare(self, room_id, worktree_path):
         with self.locked(room_id) as (directory, state):
             self.quiet(state)
@@ -558,7 +589,7 @@ class Service:
             carried = None
             if ao_workflow.normal(state):
                 purpose = purpose or ("acceptance_review" if role == "reviewer" else None)
-                framed, carried = ao_workflow.packet(self, directory, state, role, purpose, message)
+                framed, carried = ao_workflow.packet(self, directory, state, role, purpose, message, snapshot=snapshot)
             else:
                 if purpose not in (None, "implementation", "correction", "acceptance_review"):
                     raise RoomError("Astra-led rooms do not claim Fable specification consensus")
@@ -582,6 +613,8 @@ class Service:
                                     "branch_id": snapshot.get("activeBranchId"), "usage": snapshot.get("usage") or {}}}
             if ao_workflow.normal(state):
                 request["purpose"] = purpose
+                if state.get("provider_transition"):
+                    request["provider_epoch"] = 2
                 if purpose in ("implementation", "correction"):
                     request["handoff_sha256"] = state["handoff_sha256"]
                 if carried is not None:
@@ -601,6 +634,10 @@ class Service:
 
     def ao_room_sync(self, room_id):
         with self.locked(room_id) as (directory, state):
+            from ao_provider_transition import validate as transition_validate
+            from ao_routing_adoption import pending_gate
+            transition_validate(self, state)
+            pending_gate(self, state)
             client = self.client(state)
             for request in state["requests"].values():
                 if request["state"] == "completed":
@@ -786,7 +823,7 @@ class Service:
 
     def request_summary(self, request):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
-                  "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose",
+                  "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
                   "response_normalization", "response_normalization_sha256")
         result = {k: request[k] for k in fields if k in request}
@@ -821,12 +858,14 @@ class Service:
                 unknown.append(request["request_id"])
         extra = {"exception_authorization": state.get("exception_authorization")}
         if ao_workflow.normal(state):
+            import ao_provider_transition
             try:
                 agreed = ao_workflow.agreement(self, directory, state)
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
                 agreed = {"agreed": False, "reason": str(exc)}
-            extra.update(agreement=agreed, handoff=state.get("handoff"),
-                         delegate=ao_delegates.status(self.root.parent, directory, state),
+            delegate = ao_delegates.status(self.root.parent, directory, state)
+            extra.update(agreement=agreed, handoff=state.get("handoff"), delegate=delegate,
+                         provider_transition=ao_provider_transition.summary(self, directory, state, delegate),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
                          engineer_context=ao_workflow.context_summary(state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
@@ -872,10 +911,15 @@ TOOL_SCHEMAS = {
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
-    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes the ignored worktree-scoped native routing files (pr-sonnet/pr-opus, local settings, private guard) and snapshots them; invokes Claude configuration only, never inference. No candidate files are written.", schema({**R, "worktree_path": S})),
+    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Normal roles require Claude/Fable engineer and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
     "ao_room_reviewer_recovery_audit": ("Inspect one stopped, never-used native Codex reviewer against complete empty history and current passed spec/candidate/gate evidence. Saves a private audit digest, not a binding change. Bounded AO GETs only; no model, lifecycle or worker creation.", schema(R)),
     "ao_room_reviewer_recover": ("With the exact audit and actual user authorization, recover one never-used reviewer into a separate ready native Codex reviewer at the same model/MAX. Preserves the original binding claim, all evidence and review limits. Refuses any prior reviewer request, missing history or uncertainty. One recovery per room; identical request reads the saved result. No model dispatch or AO POST.", schema({**R, "audit_sha256": S, "replacement_session_id": S, "diagnosis": S, "authorization": S, "request_id": S})),
+    "ao_room_provider_transition_audit": ("Audit one normal DeepInfra V4.1 Flash room for the one-time transition to official DeepSeek: completed native history/receipts, the entire delegate ledger read-only, original integrity and a key-free target profile. Runs the exact owned/hash-verified pinned validation slice and the current validator; key metadata only, never the secret. Saves a private audit digest; bounded AO GETs; no model, lifecycle or registration mutation.", schema({**R, "target_profile": {"type": "object"}})),
+    "ao_room_provider_transition": ("With the exact audit digest, actual user switch authorization, concrete diagnosis, durable request_id and the operator's performed AO exit-agent record, commit immutable provider epoch 2 while the engineer is positively stopped. Preserve sessions, history, original evidence and review limits; archive the old launch evidence. No AO POST, registration change or model dispatch. Identical requests read or reconcile the same verified receipt. Native launch alone does not qualify MCP initialization or open dispatch.", schema({**R, "audit_sha256": S, "diagnosis": S, "authorization": S, "request_id": S, "native_stop_record": S})),
+    "ao_room_routing_adoption_audit": ("Audit a stopped existing native engineer for one v1-to-v2 routing and operating-rules adoption after provider epoch 2, before any epoch 2 native request. Verify the original preparation, provider, native history, candidate, routing files and project rules. Save private audit evidence; bounded AO GETs only, no model or lifecycle mutation.", schema(R)),
+    "ao_room_routing_adoption_stage": ("Stage the exact audited routing adoption with the actual user operating authorization and diagnosis. Save immutable intent before changing managed local runtime files; emit the exact AO project-config PUT payload for the operator to apply while the engineer is stopped. Preserve original evidence, handoff and counters. Pending adoption blocks new work; never repeat an uncertain external operation.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
+    "ao_room_routing_adoption_activate": ("Activate only the identical staged routing-adoption request after the exact new project configuration, managed files and unchanged stopped native identity/history are observed. Pin the new preparation without changing provider snapshots, handoff or review budgets. No AO POST or inference; native MCP startup remains a separate dispatch gate.", schema({**R, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),

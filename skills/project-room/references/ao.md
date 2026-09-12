@@ -82,6 +82,16 @@ When the user chooses AO for new Project Room work, also record
 `"default_backend": "ao"` in that private config. The skill uses this preference;
 the low-level legacy tools remain callable and never migrate a room automatically.
 
+Every fresh normal AO engineer preparation enables native automatic compaction
+with a 250,000-token window, independent of the feature or delegate provider.
+Optional `auto_compact_window` in that same private AO config selects an integer
+from 100,000 to 1,000,000 for future preparations only. The preparation records
+the chosen window and pins it in ignored local Claude settings before launch.
+Conflicting disable or override settings refuse preparation or dispatch. Older
+preparations retain their exact snapshots. Follow [context compaction](../../../docs/context-compaction.md)
+for the safe existing-session procedure and live validation; do not rewrite room
+evidence, repeat retained instructions, or lower Fable MAX to reduce context.
+
 Call `ao_room_open` with the actual project path, stable feature name, existing AO
 project ID and the user's existing implementation authorization. Reopening returns
 the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
@@ -165,6 +175,15 @@ Codex task discovers updated MCP tools after plugin installation.
    first. Unknown delivery stays blocked. Commit, if needed, before the final
    engineering response is captured: later changes to HEAD/index/files invalidate
    its candidate and need a correction.
+   A completed epoch-2 partial report that incorrectly names audited epoch-1
+   jobs can also receive a correction after the controller verifies the unchanged
+   completed result, transition evidence and complete ledger. Every original
+   captured job row must remain unchanged, and reported jobs are checked against
+   their own verified profiles. The original report remains rejected; this admits
+   only a new correction, with its proof recorded in controller metadata and no
+   extra context sent to Fable. Active, uncertain, foreign, missing, changed or
+   unaudited provider evidence still refuses. See the
+   [historical-report correction boundary](../../../docs/provider-transition.md#historical-report-correction).
 8. Run the gates and independent acceptance below using reviewer purpose
    `acceptance_review`. Inspect actual delegate ledger facts when assessing
    Fable's routing report. Native subagent audit coverage remains a separate item.
@@ -282,6 +301,19 @@ grants a permission; a guard error, a missing interpreter or a missing script
 exits 2, so the call is blocked.
 
 New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable retains read-only inspection, planning, pinned DeepSeek tools and pinned native delegation; root shell commands, edits, tests, browser actions and other execution tools are denied. The assigned operator or native worker runs probes and gates, including checks Fable requests for its verdict. Fable does not duplicate work assigned to Astra. A capability gap is reported for resolution, never worked around through another tool. This keeps necessary Fable judgment and final review while requiring execution to remain delegated; it does not change MAX or delegate budgets. Older preparations retain their original guard and report `historical_unrestricted_root` instead of claiming this protection.
+
+An explicitly authorized normal AO room pinned to DeepInfra V4.1 Flash can make
+one retained provider amendment to official `deepseek-flash`, then adopt v2 before
+its first new-provider request. Follow the [audited adoption procedure](../../../docs/provider-transition.md).
+Use its public audit/transition/stage/activate operations; preserve original
+snapshots, full history, consumed attempts and the same native session. A setup
+default change, pre-exec launch receipt or manual saved-state edit cannot establish
+this adoption. Keep the engineer stopped during staging and exact project-rule
+activation. After native resume, dispatch remains blocked until an actual
+initialize/initialized/tools-list exchange and the matching held connection lease
+are verified. The one-time operating delta does not replay the unchanged spec.
+The original charter remains the original agreement, not a fresh review or
+acceptance of the new provider. Live behavior and usage still need live evidence.
 
 The guard uses [Claude Code PreToolUse decisions](https://code.claude.com/docs/en/hooks); an allowed path still faces ordinary permissions. This is workflow enforcement, not a security sandbox against a malicious worker.
 
@@ -496,8 +528,7 @@ missing ledger block continuation, verification and acceptance. Only the user's 
 supported terminal action can resolve uncertain DeepSeek delivery; neither agent may
 self-resolve or replay it.
 
-A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. Native compaction remains
-owned by AO/the provider and is not automatically triggered by this adapter.
+A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. New preparations configure the native automatic-compaction window. Claude owns the actual compaction; the adapter never sends a compaction prompt or replays a turn to trigger it.
 Manual Claude compaction and a controlled native stop/resume are validated only
 as described under readiness above; automatic compaction thresholds and crash
 recovery still require their own live validation. Do not claim a smaller context

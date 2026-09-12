@@ -108,8 +108,19 @@ def handoff_record(directory, state):
     if not state.get("handoff"):
         raise RoomError("Create the agreed engineering handoff first")
     value = read(directory / state["handoff"])
+    expected = state.get("preparation_sha256")
+    transition = state.get("provider_transition")
+    if isinstance(transition, dict) and transition.get("original_preparation_sha256"):
+        try:
+            epoch = json.loads(ao_delegates.owned_bytes(directory / transition["epoch_record"]))
+            if digest(epoch) != transition.get("epoch_sha256"):
+                raise RoomError("Provider epoch handoff reference was modified")
+            if state["handoff"] == epoch["handoff"]["path"]:
+                expected = transition["original_preparation_sha256"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RoomError("Provider epoch handoff reference is unreadable or inconsistent") from exc
     if (digest(value) != state.get("handoff_sha256") or value["spec_record_sha256"] != state["spec_record_sha256"]
-            or value["preparation_sha256"] != state.get("preparation_sha256")):
+            or value["preparation_sha256"] != expected):
         raise RoomError("Engineering handoff is stale or changed")
     return value
 
@@ -195,6 +206,8 @@ def capture_engineering(home, directory, state, request, capture_completion=True
         relative = "engineering/" + request["request_id"] + ".json"
         record = {"candidate": candidate, "report_sha256": digest(report), "receipt_sha256": request["receipt_sha256"],
                   "delegation": evidence}
+        if request.get("provider_epoch") is not None:
+            record["provider_epoch"] = request["provider_epoch"]
         atomic(directory / relative, record)
         request.update(engineering_record=relative, engineering_record_sha256=digest(record), result_candidate_sha256=candidate["sha256"],
                        delegate_job_ids=[item["job_id"] for item in evidence])
@@ -212,6 +225,8 @@ def engineering_ready(service, directory, state):
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
         raise RoomError("Acceptance requires a captured completed engineering result")
+    if state.get("provider_transition") and request.get("provider_epoch") != 2:
+        raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     report = engineering_report(directory, state, request)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")
@@ -225,6 +240,8 @@ def engineering_ready(service, directory, state):
         raise RoomError("Candidate or engineering result changed since Fable completed")
     if record.get("delegation", evidence) != evidence:
         raise RoomError("Delegate evidence changed since Fable completed")
+    if state.get("provider_transition") and record.get("provider_epoch") != request.get("provider_epoch"):
+        raise RoomError("Captured engineering result belongs to another provider epoch")
     return request
 
 
@@ -376,12 +393,15 @@ def spec_changes(previous, spec):
     return "--- revision " + str(previous["revision"]) + "\n+++ revision " + str(spec["revision"]) + body
 
 
-def packet(service, directory, state, role, purpose, message):
+def packet(service, directory, state, role, purpose, message, snapshot=None):
     """One native message. Every controller check stays; only text the session already holds is omitted."""
     from ao_project_room import digest
     spec = service.spec(directory, state)
-    # Routing gates only delegation-capable turns; spec review and acceptance review stay read-only.
+    # Specification and acceptance stay read-only. Live routing-rule observations apply to delegation-capable
+    # turns; every transitioned engineer turn separately requires the native attachment gate below.
     delegating = role == "engineer" and purpose in ("implementation", "correction")
+    epoch = None
+    correction_admission = None
     binding = state.get("bindings", {}).get("engineer", {})
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
@@ -418,20 +438,52 @@ def packet(service, directory, state, role, purpose, message):
             if isinstance(prior, dict) and prior.get("outcome") == "scope_change":
                 raise RoomError("Engineering discovered a scope change; revise and agree the specification first")
             if isinstance(prior, dict):
-                ao_delegates.verify_delegation(service.root.parent, directory, state, prior)
-        ao_routing.before_dispatch(service, directory, state, prepared, purpose)
+                prior_state = state
+                if state.get("provider_transition"):
+                    from ao_provider_transition import report_state
+                    prior_state = report_state(directory, state, last)
+                try:
+                    ao_delegates.verify_delegation(service.root.parent, directory, prior_state, prior)
+                except RoomError:
+                    if purpose != "correction" or not state.get("provider_transition") or last.get("provider_epoch") != 2:
+                        raise
+                    from ao_provider_transition import historical_correction
+                    if snapshot is None:
+                        snapshot = service.identity(service.client(state), state, binding)
+                    correction_admission = historical_correction(service, directory, state, last, prior, snapshot)
     else:
         raise RoomError("Normal engineer purpose must be spec_review, implementation or correction")
+    # Every new engineer turn belongs to the active epoch, including read-only specification review.
+    # Qualify routing/native attachment before any request intent can be persisted or sent to AO.
+    if state.get("provider_transition"):
+        import ao_provider_transition
+        if snapshot is None:
+            snapshot = service.identity(service.client(state), state, state["bindings"]["engineer"])
+        epoch = ao_provider_transition.dispatch_gate(service, directory, state, snapshot)
+    if delegating:
+        ao_routing.before_dispatch(service, directory, state, prepared, purpose)
     policy = ao_delegates.validate_provider(directory, state)
     texts = part_texts(prepared, policy)
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
+    if correction_admission is not None:
+        carried["correction_admission"] = correction_admission  # audit metadata only, never appended to the native prompt
     for name in PARTS:
         if name not in held["parts"]:
             sections.append(texts[name])
             carried["parts"].append(name)
             carried["part_sha256"][name] = digest(texts[name].encode())
+    if epoch is not None:
+        import ao_provider_transition
+        if not ao_provider_transition.amendment_delivered(directory, state):
+            sections.append(ao_provider_transition.amendment_text(epoch))
+            carried["provider_amendment_sha256"] = state["provider_transition"]["epoch_sha256"]
+            if state.get("routing_adoption"):
+                from ao_routing_adoption import INSTRUCTION
+                sections.append(INSTRUCTION)
+                carried["routing_amendment_sha256"] = digest(INSTRUCTION.encode())
+                carried["routing_adoption_sha256"] = state["routing_adoption"]["receipt_sha256"]
     if held["spec_record_sha256"] != state["spec_record_sha256"]:
         carried["spec_record_sha256"] = state["spec_record_sha256"]
         if held["spec_record_sha256"] is None:
