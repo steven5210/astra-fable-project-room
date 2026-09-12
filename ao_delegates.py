@@ -379,7 +379,11 @@ def status(home, directory, state):
     controller = object.__new__(Service)
     controller.home = Path(home)
     jobs = controller._delegate_jobs(state["room_id"], directory)
+    if state.get("provider_transition"):
+        import ao_provider_transition
+        ao_provider_transition.job_attribution(home, directory, state, jobs)
     attachment = "not_prepared"
+    native_startup = None
     error = None
     routing = ao_routing.status(None, state)
     if state.get("preparation"):
@@ -388,7 +392,18 @@ def status(home, directory, state):
             prepared = validate_preparation(directory, state, session_id, check_routing=False)
             attachment = "configuration_verified"
             if (directory / "delegate-launch.json").exists():
-                attachment = "native_mcp_launch_observed"
+                attachment = "launch_observed" if state.get("provider_transition") else "native_mcp_launch_observed"
+            if state.get("provider_transition") and prepared.get("mcp_attachment"):
+                try:
+                    from ao_mcp_attachment import validate_attachment
+                    startup = validate_attachment(directory, state, prepared)
+                    if startup is None:
+                        raise ValueError("No verified native attachment receipt")
+                    native_startup = {"verified": True, "connection_id": startup["connection"]["connection_id"],
+                                      "handshake": startup["handshake"], "meaning": startup["meaning"], "limitation": startup["limitation"]}
+                    attachment = "native_mcp_initialized_observed"
+                except (ImportError, OSError, ValueError, KeyError, TypeError) as exc:
+                    native_startup = {"verified": False, "error": str(exc)}
         except (RoomError, OSError, ValueError, TypeError, KeyError) as exc:
             attachment, error = "unverified", str(exc)
             try:
@@ -400,7 +415,7 @@ def status(home, directory, state):
             "status": "unverified", "error": error, "meaning": ao_routing.MEANING}
     return {"provider": state["delegate"]["provider"], "attachment": attachment, "error": error,
             "meaning": "Configuration/launch evidence is not successful inference or native subagent accounting",
-            "jobs": jobs, "routing": routing}
+            "jobs": jobs, "routing": routing, **({"native_startup": native_startup} if state.get("provider_transition") else {})}
 
 
 def main():

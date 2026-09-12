@@ -283,6 +283,19 @@ exits 2, so the call is blocked.
 
 New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable retains read-only inspection, planning, pinned DeepSeek tools and pinned native delegation; root shell commands, edits, tests, browser actions and other execution tools are denied. The assigned operator or native worker runs probes and gates, including checks Fable requests for its verdict. Fable does not duplicate work assigned to Astra. A capability gap is reported for resolution, never worked around through another tool. This keeps necessary Fable judgment and final review while requiring execution to remain delegated; it does not change MAX or delegate budgets. Older preparations retain their original guard and report `historical_unrestricted_root` instead of claiming this protection.
 
+An explicitly authorized normal AO room pinned to DeepInfra V4.1 Flash can make
+one retained provider amendment to official `deepseek-flash`, then adopt v2 before
+its first new-provider request. Follow the [audited adoption procedure](../../../docs/provider-transition.md).
+Use its public audit/transition/stage/activate operations; preserve original
+snapshots, full history, consumed attempts and the same native session. A setup
+default change, pre-exec launch receipt or manual saved-state edit cannot establish
+this adoption. Keep the engineer stopped during staging and exact project-rule
+activation. After native resume, dispatch remains blocked until an actual
+initialize/initialized/tools-list exchange and the matching held connection lease
+are verified. The one-time operating delta does not replay the unchanged spec.
+The original charter remains the original agreement, not a fresh review or
+acceptance of the new provider. Live behavior and usage still need live evidence.
+
 The guard uses [Claude Code PreToolUse decisions](https://code.claude.com/docs/en/hooks); an allowed path still faces ordinary permissions. This is workflow enforcement, not a security sandbox against a malicious worker.
 
 Preparation snapshots the file digests, guard digest, interpreter, knobs, the
