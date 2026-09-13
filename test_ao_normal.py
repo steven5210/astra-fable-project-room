@@ -34,6 +34,13 @@ class NativeFake(FakeAO):
             return {'sessionId': sid, 'workspacePath': str(self.workspaces[sid])}
         return super().request(method, path, payload)
 
+    def finish(self, name, text='Done', usage=None, state='completed'):
+        super().finish(name, text, usage, state)
+        if state == 'completed':
+            # Positive native completion evidence for known formatting-error fixtures.
+            # Tests for missing/unknown stop evidence remove this field explicitly.
+            self.snapshots[name]['turns'][-1]['stopReason'] = 'end_turn'
+
 
 class Fixture(unittest.TestCase):
     def setUp(self):
@@ -240,8 +247,9 @@ class NormalWorkflowTests(Fixture):
         receipt_path.write_text('{}')
         with self.assertRaisesRegex(ao.RoomError, 'modified'): self.send('correction')
         receipt_path.write_bytes(original)
-        self.send('correction')
-        self.assertEqual(len(self.fake.posts), 3)
+        with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
+            self.send('correction')
+        self.assertEqual(len(self.fake.posts), 2)
 
     def test_failed_first_candidate_capture_is_durable_until_correction(self):
         self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo)); self.send('implementation')

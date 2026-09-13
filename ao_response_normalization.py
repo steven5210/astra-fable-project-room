@@ -142,6 +142,8 @@ def validate_current(service, directory, state, request, value):
     """The result keeps its existing purpose, identities and refusal semantics."""
     import ao_delegates
     import ao_workflow
+    from ao_outcomes import usable
+    usable(directory, request)
     spec = service.spec(directory, state)
     if request["spec_record_sha256"] != state["spec_record_sha256"]:
         raise RoomError("Cannot normalize a stale specification response")
@@ -159,6 +161,9 @@ def validate_current(service, directory, state, request, value):
             or current_turn[0].get("providerTurnId") != request.get("provider_turn_id")
             or not sent_message(request, current) or live_messages != saved_receipt["messages"]):
         raise RoomError("Native result is stale, incomplete or differs from its saved completed turn")
+    from ao_outcomes import observe
+    observe(service, directory, state, request, current)
+    usable(directory, request)
     if request["role"] == "engineer":
         if not ao_workflow.normal(state):
             raise RoomError("Astra-led engineering has no normal Fable report contract")
@@ -171,7 +176,7 @@ def validate_current(service, directory, state, request, value):
                 raise RoomError("Normalized specification response has an invalid verdict or exact-spec identity")
         elif request.get("purpose") in ("implementation", "correction"):
             ao_workflow.agreement(service, directory, state)
-            ao_workflow.engineering_report(directory, state, request, report=value)
+            value = ao_workflow.engineering_report(directory, state, request, report=value)
             actual = ao_workflow.workspace(service, directory, state, check_routing=False)
             if candidate_snapshot(actual) != ao_workflow.completion_candidate(directory, state, request):
                 raise RoomError("Candidate changed after the completed native result")

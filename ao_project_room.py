@@ -29,7 +29,7 @@ import ao_routing
 import ao_workflow
 
 
-TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
+TERMINAL = {"completed", "failed", "cancelled", "interrupted", "settled_failure"}
 # AO can recover historical turns without a portable outcome. They are no
 # longer active, but an owned recovered result must still settle as uncertain.
 NATIVE_TERMINAL = TERMINAL | {"recovered"}
@@ -135,6 +135,7 @@ class Client:
         result = dict(latest)
         messages = {m["id"]: m for m in latest.get("messages", [])}
         turns = {t["id"]: t for t in latest.get("turns", [])}
+        activities = {a['id']: a for a in latest.get('activities', [])}
         page = latest
         seen = set()
         for _ in range(9):
@@ -143,12 +144,16 @@ class Client:
                 break
             seen.add(cursor)
             page = self.request("GET", path + f"?limit=500&beforeSequence={cursor}")
-            messages.update({m["id"]: m for m in page.get("messages", [])})
+            for message in page.get("messages", []):
+                messages.setdefault(message["id"], message)
             # Keep the latest page's turn state when an older page repeats it.
             for turn in page.get("turns", []):
                 turns.setdefault(turn["id"], turn)
+            for activity in page.get('activities', []):
+                activities.setdefault(activity['id'], activity)
         result["messages"] = sorted(messages.values(), key=lambda m: m.get("sequence", 0))
         result["turns"] = list(turns.values())
+        result['activities'] = list(activities.values())
         result["history_truncated"] = bool(page.get("hasMoreBefore"))
         return result
 
@@ -275,7 +280,14 @@ class Service:
             history.append(request["receipt"])
         if relative not in history:
             history.append(relative)
+        if request.get("receipt"):
+            prior = read(directory / request["receipt"])
+            previous, current = prior.get("turn") or {}, receipt.get("turn") or {}
+            if (previous.get("state") == current.get("state") == "failed" and previous.get("providerTurnId")
+                    and previous.get("providerTurnId") == current.get("providerTurnId") and previous.get("id") == current.get("id")):
+                return False  # Keep the original failed receipt/usage; late observations stay in history.
         request.update(receipt=relative, receipt_sha256=digest(receipt))
+        return True
 
     def record_reroute(self, directory, state, request, reroute):
         relative = f"receipts/{request['request_id']}/reroute-{digest(reroute)}.json"
@@ -336,7 +348,7 @@ class Service:
             raise RoomError("AO conversation branch changed from its binding; do not replace or replay it")
         return snapshot
 
-    def settled(self, state, pending_transition=False):
+    def settled(self, state, pending_transition=False, outcome_request_id=None):
         from ao_reviewer_recovery import validate
         validate(self, state)
         from ao_provider_transition import validate as transition_validate
@@ -345,17 +357,21 @@ class Service:
         pending_gate(self, state)
         if ao_workflow.normal(state) and any(r.get("model_reroute") for r in state["requests"].values()):
             raise RoomError("Native model substitution contradicts this room; preserve the failure, never replay")
-        if any(r["state"] not in TERMINAL for r in state["requests"].values()):
+        if any(r["state"] not in TERMINAL and r['request_id'] != outcome_request_id for r in state["requests"].values()):
             raise RoomError("An owned request is active or uncertain; sync it without resending")
         if any(not native_turn_identity(r) for r in state["requests"].values()):
             raise RoomError("A saved terminal result lacks observed native delivery; sync it without resending")
-        if any(r["state"] != "completed" for r in state["requests"].values()):
+        if any(r["state"] not in ('completed', 'settled_failure') and r['request_id'] != outcome_request_id for r in state["requests"].values()):
             raise RoomError("An AO failure does not prove the native run stopped; sync it without resending")
+        from ao_outcomes import validate_settlement
+        for request in state['requests'].values():
+            if request['state'] == 'settled_failure':
+                validate_settlement(self.root / 'rooms' / state['room_id'], request)
         if any(v["state"] == "running" for v in state["verifications"]):
             raise RoomError("An unfinished verification is recorded; inspect its processes and evidence, never start a second verifier")
 
-    def quiet(self, state):
-        self.settled(state)
+    def quiet(self, state, outcome_request_id=None):
+        self.settled(state, outcome_request_id=outcome_request_id)
         client = self.client(state)
         for binding in state["bindings"].values():
             if busy(self.identity(client, state, binding)):
@@ -578,6 +594,10 @@ class Service:
             snapshot = self.identity(client, state, binding)
             if snapshot.get("history_truncated"):
                 raise RoomError("Conversation history exceeds the bounded accounting window")
+            if busy(snapshot):
+                raise RoomError('Native worker became active before dispatch; sync without resending')
+            import ao_outcomes
+            ao_outcomes.gate(self, directory, state, role, request_id, snapshot)
             review = None
             if role == "reviewer":
                 attempts = [r for r in state["requests"].values() if r["role"] == "reviewer"]
@@ -640,14 +660,22 @@ class Service:
             pending_gate(self, state)
             client = self.client(state)
             for request in state["requests"].values():
-                if request["state"] == "completed":
+                if request["state"] in ('completed', 'settled_failure'):
                     # Preserve older known receipts rather than recomputing their
                     # usage from a newer turn's snapshot after an adapter update.
                     native_id = native_turn_identity(request)
                     if native_id:
                         request["provider_turn_id"] = native_id
                         if ao_workflow.normal(state):
-                            self.identity(client, state, request)  # also audits late native reroutes
+                            snapshot = self.identity(client, state, request)  # also audits late native reroutes
+                            import ao_outcomes
+                            if ao_outcomes.latest_for_role(state, request['role']) == request and not request.get('model_reroute'):
+                                try:
+                                    ao_outcomes.observe(self, directory, state, request, snapshot)
+                                    request.pop('semantic_observation_error', None)
+                                except RoomError as exc:
+                                    request['semantic_observation_error'] = str(exc)[:500]
+                                    # Sync remains usable; dispatch and acceptance still require a fresh exact audit.
                         continue
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
@@ -700,16 +728,42 @@ class Service:
                     receipt = {"turn": turn, "messages": [m for m in snapshot["messages"] if m.get("turnId") == turn_id],
                                "settings": snapshot.get("settings"), "usage": snapshot.get("usage"),
                                "modelReroute": snapshot.get("modelReroute"), "history_truncated": snapshot.get("history_truncated")}
+                    if 'sessionFailures' in snapshot:
+                        receipt['sessionFailures'] = snapshot['sessionFailures']
+                    import ao_outcomes
+                    receipt['provider_failures'] = ao_outcomes.activity_failures(snapshot, turn_id)
                     if "carried" in request:
                         receipt["carried_sha256"] = digest(request["carried"])
-                    self.observation(directory, request, receipt)
-                    request["usage"] = usage_receipt(request, snapshot)
-                    if request["state"] == "completed" and request.get("purpose") in ("implementation", "correction"):
+                    if self.observation(directory, request, receipt):
+                        request["usage"] = usage_receipt(request, snapshot)
+                    if request['state'] == 'completed' and not request.get('model_reroute'):
+                        try:
+                            ao_outcomes.observe(self, directory, state, request, snapshot)
+                            request.pop('semantic_observation_error', None)
+                        except RoomError as exc:
+                            request['semantic_observation_error'] = str(exc)[:500]
+                    if request["state"] == "completed" and not request.get("semantic_observation_error") and request.get("purpose") in ("implementation", "correction"):
                         ao_workflow.capture_engineering(self.root.parent, directory, state, request)
             self.save(directory, state)
             if ao_workflow.normal(state):
                 ao_routing.observe_on_sync(self, directory, state)  # bounded GET; never refuses the sync
             return self.summary(directory, state)
+
+    def ao_room_outcome_audit(self, room_id, role='engineer', ao_database_path=None, native_transcript_path=None):
+        import ao_outcomes
+        with self.locked(room_id) as (directory, state):
+            return ao_outcomes.audit(self, directory, state, role, ao_database_path, native_transcript_path)
+
+    def ao_room_instruction_stage(self, room_id, request_id, message, authorization):
+        from ao_instruction_amendments import stage
+        with self.locked(room_id) as (directory, state):
+            return stage(self, directory, state, request_id, message, authorization)
+
+    def ao_room_outcome_resume(self, room_id, request_id, outcome_sha256, resume_request_id, diagnosis, authorization):
+        import ao_outcomes
+        with self.locked(room_id) as (directory, state):
+            return ao_outcomes.resume(self, directory, state, request_id, outcome_sha256,
+                                      resume_request_id, diagnosis, authorization)
 
     def ao_room_verify(self, room_id, candidate_path, timeout_seconds=120):
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 7200:
@@ -798,6 +852,9 @@ class Service:
             if conflict:
                 self.record_reroute(directory, state, request, conflict)
                 raise RoomError("Native model substitution contradicts the pinned reviewer identity; inspect saved reroute evidence")
+            import ao_outcomes
+            ao_outcomes.observe(self, directory, state, request, current)
+            ao_outcomes.usable(directory, request)
             expected = {"spec_sha256": checkpoint["spec_sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                         "evidence_sha256": state["checkpoint_sha256"]}
             if request["review"] != expected or request["spec_record_sha256"] != state["spec_record_sha256"]:
@@ -826,6 +883,7 @@ class Service:
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
                   "response_normalization", "response_normalization_sha256")
+        fields += ('semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'outcome_resume', 'outcome_resume_sha256')
         result = {k: request[k] for k in fields if k in request}
         if request.get("observed_turn"):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -908,6 +966,9 @@ S = {"type": "string"}
 R = {"room_id": S}
 ROLE = {"type": "string", "enum": ["engineer", "reviewer"]}
 TOOL_SCHEMAS = {
+    "ao_room_instruction_stage": ("Save actual user-authorized operating changes for the next separately authorized engineer request, without model dispatch or unpausing work. Delivered once with immutable provenance. Do not repeat existing specs or use this to change product scope, provider settings, review attempts, or an uncertain delivery.", schema({**R, "request_id": S, "message": S, "authorization": S})),
+    "ao_room_outcome_audit": ("Read and preserve the latest owned terminal outcome without inference. Correlate typed errors before truncation or formatting. Optional explicit AO database and Claude transcript paths bind native evidence to the exact retained engineer; unknown evidence holds. Does not establish a quota reset or resume work.", schema({**R, "role": ROLE, "ao_database_path": S, "native_transcript_path": S}, ['room_id'])),
+    "ao_room_outcome_resume": ("Record actual authorization for one new continuation after a freshly audited quota, provider, or output-truncation failure. Keep the same session, raw failures, specification and consumed review attempts. No model call; only the named unused successor request may pass this hold. Unknown delivery cannot be released. An exactly correlated native quota rejection may settle its known AO failed turn, retaining the original failure. A fresh authorization may supersede an unused release only for the same successor.", schema({**R, "request_id": S, "outcome_sha256": S, "resume_request_id": S, "diagnosis": S, "authorization": S})),
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),

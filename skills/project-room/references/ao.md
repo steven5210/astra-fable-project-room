@@ -38,6 +38,8 @@ Report each fact separately and keep the underlying receipts private.
 
 ## Stable-release check
 
+For diagnosed provider limits, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
+
 At the start of each new or resumed AO work session, compare the installed and
 running AO release with the official [latest stable release](https://github.com/Untrivial-ai/agent-orchestrator/releases/latest).
 The machine-readable feed is `https://api.github.com/repos/Untrivial-ai/agent-orchestrator/releases/latest`;
