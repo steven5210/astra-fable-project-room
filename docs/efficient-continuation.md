@@ -112,7 +112,7 @@ writes a private original-byte backup and immutable patch intent, and refuses an
 unknown/new upstream module. It is not run by installation, dispatch or an
 updater. No model, effort, output budget or provider is changed.
 
-For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. A verified idle daemon restart loads the override for retained controllers without a model prompt.
+For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
 
 Verify that the affected runtime is idle before using the tool. Existing native
 controllers must reload the patched module through a separately verified
