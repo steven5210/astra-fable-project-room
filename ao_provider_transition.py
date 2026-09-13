@@ -332,8 +332,20 @@ def _native(state, binding, snapshot, directory=None):
     turns, messages = snapshot.get("turns"), snapshot.get("messages")
     if not isinstance(turns, list) or not isinstance(messages, list):
         raise RoomError("Provider transition requires explicit native turn and message arrays")
+    from ao_outcomes import known_compaction_turns
+    imports = known_compaction_turns(directory, state, snapshot) if state.get('provider_transition') and directory else set()
+    settled = {}
+    if state.get('provider_transition') and directory is not None:
+        from ao_outcomes import validate_settlement
+        for request in state['requests'].values():
+            if (request.get('state') == 'settled_failure' and request.get('provider_epoch') == EPOCH
+                    and request.get('session_id') == binding['session_id']):
+                validate_settlement(directory, request)
+                settled[request['turn_id']] = request
     for turn in turns:
-        if not isinstance(turn, dict) or turn.get("state") != "completed":
+        settled_quota = (isinstance(turn, dict) and turn.get('id') in settled and turn.get('state') == 'failed')
+        compact_summary = isinstance(turn, dict) and turn.get('id') in imports and turn.get('state') == 'recovered'
+        if not settled_quota and not compact_summary and (not isinstance(turn, dict) or turn.get("state") != "completed"):
             value = turn.get("state") if isinstance(turn, dict) else None
             raise RoomError("Native history contains a turn that is not completed (state " + str(value) + "); failed, interrupted, cancelled, recovered or active work refuses")
     ids = [t.get("id") for t in turns]
@@ -346,7 +358,7 @@ def _native(state, binding, snapshot, directory=None):
         if request.get("session_id") != binding["session_id"]:
             continue
         turn_id = request.get("turn_id")
-        if request.get("state") != "completed" or not turn_id or not ao.native_turn_identity(request):
+        if (request.get("state") != "completed" and turn_id not in settled) or not turn_id or not ao.native_turn_identity(request):
             raise RoomError("Every owning native request must be known completed with native identity")
         if turn_id in owned:
             raise RoomError("Two owning requests claim the same native turn")
@@ -354,7 +366,7 @@ def _native(state, binding, snapshot, directory=None):
         if directory is not None:
             receipt = ao_workflow.completed_receipt(directory, request)
             turn = receipt.get("turn") or {}
-            if (turn.get("id") != turn_id or turn.get("state") != "completed"
+            if (turn.get("id") != turn_id or turn.get("state") != ("failed" if turn_id in settled else "completed")
                     or turn.get("providerTurnId") != ao.native_turn_identity(request)
                     or ao.digest(request["text"].encode()) != request["text_sha256"]
                     or not ao.sent_message(request, receipt) or not ao.sent_message(request, snapshot)):
@@ -370,7 +382,7 @@ def _native(state, binding, snapshot, directory=None):
     owned_turns = [{"turn_id": key, "provider_turn_id": ao.native_turn_identity(value), "request_id": value["request_id"]}
                    for key, value in sorted(owned.items())]
     unowned = [{"turn_id": t["id"], "provider_turn_id": t["providerTurnId"]}
-               for t in sorted(turns, key=lambda t: t["id"]) if t["id"] not in owned]
+               for t in sorted(turns, key=lambda t: t["id"]) if t["id"] not in owned and t["id"] not in imports]
     return {"session_id": binding["session_id"], "conversation_id": snapshot.get("conversationId"),
             "branch_id": snapshot.get("activeBranchId"), "model": (snapshot.get("settings") or {}).get("model"),
             "reasoning_effort": (snapshot.get("settings") or {}).get("reasoningEffort"), "turn_count": len(turns),
@@ -775,6 +787,8 @@ def dispatch_gate(service, directory, state, snapshot):
     original = {t["turn_id"] for t in epoch["native"]["owned_turns"] + epoch["native"]["unowned_completed_turns"]}
     allowed = original | {r["turn_id"] for r in state["requests"].values()
                           if r.get("provider_epoch") == EPOCH and r.get("turn_id") and r.get("session_id") == engineer["session_id"]}
+    from ao_outcomes import known_compaction_turns
+    allowed |= known_compaction_turns(directory, state, snapshot)
     ids = {t["id"] for t in snapshot["turns"]}
     if allowed - ids:
         raise RoomError("Pinned native turns are missing from the observed history")
@@ -813,7 +827,7 @@ def amendment_delivered(directory, state):
             if (carried.get("routing_amendment_sha256") != ao.digest(INSTRUCTION.encode())
                     or carried.get("routing_adoption_sha256") != state["routing_adoption"]["receipt_sha256"]):
                 raise RoomError("Delivered routing amendment contradicts its configured adoption")
-        if request.get("state") == "completed":
+        if request.get("state") in ("completed", "settled_failure"):
             receipt = ao_workflow.completed_receipt(directory, request)
             if receipt.get("carried_sha256") != ao.digest(carried) or not ao.sent_message(request, receipt):
                 raise RoomError("Delivered provider amendment has no matching native receipt")

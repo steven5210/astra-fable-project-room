@@ -32,6 +32,8 @@ The bundled [skill](skills/project-room/SKILL.md) supplies the roles and workflo
 
 Both agents review the same immutable spec revision and SHA-256. Findings receive explicit dispositions; a finding prefixed `BLOCKER:` prevents agreement. Both agents may propose enhancements, which Astra brings to you with the benefit, tradeoff and an issue link for your opinion and scope approval; an enhancement enters implementation only after you approve its scope and the revised spec is agreed. See [the workflow](docs/workflow.md) and [Fable's delegation policy](skills/project-room/references/fable-policy.md).
 
+Asking Fable to personally review a topic preserves its independent judgment and final verdict; it does not assign every supporting document to Fable. Suitable evidence preparation, document assembly, implementation and tests remain delegated. Compact engineering reports separate Fable's findings from controller-owned identity metadata and historical accounting. These rules reach retained sessions as a one-time update, followed by ordinary short continuations. See [efficient review and continuation](docs/efficient-continuation.md).
+
 ## Prerequisites
 
 - Python 3.10 or newer on macOS or Linux. The runtime uses POSIX locks, process groups and `/proc` or `ps` inspection; native Windows is not supported. CI exercises Python 3.11 and 3.12.
@@ -131,6 +133,8 @@ The skill walks Astra through these steps; the tool names are the `ao_room_*` MC
 7. `ao_room_send` to the reviewer with purpose `acceptance_review`; sync its terminal response; `ao_room_accept` records it only when the completed verdict names the unchanged spec, candidate and evidence hashes. Three acceptance reviews are available per room.
 
 A completed response with valid JSON surrounded by prose can use [audited formatting recovery](skills/project-room/references/ao.md#completed-response-formatting-recovery): Astra reviews all surrounding text and records the exact object without a model call. Raw evidence and review limits remain intact; ambiguous content, stale candidates and missing completion evidence are refused. This does not approve the result or bypass independent acceptance.
+
+Transport completion is checked separately from semantic success. Shared quota/provider-error holds survive restarts and take precedence over truncated or missing output. `ao_room_outcome_audit` diagnoses the exact result without inference; `ao_room_outcome_resume` records actual authorization for one named continuation without replaying the failed turn or renewing review budgets. Unknown delivery remains blocked. `ao_room_instruction_stage` stores new operating instructions while a room is paused and delivers them once on a separately authorized send. The [guide](docs/efficient-continuation.md) covers native evidence, compact report fields, the narrowly audited failed-turn quota settlement, and the explicit workaround for the affected AO 0.13 Claude bridge.
 
 Every step refuses rather than guesses: unknown delivery is never replayed, an AO failure without an observed native turn ID stays uncertain, an active or unresolved delegate job blocks the next phase, and exhausted review budgets surface the decision to you instead of opening another room. The full contract, including the exact result fields and the historical pilot rooms, is in [Project Room on Agent Orchestrator](skills/project-room/references/ao.md).
 

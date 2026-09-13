@@ -95,7 +95,10 @@ class FrozenV1RoutingTests(Fixture):
         self.service.ao_room_bind(self.room, "engineer", "engineer", ao_workflow.FABLE_MODEL, "max")
         self.agree()
         request = copy.deepcopy(self.state()["requests"]["spec_review"])
-        self.assertEqual(request["carried"]["part_sha256"], {name: ao.digest(value.encode()) for name, value in actual.items()})
+        self.assertEqual({name: request["carried"]["part_sha256"][name] for name in actual},
+                         {name: ao.digest(value.encode()) for name, value in actual.items()})
+        from ao_report_contract import PART, INSTRUCTION
+        self.assertEqual(request["carried"]["part_sha256"][PART], ao.digest(INSTRUCTION.encode()))
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.service.ao_room_send(self.room, "engineer", "Continue.", "continuation", purpose="implementation")
         self.assertEqual(self.fake.posts[-1][1]["text"], "Continue.")
