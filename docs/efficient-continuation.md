@@ -149,3 +149,7 @@ AO native identity and complete text digest matching the single imported user
 message. That proven context import may pass the existing provider-epoch history
 gate; it is never a new command, completion or quota reset. Ordinary recovered
 turns, lookalike summary prose, extra replies and changed bytes remain blocked.
+
+This compaction-import allowance applies to continuation within an already
+committed provider epoch. It does not broaden initial provider-transition
+eligibility or recompute an existing epoch's frozen history digest.

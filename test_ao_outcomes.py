@@ -318,3 +318,9 @@ class CompactionImportTests(unittest.TestCase):
             snapshot={**self.snapshot,'messages':[{**self.message,**change}]}
             self.assertEqual(native.compaction_imports([self.row], 'native', snapshot), [])
         self.assertEqual(native.compaction_imports([self.row], 'native', {**self.snapshot,'messages':[self.message,self.message]}), [])
+
+    def test_timestamp_less_conflicting_duplicate_compaction_identity_refuses(self):
+        changed = {**self.row, 'message':{'content':'Different summary'}}
+        with self.assertRaisesRegex(ao.RoomError, 'Conflicting duplicate'):
+            native.compaction_imports([self.row, changed], 'native', self.snapshot)
+        self.assertEqual(len(native.compaction_imports([self.row, self.row], 'native', self.snapshot)), 1)

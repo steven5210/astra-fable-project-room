@@ -123,6 +123,13 @@ class HistoricalCorrectionTests(AdoptionFixture):
             self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
             self.assertEqual(snapshot['turns'][-2], turn)  # Retain the recovered import; do not rewrite history.
 
+    def test_active_epoch_cannot_recommit_a_compaction_augmented_history(self):
+        from unittest.mock import patch
+        self.ready()
+        with patch.object(transition, '_native', side_effect=AssertionError('An active epoch must never be recomputed')):
+            with self.assertRaisesRegex(ao.RoomError, 'already used'):
+                transition._inspect(self.service, self.directory(), self.state(), {})
+
     def test_historical_nonresults_allow_new_correction_without_accepting_prior_report(self):
         self.ready()
         original = self.complete()

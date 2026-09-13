@@ -98,7 +98,10 @@ def compaction_imports(events, session_id, snapshot):
         if not isinstance(identity, str) or not identity or not isinstance(content, str) or not content:
             continue
         provider_id = 'acp-history-turn:' + str(len(namespace.encode())) + ':' + namespace + str(len(identity.encode())) + ':' + identity
-        summaries[provider_id] = (identity, digest(content.encode()))
+        proof = (identity, digest(content.encode()))
+        if provider_id in summaries and summaries[provider_id] != proof:
+            raise RoomError('Conflicting duplicate native compaction identity')
+        summaries[provider_id] = proof
     result = []
     for turn in snapshot.get('turns', []):
         match = summaries.get(turn.get('providerTurnId'))
