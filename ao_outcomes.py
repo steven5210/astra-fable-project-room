@@ -180,6 +180,11 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
             native = {'unknown': str(exc)[:500]}
         if native and native.get('next_human_uuid'):
             native = {**native, 'unknown': 'A later native human packet follows this owned request; reconcile it first'}
+    extra_turns = turn_ids(snapshot) - set(request['baseline']['turn_ids']) - {request['turn_id']}
+    if state['workflow'] == 'fable_engineering' and extra_turns:
+        proven_imports = {p['turn_id'] for p in (native or {}).get('compaction_imports', [])} if not (native or {}).get('unknown') else set()
+        if extra_turns - proven_imports:
+            raise RoomError('Native history contains unverified recovered context; audit its exact source before continuing')
     value = {'version': 1, 'room_id': state['room_id'], 'request_id': request['request_id'],
              'receipt_sha256': request['receipt_sha256'], 'text_sha256': request['text_sha256'],
              'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],
@@ -332,3 +337,24 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
         request['state'] = 'settled_failure'  # Original AO receipt and failure remain immutable and unusable as success.
     service.save(directory, state)
     return {**inputs, 'model_dispatch': False}
+
+
+def known_compaction_turns(directory, state, snapshot):
+    """A native resume summary is context, not a new user command or successful work."""
+    from ao_project_room import digest
+    request = latest_for_role(state, 'engineer')
+    if not request or not request.get('semantic_outcome'):
+        return set()
+    record = load(directory, request)
+    native = record.get('native') or {}
+    if native.get('unknown') or not native.get('source') or native['source'] != state.get('native_outcome_source'):
+        return set()
+    result = set()
+    for proof in native.get('compaction_imports', []):
+        turns = [t for t in snapshot.get('turns', []) if t.get('id') == proof['turn_id']]
+        messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == proof['turn_id']]
+        if (len(turns) != 1 or turns[0].get('state') != 'recovered' or digest(turns[0]) != proof['turn_sha256']
+                or digest(messages) != proof['messages_sha256']):
+            raise RoomError('Verified native compaction import changed; re-audit before continuing')
+        result.add(proof['turn_id'])
+    return result

@@ -95,6 +95,34 @@ class HistoricalCorrectionTests(AdoptionFixture):
             self.review()
             self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
+    def test_native_compaction_import_is_context_only_after_exact_evidence_audit(self):
+        from unittest.mock import patch
+        import ao_native_outcome
+        self.ready(); self.complete(ids=[])
+        snapshot = self.fake.snapshots['engineer']; branch = snapshot['activeBranchId']; identity = 'compact-summary'
+        turn = {'id':'imported-summary','state':'recovered',
+                'providerTurnId':'acp-history-turn:'+str(len(branch))+':'+branch+str(len(identity))+':'+identity}
+        message = {'id':'imported-user','turnId':turn['id'],'role':'user','origin':'human', 'text':'Saved compact context',
+                   'streaming':False,'sequence':1000}
+        snapshot['turns'].append(turn); snapshot['messages'].append(message)
+        with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'): self.correct()
+        state = self.state(); source = {'session_id':'engineer'}; state['native_outcome_source'] = source
+        ao.atomic(self.directory()/'state.json', state)
+        native_row = {'type':'user','sessionId':'native','isSidechain':False,'isCompactSummary':True,
+                      'isVisibleInTranscriptOnly':True,'uuid':identity,'message':{'content':message['text']}}
+        proof = {'anchor_uuid':'owned-packet','next_human_uuid':None,'errors':[],'stop_reasons':['end_turn'],
+                 'source':source,'source_sha256':'f'*64,
+                 'compaction_imports':ao_native_outcome.compaction_imports([native_row],'native',snapshot)}
+        with patch.object(ao_native_outcome, 'inspect', return_value=proof):
+            audit = self.service.ao_room_outcome_audit(self.room)
+            self.assertEqual(audit['native']['compaction_imports'][0]['turn_id'], turn['id'])
+            message['text'] = 'A genuine new instruction cannot hide behind the summary ID'
+            with self.assertRaisesRegex(ao.RoomError, 'compaction import changed'): self.correct()
+            message['text'] = 'Saved compact context'
+            self.correct()
+            self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
+            self.assertEqual(snapshot['turns'][-2], turn)  # Retain the recovered import; do not rewrite history.
+
     def test_historical_nonresults_allow_new_correction_without_accepting_prior_report(self):
         self.ready()
         original = self.complete()

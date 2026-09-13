@@ -141,3 +141,11 @@ completion evidence before their hold can clear. Sync can record unavailable
 history without failing; sending and acceptance still require complete evidence.
 Native retry errors followed by an observed successful final are retained as
 settled history, not treated as a new quota stop.
+
+AO can import a saved Claude compaction summary as a recovered human turn on
+native resume. The native outcome audit recognizes only a transcript-only
+`isCompactSummary` record in the exact retained session, with its length-prefixed
+AO native identity and complete text digest matching the single imported user
+message. That proven context import may pass the existing provider-epoch history
+gate; it is never a new command, completion or quota reset. Ordinary recovered
+turns, lookalike summary prose, extra replies and changed bytes remain blocked.

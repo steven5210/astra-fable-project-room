@@ -332,6 +332,8 @@ def _native(state, binding, snapshot, directory=None):
     turns, messages = snapshot.get("turns"), snapshot.get("messages")
     if not isinstance(turns, list) or not isinstance(messages, list):
         raise RoomError("Provider transition requires explicit native turn and message arrays")
+    from ao_outcomes import known_compaction_turns
+    imports = known_compaction_turns(directory, state, snapshot) if state.get('provider_transition') and directory else set()
     settled = {}
     if state.get('provider_transition') and directory is not None:
         from ao_outcomes import validate_settlement
@@ -342,7 +344,8 @@ def _native(state, binding, snapshot, directory=None):
                 settled[request['turn_id']] = request
     for turn in turns:
         settled_quota = (isinstance(turn, dict) and turn.get('id') in settled and turn.get('state') == 'failed')
-        if not settled_quota and (not isinstance(turn, dict) or turn.get("state") != "completed"):
+        compact_summary = isinstance(turn, dict) and turn.get('id') in imports and turn.get('state') == 'recovered'
+        if not settled_quota and not compact_summary and (not isinstance(turn, dict) or turn.get("state") != "completed"):
             value = turn.get("state") if isinstance(turn, dict) else None
             raise RoomError("Native history contains a turn that is not completed (state " + str(value) + "); failed, interrupted, cancelled, recovered or active work refuses")
     ids = [t.get("id") for t in turns]
@@ -379,7 +382,7 @@ def _native(state, binding, snapshot, directory=None):
     owned_turns = [{"turn_id": key, "provider_turn_id": ao.native_turn_identity(value), "request_id": value["request_id"]}
                    for key, value in sorted(owned.items())]
     unowned = [{"turn_id": t["id"], "provider_turn_id": t["providerTurnId"]}
-               for t in sorted(turns, key=lambda t: t["id"]) if t["id"] not in owned]
+               for t in sorted(turns, key=lambda t: t["id"]) if t["id"] not in owned and t["id"] not in imports]
     return {"session_id": binding["session_id"], "conversation_id": snapshot.get("conversationId"),
             "branch_id": snapshot.get("activeBranchId"), "model": (snapshot.get("settings") or {}).get("model"),
             "reasoning_effort": (snapshot.get("settings") or {}).get("reasoningEffort"), "turn_count": len(turns),
@@ -784,6 +787,8 @@ def dispatch_gate(service, directory, state, snapshot):
     original = {t["turn_id"] for t in epoch["native"]["owned_turns"] + epoch["native"]["unowned_completed_turns"]}
     allowed = original | {r["turn_id"] for r in state["requests"].values()
                           if r.get("provider_epoch") == EPOCH and r.get("turn_id") and r.get("session_id") == engineer["session_id"]}
+    from ao_outcomes import known_compaction_turns
+    allowed |= known_compaction_turns(directory, state, snapshot)
     ids = {t["id"] for t in snapshot["turns"]}
     if allowed - ids:
         raise RoomError("Pinned native turns are missing from the observed history")

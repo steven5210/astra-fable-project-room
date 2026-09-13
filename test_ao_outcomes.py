@@ -247,6 +247,13 @@ class OutcomeWorkflowTests(Fixture):
         self.assertEqual(self.service.ao_room_outcome_audit(self.room)['outcome']['kind'], 'final_available')
         self.send('correction')
 
+    def test_unowned_recovered_context_in_normal_rooms_requires_positive_native_proof(self):
+        self.failed(json.dumps(self.report()))
+        self.fake.snapshots['engineer']['turns'].append({'id':'unowned','state':'recovered','providerTurnId':'foreign'})
+        before = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'): self.send('correction')
+        self.assertEqual(len(self.fake.posts), before)
+
     def test_mcp_outcome_audit_resume_and_instruction_stage_use_fake_backend_only(self):
         import project_room, project_room_mcp
         service = project_room.Service(self.root / 'mcp-state')
@@ -290,3 +297,24 @@ class NativeFileTests(unittest.TestCase):
                 other = root / 'other.jsonl'; other.symlink_to(path)
                 with self.assertRaises(ao.RoomError): native.inspect(root, {}, request, {**source, 'transcript':str(other)}, snapshot)
                 with self.assertRaisesRegex(ao.RoomError, 'identity'): native.inspect(root, {}, request, source, {**snapshot, 'activeBranchId':'other'})
+
+
+class CompactionImportTests(unittest.TestCase):
+    def setUp(self):
+        self.row = {'type':'user','sessionId':'native','isSidechain':False,'isCompactSummary':True,
+                    'isVisibleInTranscriptOnly':True,'uuid':'summary','message':{'content':'Saved summary'}}
+        self.turn = {'id':'imported','state':'recovered','providerTurnId':'acp-history-turn:6:branch7:summary'}
+        self.message = {'id':'imported-user','turnId':'imported','role':'user','origin':'human','text':'Saved summary','streaming':False}
+        self.snapshot = {'activeBranchId':'branch','turns':[self.turn],'messages':[self.message]}
+
+    def test_only_exact_structured_native_compaction_can_explain_an_import(self):
+        result = native.compaction_imports([self.row], 'native', self.snapshot)
+        self.assertEqual([r['turn_id'] for r in result], ['imported'])
+        self.assertNotIn('Saved summary', json.dumps(result))
+        for change in ({'isCompactSummary':False},{'isVisibleInTranscriptOnly':False},{'sessionId':'foreign'}, {'isSidechain':True},
+                       {'uuid':'different'}, {'message':{'content':'Changed'}}):
+            self.assertEqual(native.compaction_imports([{**self.row, **change}], 'native', self.snapshot), [])
+        for change in ({'role':'assistant'},{'text':'Changed'},{'streaming':True}):
+            snapshot={**self.snapshot,'messages':[{**self.message,**change}]}
+            self.assertEqual(native.compaction_imports([self.row], 'native', snapshot), [])
+        self.assertEqual(native.compaction_imports([self.row], 'native', {**self.snapshot,'messages':[self.message,self.message]}), [])

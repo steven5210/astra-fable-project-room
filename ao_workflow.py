@@ -236,11 +236,11 @@ def engineering_ready(service, directory, state):
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
         raise RoomError("Acceptance requires a captured completed engineering result")
+    if state.get("provider_transition") and request.get("provider_epoch") != 2:
+        raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     from ao_outcomes import usable, observe
     observe(service, directory, state, request, service.identity(service.client(state), state, request))
     usable(directory, request)
-    if state.get("provider_transition") and request.get("provider_epoch") != 2:
-        raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     report = engineering_report(directory, state, request)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")

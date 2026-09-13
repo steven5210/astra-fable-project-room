@@ -77,6 +77,43 @@ def events_outcome(events, request, session_id):
             'errors': errors, 'settled_errors': settled_errors, 'stop_reasons': list(stops.values())}
 
 
+
+def compaction_imports(events, session_id, snapshot):
+    """Recognize only exact native compaction records imported by AO as history turns."""
+    from ao_project_room import digest
+    namespace = snapshot.get('activeBranchId')
+    if not isinstance(namespace, str):
+        return []
+    summaries = {}
+    for row in events:
+        if (row.get('type') != 'user' or row.get('sessionId') != session_id or row.get('isSidechain')
+                or row.get('isCompactSummary') is not True or row.get('isVisibleInTranscriptOnly') is not True):
+            continue
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list) and content and all(isinstance(x, dict) and x.get('type') == 'text'
+                and isinstance(x.get('text'), str) for x in content):
+            content = ''.join(x['text'] for x in content)
+        identity = row.get('uuid')
+        if not isinstance(identity, str) or not identity or not isinstance(content, str) or not content:
+            continue
+        provider_id = 'acp-history-turn:' + str(len(namespace.encode())) + ':' + namespace + str(len(identity.encode())) + ':' + identity
+        summaries[provider_id] = (identity, digest(content.encode()))
+    result = []
+    for turn in snapshot.get('turns', []):
+        match = summaries.get(turn.get('providerTurnId'))
+        if turn.get('state') != 'recovered' or not match:
+            continue
+        messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == turn.get('id')]
+        if (len(messages) != 1 or messages[0].get('role') != 'user' or messages[0].get('origin') != 'human'
+                or messages[0].get('streaming') or not isinstance(messages[0].get('text'), str)
+                or digest(messages[0]['text'].encode()) != match[1]):
+            continue
+        result.append({'turn_id': turn['id'], 'provider_turn_id': turn['providerTurnId'], 'message_id': messages[0]['id'],
+                       'native_uuid': match[0], 'text_sha256': match[1], 'turn_sha256': digest(turn), 'messages_sha256': digest(messages)})
+    return sorted(result, key=lambda x: x['turn_id'])
+
+
 def validate_source(state, source):
     from ao_native_identity import read_owner
     if not isinstance(source, dict) or set(source) != {'database', 'transcript', 'session_id', 'native_session_id'}:
@@ -117,5 +154,7 @@ def inspect(directory, state, request, source, snapshot):
     if (len(raw) != before.st_size or (before.st_ino, before.st_size, before.st_mtime_ns)
             != (after.st_ino, after.st_size, after.st_mtime_ns)):
         raise RoomError('Native transcript changed while being observed')
-    result = events_outcome([json.loads(line) for line in raw.splitlines() if line.strip()], request, source['native_session_id'])
-    return {**result, 'source': source, 'source_sha256': digest(raw)}
+    events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    result = events_outcome(events, request, source['native_session_id'])
+    return {**result, 'source': source, 'source_sha256': digest(raw),
+            'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
