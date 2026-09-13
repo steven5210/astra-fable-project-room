@@ -66,6 +66,35 @@ class HistoricalCorrectionTests(AdoptionFixture):
         self.assertEqual((self.directory()/'state.json').read_bytes(), before)
         self.assertEqual(self.fake.posts, posts)
 
+    def test_transitioned_room_continues_once_after_audited_native_quota_settlement(self):
+        from unittest.mock import patch
+        import ao_native_outcome
+        self.ready()
+        self.service.ao_room_send(self.room, 'engineer', 'Finish one section.', 'section', purpose='implementation')
+        self.fake.finish('engineer', state='failed'); self.service.ao_room_sync(self.room)
+        state = self.state(); state['native_outcome_source'] = {'session_id':'engineer'}
+        ao.atomic(self.directory()/'state.json', state)
+        proof = {'anchor_uuid':'exact-native-packet','next_human_uuid':None,'errors':[{'error':'rate_limit','http_status':429}],
+                 'stop_reasons':[], 'source_sha256':'f'*64}
+        with patch.object(ao_native_outcome, 'inspect', return_value=proof):
+            audit = self.service.ao_room_outcome_audit(self.room)
+            self.service.ao_room_outcome_resume(self.room, 'section', audit['outcome_sha256'], 'correction',
+                                               'Exact native quota rejection inspected; user confirmed reset', 'Continue once')
+            before = self.state()['requests']['section']
+            self.correct()
+            self.assertEqual(self.state()['requests']['section']['receipt_sha256'], before['receipt_sha256'])
+            self.assertEqual(self.state()['requests']['section']['state'], 'settled_failure')
+            self.assertNotIn('provider_amendment_sha256', self.state()['requests']['correction']['carried'])
+            self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
+        (self.repo/'feature.txt').write_text('implemented\n')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        # A later request reads only its own native interval; this synthetic hook supplies that interval.
+        with patch.object(ao_native_outcome, 'inspect', return_value={'anchor_uuid':'successor','next_human_uuid':None,
+            'errors':[],'stop_reasons':['end_turn'],'source_sha256':'e'*64}):
+            self.service.ao_room_sync(self.room)
+            self.review()
+            self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+
     def test_historical_nonresults_allow_new_correction_without_accepting_prior_report(self):
         self.ready()
         original = self.complete()

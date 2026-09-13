@@ -16,7 +16,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
-PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule")
+PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -29,8 +29,11 @@ def normal(state):
 
 def completed_receipt(directory, request):
     from ao_project_room import digest, read, native_turn_identity
-    if request.get("state") != "completed" or not native_turn_identity(request) or request.get("model_reroute"):
+    if request.get("state") not in ('completed', 'settled_failure') or not native_turn_identity(request) or request.get("model_reroute"):
         raise RoomError("A completed native turn with uncontradicted identity is required")
+    if request.get('state') == 'settled_failure':
+        from ao_outcomes import validate_settlement
+        validate_settlement(directory, request)
     if not request.get("receipt"):
         raise RoomError("The native result has no saved receipt")
     receipt = read(directory / request["receipt"])
@@ -74,6 +77,8 @@ def agreement(service, directory, state):
     request = latest(state, {"spec_review"})
     if not request or request["spec_record_sha256"] != state["spec_record_sha256"]:
         raise RoomError("The current exact spec requires completed Fable agreement")
+    from ao_outcomes import usable
+    usable(directory, request)
     verdict = final_json(directory, request)
     if (request["role"] != "engineer" or request["harness"] != "claude-code" or request["model"] != FABLE_MODEL
             or verdict.get("decision") != "accept" or type(verdict.get("spec_revision")) is not int
@@ -154,6 +159,8 @@ def engineering_report(directory, state, request, report=None):
     record = handoff_record(directory, state)
     if report is None:
         report = final_json(directory, request)
+    from ao_report_contract import project
+    report = project(directory, state, request, report)
     if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
             or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
@@ -196,6 +203,8 @@ def capture_engineering(home, directory, state, request, capture_completion=True
     from ao_project_room import atomic, digest
     try:
         completed_candidate = completion_candidate(directory, state, request, capture=capture_completion)
+        from ao_outcomes import usable
+        usable(directory, request)
         report = engineering_report(directory, state, request)
         # The claim is recorded before verification so a ledger lost afterwards still counts as recorded delegation.
         request["reported_delegate_job_ids"] = ao_delegates.report_job_ids(report)
@@ -206,6 +215,8 @@ def capture_engineering(home, directory, state, request, capture_completion=True
         relative = "engineering/" + request["request_id"] + ".json"
         record = {"candidate": candidate, "report_sha256": digest(report), "receipt_sha256": request["receipt_sha256"],
                   "delegation": evidence}
+        if 'controller_metadata' in report:
+            record['controller_metadata'] = report['controller_metadata']
         if request.get("provider_epoch") is not None:
             record["provider_epoch"] = request["provider_epoch"]
         atomic(directory / relative, record)
@@ -225,6 +236,9 @@ def engineering_ready(service, directory, state):
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
         raise RoomError("Acceptance requires a captured completed engineering result")
+    from ao_outcomes import usable, observe
+    observe(service, directory, state, request, service.identity(service.client(state), state, request))
+    usable(directory, request)
     if state.get("provider_transition") and request.get("provider_epoch") != 2:
         raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     report = engineering_report(directory, state, request)
@@ -311,7 +325,7 @@ def delivered(state, session_id, directory=None):
     """Context the controller itself delivered to one native session, from completed observed turns only."""
     spec_record, parts = None, set()
     completed = [r for r in state["requests"].values()
-                 if r.get("role") == "engineer" and r.get("session_id") == session_id and r.get("state") == "completed"]
+                 if r.get("role") == "engineer" and r.get("session_id") == session_id and r.get("state") in ('completed', 'settled_failure')]
     for request in sorted(completed, key=lambda r: r["created_order"]):
         if directory is not None:
             from ao_project_room import digest, sent_message
@@ -432,7 +446,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
             last = max(previous, key=lambda r: r["created_order"])
             from ao_response_normalization import ResponseFormatError
             try:
-                prior = final_json(directory, last, allow_missing=True)
+                prior = final_json(directory, last, allow_missing=True) if last["state"] == "completed" else None
             except ResponseFormatError:
                 prior = None  # known completion may need a report-only correction
             if isinstance(prior, dict) and prior.get("outcome") == "scope_change":
@@ -443,6 +457,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
                     from ao_provider_transition import report_state
                     prior_state = report_state(directory, state, last)
                 try:
+                    from ao_report_contract import project
+                    prior = project(directory, prior_state, last, prior)
                     ao_delegates.verify_delegation(service.root.parent, directory, prior_state, prior)
                 except RoomError:
                     if purpose != "correction" or not state.get("provider_transition") or last.get("provider_epoch") != 2:
@@ -464,6 +480,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
         ao_routing.before_dispatch(service, directory, state, prepared, purpose)
     policy = ao_delegates.validate_provider(directory, state)
     texts = part_texts(prepared, policy)
+    from ao_report_contract import PART, INSTRUCTION
+    texts[PART] = INSTRUCTION  # A new one-time amendment, never a rewrite of frozen workflow bytes.
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
@@ -500,5 +518,10 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
             if previous["gates"] != spec["gates"]:
                 block += "\nAgreed gates: " + json.dumps(spec["gates"])
             sections.append(block)
+    from ao_instruction_amendments import pending
+    amendments = pending(directory, state, binding['session_id'])
+    if amendments:
+        sections.extend(text for text, _ in amendments)
+        carried['instruction_amendments'] = [sha for _, sha in amendments]
     sections.append(message)
     return "\n".join(sections), carried

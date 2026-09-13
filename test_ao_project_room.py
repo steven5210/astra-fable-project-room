@@ -64,6 +64,8 @@ class FakeAO:
         snapshot = self.snapshots[name]
         turn = snapshot["turns"][-1]
         turn["state"] = state
+        if state == "completed":
+            turn["stopReason"] = "end_turn"  # Positive completion evidence for these fake replies.
         snapshot["messages"].append({"id": "answer-" + turn["id"], "role": "assistant", "text": text, "turnId": turn["id"], "sequence": len(snapshot["messages"]) + 1})
         snapshot["usage"] = usage or {"inputTokens": 100, "cachedTokens": 80, "outputTokens": 10, "totalTokens": 110, "contextUsed": 75, "contextWindow": 1000}
 
@@ -679,12 +681,13 @@ class ClientTests(unittest.TestCase):
 
     def test_pagination_preserves_latest_turn_state_and_flags_truncation(self):
         client = ao.Client("http://127.0.0.1:1234")
-        pages = [{"turns": [{"id": "one", "state": "completed"}], "messages": [{"id": "new", "sequence": 9}], "hasMoreBefore": True, "oldestSequence": 9},
-                 {"turns": [{"id": "one", "state": "running"}], "messages": [{"id": "old", "sequence": 1}], "hasMoreBefore": False, "oldestSequence": 1}]
+        pages = [{"turns": [{"id": "one", "state": "completed"}], "messages": [{"id": "new", "sequence": 9, "text": "final"}], "hasMoreBefore": True, "oldestSequence": 9},
+                 {"turns": [{"id": "one", "state": "running"}], "messages": [{"id": "old", "sequence": 1}, {"id":"new", "sequence":9, "text":"stale"}], "hasMoreBefore": False, "oldestSequence": 1}]
         with patch.object(client, "request", side_effect=pages) as request:
             result = client.conversation("session")
         self.assertEqual(result["turns"][0]["state"], "completed")
         self.assertEqual([m["id"] for m in result["messages"]], ["old", "new"])
+        self.assertEqual(result["messages"][-1]["text"], "final")
         self.assertIn("beforeSequence=9", request.call_args.args[1])
         self.assertFalse(result["history_truncated"])
 
