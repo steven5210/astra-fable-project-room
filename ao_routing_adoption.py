@@ -222,6 +222,9 @@ def _ledger(service, directory, state, epoch):
 
 
 def _inspect(service, directory, state):
+    from ao_review_extension import guard_pending_receipts, guard_replacement
+    guard_pending_receipts(directory, state)
+    guard_replacement(state, 'routing adoption')
     import ao_provider_transition
     if state.get('routing_adoption') or list((directory / BASE / 'requests').glob('*.json')):
         raise RoomError('Routing adoption is already used or pending')
@@ -393,6 +396,10 @@ def stage(service, room_id, audit_sha256, authorization, diagnosis, request_id):
     inputs = {'audit_sha256': audit_sha256, 'authorization': authorization, 'diagnosis': diagnosis, 'request_id': request_id}
     with service.locked(room_id) as (directory, state):
         ref = state.get('routing_adoption')
+        if not ref or ref.get('phase') != 'configured':
+            from ao_review_extension import guard_pending_receipts, guard_replacement
+            guard_pending_receipts(directory, state)
+            guard_replacement(state, 'routing adoption')
         if ref:
             if ref.get('request_id') != request_id or ref.get('key') != ao.digest(inputs):
                 raise RoomError('Routing adoption already belongs to another request')
@@ -465,11 +472,16 @@ def activate(service, room_id, request_id):
     ao.identifier(request_id)
     with service.locked(room_id) as (directory, state):
         ref = state.get('routing_adoption')
+        if not ref or ref.get('phase') != 'configured':
+            from ao_review_extension import guard_pending_receipts
+            guard_pending_receipts(directory, state)
         if not ref or ref.get('request_id') != request_id:
             raise RoomError('Use the exact pending routing-adoption request')
         if ref['phase'] == 'configured':
             validate(service, state)
             return _result(directory, state, ref)
+        from ao_review_extension import guard_replacement
+        guard_replacement(state, 'routing activation')
         record, saved = _pending(service, directory, state, ref)
         prepared, runtime, config, files = _bundle(directory, saved)
         if record != _record(room_id, record['inputs'], saved['evidence']['state'], prepared, runtime, files):

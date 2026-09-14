@@ -169,9 +169,10 @@ class ReviewerRecoveryTests(unittest.TestCase):
                         self.fake.snapshots = copy.deepcopy(original)
                         for field in missing:
                             self.fake.snapshots[name].pop(field)
-                        normalized = self.fake.conversation(name)
-                        for field in set(missing) & {"messages", "turns"}:
-                            self.assertEqual(normalized[field], [])  # Production normalization formerly admitted this.
+                        # Both production readers now refuse missing arrays;
+                        # unknown history cannot become a clean unused reviewer.
+                        with self.assertRaisesRegex(ao.RoomError, "explicit complete native history"):
+                            self.fake.conversation(name)
                         if name == "reviewer":
                             self.assert_refused_without_state_change(self.audit)
                         self.assert_refused_without_state_change(lambda: self.recover(args))
@@ -230,7 +231,7 @@ class ReviewerRecoveryTests(unittest.TestCase):
                         in_final_admission = False
                 def wire_request(method, path, payload=None):
                     nonlocal injected
-                    if in_final_admission and method == "GET" and path == "/sessions/reviewer/conversation?limit=500":
+                    if in_final_admission and method == "GET" and path == "/sessions/reviewer/conversation?limit=100":
                         injected = True
                         self.fake.snapshots["reviewer"].update(
                             turns=[{"id": "external", "providerTurnId": "external-native", "state": terminal}],

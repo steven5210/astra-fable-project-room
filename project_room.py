@@ -205,9 +205,32 @@ class Service:
                 load_server(qwen)  # Validate configuration only; never launch upstream here.
             if deepseek and (deepseek_config or delegate_provider == "deepseek"):
                 self._deepseek_config(deepseek)  # key-free validation of the supplied or reselected file; no key, no network
+            override = prior.get("claude_config_dir_override", os.environ.get("CLAUDE_CONFIG_DIR"))
+            recorded = prior.get("claude_config_dir")
+            if ("claude_config_dir" in prior
+                    and (not isinstance(recorded, str) or not recorded or not Path(recorded).expanduser().is_absolute())):
+                raise room.RoomError("Saved Claude configuration requires a nonempty recorded absolute directory; "
+                                     "no directory was inferred from this cwd. No configuration or existing room snapshot was changed")
+            if override is not None:
+                if not isinstance(override, str) or not override:
+                    raise room.RoomError("CLAUDE_CONFIG_DIR must be a nonempty directory override or remain unset")
+                override_path = Path(override).expanduser()
+                resolved = str(override_path.resolve())
+                if ("claude_config_dir_override" in prior and not override_path.is_absolute()
+                        and (not isinstance(recorded, str) or not Path(recorded).expanduser().is_absolute()
+                             or str(Path(recorded).expanduser().resolve()) != resolved)):
+                    raise room.RoomError("Saved relative Claude configuration override cannot be resolved consistently; "
+                                         "run setup from the original directory where it matches the recorded absolute directory. "
+                                         "No configuration or existing room snapshot was changed")
+                if recorded and str(Path(recorded).expanduser().resolve()) != resolved:
+                    raise room.RoomError("Claude configuration directory override and recorded directory disagree; "
+                                         "resolve the saved configuration before setup. Nothing was written")
+                # Persist the selected directory, not cwd-dependent text that a
+                # later worker or retained MCP would resolve somewhere else.
+                override = resolved
+            config_dir = str(Path(recorded or override or Path.home() / ".claude").expanduser().resolve())
             config = {"version": 1, "claude_bin": executable, "model": MODEL,
-                      "claude_config_dir": prior.get("claude_config_dir") or str(Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser().resolve()),
-                      "claude_config_dir_override": prior.get("claude_config_dir_override", os.environ.get("CLAUDE_CONFIG_DIR")),
+                      "claude_config_dir": config_dir, "claude_config_dir_override": override,
                       "qwen_config": qwen, "deepseek_config": deepseek,
                       "review_timeout_seconds": prior.get("review_timeout_seconds", 1800),
                       "implementation_timeout_seconds": prior.get("implementation_timeout_seconds", 3600)}

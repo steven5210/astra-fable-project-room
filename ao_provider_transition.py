@@ -268,7 +268,7 @@ class _CompleteClient:
         self.client = client
 
     def request(self, method, path, payload=None):
-        if method != "GET":
+        if method != "GET" or payload is not None:
             raise RoomError("Provider audit permits AO GET observations only")
         raw = self.client.request(method, path, payload)
         if re.fullmatch(r"/sessions/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}", path):
@@ -278,41 +278,9 @@ class _CompleteClient:
         return raw
 
     def conversation(self, session_id):
-        path = "/sessions/" + ao.identifier(session_id) + "/conversation?limit=500"
-        result, turns, messages, seen = None, {}, {}, set()
-        for _ in range(10):
-            page = self.request("GET", path)
-            if (not isinstance(page, dict) or any(not isinstance(page.get(k), list) for k in ("turns", "messages"))
-                    or type(page.get("hasMoreBefore")) is not bool):
-                raise RoomError("Provider transition requires explicit complete native history arrays in the raw AO response")
-            if "history_truncated" in page and page["history_truncated"] is not False:
-                raise RoomError("Raw native history contains contradictory truncation evidence")
-            for name, target in (("turns", turns), ("messages", messages)):
-                identities = []
-                for item in page[name]:
-                    if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
-                        raise RoomError("Raw native history identity is ambiguous")
-                    identities.append(item["id"])
-                    if item["id"] in target and ao.digest(target[item["id"]]) != ao.digest(item):
-                        raise RoomError("Raw native history contains conflicting " + name + " across pages")
-                    target.setdefault(item["id"], item)
-                if len(set(identities)) != len(identities):
-                    raise RoomError("Raw native history contains duplicate identities")
-            if result is None:
-                result = dict(page)
-            elif any(ao.digest(page.get(k)) != ao.digest(result.get(k))
-                     for k in ("sessionId", "conversationId", "activeBranchId", "controller", "settings", "branchMaterialization")):
-                raise RoomError("Native conversation identity changed during bounded history observation")
-            if not page["hasMoreBefore"]:
-                result.update(turns=list(turns.values()), messages=sorted(messages.values(), key=lambda m: m.get("sequence", 0)),
-                              history_truncated=False)
-                return result
-            cursor = page.get("oldestSequence")
-            if type(cursor) is not int or cursor <= 0 or cursor in seen:
-                raise RoomError("Native history pagination is incomplete or ambiguous")
-            seen.add(cursor)
-            path = "/sessions/" + ao.identifier(session_id) + "/conversation?limit=500&beforeSequence=" + str(cursor)
-        raise RoomError("Provider transition requires complete native history within its bounded observation window")
+        from ao_history import conversation
+        path = "/sessions/" + ao.identifier(session_id) + "/conversation"
+        return conversation(self.request, path, strict=True)
 
 
 def _history_digest(turns, messages):
@@ -392,6 +360,8 @@ def _native(state, binding, snapshot, directory=None):
 
 def _inspect(service, directory, state, target_input, reconcile=None):
     service.settled(state, pending_transition=reconcile is not None)
+    from ao_review_extension import guard_replacement
+    guard_replacement(state, 'provider transition')
     if not ao_workflow.normal(state):
         raise RoomError("Provider transition is for normal Fable rooms")
     if state.get("provider_transition") is not None:
@@ -597,6 +567,8 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
             if record["inputs"] != inputs:
                 raise RoomError("Provider transition already belongs to another payload; only its identical result can be read")
             return _result(state, record, epoch)
+        from ao_review_extension import guard_replacement
+        guard_replacement(state, 'provider transition')
         pending = _pending_receipts(directory)
         if len(pending) > 1:
             raise RoomError("Multiple uncommitted provider transition receipts exist; diagnose before continuing")

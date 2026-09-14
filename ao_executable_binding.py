@@ -205,6 +205,8 @@ def bind(service, room_id, request_id, executable_path, launch_path, database_pa
         if existing is not None and state.get('executable_binding') == pointer:
             effective(directory, state, prepared)
             return {**pointer, 'model_dispatch': False, 'idempotent': True}
+        from ao_review_extension import guard_pending_receipts
+        guard_pending_receipts(directory, state)
         # A crash between durable intent and state commit may only replay this
         # exact intent against the identical state and fresh local/native evidence.
         if existing is not None:
@@ -215,6 +217,8 @@ def bind(service, room_id, request_id, executable_path, launch_path, database_pa
             prior = _chain(directory, state, prepared)
             source = prior['target'] if prior else prepared['routing']['claude']
         evidence = _inspect(service, directory, state, inputs, prepared, source)
+        from ao_review_extension import guard_native_owner
+        guard_native_owner(service, state, evidence['native_owner'])
         record = existing or {'version': 1, 'room_id': room_id, 'inputs': inputs,
             'recorded_at': time.time(), 'before_state_sha256': ao.digest(state),
             'engineer': state['bindings']['engineer'], 'preparation': state['preparation'],

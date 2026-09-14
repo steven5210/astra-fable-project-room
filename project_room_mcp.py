@@ -3,9 +3,53 @@
 
 import json
 import math
+from pathlib import Path
 import sys
 
+RUNTIME = None
+INPUT_CWD = None
+if __name__ == "__main__":
+    # The plugin installer may remove its old cache while this connection (or
+    # a detached legacy worker) is still alive. Pin files before lazy imports.
+    sys.dont_write_bytecode = True
+    INPUT_CWD = Path.cwd()
+    from project_room_runtime import RuntimeRetentionError, activate
+    try:
+        RUNTIME = activate(__file__)
+    except (OSError, RuntimeRetentionError) as exc:
+        sys.stderr.write("Project Room MCP runtime could not be retained: " + str(exc) + "\n")
+        raise SystemExit(1)
+
 import project_room
+
+RELATIVE_PATH_ARGUMENTS = {
+    "room_open": "project_path", "room_list": "project_path",
+    "ao_room_open": "project_path", "ao_room_list": "project_path",
+    "ao_room_prepare": "worktree_path", "ao_room_handoff": "worktree_path",
+    "ao_room_verify": "candidate_path",
+}
+
+
+def input_arguments(name, arguments):
+    """Keep supported caller-relative paths anchored before runtime chdir.
+
+    Native evidence paths already require exact absolute, non-symlink inputs;
+    changing those would weaken their validators. Text, gate argv, profiles,
+    identifiers, invalid types and API-import behavior remain untouched.
+    """
+    if INPUT_CWD is None or not isinstance(name, str) or not isinstance(arguments, dict):
+        return arguments
+    field = RELATIVE_PATH_ARGUMENTS.get(name)
+    value = arguments.get(field) if field else None
+    # Empty room_list paths mean an unfiltered listing. Other path APIs reject
+    # blanks; normalization must not turn an invalid blank into a valid path.
+    if not isinstance(value, str) or not value or (name != "room_list" and not value.strip()):
+        return arguments
+    expanded = Path(value).expanduser()
+    if expanded.is_absolute():
+        return arguments
+    return {**arguments, field: str(INPUT_CWD / expanded)}
+
 
 MAX_LINE = 3_000_000
 INSTRUCTIONS = (
@@ -59,7 +103,9 @@ def handle(message, service):
         version = params.get("protocolVersion")
         result = {"protocolVersion": version if version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2024-11-05",
                   "capabilities": {"tools": {"listChanged": False}},
-                  "serverInfo": {"name": "astra-fable-project-room", "version": "0.3.0"}, "instructions": INSTRUCTIONS}
+                  "serverInfo": {"name": "astra-fable-project-room", "version": RUNTIME["version"] if RUNTIME else "0.3.0"}, "instructions": INSTRUCTIONS}
+        if RUNTIME:
+            result["_meta"] = {"project-room/runtime": RUNTIME}
     elif method == "ping":
         result = {}
     elif method == "tools/list":
@@ -70,7 +116,8 @@ def handle(message, service):
                             for name, (description, schema) in project_room.TOOL_SCHEMAS.items()]}
     elif method == "tools/call":
         try:
-            value = service.call(params.get("name"), params.get("arguments", {}))
+            name = params.get("name")
+            value = service.call(name, input_arguments(name, params.get("arguments", {})))
             result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
                       "structuredContent": value, "isError": False}
         except Exception as exc:

@@ -416,6 +416,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     delegating = role == "engineer" and purpose in ("implementation", "correction")
     epoch = None
     correction_admission = None
+    review_extension = None
     binding = state.get("bindings", {}).get("engineer", {})
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
@@ -430,9 +431,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
                 + "\n<specification>\n" + spec["content"] + "\n</specification>\nAgreed gates: "
                 + json.dumps(spec["gates"]) + "\nTask instruction:\n" + message), None
     if purpose == "spec_review":
-        count = sum(r.get("purpose") == "spec_review" for r in state["requests"].values())
-        if count >= 3:
-            raise RoomError("Three Fable spec-review attempts exhausted; preserve evidence and surface the user decision")
+        from ao_review_extension import admission
+        review_extension = admission(service, directory, state)
     elif purpose in ("implementation", "correction"):
         agreement(service, directory, state)
         handoff = handoff_record(directory, state)
@@ -485,6 +485,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
+    if review_extension is not None:
+        carried['spec_review_extension_sha256'] = review_extension  # Audited allowance, never native prompt text.
     if correction_admission is not None:
         carried["correction_admission"] = correction_admission  # audit metadata only, never appended to the native prompt
     for name in PARTS:
