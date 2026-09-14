@@ -110,7 +110,7 @@ def validate_preparation(directory, state, session_id=None, check_routing=True):
                     or (session_id is not None and observed.get("session_id") != session_id)):
                 raise RoomError("Native delegate launch contradicts the prepared engineer")
     if check_routing:
-        ao_routing.validate_local(prepared)
+        ao_routing.validate_local(prepared, state, directory)
     return prepared
 
 

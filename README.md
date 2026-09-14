@@ -34,6 +34,8 @@ Both agents review the same immutable spec revision and SHA-256. Findings receiv
 
 Asking Fable to personally review a topic preserves its independent judgment and final verdict; it does not assign every supporting document to Fable. Suitable evidence preparation, document assembly, implementation and tests remain delegated. Compact engineering reports separate Fable's findings from controller-owned identity metadata and historical accounting. These rules reach retained sessions as a one-time update, followed by ordinary short continuations. See [efficient review and continuation](docs/efficient-continuation.md).
 
+An app update that removes a pinned Claude executable has a separate [audited repair](docs/efficient-continuation.md#a-pinned-claude-executable-disappeared). It retains the native session and original preparation, records the real replacement identity, and leaves continuation and quota holds with the existing operator.
+
 ## Prerequisites
 
 - Python 3.10 or newer on macOS or Linux. The runtime uses POSIX locks, process groups and `/proc` or `ps` inspection; native Windows is not supported. CI exercises Python 3.11 and 3.12.

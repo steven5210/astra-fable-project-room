@@ -528,7 +528,7 @@ def validate(service, state, provider_epoch=None):
         prepared = json.loads(owned_bytes(directory / state['preparation']))
         if ao.digest(prepared) != state['preparation_sha256']:
             raise RoomError('Routing-adoption preparation changed')
-        ao_routing.validate_local(prepared)
+        ao_routing.validate_local(prepared, state, directory)
         return record
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RoomError('Routing-adoption evidence is unreadable or inconsistent') from exc

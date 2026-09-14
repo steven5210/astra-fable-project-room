@@ -153,3 +153,48 @@ turns, lookalike summary prose, extra replies and changed bytes remain blocked.
 This compaction-import allowance applies to continuation within an already
 committed provider epoch. It does not broaden initial provider-transition
 eligibility or recompute an existing epoch's frozen history digest.
+
+
+## A pinned Claude executable disappeared
+
+A Claude app or CLI update can remove a versioned binary that AO still uses.
+AO may then fail `session/load` before a controller or model request starts.
+Keep the native session stopped while diagnosing the exact launch path and
+recorded preparation. Changing only a symlink does not update Project Room's
+historical executable identity check.
+
+The operator can repair this through `ao_executable_binding.py`. Prepare an
+independently retained copy of the selected user-installed executable, inspect
+its real version and bytes, and set AO's observed launch path to that copy.
+Then invoke the module with `--home`, `--room-id`, an unused `--request-id`,
+`--executable-path`, `--launch-path`, `--database-path`, and the actual
+`--authorization` and `--diagnosis`. All paths must be absolute; the executable
+must be a canonical owned file without symlinks. The launch path may be an
+owned symlink that resolves to that exact file. The helper does not install,
+retarget, start or resume anything, and runs only a bounded `--version` probe.
+
+Repair requires a previously recorded executable that is now missing or
+changed, an idle stopped Fable MAX owner in the same native conversation and
+branch, complete settled transport history, no unsettled owned request and
+unchanged routing files and provider attachment. A separate immutable journal
+records the actual replacement SHA-256, size, mtime, version and launch path.
+The original preparation, provider epochs, routing adoption, requests, quota
+holds and review limits remain unchanged. Every subsequent routing check
+validates the journal, actual bytes, launch path and retained native identity.
+Status presents both the original and current executable identity.
+
+A failed or recovered historical turn remains failed or recovered; this
+operation neither accepts it nor grants continuation. A receipt written before
+an interrupted state commit holds further work and can be reconciled only by
+the identical request against unchanged evidence. After repair, the assigned
+operator may perform the separately authorized same-session resume and verify
+the new process, MAX, native continuity and MCP connection before any prompt.
+Configured identity and an idle reload do not prove native routing enforcement,
+model quality, quota availability or token savings. Never spoof metadata or
+rewrite historical pin receipts to make a replacement appear unchanged.
+
+Executable repair is bound to the exact current preparation. A later provider
+or routing-preparation transition is not implicitly supported by this receipt;
+it needs its own compatibility handling. The operator must also prove that AO
+uses the supplied launch path, since a valid arbitrary symlink alone is not
+evidence of the live process executable.
