@@ -55,6 +55,7 @@ The caller constructs the validated session path; this helper only issues GETs.
         result.update({name: list(items.values()) for name, items in collections.items()})
         result["messages"].sort(key=lambda m: m.get("sequence", 0))
         result["history_truncated"] = truncated
+        result["hasMoreBefore"] = truncated
         return result
 
     while pages < MAX_PAGES and requests < MAX_REQUESTS:

@@ -115,9 +115,14 @@ def receipt(directory, request):
 
 def native_quota_failure(record):
     native = record.get('native') or {}
-    return (record['outcome']['kind'] == 'quota_limit' and not native.get('unknown')
+    return (record['outcome']['kind'] == 'quota_limit' and not inconclusive(record)
             and bool(native.get('anchor_uuid')) and native.get('next_human_uuid') is None
             and any(e.get('error') == 'rate_limit' or e.get('http_status') == 429 for e in native.get('errors', [])))
+
+
+def inconclusive(record):
+    return bool((record.get('native') or {}).get('unknown')
+                or (record.get('observation_outcome') or {}).get('kind') == 'unknown')
 
 
 def validate_settlement(directory, request):
@@ -149,7 +154,7 @@ def latest_for_role(state, role):
     return max(rows, key=lambda r: r['created_order']) if rows else None
 
 
-def observe(service, directory, state, request, snapshot, allow_unknown_clear=False):
+def observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None):
     from ao_project_room import atomic, digest, read, sent_message, turn_ids
     from ao_project_room import native_turn_identity
     identity = native_turn_identity(request)
@@ -191,12 +196,40 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
              'ao_terminal': turns[0], 'session_failures': observed['sessionFailures'], 'provider_failures': activities,
              'native': native, 'outcome': classify(observed, native,
                 require_structured=state['workflow'] == 'fable_engineering' or request['role'] == 'reviewer')}
+    old = load(directory, request) if request.get('semantic_outcome') else None
+    prior_source_verification = (old or {}).get('native_source_verification')
+    if source_verification is not None:
+        value['native_source_verification'] = source_verification
+    elif isinstance(prior_source_verification, dict) and prior_source_verification.get('source') == source:
+        # Keep the prior explicit audit's proof. Merely observing the same result
+        # must not drop metadata and invalidate its exact continuation digest.
+        value['native_source_verification'] = prior_source_verification
+    if old and old.get('resolved_observation_sha256'):
+        value['resolved_observation_sha256'] = old['resolved_observation_sha256']
+    if (old and old['outcome']['kind'] in RESUMABLE and inconclusive(old)
+            and (allow_unknown_clear or source_verification is not None)
+            and value['outcome']['kind'] != 'unknown' and not inconclusive(value)):
+        # An explicit resolution must not recreate an earlier outcome hash and
+        # reactivate its old continuation authority. Retain the diagnosed record.
+        value['resolved_observation_sha256'] = digest(old)
     # A later quiet snapshot cannot clear an observed failure. Only the explicit
     # one-use continuation record can admit another request; original errors remain.
-    old = load(directory, request) if request.get('semantic_outcome') else None
-    if old and not value['outcome']['hold'] and (old['outcome']['kind'] in RESUMABLE
-            or (old['outcome']['kind'] == 'unknown' and not allow_unknown_clear)):
-        return old
+    if old and old['outcome']['kind'] in RESUMABLE and value['outcome']['kind'] == 'unknown':
+        # Preserve the known failure and the newer uncertainty independently. Its
+        # changed digest invalidates prior continuation authority; uncertainty is
+        # never converted into a diagnosed failure merely by retaining its kind.
+        value['observation_outcome'] = value['outcome']
+        value['outcome'] = old['outcome']
+    elif (old and old['outcome']['kind'] in RESUMABLE and inconclusive(old)
+            and not allow_unknown_clear and source_verification is None):
+        value['observation_outcome'] = old.get('observation_outcome') or {
+            'kind': 'unknown', 'hold': True, 'reason': old['native']['unknown']}
+        value['outcome'] = old['outcome']
+    elif old and not value['outcome']['hold'] and (old['outcome']['kind'] in RESUMABLE
+            or (old['outcome']['kind'] == 'unknown' and (not allow_unknown_clear or source_verification is not None))):
+        if source_verification is None and not (allow_unknown_clear and inconclusive(old)):
+            return old
+        value['outcome'] = old['outcome']  # A verified source move cannot clear the existing sticky hold.
     path = 'outcomes/' + request['request_id'] + '/' + digest(value) + '.json'
     if (directory / path).exists():
         if read(directory / path) != value:
@@ -204,6 +237,8 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
     else:
         atomic(directory / path, value)
     request.update(semantic_outcome=path, semantic_outcome_sha256=digest(value), semantic_status=value['outcome'])
+    if source_verification is not None:
+        state['native_outcome_source_evidence'] = {'path': path, 'sha256': digest(value), 'request_id': request['request_id']}
     service.save(directory, state)
     return value
 
@@ -261,7 +296,7 @@ def gate(service, directory, state, role, new_request_id, snapshot):
         return
     release = release_record(directory, state, request)
     if (release and release['resume_request_id'] == new_request_id
-            and release['outcome_sha256'] == request['semantic_outcome_sha256']):
+            and release['outcome_sha256'] == request['semantic_outcome_sha256'] and not inconclusive(value)):
         return
     raise RoomError('Native semantic hold: ' + value['outcome']['kind'] + '. Inspect ao_room_outcome_audit; no automatic retry or replay.')
 
@@ -273,10 +308,13 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
     audit_quiet(service, directory, state, request)
     if bool(ao_database_path) != bool(native_transcript_path):
         raise RoomError('Supply both exact native evidence paths or neither')
+    source_verification = None
     if ao_database_path:
         from ao_native_identity import read_owner
         from ao_native_outcome import validate_source
         owner = read_owner(ao_database_path, request['session_id'])
+        from ao_review_extension import guard_native_owner
+        guard_native_owner(service, state, owner)
         source = {'database': ao_database_path, 'transcript': native_transcript_path,
                   'session_id': request['session_id'], 'native_session_id': owner['provider_conversation_id']}
         validate_source(state, source)
@@ -284,13 +322,16 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
         # read-only audit can correct a moved source; prior outcome records retain it.
         from ao_native_outcome import inspect
         snapshot = service.identity(service.client(state), state, request)
-        inspect(directory, state, request, source, snapshot)
+        verified = inspect(directory, state, request, source, snapshot)
+        source_verification = {'source': source, 'native_owner': owner, 'native': verified}
         state['native_outcome_source'] = source
     snapshot = service.identity(service.client(state), state, request)
-    value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True)
+    value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True,
+                    source_verification=source_verification)
     return {'request_id': request['request_id'], 'outcome': value['outcome'],
             'outcome_sha256': request['semantic_outcome_sha256'], 'native': value['native'],
-            'resume_eligible': (value['outcome']['kind'] in RESUMABLE and not (value.get('native') or {}).get('unknown') if request['state'] == 'completed'
+            'observation_outcome': value.get('observation_outcome'),
+            'resume_eligible': (value['outcome']['kind'] in RESUMABLE and not inconclusive(value) if request['state'] == 'completed'
                                 else native_quota_failure(value)),
             'model_dispatch': False, 'quota_reset_established': False}
 
@@ -321,7 +362,7 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
     snapshot = service.identity(service.client(state), state, request)
     value = observe(service, directory, state, request, snapshot)
     if (request['semantic_outcome_sha256'] != outcome_sha256 or value['outcome']['kind'] not in RESUMABLE
-            or (value.get('native') or {}).get('unknown')):
+            or inconclusive(value)):
         raise RoomError('Outcome evidence changed or does not establish an eligible diagnosed failure')
     if request['state'] != 'completed':
         if request['state'] not in ('uncertain', 'settled_failure') or not native_quota_failure(value):

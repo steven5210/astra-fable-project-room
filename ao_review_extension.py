@@ -16,10 +16,10 @@ from room import RoomError
 
 BASE = 'spec-review-extension'
 LIMIT = 3
+MAX_RECORD_BYTES = 96_000_000
 PIN_FIELDS = ('room_id', 'project_path', 'git_common_dir', 'ao_project_id', 'ao_url', 'workflow',
               'authorization', 'exception_authorization', 'bindings', 'delegate', 'preparation',
-              'preparation_sha256', 'provider_transition', 'routing_adoption', 'instruction_amendments',
-              'native_outcome_source', 'executable_binding', 'reviewer_recovery')
+              'preparation_sha256', 'provider_transition', 'routing_adoption', 'reviewer_recovery')
 # Later observations may add a hold or independently authorize its named successor.
 # Their original files stay in the audit manifest; this grant never releases them.
 OBSERVATIONS = {'semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'semantic_observation_error',
@@ -34,7 +34,7 @@ def _hash(value, label):
 
 def _read(path):
     try:
-        return json.loads(ao_delegates.owned_bytes(path, 96_000_000))
+        return json.loads(ao_delegates.owned_bytes(path, MAX_RECORD_BYTES))
     except (OSError, ValueError, TypeError) as exc:
         raise RoomError('Review-extension evidence is unreadable or inconsistent') from exc
 
@@ -48,6 +48,11 @@ def _relative(directory, relative):
 
 def _pending(directory):
     return sorted((directory / BASE / 'requests').glob('*.json'))
+
+
+def guard_pending_receipts(directory, state):
+    if state.get('spec_review_extension') is None and _pending(directory):
+        raise RoomError('An uncommitted review-extension receipt exists; reconcile only its identical request')
 
 
 def _consumptions(directory):
@@ -193,6 +198,10 @@ def _inspect(service, directory, state, target, reconcile=False):
     if (spec['revision'] != target['spec_revision'] or spec['sha256'] != target['spec_sha256']
             or spec['revision'] != prior_revision + 1):
         raise RoomError('Register the exact next charter revision before its review-extension audit')
+    if state.get('executable_binding') or list((directory / 'executable-bindings').glob('*.json')):
+        import ao_executable_binding
+        # A grant cannot change the state needed to reconcile a pending repair.
+        ao_executable_binding._chain(directory, state, _read(directory / state['preparation']))
     actual = ao_workflow.workspace(service, directory, state, check_routing=False)
     ao_delegates.validate_provider(directory, state)
     ao_delegates.assert_settled(service.root.parent, copy.deepcopy(state), directory)
@@ -223,6 +232,11 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
         evidence, snapshots = _inspect(service, directory, state, target)
         value = {'version': 1, 'evidence': evidence, 'observed_snapshots': snapshots, 'observed_at': time.time()}
         sha256 = ao.digest(value)
+        # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
+        # Keep both complete raw snapshots; an oversized audit is never published.
+        serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
+        if len(serialized) > MAX_RECORD_BYTES:
+            raise RoomError('Complete review-extension audit exceeds its readable size bound; no audit was published')
         _store_once(directory / BASE / 'audits' / (sha256 + '.json'), value)
         return {'eligible': True, 'audit_sha256': sha256, 'room_id': room_id, **target,
                 'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': LIMIT,
@@ -235,6 +249,26 @@ def _retained(directory, state, evidence):
         raise RoomError('Review-extension original state evidence was modified')
     if any(state.get(k) != baseline.get(k) for k in PIN_FIELDS):
         raise RoomError('Review-extension room, native binding, authorization or pinned metadata changed')
+    original_amendments = baseline.get('instruction_amendments', [])
+    current_amendments = state.get('instruction_amendments', [])
+    if (not isinstance(current_amendments, list)
+            or current_amendments[:len(original_amendments)] != original_amendments):
+        raise RoomError('Review-extension original instruction amendments were removed, reordered or changed')
+    from ao_instruction_amendments import pending
+    pending(directory, state, baseline['bindings']['engineer']['session_id'])  # Validates original and appended immutable bytes.
+    _source_record(directory, state, evidence)
+    if (state.get('executable_binding') or baseline.get('executable_binding')
+            or list((directory / 'executable-bindings').glob('*.json'))):
+        import ao_executable_binding
+        prepared = _read(directory / state['preparation'])
+        ao_executable_binding._chain(directory, state, prepared)
+        pointer = state.get('executable_binding')
+        while pointer != baseline.get('executable_binding'):
+            if pointer is None:
+                raise RoomError('Review-extension original executable binding is missing from its journal')
+            record = ao_executable_binding._read(directory, pointer)
+            _same_owner(record['evidence']['native_owner'], evidence)
+            pointer = record['previous']
     for key in ('acceptances', 'verifications'):
         if state[key][:len(baseline[key])] != baseline[key]:
             raise RoomError('Review-extension retained acceptance or verification history changed')
@@ -248,6 +282,61 @@ def _retained(directory, state, evidence):
     ao_workflow.spec_record_file(directory, evidence['spec_record_sha256'])
 
 
+def _same_owner(owner, evidence):
+    if (not isinstance(owner, dict)
+            or {k: v for k, v in owner.items() if k not in ('activity_state', 'controller_generation')}
+            != evidence['native_owner']):
+        raise RoomError('The committed fourth-review grant requires the same native owner; replacement was not recorded')
+
+
+def _source_record(directory, state, evidence):
+    source = state.get('native_outcome_source')
+    if source == evidence['state'].get('native_outcome_source'):
+        return
+    pointer = state.get('native_outcome_source_evidence')
+    if not isinstance(source, dict) or not isinstance(pointer, dict) or set(pointer) != {'path', 'sha256', 'request_id'}:
+        raise RoomError('Changed native outcome source requires its saved verified source audit')
+    request = state['requests'][pointer['request_id']]
+    value = _read(_relative(directory, pointer['path']))
+    from ao_outcomes import load
+    load(directory, {**request, 'semantic_outcome': pointer['path'], 'semantic_outcome_sha256': pointer['sha256'],
+                     'semantic_status': value['outcome']})
+    proof = value.get('native_source_verification') or {}
+    if not isinstance(proof, dict):
+        raise RoomError('Native source audit has malformed verification evidence')
+    native = proof.get('native') or {}
+    if (not isinstance(native, dict) or proof.get('source') != source or native.get('source') != source or native.get('unknown')
+            or not native.get('anchor_uuid') or not native.get('source_sha256')
+            or request.get('role') != 'engineer' or request.get('session_id') != source.get('session_id')
+            or source.get('session_id') != evidence['state']['bindings']['engineer']['session_id']
+            or source.get('native_session_id') != evidence['target']['native_session_id']):
+        raise RoomError('Native source audit does not prove the grant\'s retained owner')
+    _same_owner(proof['native_owner'], evidence)
+
+
+def _anchor(directory, state):
+    reference = state['spec_review_extension']
+    record = _read(_relative(directory, reference['receipt']))
+    if ao.digest(record) != reference['receipt_sha256'] or record['room_id'] != state['room_id']:
+        raise RoomError('Committed review-extension grant was modified')
+    evidence = _audit(directory, record['inputs']['audit_sha256'])['evidence']
+    if record['evidence_sha256'] != ao.digest(evidence):
+        raise RoomError('Review-extension audit chain changed')
+    return evidence
+
+
+def guard_native_owner(service, state, owner):
+    """A source-path audit or executable repair may retain, never replace, this owner."""
+    if state.get('spec_review_extension'):
+        _same_owner(owner, _anchor(service.root / 'rooms' / state['room_id'], state))
+
+
+def guard_replacement(state, operation):
+    if state.get('spec_review_extension'):
+        raise RoomError('The committed fourth-review grant pins provider and routing identity; ' + operation
+                        + ' is unsupported after that grant. No transition intent was written')
+
+
 def validate(service, state, allow_pending=False):
     """Offline integrity and accounting only; available never means a provider hold cleared."""
     directory = service.root / 'rooms' / state['room_id']
@@ -255,8 +344,8 @@ def validate(service, state, allow_pending=False):
     if reference is None:
         if _consumptions(directory):
             raise RoomError('Fourth-review consumption evidence has no committed grant; diagnose without resending')
-        if _pending(directory) and not allow_pending:
-            raise RoomError('An uncommitted review-extension receipt exists; reconcile only its identical request')
+        if not allow_pending:
+            guard_pending_receipts(directory, state)
         return None
     try:
         request_id = ao.identifier(reference['request_id'])
@@ -387,7 +476,8 @@ def admission(service, directory, state):
         raise RoomError('The review extension belongs only to its exact audited next charter')
     actual = ao_workflow.workspace(service, directory, state, check_routing=False)
     _acceptance(directory, state, target['retained_candidate_sha256'], actual)
-    if _owner(state, target['native_owner_database'], target['native_session_id'], actual) != evidence['native_owner']:
+    database = (state.get('native_outcome_source') or {}).get('database', target['native_owner_database'])
+    if _owner(state, database, target['native_session_id'], actual) != evidence['native_owner']:
         raise RoomError('The retained native owner changed after the review extension')
     from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity
     client, observer = _CompleteClient(service.client(state)), _ReadOnlyIdentity(service)

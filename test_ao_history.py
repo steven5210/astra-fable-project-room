@@ -47,6 +47,7 @@ class HistoryTests(unittest.TestCase):
                 self.assertEqual({a["id"] for a in result["activities"]}, {"a1", "a2"})
                 self.assertIn(pages[1]["activities"][0], result["activities"])
                 self.assertFalse(result["history_truncated"])
+                self.assertFalse(result["hasMoreBefore"])
 
     def test_actual_oversized_response_shrinks_read_pages_without_losing_evidence(self):
         # A native timeline larger than the transport cap, with a complete reference.
@@ -154,13 +155,38 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(raw.call_count, 50)
 
     def test_page_and_byte_bounds_never_certify_incomplete_history(self):
-        for bound, value in (("MAX_PAGES", 1), ("MAX_OBSERVATION_BYTES", len(history.canonical(self.pages()[0])) + 1)):
+        for bound, value in (("MAX_PAGES", 1), ("MAX_REQUESTS", 1),
+                             ("MAX_OBSERVATION_BYTES", len(history.canonical(self.pages()[0])) + 1)):
             with patch.object(history, bound, value):
                 with self.subTest(bound=bound), self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
                     self.observe(self.pages())
                 raw, result = self.observe(self.pages(), False)
                 self.assertTrue(result["history_truncated"])
+                self.assertTrue(result["hasMoreBefore"])
                 self.assertEqual([m["id"] for m in result["messages"]], ["m2"])
+
+    def test_request_bound_includes_oversized_retries_without_advancing_cursor(self):
+        for strict in (False, True):
+            calls = []
+
+            def fetch(method, path):
+                calls.append((method, path))
+                if len(calls) == 1:
+                    return copy.deepcopy(self.pages()[0])
+                raise history.ResponseTooLarge("synthetic oversized history GET")
+
+            with self.subTest(strict=strict), patch.object(history, "MAX_REQUESTS", 3):
+                if strict:
+                    with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                        history.conversation(fetch, "/sessions/fixture/conversation", strict=True)
+                else:
+                    result = history.conversation(fetch, "/sessions/fixture/conversation")
+                    self.assertTrue(result["history_truncated"])
+                    self.assertTrue(result["hasMoreBefore"])
+                    self.assertEqual([m["id"] for m in result["messages"]], ["m2"])
+            self.assertEqual(calls, [("GET", "/sessions/fixture/conversation?limit=100"),
+                                    ("GET", "/sessions/fixture/conversation?limit=100&beforeSequence=20"),
+                                    ("GET", "/sessions/fixture/conversation?limit=50&beforeSequence=20")])
 
     def test_elapsed_bound_fails_before_another_read(self):
         with patch.object(history.time, "monotonic", side_effect=[0, 0, 1, 151]):

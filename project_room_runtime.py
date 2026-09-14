@@ -200,6 +200,11 @@ def activate(entrypoint):
     # Resolve relative PROJECT_ROOM_HOME before changing cwd, preserving the
     # caller's state selection for this process and its detached workers.
     os.environ["PROJECT_ROOM_HOME"] = str(home)
+    # Claude also resolves this inherited setting against cwd. Keep the same
+    # account/settings directory for MCP callers and their delegated processes.
+    claude_directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    if claude_directory and not Path(claude_directory).expanduser().is_absolute():
+        os.environ["CLAUDE_CONFIG_DIR"] = str((startup_cwd / Path(claude_directory).expanduser()).resolve())
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     sys.dont_write_bytecode = True
     sys.path[:] = [runtime["path"]] + [entry for entry in search_paths if Path(entry) != source]

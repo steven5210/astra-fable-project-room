@@ -18,13 +18,27 @@ owned private parent directory.
 Only the package version is read from `.codex-plugin/plugin.json`. Configuration,
 credentials, transcripts, tests, private fixtures, and room state are not copied.
 State-home selection stays the same, including a relative `PROJECT_ROOM_HOME`
-resolved against the original working directory. The MCP then uses the retained
+resolved against the original working directory. An inherited relative
+`CLAUDE_CONFIG_DIR` is also resolved before the working directory changes, so
+Claude account/settings selection and child-process inheritance keep their
+original meaning. The MCP then uses the retained
 directory for its imports and working directory. Normal Python API imports and
 direct `project_room.py` operator calls retain their existing source semantics.
 Supported relative MCP project, workspace, and candidate paths remain anchored
 to the original startup directory before dispatch. Prompt text, gate argv,
 profile objects, and native evidence paths that already require exact absolute
 inputs retain their original validation and meaning.
+
+Controller setup saves an explicitly selected Claude directory and its override
+as the same absolute path, so new room profiles and worker environments keep
+that account selection after a cwd change. A historical relative override can
+be normalized by setup only from a directory where it matches the already
+recorded absolute selection. An existing recorded directory must be nonempty
+absolute text; setup cannot infer it from a later working directory. A mismatch
+refuses before configuration publication;
+an inherited environment variable does not override that saved choice. Setup
+does not rewrite immutable room snapshots. A historical snapshot that still
+disagrees must remain in a diagnosed hold pending explicit recovery.
 
 Retained copies are not automatically deleted, including when the MCP exits.
 Legacy workers can outlive their originating MCP and still need its exact source,

@@ -383,6 +383,10 @@ def context(service, directory, state):
     recorded = room.get("claude_config_dir") or controller.get("claude_config_dir")
     candidates = {str(Path(value).expanduser().resolve()) for value in (override, recorded) if isinstance(value, str) and value}
     if len(candidates) > 1:
+        if isinstance(override, str) and not Path(override).expanduser().is_absolute():
+            raise RoomError("Saved relative Claude configuration override disagrees with its recorded directory from this cwd; "
+                            "run controller setup from the original matching directory. Existing room snapshots remain unchanged "
+                            "and require explicit recovery if they still disagree; no account directory was selected")
         raise RoomError("Claude configuration directory override and recorded directory disagree")
     config_dir = candidates.pop() if candidates else str(Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")).expanduser().resolve())
     return {"claude_config_dir": config_dir, "claude_bin": room.get("claude_bin") or controller.get("claude_bin"), "python": sys.executable}

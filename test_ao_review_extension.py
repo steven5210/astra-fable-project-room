@@ -2,7 +2,12 @@
 
 import copy
 import json
+import os
 import sqlite3
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
@@ -12,11 +17,13 @@ import ao_workflow
 import project_room
 import project_room_mcp
 from test_ao_normal import Fixture
+from test_ao_adoption import AdoptionFixture
 
 
-class ReviewExtensionTests(Fixture):
+class ReviewExtensionFixture(Fixture):
     def setUp(self):
         super().setUp()
+        self.configure_runtime()
         self.room = self.open()
         self.spec()
         original_request = self.fake.request
@@ -37,6 +44,10 @@ class ReviewExtensionTests(Fixture):
         self.implement()
         self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.make_database()
+        self.target_spec = None
+
+    def make_database(self):
         self.database = self.root / 'synthetic-ao.db'
         binding = self.state()['bindings']['engineer']
         with sqlite3.connect(self.database) as db:
@@ -51,7 +62,8 @@ class ReviewExtensionTests(Fixture):
                        (binding['conversation_id'], 'engineer', binding['branch_id']))
             db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
                        (binding['branch_id'], binding['conversation_id'], 'synthetic-native-owner', 'engineer', 'native', 0))
-        self.target_spec = None
+    def configure_runtime(self):
+        pass
 
     def register(self):
         if self.target_spec is None:
@@ -82,6 +94,8 @@ class ReviewExtensionTests(Fixture):
                          'decision': 'accept', 'spec_revision': 2, 'spec_sha256': self.target_spec['sha256']}))
         return self.service.ao_room_sync(self.room)
 
+
+class ReviewExtensionTests(ReviewExtensionFixture):
     def test_registration_does_not_consume_or_grant_and_audit_is_observational(self):
         self.register()
         before = (self.directory() / 'state.json').read_bytes()
@@ -592,9 +606,10 @@ class ReviewExtensionTests(Fixture):
         with self.assertRaises(ao.RoomError):
             self.send('spec_review', 'wrong-history')
         self.fake.snapshots['engineer']['messages'][0]['text'] = self.state()['requests']['charter-1']['text']
-        self.service.ao_room_spec_put(self.room, 3, 'Another authorized scope.', self.gates, 'Another exact approval')
-        with self.assertRaisesRegex(ao.RoomError, 'exact audited next charter'):
-            self.send('spec_review', 'wrong-spec')
+        before = (self.directory() / 'state.json').read_bytes()
+        with self.assertRaisesRegex(ao.RoomError, 'unused fourth-review grant'):
+            self.service.ao_room_spec_put(self.room, 3, 'Another authorized scope.', self.gates, 'Another exact approval')
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
 
     def test_known_semantic_hold_is_preserved_and_still_blocks_dispatch(self):
         self.register()
@@ -633,6 +648,489 @@ class ReviewExtensionTests(Fixture):
                 'params': {'name': 'ao_room_spec_review_extend', 'arguments': inputs}}, controller)
         self.assertFalse(response['result']['isError'])
         self.assertEqual(response['result']['structuredContent']['remaining_spec_reviews'], 1)
+
+
+class ExtensionEvolutionTests(ReviewExtensionFixture):
+    def room_files(self):
+        return {str(p.relative_to(self.directory())): p.read_bytes()
+                for p in self.directory().rglob('*') if p.is_file()}
+
+    def stage(self, key, message):
+        return self.service.ao_room_instruction_stage(self.room, key, message, 'Actual authorization for this new operating instruction')
+
+    def test_authorized_amendments_append_before_and_after_fourth_completion(self):
+        first = self.stage('original-instruction', 'Keep each observation explicit.')
+        original = (self.directory() / first['path']).read_bytes()
+        grant = self.grant()
+        second = self.stage('after-grant', 'Name the observed limitation.')
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+        self.send('spec_review', 'fourth')
+        self.assertIn('Name the observed limitation.', self.state()['requests']['fourth']['text'])
+        self.finish_fourth()
+        self.stage('after-completion', 'Keep the next verification bounded.')
+        self.service.quiet(self.state())
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+        self.assertEqual(self.state()['spec_review_extension']['receipt_sha256'], grant['receipt_sha256'])
+        self.assertEqual((self.directory() / first['path']).read_bytes(), original)
+        self.assertEqual(self.state()['instruction_amendments'][:2],
+                         [{'path': first['path'], 'sha256': first['sha256']}, {'path': second['path'], 'sha256': second['sha256']}])
+        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+            self.send('spec_review', 'fifth')
+        state = self.state(); state['instruction_amendments'].pop(0)
+        ao.atomic(self.directory() / 'state.json', state)
+        with self.assertRaisesRegex(ao.RoomError, 'original instruction amendments'):
+            self.service.ao_room_status(self.room)
+
+    def write_native(self, folder):
+        import ao_outcomes
+        request = ao_outcomes.latest_for_role(self.state(), 'engineer')
+        folder.mkdir(exist_ok=True)
+        path = folder / 'synthetic-native-owner.jsonl'
+        rows = [{'type': 'user', 'sessionId': 'synthetic-native-owner', 'uuid': 'synthetic-human',
+                 'timestamp': datetime.fromtimestamp(request['created_at'] + 1, timezone.utc).isoformat(),
+                 'origin': {'kind': 'human'}, 'message': {'content': request['text']}},
+                {'type': 'assistant', 'sessionId': 'synthetic-native-owner', 'uuid': 'synthetic-assistant',
+                 'timestamp': datetime.fromtimestamp(request['created_at'] + 2, timezone.utc).isoformat(),
+                 'message': {'id': 'synthetic-final', 'model': ao_workflow.FABLE_MODEL, 'stop_reason': 'end_turn'}}]
+        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        return path
+
+    def test_first_and_moved_native_source_remain_auditable_without_reopening_review(self):
+        self.grant()
+        path = self.write_native(self.root / 'native-first')
+        self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(path))
+        first = self.state()['native_outcome_source_evidence']
+        original = (self.directory() / first['path']).read_bytes()
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+        moved_db = self.root / 'moved-ao.db'; shutil.copyfile(self.database, moved_db); self.database.unlink()
+        moved_folder = self.root / 'native-moved'; moved_folder.mkdir()
+        moved_path = moved_folder / path.name; path.rename(moved_path)
+        self.service.ao_room_outcome_audit(self.room, ao_database_path=str(moved_db), native_transcript_path=str(moved_path))
+        self.assertNotEqual(self.state()['native_outcome_source_evidence'], first)
+        self.assertEqual((self.directory() / first['path']).read_bytes(), original)
+        self.send('spec_review', 'fourth')
+        # A later ordinary observation can have incomplete native-source evidence;
+        # the saved source audit remains independently verifiable and sync stays usable.
+        self.finish_fourth()
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+        current_native = self.write_native(moved_folder)
+        self.service.ao_room_outcome_audit(self.room, ao_database_path=str(moved_db), native_transcript_path=str(current_native))
+        self.service.quiet(self.state())
+        self.assertEqual((self.directory() / first['path']).read_bytes(), original)
+        pointer = self.state()['native_outcome_source_evidence']
+        (self.directory() / pointer['path']).write_text('{}')
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_status(self.room)
+
+    def test_changed_native_owner_source_refuses_before_any_room_write(self):
+        self.grant()
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET provider_conversation_id='replacement-native'")
+            db.execute("UPDATE conversation_branches SET provider_conversation_id='replacement-native'")
+        before = self.room_files()
+        with self.assertRaisesRegex(ao.RoomError, 'same native owner'):
+            self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database),
+                                             native_transcript_path=str(self.root / 'replacement-native.jsonl'))
+        self.assertEqual(self.room_files(), before)
+
+    def moved_source_hold(self, kind):
+        self.grant()
+        snapshot = self.fake.snapshots['engineer']
+        if kind == 'quota_limit':
+            snapshot['turns'][-1]['error'] = {'type': 'rate_limit'}
+        else:
+            snapshot['sessionFailures'] = [{'type': 'unclassified'}]
+        self.service.ao_room_sync(self.room)
+        original_request = self.state()['requests']['implementation']
+        original_outcome = (self.directory() / original_request['semantic_outcome']).read_bytes()
+        path = self.write_native(self.root / 'native-first')
+        first = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(path))
+        self.assertEqual(first['outcome']['kind'], kind)
+        if kind == 'quota_limit':
+            self.service.ao_room_outcome_resume(self.room, 'implementation', first['outcome_sha256'], 'fourth-after-source',
+                'The original correlated quota stop was diagnosed.', 'Actual approval for only the named continuation.')
+        previous = self.state()['requests']['implementation']
+        release_bytes = ((self.directory() / previous['outcome_resume']).read_bytes() if previous.get('outcome_resume') else None)
+        snapshot['turns'][-1].pop('error', None)
+        snapshot['sessionFailures'] = []
+        moved_folder = self.root / 'native-moved'; moved_folder.mkdir()
+        moved_path = moved_folder / path.name; path.rename(moved_path)
+        moved = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(moved_path))
+        current = self.state()['requests']['implementation']
+        self.assertEqual(moved['outcome'], first['outcome'])
+        self.assertTrue(moved['outcome']['hold'])
+        self.assertNotEqual(moved['outcome_sha256'], first['outcome_sha256'])
+        self.assertEqual(current.get('outcome_resume'), previous.get('outcome_resume'))
+        self.assertEqual(current.get('outcome_resume_sha256'), previous.get('outcome_resume_sha256'))
+        if release_bytes is not None:
+            self.assertEqual((self.directory() / current['outcome_resume']).read_bytes(), release_bytes)
+        self.assertEqual((self.directory() / original_request['semantic_outcome']).read_bytes(), original_outcome)
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: ' + kind):
+            self.send('spec_review', 'fourth-after-source')
+        self.assertNotIn('fourth-after-source', self.state()['requests'])
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+        return moved
+
+    def test_source_move_preserves_quota_hold_and_cannot_renew_named_continuation(self):
+        self.moved_source_hold('quota_limit')
+
+    def test_source_move_preserves_unknown_hold_until_separate_exact_outcome_audit(self):
+        self.moved_source_hold('unknown')
+        # The existing no-path diagnostic audit retains its separate authority to
+        # clear an unknown outcome after the exact owned evidence becomes complete.
+        audited = self.service.ao_room_outcome_audit(self.room)
+        self.assertFalse(audited['outcome']['hold'])
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+
+    def known_hold_through_unknown(self, ambiguity):
+        from pathlib import Path
+        self.moved_source_hold('quota_limit')
+        source = self.state()['native_outcome_source']
+        snapshot = self.fake.snapshots['engineer']
+        path = Path(source['transcript']); raw = path.read_bytes()
+        before = self.state()['requests']['implementation']
+        old_release = (self.directory() / before['outcome_resume']).read_bytes()
+        if ambiguity == 'ao':
+            snapshot['sessionFailures'] = [{'type': 'unclassified'}]
+            uncertain = self.service.ao_room_outcome_audit(self.room, ao_database_path=source['database'],
+                                                         native_transcript_path=source['transcript'])
+        else:
+            path.unlink()
+            uncertain = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(uncertain['outcome']['kind'], 'quota_limit')
+        self.assertEqual(uncertain['observation_outcome']['kind'], 'unknown')
+        self.assertFalse(uncertain['resume_eligible'])
+        self.assertNotEqual(uncertain['outcome_sha256'], before['semantic_outcome_sha256'])
+        unknown_request = self.state()['requests']['implementation']
+        unknown_bytes = (self.directory() / unknown_request['semantic_outcome']).read_bytes()
+        with self.assertRaisesRegex(ao.RoomError, 'eligible diagnosed failure'):
+            self.service.ao_room_outcome_resume(self.room, 'implementation', uncertain['outcome_sha256'], 'fourth-after-source',
+                'Unknown evidence is not a diagnosis.', 'Synthetic approval cannot bypass ambiguous evidence.')
+        snapshot['sessionFailures'] = []
+        if not path.exists(): path.write_bytes(raw)
+        # A quiet automatic observation retains the unresolved diagnosis; only
+        # an explicit healthy audit can update it, while preserving known quota.
+        self.service.ao_room_sync(self.room)
+        automatic = self.state()['requests']['implementation']
+        self.assertEqual(ao.read(self.directory() / automatic['semantic_outcome'])['observation_outcome']['kind'], 'unknown')
+        healthy = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(healthy['outcome']['kind'], 'quota_limit')
+        self.assertTrue(healthy['outcome']['hold'])
+        self.assertIsNone(healthy['observation_outcome'])
+        self.assertTrue(healthy['resume_eligible'])
+        self.assertIn('resolved_observation_sha256', ao.read(self.directory() / self.state()['requests']['implementation']['semantic_outcome']))
+        self.assertEqual((self.directory() / before['outcome_resume']).read_bytes(), old_release)
+        self.assertEqual((self.directory() / unknown_request['semantic_outcome']).read_bytes(), unknown_bytes)
+        with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
+            self.send('spec_review', 'unnamed-after-unknown')
+        self.service.ao_room_outcome_resume(self.room, 'implementation', healthy['outcome_sha256'], 'fourth-after-source',
+            'Complete evidence now resolves the ambiguity; original quota stop remains.',
+            'Actual fresh approval for the same named continuation and this exact outcome.')
+        self.assertEqual(self.send('spec_review', 'fourth-after-source')['state'], 'submitted')
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+
+    def test_known_quota_survives_ao_unknown_and_healthy_source_audits(self):
+        self.known_hold_through_unknown('ao')
+
+    def test_known_quota_survives_native_unknown_and_healthy_explicit_audit(self):
+        self.known_hold_through_unknown('native')
+
+    def test_reappearing_known_error_cannot_reactivate_previously_invalidated_release(self):
+        from ao_outcomes import gate
+        self.grant()
+        snapshot = self.fake.snapshots['engineer']
+        snapshot['turns'][-1]['error'] = {'type': 'rate_limit'}
+        first = self.service.ao_room_outcome_audit(self.room)
+        self.service.ao_room_outcome_resume(self.room, 'implementation', first['outcome_sha256'], 'named-successor',
+            'Original quota failure diagnosis.', 'Actual approval for this single named successor.')
+        previous = self.state()['requests']['implementation']
+        original_release_path = previous['outcome_resume']
+        release_bytes = (self.directory() / previous['outcome_resume']).read_bytes()
+        for cycle in (1, 2):
+            snapshot['turns'][-1].pop('error')
+            snapshot['sessionFailures'] = [{'type': 'unclassified'}]
+            self.service.ao_room_sync(self.room)
+            snapshot['sessionFailures'] = []
+            snapshot['turns'][-1]['error'] = {'type': 'rate_limit'}
+            state = self.state()
+            with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
+                gate(self.service, self.directory(), state, 'engineer', 'named-successor', snapshot)
+            ambiguous = self.state()['requests']['implementation']
+            self.assertNotEqual(ambiguous['semantic_outcome_sha256'], previous['semantic_outcome_sha256'])
+            audit = self.service.ao_room_outcome_audit(self.room)
+            self.assertEqual(audit['outcome']['kind'], 'quota_limit')
+            self.assertTrue(audit['resume_eligible'])
+            self.assertNotEqual(audit['outcome_sha256'], previous['semantic_outcome_sha256'])
+            with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
+                gate(self.service, self.directory(), self.state(), 'engineer', 'named-successor', snapshot)
+            self.service.ao_room_outcome_resume(self.room, 'implementation', audit['outcome_sha256'], 'named-successor',
+                'Explicit resolution of uncertainty cycle ' + str(cycle), 'Actual fresh approval for the exact current outcome.')
+            current = self.state()['requests']['implementation']
+            current_hash = current['semantic_outcome_sha256']
+            gate(self.service, self.directory(), self.state(), 'engineer', 'named-successor', snapshot)
+            self.assertEqual(self.state()['requests']['implementation']['semantic_outcome_sha256'], current_hash)
+            previous = current
+        self.assertEqual((self.directory() / original_release_path).read_bytes(), release_bytes)
+        self.assertNotEqual(self.state()['requests']['implementation']['outcome_resume'], original_release_path)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+
+    def test_provider_and_routing_replacement_refuse_before_intents_and_used_reviewer_stays_used(self):
+        self.grant()
+        actions = [lambda: self.service.ao_room_provider_transition(self.room, '0' * 64, 'Diagnosed', 'Actual approval', 'transition', 'Stopped'),
+                   lambda: self.service.ao_room_routing_adoption_stage(self.room, '0' * 64, 'Actual approval', 'Diagnosed', 'adoption')]
+        for action in actions:
+            before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+            posts = copy.deepcopy(self.fake.posts)
+            with self.assertRaisesRegex(ao.RoomError, 'unsupported after that grant'):
+                action()
+            self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+            self.assertEqual(self.fake.posts, posts)
+        before = self.room_files()
+        with self.assertRaisesRegex(ao.RoomError, 'reviewer was already used'):
+            self.service.ao_room_reviewer_recovery_audit(self.room)
+        self.assertEqual(self.room_files(), before)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+
+    def test_pending_grant_blocks_routing_writes_and_identical_grant_still_reconciles(self):
+        inputs = self.grant_inputs()
+        with patch.object(self.service, 'save', side_effect=OSError('Synthetic grant projection interruption')):
+            with self.assertRaises(OSError): self.service.ao_room_spec_review_extend(**inputs)
+        actions = [lambda: self.service.ao_room_routing_adoption_audit(self.room),
+                   lambda: self.service.ao_room_routing_adoption_stage(self.room, '0' * 64, 'Actual approval', 'Diagnosed', 'adoption'),
+                   lambda: self.service.ao_room_routing_adoption_activate(self.room, 'adoption')]
+        before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(self.fake.posts)
+        for action in actions:
+            with self.assertRaisesRegex(ao.RoomError, 'uncommitted review-extension receipt'):
+                action()
+            self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+            self.assertEqual(self.fake.posts, posts)
+        self.assertEqual(self.service.ao_room_spec_review_extend(**inputs)['remaining_spec_reviews'], 1)
+
+    def test_complete_two_role_audit_overflow_refuses_before_publication(self):
+        self.register()
+        for role in ('engineer', 'reviewer'):
+            self.fake.snapshots[role]['activities'].append({'id': role + '-large-observation',
+                'activityKind': 'tool', 'detail': '🧭' * 15_000, 'status': 'completed'})
+        before = self.room_files()
+        with patch.object(extension, 'MAX_RECORD_BYTES', 100_000):
+            with self.assertRaisesRegex(ao.RoomError, 'exceeds its readable size bound'):
+                self.audit()
+        self.assertEqual(self.room_files(), before)
+
+    def test_exact_serialized_audit_bound_retains_full_unicode_snapshots_and_remains_readable(self):
+        self.register()
+        self.fake.snapshots['reviewer']['activities'].append({'id': 'unicode-observation', 'detail': '🧭' * 128})
+        with patch.object(extension.time, 'time', return_value=123.25):
+            first = self.audit()
+            path = self.directory() / extension.BASE / 'audits' / (first['audit_sha256'] + '.json')
+            raw = path.read_bytes(); path.unlink()
+            with patch.object(extension, 'MAX_RECORD_BYTES', len(raw)):
+                second = self.audit()
+                saved = extension._audit(self.directory(), second['audit_sha256'])
+                self.assertEqual(saved['observed_snapshots']['reviewer']['activities'], self.fake.snapshots['reviewer']['activities'])
+                self.assertEqual(path.read_bytes(), raw)
+                self.service.ao_room_spec_review_extend(**self.grant_inputs(second))
+
+
+class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
+    def configure_runtime(self):
+        self.original_executable = self.root / 'original-claude'
+        self.original_executable.write_text('#!/bin/sh\nprintf "original (Claude Code)\\n"\n')
+        self.original_executable.chmod(0o700)
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.original_executable), 'claude_config_dir': str(self.claude_env)})
+
+    def test_orphan_repair_blocks_fresh_audit_and_old_audit_grant_until_exact_reconciliation(self):
+        import ao_executable_binding as executable
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        self.register()
+        self.original_executable.unlink()
+        # A missing original with no journal remains auditable. This checks the
+        # immutable journal, not the live executable fingerprint.
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        inputs = self.grant_inputs(audited)
+        target = self.root / 'orphan-repair-target'
+        target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        launch = self.root / 'orphan-repair-launch'; launch.symlink_to(target)
+        args = (self.service, self.room, 'orphan-repair', str(target), str(launch), str(self.database),
+                'Actual repair approval preserves the retained owner.', 'Original executable is missing')
+        before_state = (self.directory() / 'state.json').read_bytes()
+        with patch.object(self.service, 'save', side_effect=OSError('Synthetic repair projection interruption')):
+            with self.assertRaises(OSError): executable.bind(*args)
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), before_state)
+        journal = self.directory() / 'executable-bindings' / 'orphan-repair.json'
+        journal_bytes = journal.read_bytes()
+        before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(self.fake.posts)
+        with (patch.object(self.service, 'client', side_effect=AssertionError('Orphan refusal precedes AO observation')),
+              patch.object(self.service, 'save', side_effect=AssertionError('Orphan refusal precedes state projection'))):
+            for action in (self.audit, lambda: self.service.ao_room_spec_review_extend(**inputs)):
+                with self.assertRaisesRegex(ao.RoomError, 'Unclaimed or missing executable binding intent'):
+                    action()
+                self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+        executable.bind(*args)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertNotIn('spec_review_extension', self.state())
+        self.assertEqual(self.grant()['remaining_spec_reviews'], 1)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(self.fake.posts, posts)
+
+    def test_executable_repairs_append_verified_descendants_before_and_after_review(self):
+        import ao_executable_binding as executable
+        self.grant()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        original_preparation = (self.directory() / self.state()['preparation']).read_bytes()
+        launch = self.root / 'launch-claude'
+        previous = self.original_executable
+        for number in (1, 2):
+            target = self.root / ('replacement-' + str(number))
+            target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+            previous.unlink()
+            if launch.is_symlink(): launch.unlink()
+            launch.symlink_to(target)
+            executable.bind(self.service, self.room, 'repair-' + str(number), str(target), str(launch), str(self.database),
+                            'Actual authorization for retained executable repair', 'Original executable was removed')
+            self.service.quiet(self.state())
+            if number == 1:
+                first_pointer = self.state()['executable_binding']
+                first_bytes = (self.directory() / first_pointer['path']).read_bytes()
+                self.fake.snapshots['engineer']['controller'] = 'ready'
+                self.send('spec_review', 'fourth'); self.finish_fourth()
+                self.fake.snapshots['engineer']['controller'] = 'stopped'
+            previous = target
+        self.assertEqual((self.directory() / first_pointer['path']).read_bytes(), first_bytes)
+        self.assertEqual((self.directory() / self.state()['preparation']).read_bytes(), original_preparation)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+        state = self.state(); state['executable_binding'] = first_pointer
+        ao.atomic(self.directory() / 'state.json', state)
+        with self.assertRaises(ao.RoomError): self.service.ao_room_status(self.room)
+
+    def test_pending_grant_blocks_eligible_repair_before_intent_and_exact_grant_reconciles(self):
+        import ao_executable_binding as executable
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        inputs = self.grant_inputs()
+        with patch.object(self.service, 'save', side_effect=OSError('Synthetic grant projection interruption')):
+            with self.assertRaises(OSError): self.service.ao_room_spec_review_extend(**inputs)
+        original_bytes = self.original_executable.read_bytes(); original_stat = self.original_executable.stat()
+        self.original_executable.unlink()
+        target = self.root / 'repair-target'; target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        launch = self.root / 'repair-launch'; launch.symlink_to(target)
+        before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'uncommitted review-extension receipt'):
+            executable.bind(self.service, self.room, 'pending-repair', str(target), str(launch), str(self.database),
+                            'Actual authorized repair', 'Original executable is missing')
+        self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+        self.assertEqual(self.fake.posts, posts)
+        self.original_executable.write_bytes(original_bytes); self.original_executable.chmod(original_stat.st_mode)
+        os.utime(self.original_executable, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        self.assertEqual(self.service.ao_room_spec_review_extend(**inputs)['remaining_spec_reviews'], 1)
+
+    def test_changed_native_owner_repair_refuses_before_intent_or_state_write(self):
+        import ao_executable_binding as executable
+        self.grant()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        target = self.root / 'changed-owner-target'; target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        launch = self.root / 'changed-owner-launch'; launch.symlink_to(target)
+        self.original_executable.unlink()
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET provider_conversation_id='changed-native-owner'")
+            db.execute("UPDATE conversation_branches SET provider_conversation_id='changed-native-owner'")
+        before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        database_bytes = self.database.read_bytes(); posts = copy.deepcopy(self.fake.posts)
+        with (patch.object(extension, 'guard_native_owner', wraps=extension.guard_native_owner) as guard,
+              patch.object(executable, '_store_once', side_effect=AssertionError('No repair intent may be written')),
+              patch.object(self.service, 'save', side_effect=AssertionError('No room state may be written'))):
+            with self.assertRaisesRegex(ao.RoomError, 'same native owner'):
+                executable.bind(self.service, self.room, 'changed-owner', str(target), str(launch), str(self.database),
+                                'Actual repair approval preserves the original owner.', 'Original executable is missing')
+            self.assertEqual(guard.call_count, 1)
+            self.assertEqual(guard.call_args.args[2]['provider_conversation_id'], 'changed-native-owner')
+        self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+        self.assertEqual(self.database.read_bytes(), database_bytes)
+        self.assertEqual(self.fake.posts, posts)
+
+
+class ExtensionConfiguredIdempotenceTests(AdoptionFixture):
+    make_database = ReviewExtensionFixture.make_database
+    register = ReviewExtensionFixture.register
+    audit = ReviewExtensionFixture.audit
+    grant_inputs = ReviewExtensionFixture.grant_inputs
+    grant = ReviewExtensionFixture.grant
+
+    def test_existing_provider_and_routing_results_remain_read_only_after_real_grant(self):
+        import ao_provider_transition as provider
+        import ao_routing_adoption as routing
+        prepared = self.configure_routing()
+        attachment = self.start_attachment(prepared)
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        self.implement(); self.review()
+        self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
+        attachment.stdin.close(); attachment.wait(timeout=10)
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        self.make_database(); self.target_spec = None
+        grant = self.grant()
+        provider_inputs = ao.read(self.directory() / self.state()['provider_transition']['receipt'])['inputs']
+        before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(self.fake.posts)
+        with (patch.object(self.service, 'save', side_effect=AssertionError('Identical results never save')),
+              patch.object(self.service, 'client', side_effect=AssertionError('Identical results never observe AO'))):
+            self.assertTrue(provider.transition(self.service, self.room, **provider_inputs)['transitioned'])
+            self.assertEqual(routing.stage(*self.stage_args)['phase'], 'configured')
+            self.assertEqual(routing.activate(self.service, self.room, 'routing-change')['phase'], 'configured')
+        self.assertEqual({str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}, before)
+        self.assertEqual(self.fake.posts, posts)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['receipt_sha256'], grant['receipt_sha256'])
+
+
+class ExtensionAuditEncodingTests(unittest.TestCase):
+    def test_unicode_audit_publishes_exact_utf8_and_reads_back_under_ascii_locale(self):
+        script = r'''
+import contextlib, json, locale, tempfile
+from pathlib import Path
+from unittest.mock import patch
+import ao_review_extension as extension
+import ao_project_room as ao
+from ao_reviewer_recovery import _saved_audit, _store_once
+
+class SyntheticService:
+    @contextlib.contextmanager
+    def locked(self, room_id):
+        yield directory, {'spec_record_sha256': 'a' * 64}
+
+with tempfile.TemporaryDirectory() as temp:
+    directory = Path(temp).resolve()
+    snapshots = {role: {'activities': [{'detail': '\U0001f9ed'}]} for role in ('engineer', 'reviewer')}
+    with patch.object(extension, '_inspect', return_value=({'synthetic_evidence': '\U0001f9ed'}, snapshots)):
+        result = extension.audit(SyntheticService(), 'synthetic-room', 2, 'a' * 64, 'b' * 64,
+                                 'synthetic-native-owner', str(directory / 'synthetic.db'))
+    record = extension._audit(directory, result['audit_sha256'])
+    path = directory / extension.BASE / 'audits' / (result['audit_sha256'] + '.json')
+    expected = json.dumps(record, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
+    assert path.read_bytes() == expected
+    assert record['observed_snapshots'] == snapshots
+    assert len(list(path.parent.iterdir())) == 1
+    assert ao.read(path) == record
+    recovery_path = directory / 'reviewer-recovery' / 'audits' / (result['audit_sha256'] + '.json')
+    _store_once(recovery_path, record)
+    assert ao.read(recovery_path) == record
+    assert _saved_audit(directory, result['audit_sha256']) == record
+    state_path = directory / 'state.json'
+    ao.atomic(state_path, record)
+    assert state_path.read_bytes() == expected
+    assert ao.read(state_path) == record
+    print(json.dumps({'encoding': locale.getpreferredencoding(False), 'readable': True}))
+'''
+        process = subprocess.run([sys.executable, '-c', script], cwd=os.path.dirname(__file__),
+            env={**os.environ, 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0'},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        value = json.loads(process.stdout)
+        self.assertIn(value['encoding'].lower(), ('us-ascii', 'ascii', 'ansi_x3.4-1968'))
+        self.assertTrue(value['readable'])
 
 
 class CompactionOwnerScopeTests(unittest.TestCase):

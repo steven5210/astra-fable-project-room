@@ -250,6 +250,46 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         self.assertEqual(Path(status["room_path"]), state.parent)
         self.assertEqual(state.read_bytes(), original)
 
+    def test_claude_config_selection_and_inherited_environment_survive_runtime_chdir(self):
+        settings = self.base / "claude-settings"
+        settings.mkdir()
+        (settings / "settings.json").write_text('{"synthetic_marker":"same-settings"}')
+        script = r'''
+import json, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+def offline_only(event, args):
+    if event in ('subprocess.Popen', 'os.system', 'os.posix_spawn', 'socket.__new__', 'socket.connect'):
+        raise RuntimeError('Fixture denied ' + event)
+    if event == 'open' and isinstance(args[0], (str, bytes)):
+        path = Path(os.path.abspath(os.fsdecode(args[0])))
+        if path == Path.home() or Path.home() in path.parents:
+            raise RuntimeError('Fixture denied actual-home access')
+sys.addaudithook(offline_only)
+sys.path.insert(0, sys.argv[1])
+from project_room_runtime import activate
+runtime = activate(Path(sys.argv[1]) / 'project_room_mcp.py')
+from ao_routing import context
+home = Path(os.environ['PROJECT_ROOM_HOME'])
+observed = context(SimpleNamespace(root=home / 'ao'), home / 'synthetic-room', {})
+selected = Path(observed['claude_config_dir'])
+print(json.dumps({'selected': str(selected), 'inherited': os.environ['CLAUDE_CONFIG_DIR'],
+                  'settings': json.loads((selected / 'settings.json').read_text()), 'cwd': str(Path.cwd()),
+                  'runtime': runtime['path']}))
+'''
+        for configured in ("../claude-settings", str(settings)):
+            with self.subTest(configured=configured):
+                result = subprocess.run([sys.executable, "-B", "-c", script, str(self.source)], cwd=self.source,
+                    env={**os.environ, "PROJECT_ROOM_HOME": str(self.home), "CLAUDE_CONFIG_DIR": configured},
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                observed = json.loads(result.stdout)
+                self.assertEqual(observed['selected'], str(settings))
+                self.assertEqual(observed['inherited'], str(settings))
+                self.assertEqual(observed['settings'], {'synthetic_marker': 'same-settings'})
+                self.assertEqual(observed['cwd'], observed['runtime'])
+                self.assertNotEqual(observed['cwd'], str(self.source))
+
     def test_overlap_and_linked_store_are_refused(self):
         with self.assertRaises(runtime.RuntimeRetentionError):
             runtime.retain(self.source, self.source / "state")

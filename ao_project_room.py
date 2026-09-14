@@ -59,7 +59,7 @@ def atomic(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=".pending-")
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
             stream.write("\n")
             stream.flush()
@@ -76,7 +76,7 @@ def atomic(path, value):
 
 
 def read(path):
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def git(path, *args):
@@ -444,6 +444,9 @@ class Service:
             self.quiet(state)
             if state.get("spec") and revision <= self.spec(directory, state)["revision"]:
                 raise RoomError("A new spec needs a strictly newer revision")
+            from ao_review_extension import LIMIT, _reviews
+            if state.get("spec_review_extension") and len(_reviews(state)) == LIMIT:
+                raise RoomError("The unused fourth-review grant belongs to the current exact charter; a different spec was not saved")
             atomic(target, spec)
             state.update(spec=relative, spec_record_sha256=digest(spec), checkpoint=None)
             self.save(directory, state)

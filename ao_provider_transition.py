@@ -360,6 +360,8 @@ def _native(state, binding, snapshot, directory=None):
 
 def _inspect(service, directory, state, target_input, reconcile=None):
     service.settled(state, pending_transition=reconcile is not None)
+    from ao_review_extension import guard_replacement
+    guard_replacement(state, 'provider transition')
     if not ao_workflow.normal(state):
         raise RoomError("Provider transition is for normal Fable rooms")
     if state.get("provider_transition") is not None:
@@ -565,6 +567,8 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
             if record["inputs"] != inputs:
                 raise RoomError("Provider transition already belongs to another payload; only its identical result can be read")
             return _result(state, record, epoch)
+        from ao_review_extension import guard_replacement
+        guard_replacement(state, 'provider transition')
         pending = _pending_receipts(directory)
         if len(pending) > 1:
             raise RoomError("Multiple uncommitted provider transition receipts exist; diagnose before continuing")
