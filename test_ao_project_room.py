@@ -36,7 +36,7 @@ class FakeAO:
         self.sessions[name] = {"id": name, "projectId": "project", "harness": harness, "mode": "chat", "kind": "worker"}
         self.snapshots[name] = {"sessionId": name, "conversationId": name + "-native", "activeBranchId": "root",
                                 "settings": {"model": "astra" if harness == "codex" else "fable", "reasoningEffort": "max"},
-                                "turns": [], "messages": [], "usage": {}, "history_truncated": False}
+                                "turns": [], "messages": [], "activities": [], "usage": {}, "history_truncated": False}
 
     def conversation(self, name):
         return copy.deepcopy(self.snapshots[name])
@@ -681,8 +681,8 @@ class ClientTests(unittest.TestCase):
 
     def test_pagination_preserves_latest_turn_state_and_flags_truncation(self):
         client = ao.Client("http://127.0.0.1:1234")
-        pages = [{"turns": [{"id": "one", "state": "completed"}], "messages": [{"id": "new", "sequence": 9, "text": "final"}], "hasMoreBefore": True, "oldestSequence": 9},
-                 {"turns": [{"id": "one", "state": "running"}], "messages": [{"id": "old", "sequence": 1}, {"id":"new", "sequence":9, "text":"stale"}], "hasMoreBefore": False, "oldestSequence": 1}]
+        pages = [{"turns": [{"id": "one", "state": "completed"}], "messages": [{"id": "new", "sequence": 9, "text": "final"}], "activities": [], "hasMoreBefore": True, "oldestSequence": 9},
+                 {"turns": [{"id": "one", "state": "running"}], "messages": [{"id": "old", "sequence": 1}, {"id":"new", "sequence":9, "text":"stale"}], "activities": [], "hasMoreBefore": False, "oldestSequence": 1}]
         with patch.object(client, "request", side_effect=pages) as request:
             result = client.conversation("session")
         self.assertEqual(result["turns"][0]["state"], "completed")

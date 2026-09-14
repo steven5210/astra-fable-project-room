@@ -42,9 +42,9 @@ class CompleteHistoryPaginationTests(unittest.TestCase):
         second = {'id': 'turn-2', 'providerTurnId': 'native-turn-2', 'state': 'completed'}
         earlier = {'id': 'message-1', 'turnId': 'turn-1', 'role': 'assistant', 'text': 'Earlier completed result', 'sequence': 10}
         later = {'id': 'message-2', 'turnId': 'turn-2', 'role': 'assistant', 'text': 'Latest completed result', 'sequence': 30}
-        return [{**copy.deepcopy(identity), 'turns': [second], 'messages': [later], 'hasMoreBefore': True, 'oldestSequence': 30},
+        return [{**copy.deepcopy(identity), 'turns': [second], 'messages': [later], 'activities': [], 'hasMoreBefore': True, 'oldestSequence': 30},
                 {**copy.deepcopy(identity), 'turns': [first, copy.deepcopy(second)], 'messages': [earlier, copy.deepcopy(later)],
-                 'hasMoreBefore': False, 'oldestSequence': 10}]
+                 'activities': [], 'hasMoreBefore': False, 'oldestSequence': 10}]
 
     def test_identical_cross_page_overlap_is_retained_once(self):
         pages = self.pages()
@@ -56,8 +56,8 @@ class CompleteHistoryPaginationTests(unittest.TestCase):
         self.assertEqual({t['id']: t for t in result['turns']}, {t['id']: t for t in pages[1]['turns']})
         self.assertEqual(result['messages'], pages[1]['messages'])
         self.assertFalse(result['history_truncated'])
-        self.assertEqual(client.calls, [('GET', '/sessions/engineer/conversation?limit=500', None),
-                                        ('GET', '/sessions/engineer/conversation?limit=500&beforeSequence=30', None)])
+        self.assertEqual(client.calls, [('GET', '/sessions/engineer/conversation?limit=100', None),
+                                        ('GET', '/sessions/engineer/conversation?limit=100&beforeSequence=30', None)])
 
     def test_conflicting_cross_page_turn_and_message_values_refuse(self):
         for collection, field, changed in (('turns', 'state', 'streaming'), ('turns', 'providerTurnId', 'different-native-turn'),
@@ -367,7 +367,7 @@ class ProviderTransitionTests(DelegateFixture):
         self.assert_refused_without_change(self.audit_transition, 'lost a recorded job')
 
     def test_native_missing_raw_history_receipt_or_completed_identity_refuses(self):
-        for field in ('turns', 'messages', 'hasMoreBefore'):
+        for field in ('turns', 'messages', 'activities', 'hasMoreBefore'):
             with self.subTest(field=field):
                 self.missing_raw_fields = {field}
                 self.assert_refused_without_change(self.audit_transition, 'raw AO response')

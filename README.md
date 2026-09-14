@@ -99,6 +99,12 @@ All AO configuration lives in the private data directory, never in the plugin or
 
    Install it only for the creation of the intended engineer, create the Astra reviewer before installing it or after restoring the previous configuration, and restore the prior hook afterwards. A failed preparation leaves the room unprepared and AO does not launch the paid worker. The full procedure, including the user and managed Claude settings that must not disable hooks or force subagent models, is in [Native delegation routing](skills/project-room/references/ao.md#native-delegation-routing).
 
+Long native histories use [bounded smaller history pages](docs/ao-history-reads.md),
+including complete activity evidence. An oversized observation is never a reason
+to resend a model turn. The MCP connector also retains its own coherent runtime
+outside the replaceable plugin cache; see [connector updates](docs/connector-runtime.md)
+for refresh and retention behavior.
+
 ## Roles, agreement and delegation
 
 New AO rooms use `workflow: "fable_engineering"`. Astra writes and approves the exact specification; Fable reviews it read-only and returns an `accept` or `changes_required` verdict for those exact bytes; only then can Astra record the handoff. A material scope change needs a newer revision and fresh agreement. A task-specific `workflow: "astra_led"` exception, in which Astra implements directly in an isolated worktree, requires the actual per-task `exception_authorization`, attaches no Fable delegates, and never changes the default roles for later rooms.
@@ -111,6 +117,11 @@ Fable's delegation is deliberate and bounded:
 - **Older rooms and workers** do not acquire this routing silently. Rooms prepared before the mechanism report `delegate.routing.status` as `not_configured`; only a fresh preparation writes the routing files, and only a later dispatch or sync can move a room to `verified`. None of these states proves native enforcement, the served model or effort, or compaction behavior.
 
 The pinned delegate ladder, verification duties at every tier, and the fixed DeepSeek and Qwen operating parameters are in [Fable's policy](skills/project-room/references/fable-policy.md).
+
+After three charter-review intents and an accepted candidate, a real new user
+decision can authorize [one additional exact charter review](docs/one-charter-review-extension.md).
+The audited operation preserves the same native session and prior evidence. It
+is available once per room and grants no extra source or acceptance reviews.
 
 Fable owns delegation decisions, and quality always beats token savings. In DeepSeek rooms, DeepSeek is the first choice for substantive work whenever it can meet the full quality bar: self-contained implementation, tests, research and reviews against verifiable requirements, plus bounded module design or debugging when its demonstrated quality warrants it. Fable chooses Sonnet, Opus or itself when better suited and routes up when in doubt; it does not need to force a lower-tier failure first. Sonnet supplies agentic execution, Opus supplies bounded judgment or appropriate browser work, and Fable retains cross-cutting judgment, adjudication and the final engineering verdict. Delegates perform routine execution; Fable maintains quality through clear task requirements, suitable routing, checking results and its final verdict. In newly prepared AO rooms, Fable can retain judgment work itself but execution tools stay with the operator or pinned workers. A quality or capability gap must be reported for resolution. Older AO and legacy rooms retain their recorded direct-execution exception; it never overrides an explicit task restriction. Each routing choice records its reason and outcome.
 

@@ -27,6 +27,7 @@ from room import RoomError
 import ao_delegates
 import ao_routing
 import ao_workflow
+import ao_history
 
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted", "settled_failure"}
@@ -122,40 +123,16 @@ class Client:
                                          headers={"Content-Type": "application/json"})
         try:
             with self.opener.open(request, timeout=15) as response:
-                raw = response.read(8_000_001)
-                if len(raw) > 8_000_000:
-                    raise RoomError("AO response exceeds 8 MB; delivery may still have occurred")
+                raw = response.read(ao_history.MAX_RESPONSE_BYTES + 1)
+                if len(raw) > ao_history.MAX_RESPONSE_BYTES:
+                    raise ao_history.ResponseTooLarge("AO response exceeds 8 MB; delivery may still have occurred")
                 return json.loads(raw) if raw else {}
         except (urllib.error.URLError, ValueError, OSError) as exc:
             raise RoomError(f"AO {method} failed ({type(exc).__name__}); inspect AO and reconcile, never blindly retry") from exc
 
     def conversation(self, session_id):
         path = f"/sessions/{identifier(session_id)}/conversation"
-        latest = self.request("GET", path + "?limit=500")
-        result = dict(latest)
-        messages = {m["id"]: m for m in latest.get("messages", [])}
-        turns = {t["id"]: t for t in latest.get("turns", [])}
-        activities = {a['id']: a for a in latest.get('activities', [])}
-        page = latest
-        seen = set()
-        for _ in range(9):
-            cursor = page.get("oldestSequence")
-            if not page.get("hasMoreBefore") or not isinstance(cursor, int) or cursor <= 0 or cursor in seen:
-                break
-            seen.add(cursor)
-            page = self.request("GET", path + f"?limit=500&beforeSequence={cursor}")
-            for message in page.get("messages", []):
-                messages.setdefault(message["id"], message)
-            # Keep the latest page's turn state when an older page repeats it.
-            for turn in page.get("turns", []):
-                turns.setdefault(turn["id"], turn)
-            for activity in page.get('activities', []):
-                activities.setdefault(activity['id'], activity)
-        result["messages"] = sorted(messages.values(), key=lambda m: m.get("sequence", 0))
-        result["turns"] = list(turns.values())
-        result['activities'] = list(activities.values())
-        result["history_truncated"] = bool(page.get("hasMoreBefore"))
-        return result
+        return ao_history.conversation(self.request, path)
 
 
 def turn_ids(snapshot):
@@ -348,9 +325,11 @@ class Service:
             raise RoomError("AO conversation branch changed from its binding; do not replace or replay it")
         return snapshot
 
-    def settled(self, state, pending_transition=False, outcome_request_id=None):
+    def settled(self, state, pending_transition=False, outcome_request_id=None, pending_review_extension=False):
         from ao_reviewer_recovery import validate
         validate(self, state)
+        from ao_review_extension import validate as review_extension_validate
+        review_extension_validate(self, state, allow_pending=pending_review_extension)
         from ao_provider_transition import validate as transition_validate
         transition_validate(self, state, allow_pending=pending_transition)
         from ao_routing_adoption import pending_gate
@@ -518,6 +497,16 @@ class Service:
         from ao_reviewer_recovery import audit
         return audit(self, room_id)
 
+    def ao_room_spec_review_extension_audit(self, room_id, spec_revision, spec_sha256, retained_candidate_sha256,
+                                          native_session_id, native_owner_database):
+        from ao_review_extension import audit
+        return audit(self, room_id, spec_revision, spec_sha256, retained_candidate_sha256,
+                     native_session_id, native_owner_database)
+
+    def ao_room_spec_review_extend(self, room_id, audit_sha256, authorization, diagnosis, request_id):
+        from ao_review_extension import extend
+        return extend(self, room_id, audit_sha256, authorization, diagnosis, request_id)
+
     def ao_room_reviewer_recover(self, room_id, audit_sha256, replacement_session_id, diagnosis, authorization, request_id):
         from ao_reviewer_recovery import recover
         return recover(self, room_id, audit_sha256, replacement_session_id, diagnosis, authorization, request_id)
@@ -639,6 +628,9 @@ class Service:
                     request["handoff_sha256"] = state["handoff_sha256"]
                 if carried is not None:
                     request["carried"] = carried  # what this packet delivered; derived later, never claimed by the agent
+            if (carried or {}).get('spec_review_extension_sha256'):
+                from ao_review_extension import consume
+                consume(self, directory, state, request)  # Durable consumption precedes state projection and dispatch.
             state["requests"][request_id] = request
             self.save(directory, state)  # Persist intent BEFORE any request may reach AO.
             try:
@@ -654,6 +646,8 @@ class Service:
 
     def ao_room_sync(self, room_id):
         with self.locked(room_id) as (directory, state):
+            from ao_review_extension import validate as review_extension_validate
+            review_extension_validate(self, state)  # Verify consumption before any reconciliation evidence is written.
             from ao_provider_transition import validate as transition_validate
             from ao_routing_adoption import pending_gate
             transition_validate(self, state)
@@ -917,6 +911,7 @@ class Service:
         extra = {"exception_authorization": state.get("exception_authorization")}
         if ao_workflow.normal(state):
             import ao_provider_transition
+            import ao_review_extension
             try:
                 agreed = ao_workflow.agreement(self, directory, state)
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -924,6 +919,7 @@ class Service:
             delegate = ao_delegates.status(self.root.parent, directory, state)
             extra.update(agreement=agreed, handoff=state.get("handoff"), delegate=delegate,
                          provider_transition=ao_provider_transition.summary(self, directory, state, delegate),
+                         spec_review_extension=ao_review_extension.summary(self, state),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
                          engineer_context=ao_workflow.context_summary(state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
@@ -975,6 +971,8 @@ TOOL_SCHEMAS = {
     "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and exact configured model/effort. Normal roles require Claude/Fable engineer and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
     "ao_room_reviewer_recovery_audit": ("Inspect one stopped, never-used native Codex reviewer against complete empty history and current passed spec/candidate/gate evidence. Saves a private audit digest, not a binding change. Bounded AO GETs only; no model, lifecycle or worker creation.", schema(R)),
+    "ao_room_spec_review_extension_audit": ("Audit eligibility for this room's sole additional Fable charter review after exactly three retained spec-review intents. Register the exact next charter revision first. Bind its bytes, gates and approval, original accepted candidate/receipts/counters, retained MAX bindings and the explicit read-only AO database's native session identity. Complete settled native history is required. Saves audit evidence only; no model, native lifecycle or room/session replacement.", schema({**R, "spec_revision": {"type": "integer", "minimum": 2}, "spec_sha256": S, "retained_candidate_sha256": S, "native_session_id": S, "native_owner_database": S})),
+    "ao_room_spec_review_extend": ("Commit this room's one-ever additional Fable charter-review allowance using the exact audit, actual new user approval text with its context, diagnosis and durable request_id. Applies only to the audited next charter and retained native session/candidate. The fourth review intent exhausts it even if failed or uncertain. Identical calls read or reconcile the same receipt; no repeat grants, counter reset, source-review/acceptance allowance change, provider-hold release or model dispatch.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
     "ao_room_reviewer_recover": ("With the exact audit and actual user authorization, recover one never-used reviewer into a separate ready native Codex reviewer at the same model/MAX. Preserves the original binding claim, all evidence and review limits. Refuses any prior reviewer request, missing history or uncertainty. One recovery per room; identical request reads the saved result. No model dispatch or AO POST.", schema({**R, "audit_sha256": S, "replacement_session_id": S, "diagnosis": S, "authorization": S, "request_id": S})),
     "ao_room_provider_transition_audit": ("Audit one normal DeepInfra V4.1 Flash room for the one-time transition to official DeepSeek: completed native history/receipts, the entire delegate ledger read-only, original integrity and a key-free target profile. Runs the exact owned/hash-verified pinned validation slice and the current validator; key metadata only, never the secret. Saves a private audit digest; bounded AO GETs; no model, lifecycle or registration mutation.", schema({**R, "target_profile": {"type": "object"}})),
     "ao_room_provider_transition": ("With the exact audit digest, actual user switch authorization, concrete diagnosis, durable request_id and the operator's performed AO exit-agent record, commit immutable provider epoch 2 while the engineer is positively stopped. Preserve sessions, history, original evidence and review limits; archive the old launch evidence. No AO POST, registration change or model dispatch. Identical requests read or reconcile the same verified receipt. Native launch alone does not qualify MCP initialization or open dispatch.", schema({**R, "audit_sha256": S, "diagnosis": S, "authorization": S, "request_id": S, "native_stop_record": S})),
@@ -982,7 +980,7 @@ TOOL_SCHEMAS = {
     "ao_room_routing_adoption_stage": ("Stage the exact audited routing adoption with the actual user operating authorization and diagnosis. Save immutable intent before changing managed local runtime files; emit the exact AO project-config PUT payload for the operator to apply while the engineer is stopped. Preserve original evidence, handoff and counters. Pending adoption blocks new work; never repeat an uncertain external operation.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
     "ao_room_routing_adoption_activate": ("Activate only the identical staged routing-adoption request after the exact new project configuration, managed files and unchanged stopped native identity/history are observed. Pin the new preparation without changing provider snapshots, handoff or review budgets. No AO POST or inference; native MCP startup remains a separate dispatch gate.", schema({**R, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
-    "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
+    "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension, and three acceptance reviews per room.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
