@@ -255,17 +255,44 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         settings.mkdir()
         (settings / "settings.json").write_text('{"synthetic_marker":"same-settings"}')
         script = r'''
-import json, os, sys
+import json, os, sys, sysconfig
 from pathlib import Path
 from types import SimpleNamespace
+actual_home = Path.home()
+home_roots = (actual_home, actual_home.resolve())
+fixture_root = Path(sys.argv[1]).resolve().parent
+stdlib_root = Path(sysconfig.get_path('stdlib')).resolve()
+root_home = actual_home.resolve() == Path(actual_home.anchor)
+write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+def within(path, root):
+    return path == root or root in path.parents
 def offline_only(event, args):
-    if event in ('subprocess.Popen', 'os.system', 'os.posix_spawn', 'socket.__new__', 'socket.connect'):
+    if event.startswith('socket.') or event in ('subprocess.Popen', 'os.system', 'os.posix_spawn',
+                                                'os.exec', 'os.fork', 'os.forkpty', 'pty.spawn'):
         raise RuntimeError('Fixture denied ' + event)
-    if event == 'open' and isinstance(args[0], (str, bytes)):
+    if event == 'open' and isinstance(args[0], (str, bytes, os.PathLike)):
         path = Path(os.path.abspath(os.fsdecode(args[0])))
-        if path == Path.home() or Path.home() in path.parents:
+        resolved = path.resolve()
+        if any(within(path, root) or within(resolved, root) for root in home_roots):
+            # UID-only CI containers can have HOME=/. Permit only this fixture
+            # and read-only stdlib imports there, preserving the account fence.
+            if root_home and (within(resolved, fixture_root)
+                              or (not args[2] & write_flags and within(resolved, stdlib_root))):
+                return
             raise RuntimeError('Fixture denied actual-home access')
 sys.addaudithook(offline_only)
+for event, args in (
+    ('open', (str(actual_home / '.claude' / 'synthetic-never-read'), 'r', os.O_RDONLY)),
+    ('open', (str(actual_home / '.project-room' / 'synthetic-never-read'), 'r', os.O_RDONLY)),
+    ('subprocess.Popen', ('synthetic-never-run', [], None, None)),
+    ('socket.__new__', (None, 0, 0, 0)),
+):
+    try:
+        sys.audit(event, *args)  # Check the fence without touching an account or launching anything.
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('Fixture fence did not deny ' + event)
 sys.path.insert(0, sys.argv[1])
 from project_room_runtime import activate
 runtime = activate(Path(sys.argv[1]) / 'project_room_mcp.py')
@@ -275,20 +302,22 @@ observed = context(SimpleNamespace(root=home / 'ao'), home / 'synthetic-room', {
 selected = Path(observed['claude_config_dir'])
 print(json.dumps({'selected': str(selected), 'inherited': os.environ['CLAUDE_CONFIG_DIR'],
                   'settings': json.loads((selected / 'settings.json').read_text()), 'cwd': str(Path.cwd()),
-                  'runtime': runtime['path']}))
+                  'runtime': runtime['path'], 'guard_home': str(actual_home)}))
 '''
-        for configured in ("../claude-settings", str(settings)):
-            with self.subTest(configured=configured):
-                result = subprocess.run([sys.executable, "-B", "-c", script, str(self.source)], cwd=self.source,
-                    env={**os.environ, "PROJECT_ROOM_HOME": str(self.home), "CLAUDE_CONFIG_DIR": configured},
-                    capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                observed = json.loads(result.stdout)
-                self.assertEqual(observed['selected'], str(settings))
-                self.assertEqual(observed['inherited'], str(settings))
-                self.assertEqual(observed['settings'], {'synthetic_marker': 'same-settings'})
-                self.assertEqual(observed['cwd'], observed['runtime'])
-                self.assertNotEqual(observed['cwd'], str(self.source))
+        for probe_home in dict.fromkeys((str(Path.home()), os.path.sep)):
+            for configured in ("../claude-settings", str(settings)):
+                with self.subTest(home=probe_home, configured=configured):
+                    result = subprocess.run([sys.executable, "-B", "-c", script, str(self.source)], cwd=self.source,
+                        env={**os.environ, "HOME": probe_home, "PROJECT_ROOM_HOME": str(self.home),
+                             "CLAUDE_CONFIG_DIR": configured}, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    observed = json.loads(result.stdout)
+                    self.assertEqual(observed['guard_home'], probe_home)
+                    self.assertEqual(observed['selected'], str(settings))
+                    self.assertEqual(observed['inherited'], str(settings))
+                    self.assertEqual(observed['settings'], {'synthetic_marker': 'same-settings'})
+                    self.assertEqual(observed['cwd'], observed['runtime'])
+                    self.assertNotEqual(observed['cwd'], str(self.source))
 
     def test_overlap_and_linked_store_are_refused(self):
         with self.assertRaises(runtime.RuntimeRetentionError):
