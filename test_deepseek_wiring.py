@@ -765,7 +765,10 @@ class InventoryReadTests(unittest.TestCase):
 class StatusSurfaceTests(WiringFixture):
     def test_delegate_jobs_summary_is_bounded_allowlisted_and_read_only(self):
         self.configure("deepseek")
-        room_id, root = self.open_room("Ledger feature")
+        # Public timestamp digits can coincide with a private PID; compare its
+        # field/value structurally instead of searching every serialized byte.
+        with mock.patch.object(room, "now", return_value="2026-09-14T11:11:22.424245+00:00"):
+            room_id, root = self.open_room("Ledger feature")
         ledger = deepseek_adapter.Ledger(self.home)
         with ledger.transaction() as db:
             for index in range(22):
@@ -785,8 +788,11 @@ class StatusSurfaceTests(WiringFixture):
         oldest_visible = [item for item in summary["items"] if item["job_id"] == "0" * 32]
         self.assertEqual(oldest_visible, [], "the oldest row is beyond the 20 newest")
         serialized = json.dumps(status)
-        for private in ("PRIVATE_DIAGNOSIS_TEXT", "PRIVATE_NOTE_TEXT", "4242", "worker_pid", "diagnosis"):
+        for private in ("PRIVATE_DIAGNOSIS_TEXT", "PRIVATE_NOTE_TEXT", "worker_pid", "diagnosis"):
             self.assertNotIn(private, serialized)
+        for item in summary["items"]:
+            self.assertNotIn(4242, item.values())
+            self.assertNotIn("4242", item.values())
         self.assertEqual(self.service.room_status(self.room_id)["delegate_jobs"]["unavailable_reason"], "provider_not_deepseek")
         with mock.patch.object(project_room.sqlite3, "connect", wraps=sqlite3.connect) as connect:
             self.service.room_status(room_id)

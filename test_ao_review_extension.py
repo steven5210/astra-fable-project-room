@@ -429,6 +429,79 @@ class ReviewExtensionTests(Fixture):
         self.assertEqual(len(self.fake.posts), posts)
         self.assertNotIn('changed-activity-fourth', self.state()['requests'])
 
+    def test_two_role_native_audit_scopes_engineer_compaction_after_charter_revision(self):
+        import ao_outcomes
+        self.register()
+        state = self.state()
+        # Construct an already verified compaction observation in this synthetic
+        # fixture. The actual record/receipt validator remains active below.
+        request = ao_outcomes.latest_for_role(state, 'engineer')
+        record = ao.read(self.directory() / request['semantic_outcome'])
+        source = {'session_id': 'engineer', 'native_session_id': 'synthetic-native-owner',
+                  'database': str(self.database), 'transcript': str(self.root / 'synthetic-native-owner.jsonl')}
+        turn = {'id': 'compacted-turn', 'providerTurnId': 'acp-history-turn:synthetic', 'state': 'recovered'}
+        message = {'id': 'compaction-message', 'turnId': turn['id'], 'role': 'user',
+                   'text': 'Synthetic retained compacted context.', 'origin': 'human', 'streaming': False, 'sequence': 100}
+        proof = {'turn_id': turn['id'], 'provider_turn_id': turn['providerTurnId'], 'message_id': message['id'],
+                 'native_uuid': 'synthetic-compaction-uuid', 'text_sha256': ao.digest(message['text'].encode()),
+                 'turn_sha256': ao.digest(turn), 'messages_sha256': ao.digest([message])}
+        record['native'] = {'source': source, 'compaction_imports': [proof]}
+        sha256 = ao.digest(record)
+        relative = 'outcomes/' + request['request_id'] + '/' + sha256 + '.json'
+        ao.atomic(self.directory() / relative, record)
+        request.update(semantic_outcome=relative, semantic_outcome_sha256=sha256)
+        state['native_outcome_source'] = source
+        state['provider_transition'] = {'epoch': 2}  # Select the pure native-proof path; no epoch mutation or lifecycle call.
+        engineer = self.fake.conversation('engineer')
+        engineer['turns'].append(turn)
+        engineer['messages'].append(message)
+        reviewer = self.fake.conversation('reviewer')
+        before = {str(p.relative_to(self.directory())): p.read_bytes()
+                  for p in self.directory().rglob('*') if p.is_file()}
+        self.assertEqual(ao_outcomes.known_compaction_turns(self.directory(), state, engineer), {turn['id']})
+        self.assertEqual(ao_outcomes.known_compaction_turns(self.directory(), state, reviewer), set())
+        for role, snapshot in (('engineer', engineer), ('reviewer', reviewer)):
+            native = extension._native_evidence(self.directory(), state, state['bindings'][role], snapshot)
+            self.assertEqual(native['session_id'], state['bindings'][role]['session_id'])
+        # Changing only the engineer's verified import still refuses in its
+        # owning session, while another session cannot borrow that exemption.
+        for field in ('messages', 'turns'):
+            changed = copy.deepcopy(engineer)
+            changed[field][-1]['changed'] = True
+            with self.subTest(field=field), self.assertRaisesRegex(ao.RoomError, 'Verified native compaction import changed'):
+                extension._native_evidence(self.directory(), state, state['bindings']['engineer'], changed)
+        for session_id in ('reviewer', 'another-engineer', None):
+            snapshot = {**engineer, 'sessionId': session_id}
+            with self.subTest(session_id=session_id):
+                self.assertEqual(ao_outcomes.known_compaction_turns(self.directory(), state, snapshot), set())
+        reviewer['turns'].append(copy.deepcopy(turn))
+        reviewer['messages'].append(copy.deepcopy(message))
+        for outcome in ('recovered', 'failed'):
+            reviewer['turns'][-1]['state'] = outcome
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(ao.RoomError, 'not completed'):
+                extension._native_evidence(self.directory(), state, state['bindings']['reviewer'], reviewer)
+        from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity
+        for role in ('engineer', 'reviewer'):
+            for session_id in ('different-session', None):
+                original = self.fake.snapshots[role]['sessionId']
+                try:
+                    self.fake.snapshots[role]['sessionId'] = session_id
+                    with self.subTest(role=role, session_id=session_id), self.assertRaises(ao.RoomError):
+                        _ReadOnlyIdentity(self.service).identity(_CompleteClient(self.fake), state, state['bindings'][role])
+                finally:
+                    self.fake.snapshots[role]['sessionId'] = original
+        path = self.directory() / relative
+        original = path.read_bytes()
+        try:
+            path.write_text('{}')
+            with self.assertRaises(ao.RoomError):
+                extension._native_evidence(self.directory(), state, state['bindings']['engineer'], engineer)
+        finally:
+            path.write_bytes(original)
+        after = {str(p.relative_to(self.directory())): p.read_bytes()
+                 for p in self.directory().rglob('*') if p.is_file()}
+        self.assertEqual(after, before)
+
     def test_identical_grant_reconciles_receipt_then_state_crash_without_a_model_call(self):
         inputs = self.grant_inputs()
         before = (self.directory() / 'state.json').read_bytes()
@@ -560,6 +633,32 @@ class ReviewExtensionTests(Fixture):
                 'params': {'name': 'ao_room_spec_review_extend', 'arguments': inputs}}, controller)
         self.assertFalse(response['result']['isError'])
         self.assertEqual(response['result']['structuredContent']['remaining_spec_reviews'], 1)
+
+
+class CompactionOwnerScopeTests(unittest.TestCase):
+    def test_absent_blank_or_nonstring_session_identity_never_grants_an_exemption(self):
+        import ao_outcomes
+        for session_id in (None, '', ' ', 0, False, [], {}):
+            state = {'requests': {'earlier': {'role': 'engineer', 'created_order': 1,
+                       'session_id': session_id, 'semantic_outcome': 'synthetic-outcome'}},
+                     'bindings': {'engineer': {'session_id': session_id}}}
+            with self.subTest(session_id=session_id), patch.object(ao_outcomes, 'load', side_effect=AssertionError('No owning identity')):
+                self.assertEqual(ao_outcomes.known_compaction_turns(None, state, {'sessionId': session_id}), set())
+
+    def test_malformed_or_different_native_source_never_grants_an_exemption(self):
+        import ao_outcomes
+        turn = {'id': 'compaction', 'state': 'recovered'}
+        message = {'turnId': turn['id'], 'text': 'Synthetic compacted context'}
+        proof = {'turn_id': turn['id'], 'turn_sha256': ao.digest(turn), 'messages_sha256': ao.digest([message])}
+        state = {'requests': {'earlier': {'role': 'engineer', 'created_order': 1,
+                   'session_id': 'engineer', 'semantic_outcome': 'synthetic-outcome'}},
+                 'bindings': {'engineer': {'session_id': 'engineer'}}}
+        snapshot = {'sessionId': 'engineer', 'turns': [turn], 'messages': [message]}
+        for source in (None, 'not-an-object', [], {}, {'session_id': 'reviewer'}, {'session_id': None}):
+            state['native_outcome_source'] = source
+            record = {'native': {'source': source, 'compaction_imports': [proof]}}
+            with self.subTest(source=source), patch.object(ao_outcomes, 'load', return_value=record):
+                self.assertEqual(ao_outcomes.known_compaction_turns(None, state, snapshot), set())
 
 
 if __name__ == '__main__':

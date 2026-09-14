@@ -343,11 +343,19 @@ def known_compaction_turns(directory, state, snapshot):
     """A native resume summary is context, not a new user command or successful work."""
     from ao_project_room import digest
     request = latest_for_role(state, 'engineer')
-    if not request or not request.get('semantic_outcome'):
+    session_id = request.get('session_id') if request else None
+    if (not request or not request.get('semantic_outcome')
+            or not isinstance(session_id, str) or not session_id.strip()
+            or snapshot.get('sessionId') != session_id
+            or session_id != state.get('bindings', {}).get('engineer', {}).get('session_id')):
+        # A two-role audit also inspects reviewer history. Engineer compaction
+        # proofs are neither required there nor transferable to another session.
         return set()
     record = load(directory, request)
     native = record.get('native') or {}
-    if native.get('unknown') or not native.get('source') or native['source'] != state.get('native_outcome_source'):
+    source = native.get('source')
+    if (native.get('unknown') or not isinstance(source, dict) or source.get('session_id') != session_id
+            or source != state.get('native_outcome_source')):
         return set()
     result = set()
     for proof in native.get('compaction_imports', []):
