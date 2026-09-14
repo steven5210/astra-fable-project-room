@@ -549,7 +549,7 @@ def prepare(service, directory, state, worktree, prepared):
         raise RoomError("Native routing preparation refused at " + stage + ": " + str(exc)) from exc
 
 
-def validate_local(prepared):
+def validate_local(prepared, state=None, directory=None):
     """Offline re-validation: pinned files, ignore status, guard, interpreter, executable identity, surrounding settings."""
     from ao_project_room import digest
     routing = prepared.get("routing") if prepared else None
@@ -577,7 +577,11 @@ def validate_local(prepared):
             raise RoomError("Pinned browser skill differs from the exact observed skill")
         if not os.access(routing["python"], os.X_OK):
             raise RoomError("Routing guard interpreter is unavailable")
-        check_claude(routing.get("claude") or {})
+        replacement = None
+        if state is not None and directory is not None:
+            from ao_executable_binding import effective
+            replacement = effective(directory, state, prepared)
+        check_claude(replacement or routing.get("claude") or {})
         contradictions(routing["claude_config_dir"], worktree)
         if "compaction" in routing:
             _compaction_sources(routing["compaction"], routing["claude_config_dir"], worktree, os.environ)
@@ -604,7 +608,7 @@ def record_observation(service, directory, state, observed, source, consistent):
 
 def before_dispatch(service, directory, state, prepared, purpose):
     """Local validation for every engineer dispatch; live rules check before implementation/correction."""
-    routing = validate_local(prepared)
+    routing = validate_local(prepared, state, directory)
     if routing is None:
         return routing
     try:
@@ -661,7 +665,13 @@ def status(prepared, state, directory=None):
         summary["compaction"] = routing["compaction"]
         summary["compaction_meaning"] = "Configured native window; actual compaction, continuity, quality and usage need observation."
     try:
-        validate_local(prepared)
+        validate_local(prepared, state, directory)
+        if directory is not None and state.get("executable_binding"):
+            from ao_executable_binding import effective
+            summary["original_claude"] = claude
+            claude = effective(directory, state, prepared)
+            summary["claude"] = claude
+            summary["executable_binding"] = state["executable_binding"]
     except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
         return {"status": "unverified", "error": str(exc), **summary}
     last = state.get("routing_rules")
