@@ -112,7 +112,7 @@ COMPLETION_HELPER = r'''function projectRoomAsyncCompletionBarrier(session) {
     const beforeHandoff = () => {
         if (!session.cancelled && pending(session.activeTurn)) {
             throw RequestError.internalError(errorKindData("async_completion_unverified"),
-                "A previously submitted successor reached the SDK before owned async completion could be correlated. Both requests are unverified; do not replay them.");
+                "The SDK advanced to an uncorrelated result or successor before owned async completion could be verified. Submitted requests remain unverified; do not replay them.");
         }
     };
     return { observe, finish, pending, tracked, beforeHandoff };
@@ -137,13 +137,9 @@ def _completion_edits():
          b'            if (session.activeTurn) {\n'
          b'                if (!isHeldOpen(session.activeTurn)) {\n',
          b'        const ensureActiveTurn = () => {\n'
-         b'            if (isHeldOpen(session.activeTurn) &&\n'
-         b'                (session.turnQueue ?? []).some((queued) =>\n'
-         b'                    queued !== session.activeTurn && !queued.settled)) completionBarrier.beforeHandoff();\n'
+         b'            if (isHeldOpen(session.activeTurn)) completionBarrier.beforeHandoff();\n'
          b'            if (session.activeTurn) {\n'
-         b'                if (!isHeldOpen(session.activeTurn) ||\n'
-         b'                    !(session.turnQueue ?? []).some((queued) =>\n'
-         b'                        queued !== session.activeTurn && !queued.settled)) {\n'),
+         b'                if (!isHeldOpen(session.activeTurn)) {\n'),
         (b'                        const isAutonomousResult = message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);',
          b'                        const ownedAsyncResult = completionBarrier.finish(message);\n'
          b'                        const isAutonomousResult = !ownedAsyncResult && message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);'),

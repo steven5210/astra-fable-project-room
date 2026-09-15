@@ -120,7 +120,7 @@ export class ClaudeAcpAgent {
                                 recordResultForOrphanCommands();
                                 ensureActiveTurn();
                         }
-                        session.usage += message.usage ?? 1;
+                        if (!isAutonomousResult) session.usage += message.usage ?? 1;
                         if (isAutonomousResult) { settleDeferredIfDrained(); break; }
                         if (message.stop_reason === "refusal") {
                             settleOrDefer({ stopReason: "refusal", usage: sessionUsage(session) });
@@ -340,6 +340,34 @@ class CompletionPatchTests(unittest.TestCase):
                     assert(successor.error?.data?.kind === "async_completion_unverified", "submitted successor got a false result");
                     assert(f.session.submissions === 1 && f.session.queryClosed, "uncertain dispatch was relabeled unsent"); await f.end();'''
                              .replace('ECHO', json.dumps(echo)))
+
+    def test_held_unknown_result_cannot_overwrite_parent_outcome_or_usage(self):
+        for result_uuid in ('"foreign"', 'undefined'):
+            with self.subTest(result_uuid=result_uuid):
+                self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
+                    await f.stopped("a");
+                    await f.send({ type: "user", parent_tool_use_id: null, uuid: "foreign",
+                        origin: { kind: "peer", from: "synthetic-peer" }, message: { content: "peer message" } });
+                    await f.result(RESULT_UUID, { origin: undefined, stop_reason: "refusal", usage: 7 });
+                    assert(f.settled.length === 1 && f.settled[0].data?.kind === "async_completion_unverified", "unknown result assigned to held parent");
+                    assert(!f.settled[0].result && f.session.usage === 1 && f.session.queryClosed, "unknown usage or old success assigned to parent");
+                    assert(!f.settled[0].error.includes("Both requests"), "single request reported as two"); await f.end();'''
+                             .replace('RESULT_UUID', result_uuid))
+
+    def test_known_peer_result_keeps_parent_outcome_and_usage(self):
+        self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
+            await f.stopped("a");
+            await f.result("peer", { origin: { kind: "peer" }, stop_reason: "refusal", usage: 7 });
+            assert(f.settled.length === 0 && f.session.usage === 1, "known autonomous result changed parent");
+            await f.notice("a", "notice-a"); await f.result("notice-a");
+            assert(f.settled[0].result.stopReason === "end_turn" && f.settled[0].result.usage === 2, "peer result leaked into final parent"); await f.end();''')
+
+    def test_legacy_native_hold_without_confirmed_async_debt_keeps_original_handoff(self):
+        self.execute('''const f = fixture();
+            await f.send({ type: "system", subtype: "task_started", task_id: "legacy", subagent_type: "worker", tool_use_id: "legacy-tool" });
+            await f.result("primary"); assert(f.settled.length === 0, "fixture did not hold legacy turn");
+            await f.result(undefined, { origin: undefined, usage: 7 });
+            assert(f.settled.length === 1 && f.settled[0].result.usage === 1, "non-barrier turn lost original handoff semantics"); await f.end();''')
 
     def test_ordinary_non_async_turn_needs_no_result_uuid(self):
         self.execute('''const f = fixture(); await f.result(undefined, { origin: undefined });
