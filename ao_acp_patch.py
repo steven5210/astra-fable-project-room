@@ -23,12 +23,15 @@ PRECEDENCE_SHA256 = '7ee854a6bbcdfa07556aa023eb4c691e7406e26ffb29b49383ded8c316f
 # This helper is inserted into the verified vendor module, without another
 # runtime dependency. A task's terminal edge / a background-set snapshot proves
 # the worker stopped, not that its queued notification has been processed.
-# Only root Agent/Task structured async results establish debt. The SDK's typed
-# task-notification origin and exact leading envelope bind its task/tool ids;
+# Only root Agent/Task structured async results establish debt. A typed task
+# start can establish the exact tool id when the ordinary cache is unavailable.
+# The SDK's typed task-notification origin and exact leading envelope bind ids;
 # a result's user_message_uuid must then match that notification's replay uuid.
 # Never search arbitrary report text for an id, count idle events, or use time.
 COMPLETION_HELPER = r'''function projectRoomAsyncCompletionBarrier(session) {
     const tasks = (turn) => turn?._projectRoomAsyncTasks;
+    // A result handler can still fail after its last debt was correlated.
+    const tracked = (turn) => tasks(turn) !== undefined;
     const outstanding = (turn) => (tasks(turn)?.size ?? 0) > 0;
     const pending = (turn) => !turn?.settled && outstanding(turn);
     const contentBlocks = (message) => typeof message.message?.content === "string"
@@ -36,8 +39,14 @@ COMPLETION_HELPER = r'''function projectRoomAsyncCompletionBarrier(session) {
         : (Array.isArray(message.message?.content) ? message.message.content : []);
     const observe = (message) => {
         const turn = session.activeTurn;
-        if (!turn || turn.settled || message.type !== "user" ||
-            message.parent_tool_use_id !== null) return;
+        if (!turn || turn.settled) return;
+        if (message.type === "system" && message.subtype === "task_started" &&
+            typeof message.subagent_type === "string" && message.subagent_type.length > 0 &&
+            typeof message.task_id === "string" && message.task_id.length > 0 &&
+            typeof message.tool_use_id === "string" && message.tool_use_id.length > 0) {
+            (turn._projectRoomAgentStarts ??= new Map()).set(message.task_id, message.tool_use_id);
+        }
+        if (message.type !== "user" || message.parent_tool_use_id !== null) return;
         const blocks = contentBlocks(message);
         const output = message.tool_use_result;
         if (output?.status === "async_launched" &&
@@ -47,11 +56,17 @@ COMPLETION_HELPER = r'''function projectRoomAsyncCompletionBarrier(session) {
                 return block.type === "tool_result" &&
                     (tool?.name === "Agent" || tool?.name === "Task");
             });
-            if (calls.length > 0) {
+            const startedToolId = turn._projectRoomAgentStarts?.get(output.agentId);
+            const startedTool = session.toolUseCache[startedToolId];
+            const pairedStart = startedToolId &&
+                (!startedTool || startedTool.name === "Agent" || startedTool.name === "Task") &&
+                blocks.some((block) => block.type === "tool_result" && block.tool_use_id === startedToolId);
+            if (calls.length > 0 || pairedStart) {
                 const debts = turn._projectRoomAsyncTasks ??= new Map();
                 // Ambiguous structured output is still confirmed async work,
                 // but cannot authorize completion using an invented tool id.
-                const toolId = calls.length === 1 ? calls[0].tool_use_id : null;
+                const toolId = pairedStart ? startedToolId :
+                    (calls.length === 1 && !startedToolId ? calls[0].tool_use_id : null);
                 const key = toolId ?? ("unbound:" + output.agentId);
                 if (!debts.has(key)) debts.set(key, {
                     taskId: output.agentId, toolId, notificationUuid: null,
@@ -82,13 +97,25 @@ COMPLETION_HELPER = r'''function projectRoomAsyncCompletionBarrier(session) {
         const knownSubtype = new Set(["success", "error_during_execution",
             "error_max_turns", "error_max_budget_usd",
             "error_max_structured_output_retries"]);
+        const mappedReason = { success: "completed", error_during_execution: "completed",
+            error_max_turns: "max_turns", error_max_budget_usd: "budget_exhausted",
+            error_max_structured_output_retries: "structured_output_retry_exhausted" };
+        const mappedNullStop = message.stop_reason === null &&
+            message.deferred_tool_use == null &&
+            (message.terminal_reason == null || message.terminal_reason === mappedReason[message.subtype]);
         if (knownSubtype.has(message.subtype) && (message.is_error === true ||
-            ["end_turn", "max_tokens", "refusal"].includes(message.stop_reason))) {
+            ["end_turn", "max_tokens", "refusal"].includes(message.stop_reason) || mappedNullStop)) {
             for (const [key] of matched) tasks(turn).delete(key);
         }
         return true;
     };
-    return { observe, finish, pending, outstanding };
+    const beforeHandoff = () => {
+        if (!session.cancelled && pending(session.activeTurn)) {
+            throw RequestError.internalError(errorKindData("async_completion_unverified"),
+                "A previously submitted successor reached the SDK before owned async completion could be correlated. Both requests are unverified; do not replay them.");
+        }
+    };
+    return { observe, finish, pending, tracked, beforeHandoff };
 }
 '''.encode()
 
@@ -110,6 +137,9 @@ def _completion_edits():
          b'            if (session.activeTurn) {\n'
          b'                if (!isHeldOpen(session.activeTurn)) {\n',
          b'        const ensureActiveTurn = () => {\n'
+         b'            if (isHeldOpen(session.activeTurn) &&\n'
+         b'                (session.turnQueue ?? []).some((queued) =>\n'
+         b'                    queued !== session.activeTurn && !queued.settled)) completionBarrier.beforeHandoff();\n'
          b'            if (session.activeTurn) {\n'
          b'                if (!isHeldOpen(session.activeTurn) ||\n'
          b'                    !(session.turnQueue ?? []).some((queued) =>\n'
@@ -117,6 +147,15 @@ def _completion_edits():
         (b'                        const isAutonomousResult = message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);',
          b'                        const ownedAsyncResult = completionBarrier.finish(message);\n'
          b'                        const isAutonomousResult = !ownedAsyncResult && message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);'),
+        (b'                                recordResultForOrphanCommands();\n'
+         b'                                ensureActiveTurn();',
+         b'                                if (!ownedAsyncResult) {\n'
+         b'                                    recordResultForOrphanCommands();\n'
+         b'                                    ensureActiveTurn();\n'
+         b'                                }'),
+        (b'                                if (session.activeTurn !== queued) {\n',
+         b'                                if (session.activeTurn !== queued) {\n'
+         b'                                    completionBarrier.beforeHandoff();\n'),
         (b'                    const inFlight = session.activeTurn;\n'
          b'                    settleActive(session.cancelled\n'
          b'                        ? { stopReason: "cancelled", usage: sessionUsage(session) }\n'
@@ -137,7 +176,7 @@ def _completion_edits():
          b'        if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {'),
         (b'                    if (wasHeld) {\n'
          b"                        // A held turn's answer already streamed and its outcome is\n",
-         b'                    if (wasHeld && !completionBarrier.outstanding(turn)) {\n'
+         b'                    if (wasHeld && !completionBarrier.tracked(turn)) {\n'
          b"                        // A held turn's answer already streamed and its outcome is\n"),
     )
 

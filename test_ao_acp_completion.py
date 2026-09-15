@@ -22,12 +22,16 @@ const errorKindData = (kind) => ({ kind });
 const RequestError = { internalError: (data, detail) => Object.assign(new Error(detail), { data }) };
 export class ClaudeAcpAgent {
     sessions = {};
+    async syncFastModeState() {}
     async prompt(params) {
         const session = this.sessions[params.sessionId];
         if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
             throw new Error("fixture has no plans");
         }
         session.submissions++;
+        const turn = { settled: false, spawnedTaskIds: new Set(), promptUuid: params.uuid };
+        session.turnQueue.push(turn);
+        return new Promise((resolve, reject) => { turn.resolve = resolve; turn.reject = reject; });
     }
     async runConsumer(session, params) {
         let stopReason = "end_turn";
@@ -57,6 +61,7 @@ export class ClaudeAcpAgent {
             if (session.activeTurn && turnAwaitingSubagents(session.activeTurn)) session.activeTurn.deferredSettle = outcome;
             else settleActive(outcome);
         };
+        const recordResultForOrphanCommands = () => {};
         const ensureActiveTurn = () => {
             if (session.activeTurn) {
                 if (!isHeldOpen(session.activeTurn)) {
@@ -65,6 +70,7 @@ export class ClaudeAcpAgent {
                 settleActive(session.activeTurn.deferredSettle);
             }
             session.activeTurn = session.turnQueue.find((turn) => !turn.settled) ?? null;
+            session.usage = 0;
         };
         try {
             while (true) {
@@ -96,9 +102,24 @@ export class ClaudeAcpAgent {
                     case "assistant":
                         session.text.push(message.text);
                         break;
+                    case "user": {
+                        const queued = session.turnQueue.find((turn) => turn.promptUuid === message.uuid && !turn.settled);
+                        if (queued) {
+                                if (session.activeTurn !== queued) {
+                                    if (session.activeTurn) settleActive(session.activeTurn.deferredSettle);
+                                    session.activeTurn = queued;
+                                    session.usage = 0;
+                                }
+                        }
+                        break;
+                    }
                     case "result": {
                         const isAutonomousResult = message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
-                        if (!isAutonomousResult) ensureActiveTurn();
+                        if (!isAutonomousResult) {
+                                await this.syncFastModeState();
+                                recordResultForOrphanCommands();
+                                ensureActiveTurn();
+                        }
                         session.usage += message.usage ?? 1;
                         if (isAutonomousResult) { settleDeferredIfDrained(); break; }
                         if (message.stop_reason === "refusal") {
@@ -126,6 +147,11 @@ export class ClaudeAcpAgent {
                                     await failActiveWithSessionFailure("provider_error", new Error(message.errors.join(", ")));
                                 }
                                 break;
+                            case "error_max_turns":
+                            case "error_max_budget_usd":
+                            case "error_max_structured_output_retries":
+                                stopReason = "max_turn_requests";
+                                break;
                         }
                         if (!session.cancelled) settleOrDefer({ stopReason, usage: sessionUsage(session) });
                         break;
@@ -133,14 +159,16 @@ export class ClaudeAcpAgent {
                 }
             }
         } catch (error) {
-            const turn = session.activeTurn;
-            if (turn && !turn.settled) {
+            session.queryClosed = true;
+            for (const turn of session.turnQueue) {
+              if (!turn.settled) {
                 const wasHeld = isHeldOpen(turn);
                 turn.settled = true;
                     if (wasHeld) {
                         // A held turn's answer already streamed and its outcome is
                         turn.resolve(turn.deferredSettle);
                     } else { turn.reject(error); }
+              }
             }
         }
     }
@@ -172,13 +200,14 @@ function fixture() {
     const running = agent.runConsumer(session, { sessionId: "test" });
     const send = async (message) => {
         if (!waiting) throw new Error("fixture has no pending read");
-        await new Promise((resolve) => {
+        await Promise.race([new Promise((resolve) => {
             drained = resolve;
             const waiter = waiting; waiting = undefined;
             waiter.resolve({ value: message, done: false });
-        });
+        }), running]);
     };
     const end = async (crash = false) => {
+        if (session.queryClosed) return running;
         if (crash) waiting.reject(new Error("synthetic transport crash"));
         else waiting.resolve({ done: true });
         await running;
@@ -186,7 +215,8 @@ function fixture() {
     const launch = async (task, tool = "Agent", parent = null) => {
         const id = "tool-" + task;
         session.toolUseCache[id] = { name: tool, id };
-        await send({ type: "system", subtype: "task_started", task_id: task, subagent_type: "worker", tool_use_id: id });
+        await send({ type: "system", subtype: "task_started", task_id: task,
+            subagent_type: ["Agent", "Task"].includes(tool) ? "worker" : undefined, tool_use_id: id });
         await send({ type: "user", parent_tool_use_id: parent,
             message: { content: [{ type: "tool_result", tool_use_id: id }] },
             tool_use_result: { status: "async_launched", agentId: task } });
@@ -270,12 +300,46 @@ class CompletionPatchTests(unittest.TestCase):
         self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
             await f.end(true); assert(f.settled.length === 1 && f.settled[0].error === "synthetic transport crash", "crash became held success");''')
 
+    def test_last_correlated_result_handler_failure_cannot_reuse_interim_success(self):
+        self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
+            await f.stopped("a"); await f.notice("a", "notice-a");
+            f.agent.syncFastModeState = async () => { throw new Error("synthetic result delivery failure"); };
+            await f.result("notice-a");
+            assert(f.settled.length === 1 && f.settled[0].error === "synthetic result delivery failure", "final handler failure became older success"); await f.end();''')
+
     def test_successor_rejected_before_dispatch_while_owned_debt_is_pending(self):
         self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
             const attempts = await Promise.allSettled([f.agent.prompt({ sessionId: "test" }), f.agent.prompt({ sessionId: "test" })]);
             assert(attempts.every((x) => x.status === "rejected") && f.session.submissions === 0, "successor was queued");
             f.session.cancelled = true; await f.idle();
             assert(f.settled[0].result.stopReason === "cancelled", "cancel was hidden"); await f.end();''')
+
+    def test_prequeued_successor_cannot_steal_owned_followup_result_or_usage(self):
+        self.execute('''const f = fixture(); let successor;
+            const submitted = f.agent.prompt({ sessionId: "test", uuid: "successor" }).then((value) => { successor = value; });
+            await f.launch("a"); await f.result("primary"); await f.stopped("a");
+            await f.notice("a", "notice-a"); await f.send({ type: "assistant", text: "A final" });
+            await f.result("notice-a");
+            assert(f.settled.length === 1 && f.settled[0].result.usage === 2, "parent lost followup result or usage");
+            assert(successor === undefined && f.session.turnQueue.length === 1, "queued successor received A result");
+            await f.send({ type: "user", parent_tool_use_id: null, uuid: "successor", message: { content: "B" } });
+            await f.result("successor", { origin: { kind: "human" }, usage: 7 }); await submitted;
+            assert(successor.usage === 7, "successor inherited parent usage"); await f.end();''')
+
+    def test_ambiguous_prequeued_handoff_fails_both_submitted_requests(self):
+        for echo in (True, False):
+            with self.subTest(echo=echo):
+                self.execute('''const f = fixture(); let successor;
+                    const submitted = f.agent.prompt({ sessionId: "test", uuid: "successor" }).then(
+                        (result) => { successor = { result }; }, (error) => { successor = { error }; });
+                    await f.launch("a"); await f.result("primary");
+                    if (ECHO) await f.send({ type: "user", parent_tool_use_id: null, uuid: "successor", message: { content: "B" } });
+                    else await f.result("successor", { origin: { kind: "human" } });
+                    await submitted;
+                    assert(f.settled.length === 1 && f.settled[0].data.kind === "async_completion_unverified", "parent handed off with interim success");
+                    assert(successor.error?.data?.kind === "async_completion_unverified", "submitted successor got a false result");
+                    assert(f.session.submissions === 1 && f.session.queryClosed, "uncertain dispatch was relabeled unsent"); await f.end();'''
+                             .replace('ECHO', json.dumps(echo)))
 
     def test_ordinary_non_async_turn_needs_no_result_uuid(self):
         self.execute('''const f = fixture(); await f.result(undefined, { origin: undefined });
@@ -303,8 +367,53 @@ class CompletionPatchTests(unittest.TestCase):
             await f.result("primary"); await f.notice("a", "notice-a"); await f.result("notice-a");
             assert(f.settled.length === 0, "ambiguous structured output invented tool correlation"); await f.end();''')
         self.execute('''const f = fixture(); await f.launch("a"); await f.stopped("a"); await f.result("primary");
-            await f.notice("a", "notice-a"); await f.result("notice-a", { stop_reason: null }); await f.idle();
+            await f.notice("a", "notice-a"); await f.result("notice-a", { stop_reason: "tool_use" }); await f.idle();
             assert(f.settled.length === 0, "unknown stop reason established completion"); await f.end();''')
+
+    def test_typed_start_pairs_cold_cache_or_grouped_launch_without_guessing_ids(self):
+        for grouped in (True, False):
+            with self.subTest(grouped=grouped):
+                self.execute('''const f = fixture();
+                    await f.send({ type: "system", subtype: "task_started", task_id: "a", subagent_type: "worker", tool_use_id: "tool-a" });
+                    const blocks = [{ type: "tool_result", tool_use_id: "tool-a" }];
+                    if (GROUPED) {
+                        f.session.toolUseCache["tool-b"] = { name: "Agent" };
+                        blocks.push({ type: "tool_result", tool_use_id: "tool-b" });
+                    }
+                    await f.stopped("a");
+                    await f.send({ type: "user", parent_tool_use_id: null, message: { content: blocks },
+                        tool_use_result: { status: "async_launched", agentId: "a" } });
+                    await f.result("primary"); assert(f.settled.length === 0, "typed native launch lost on missing cache");
+                    await f.notice("a", "notice-a"); await f.result("notice-a");
+                    assert(f.settled.length === 1 && f.settled[0].result.usage === 2, "exact typed task pairing did not drain"); await f.end();'''
+                             .replace('GROUPED', json.dumps(grouped)))
+        self.execute('''const f = fixture();
+            await f.send({ type: "system", subtype: "task_started", task_id: "a", subagent_type: "worker", tool_use_id: "other-tool" });
+            f.session.toolUseCache["tool-a"] = { name: "Agent" };
+            await f.send({ type: "user", parent_tool_use_id: null,
+                message: { content: [{ type: "tool_result", tool_use_id: "tool-a" }] },
+                tool_use_result: { status: "async_launched", agentId: "a" } });
+            await f.stopped("a"); await f.result("primary"); await f.notice("a", "notice-a"); await f.result("notice-a");
+            assert(f.settled.length === 0, "conflicting typed tool identity guessed completion"); await f.end();''')
+
+    def test_sdk_mapped_null_terminal_stops_drain_but_deferred_work_stays_held(self):
+        for subtype in ('success', 'error_during_execution', 'error_max_turns',
+                        'error_max_budget_usd', 'error_max_structured_output_retries'):
+            with self.subTest(subtype=subtype):
+                expected = 'max_turn_requests' if subtype.startswith('error_max_') else 'end_turn'
+                self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
+                    await f.stopped("a"); await f.notice("a", "notice-a");
+                    await f.result("notice-a", { subtype: SUBTYPE, stop_reason: null, errors: [] });
+                    assert(f.settled.length === 1 && f.settled[0].result.stopReason === EXPECTED, "SDK terminal mapping stranded turn"); await f.end();'''
+                             .replace('SUBTYPE', json.dumps(subtype)).replace('EXPECTED', json.dumps(expected)))
+        for extra in ({'stop_reason': None, 'terminal_reason': 'tool_deferred'},
+                      {'stop_reason': None, 'terminal_reason': 'max_turns'},
+                      {'stop_reason': None, 'deferred_tool_use': {'id': 'pending-tool'}}):
+            with self.subTest(extra=extra):
+                self.execute('''const f = fixture(); await f.launch("a"); await f.result("primary");
+                    await f.stopped("a"); await f.notice("a", "notice-a"); await f.result("notice-a", EXTRA);
+                    assert(f.settled.length === 0, "deferred SDK work accepted as completion"); await f.end();'''
+                             .replace('EXTRA', json.dumps(extra)))
 
     def test_owned_error_overrides_max_tokens_and_auth_refusal_are_preserved(self):
         for extra, expect in [

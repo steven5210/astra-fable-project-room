@@ -325,7 +325,19 @@ class Service:
             raise RoomError("AO conversation branch changed from its binding; do not replace or replay it")
         return snapshot
 
+    def _routing_refresh_gate(self, state):
+        # Every room mutation must preserve the exact state needed to reconcile
+        # an unfinished routing refresh. Check immutable ancestry only: ordinary
+        # runtime drift must remain diagnosable through sync, and saved status
+        # plus the refresh's own exact reconciliation stay outside this gate.
+        from ao_routing_refresh import BASE, _chain
+        directory = self.root / "rooms" / state["room_id"]
+        journal = directory / BASE
+        if state.get("routing_refresh") is not None or journal.exists() or journal.is_symlink():
+            _chain(directory, state, ao_delegates.preparation(directory, state))
+
     def settled(self, state, pending_transition=False, outcome_request_id=None, pending_review_extension=False):
+        self._routing_refresh_gate(state)
         from ao_reviewer_recovery import validate
         validate(self, state)
         from ao_review_extension import validate as review_extension_validate
@@ -649,6 +661,7 @@ class Service:
 
     def ao_room_sync(self, room_id):
         with self.locked(room_id) as (directory, state):
+            self._routing_refresh_gate(state)  # Sync also persists observations and changes the pending intent's state.
             from ao_review_extension import validate as review_extension_validate
             review_extension_validate(self, state)  # Verify consumption before any reconciliation evidence is written.
             from ao_provider_transition import validate as transition_validate

@@ -51,11 +51,13 @@ alone is insufficient when diagnosing premature completion.
 The operation changes only the three ignored routing files and their
 content-addressed guard, recording original and replacement bytes before writes.
 It retains the original preparation, executable binding, provider epochs, quota
-holds, requests and review counts. A fourth-review grant must already be consumed
+holds, requests and review counts. An existing fourth-review grant must already be consumed
 by the completed accepted review of the current exact spec; an unused or rejected
 grant cannot be refreshed. A crash leaves ordinary routing blocked until the
-identical request reconciles unchanged evidence. Unknown file changes are never
-overwritten. Reload the retained controller separately and verify native identity
+identical request reconciles unchanged evidence. While its intent is pending,
+specification, instruction and grant changes, and sync observation writes, are
+blocked before they can invalidate recovery. Saved status remains readable.
+Unknown file changes are never overwritten. Reload the retained controller separately and verify native identity
 and loaded settings before an independently authorized prompt. Neither refresh nor
 reload grants continuation, clears quota, or proves live enforcement or savings.
 
@@ -166,11 +168,17 @@ The opt-in `--completion-barrier` additionally prevents a confirmed asynchronous
 worker's interim answer from completing its parent turn before Fable processes
 that worker's result. It accepts the exact reviewed original module or the exact
 earlier quota-precedence patch. A separate immutable intent and backup preserve
-both histories. The bridge binds a structured async launch to the SDK's typed task
-notification and its corresponding terminal result; neither an empty background
-task list nor a worker's terminal event alone proves Fable has finished. A lost
-stream with unmatched work fails as `async_completion_unverified`, preserving
-uncertainty instead of promoting an interim answer. This patch makes no model
+both histories. The bridge binds a structured async launch to a user message with
+the SDK's typed `task-notification` origin, matching leading task/tool IDs, and
+that message's corresponding terminal result. A typed task-start event can
+corroborate the tool ID when the normal cache is unavailable. Neither an empty
+background task list nor a worker's terminal event alone proves Fable has finished.
+A clean stream end with unmatched work fails as `async_completion_unverified`;
+thrown transport or result-handler failures preserve their error instead of
+promoting an interim answer. A matched worker follow-up cannot settle a queued
+successor or assign the parent's usage to it. If a previously submitted successor
+reaches the SDK before ownership can be resolved, both requests fail as unverified;
+neither is treated as unsent or automatically replayed. This patch makes no model
 call, does not import historical late reports, and does not authorize replay.
 
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
@@ -189,8 +197,12 @@ Offline tests cover quota precedence, stale and ambiguous evidence, exact-once
 continuation, restart persistence, immutable failures, schema projection and
 one-time instruction delivery. They use fake AO and synthetic native evidence.
 The completion barrier also has offline probes of the exact reviewed vendor
-consumer. Those reproduce the early-completion race and preserve ordinary results,
-typed errors and usage accounting. Native wire correlation still needs validation
+consumer. Those reproduce the early-completion and queued-successor races and
+check ordinary results, typed errors, cancellation and usage accounting.
+Notifications that do not request a query and unsupported or unbound identities
+cannot prove completion. The SDK does not declare a correlation UUID on its error
+result type; an autonomous error without that identity remains unverified.
+Native wire correlation still needs validation
 during useful authorized work; a missing correlation must hold rather than guess.
 Useful live work after an authorized resume must still demonstrate actual
 quality, delegation and token savings. Retain MAX and existing delegate budgets.
