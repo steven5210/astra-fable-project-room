@@ -176,7 +176,9 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
     observed = {**saved, 'turn': turns[0], 'sessionFailures': snapshot.get('sessionFailures', []),
                 'provider_failures': activities}
     native = None
-    source = state.get('native_outcome_source')
+    from ao_native_outcome import source_keys
+    source_key, source_evidence_key = source_keys(request['role'])
+    source = state.get(source_key)
     if source and source.get('session_id') == request['session_id']:
         from ao_native_outcome import inspect
         try:
@@ -238,7 +240,7 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
         atomic(directory / path, value)
     request.update(semantic_outcome=path, semantic_outcome_sha256=digest(value), semantic_status=value['outcome'])
     if source_verification is not None:
-        state['native_outcome_source_evidence'] = {'path': path, 'sha256': digest(value), 'request_id': request['request_id']}
+        state[source_evidence_key] = {'path': path, 'sha256': digest(value), 'request_id': request['request_id']}
     service.save(directory, state)
     return value
 
@@ -311,20 +313,22 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
     source_verification = None
     if ao_database_path:
         from ao_native_identity import read_owner
-        from ao_native_outcome import validate_source
+        from ao_native_outcome import validate_source, source_keys
         owner = read_owner(ao_database_path, request['session_id'])
         from ao_review_extension import guard_native_owner
-        guard_native_owner(service, state, owner)
+        guard_native_owner(service, state, owner, role=role)
         source = {'database': ao_database_path, 'transcript': native_transcript_path,
                   'session_id': request['session_id'], 'native_session_id': owner['provider_conversation_id']}
-        validate_source(state, source)
+        if role == 'reviewer':
+            source['workspace_path'] = owner['workspace_path']
+        validate_source(state, source, role)
         # Validate the complete exact-turn source before persisting a path. An explicit
         # read-only audit can correct a moved source; prior outcome records retain it.
         from ao_native_outcome import inspect
         snapshot = service.identity(service.client(state), state, request)
         verified = inspect(directory, state, request, source, snapshot)
         source_verification = {'source': source, 'native_owner': owner, 'native': verified}
-        state['native_outcome_source'] = source
+        state[source_keys(role)[0]] = source
     snapshot = service.identity(service.client(state), state, request)
     value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True,
                     source_verification=source_verification)

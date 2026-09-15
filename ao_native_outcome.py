@@ -26,7 +26,7 @@ def human_text(row):
     return ''.join(x['text'] for x in content)
 
 
-def events_outcome(events, request, session_id):
+def events_outcome(events, request, session_id, workspace=None):
     from ao_project_room import digest
     if (not isinstance(events, list) or any(not isinstance(x, dict) for x in events)
             or digest(request['text'].encode()) != request['text_sha256']):
@@ -49,6 +49,8 @@ def events_outcome(events, request, session_id):
     if len(anchors) != 1:
         raise RoomError('Native caller correlation is missing or ambiguous')
     anchor = anchors[0]
+    if workspace is not None and anchor.get('cwd') != workspace:
+        raise RoomError('Native reviewer caller workspace contradicts its retained owner')
     start = timestamp(anchor['timestamp'])
     following = [x for x in rows if timestamp(x['timestamp']) > start and human_text(x) is not None]
     end = timestamp(following[0]['timestamp']) if following else float('inf')
@@ -59,6 +61,12 @@ def events_outcome(events, request, session_id):
         message = row.get('message')
         if not isinstance(message, dict):
             raise RoomError('Malformed native assistant evidence')
+        if workspace is not None:
+            if row.get('cwd') != workspace:
+                raise RoomError('Native reviewer response workspace contradicts its retained owner')
+            if (row.get('isApiErrorMessage') is not True and message.get('model') != '<synthetic>'
+                    and message.get('model') != request['model']):
+                raise RoomError('Native response model contradicts the owned request')
         if row.get('isApiErrorMessage') is True:
             nested = row.get('apiError') or {}
             if not isinstance(nested, dict):
@@ -117,13 +125,25 @@ def compaction_imports(events, session_id, snapshot):
     return sorted(result, key=lambda x: x['turn_id'])
 
 
-def validate_source(state, source):
+def source_keys(role):
+    if role == 'engineer':
+        return 'native_outcome_source', 'native_outcome_source_evidence'
+    if role == 'reviewer':
+        return 'native_reviewer_outcome_source', 'native_reviewer_outcome_source_evidence'
+    raise RoomError('Native outcome source requires an exact engineer or reviewer role')
+
+
+def validate_source(state, source, role='engineer'):
     from ao_native_identity import read_owner
-    if not isinstance(source, dict) or set(source) != {'database', 'transcript', 'session_id', 'native_session_id'}:
+    key, _ = source_keys(role)
+    expected = {'database', 'transcript', 'session_id', 'native_session_id'}
+    if role == 'reviewer':
+        expected.add('workspace_path')
+    if not isinstance(source, dict) or set(source) != expected:
         raise RoomError('Native outcome source has an unexpected shape')
-    binding = state['bindings'].get('engineer', {})
+    binding = state['bindings'].get(role, {})
     if binding.get('harness') != 'claude-code' or source['session_id'] != binding.get('session_id'):
-        raise RoomError('Native outcome source is not the bound Claude engineer')
+        raise RoomError('Native outcome source is not the bound Claude ' + role)
     try:
         owner = read_owner(source['database'], binding['session_id'])
     except (ValueError, OSError) as exc:
@@ -131,16 +151,43 @@ def validate_source(state, source):
     if (owner['project_id'] != state['ao_project_id']
             or owner['provider_conversation_id'] != source['native_session_id']):
         raise RoomError('Native outcome owner changed')
+    if role == 'reviewer':
+        if (state.get('workflow') != 'astra_led' or state.get('spec_review_extension')
+                or any(other != role and value.get('session_id') == binding['session_id']
+                       for other, value in state['bindings'].items())
+                or owner['ao_conversation_id'] != binding.get('conversation_id')
+                or owner['active_branch_id'] != binding.get('branch_id')
+                or owner['workspace_path'] != source['workspace_path']
+                or not isinstance(source['workspace_path'], str) or not Path(source['workspace_path']).is_absolute()):
+            raise RoomError('Native reviewer owner/workspace contradicts its exact Astra-led binding')
+        previous = state.get(key)
+        if previous is not None and (not isinstance(previous, dict) or set(previous) != expected
+                or any(previous[k] != source[k] for k in ('session_id', 'native_session_id', 'workspace_path'))):
+            raise RoomError('Native reviewer source cannot replace its retained owner or workspace')
     return owner
 
 
 def inspect(directory, state, request, source, snapshot):
     from ao_project_room import digest
-    owner = validate_source(state, source)
-    # Workspace comes from the immutable preparation, not an inferred project directory.
-    from ao_delegates import validate_preparation
-    prepared = validate_preparation(directory, state, request['session_id'], check_routing=False)
-    if (owner['workspace_path'] != prepared['worktree'] or owner['ao_conversation_id'] != snapshot.get('conversationId')
+    role = request.get('role', 'engineer')
+    owner = validate_source(state, source) if role == 'engineer' else validate_source(state, source, role)
+    if role == 'reviewer':
+        binding = state['bindings']['reviewer']
+        if (any(request.get(k) != binding.get(k) for k in
+                ('session_id', 'harness', 'model', 'reasoning_effort', 'conversation_id', 'branch_id'))
+                or request.get('model_reroute') or source['session_id'] != request['session_id']
+                or snapshot.get('sessionId') != request['session_id']
+                or (snapshot.get('settings') or {}).get('model') != request['model']
+                or (snapshot.get('settings') or {}).get('reasoningEffort') != request['reasoning_effort']
+                or snapshot.get('history_truncated')):
+            raise RoomError('Native reviewer request/model/history contradicts its exact binding')
+        workspace = source['workspace_path']
+    else:
+        # Engineer workspace retains its original immutable preparation proof.
+        from ao_delegates import validate_preparation
+        prepared = validate_preparation(directory, state, request['session_id'], check_routing=False)
+        workspace = prepared['worktree']
+    if (owner['workspace_path'] != workspace or owner['ao_conversation_id'] != snapshot.get('conversationId')
             or owner['active_branch_id'] != snapshot.get('activeBranchId')):
         raise RoomError('Native outcome workspace/conversation identity changed')
     path = Path(source['transcript'])
@@ -158,6 +205,7 @@ def inspect(directory, state, request, source, snapshot):
             != (after.st_ino, after.st_size, after.st_mtime_ns)):
         raise RoomError('Native transcript changed while being observed')
     events = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    result = events_outcome(events, request, source['native_session_id'])
+    result = events_outcome(events, request, source['native_session_id'],
+                            workspace=workspace if role == 'reviewer' else None)
     return {**result, 'source': source, 'source_sha256': digest(raw),
             'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}

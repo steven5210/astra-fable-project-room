@@ -136,13 +136,26 @@ reads, not model calls or proof of a quota reset.
 
 When the bridge omitted error details, the operator can provide both
 `ao_database_path` and `native_transcript_path`. The adapter validates the exact
-retained Claude engineer, AO project/conversation/branch and prepared workspace
-against read-only native ownership storage. It binds those paths for future
-observations of that engineer. It reads the explicit owned transcript only,
+retained Claude role and AO project/conversation/branch against read-only native
+ownership storage. An engineer keeps its immutable prepared-workspace check. An
+Astra-led Claude reviewer needs no engineer preparation: the exact native caller
+and every correlated root assistant row must carry the retained owner's workspace,
+and the request, binding and observed model/effort must match. Reviewer source
+paths and workspace are saved separately from engineer evidence; later path
+audits cannot replace that reviewer native identity or workspace. It reads the explicit owned transcript only,
 never credentials or account settings. Correlation uses the caller's exact
 digest, native session and bounded human-message interval; compaction summaries,
 tool results, queue metadata and child sessions are not caller messages.
 Malformed, changed or ambiguous evidence holds rather than authorizing work.
+
+Establishing an explicit source preserves an existing unknown hold. Run a second
+`ao_room_outcome_audit` for the same role without source paths to reassess the
+unchanged verified source. A proven native `end_turn` can then establish that an
+unstructured response finished. An operator must still review the complete raw
+response and submit exact receipt/text hashes and a JSON span to
+`ao_room_response_normalize`; exact candidate, gates, verdict and review-budget
+checks remain required for acceptance. Neither audit parses an approval from prose,
+accepts the candidate, clears a known quota failure, or grants another review.
 
 After diagnosing the failure and obtaining actual authorization to continue,
 call `ao_room_outcome_resume` with the failed `request_id`, the fresh audit's
