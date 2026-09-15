@@ -26,6 +26,9 @@ MODELS = {"pr-sonnet": "claude-sonnet-5", "pr-opus": "claude-opus-5"}
 EFFORT = "max"
 ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2",
        "CLAUDE_CODE_DISABLE_WORKFLOWS": "1", "CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS": "1"}
+# This setting is pinned by new local-settings bytes, not added to historical
+# routing env/rules snapshots that retained preparations must still reproduce.
+FOREGROUND_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 # A forced subagent model overrides explicit definitions; the plain default only
 # applies to agents without a model and is recorded, not treated as protection.
 CONTRADICTORY_ENV = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE",)
@@ -191,7 +194,18 @@ def _model_policy(data, label):
         raise RoomError(label + " Claude settings restrict availableModels without both pinned worker models")
 
 
-def settings_document(existing, command):
+def _foreground_env(value, label):
+    env = _mapping(value, label + " env")
+    if any(key in env and env[key] != expected for key, expected in FOREGROUND_ENV.items()):
+        raise RoomError(label + " conflicts with foreground native delegation (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS must be exactly '1')")
+
+
+def foreground_settings(settings):
+    _foreground_env(settings.get("env"), "Local settings")
+    return {**settings, "env": {**_mapping(settings.get("env"), "Local settings env"), **FOREGROUND_ENV}}
+
+
+def settings_document(existing, command, *, foreground=False):
     existing = _mapping(existing, "Existing local settings")
     if existing.get("disableAllHooks") or existing.get("allowManagedHooksOnly"):
         raise RoomError("Existing local settings disable or suppress local hooks")
@@ -214,7 +228,8 @@ def settings_document(existing, command):
     entry = {"matcher": MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
     pre = list(pre) + ([] if entry in pre else [entry])
     hooks["PreToolUse"] = pre
-    return {**existing, "env": env, "permissions": permissions, "hooks": hooks}
+    result = {**existing, "env": env, "permissions": permissions, "hooks": hooks}
+    return foreground_settings(result) if foreground else result
 
 
 def check_settings(settings, routing):
@@ -270,7 +285,7 @@ def _settings_file(path):
     return _mapping(value, str(path))
 
 
-def contradictions(config_dir, worktree=None, environ=None):
+def contradictions(config_dir, worktree=None, environ=None, *, foreground=False):
     """Refuse configuration that would silently override or disable the routing protections."""
     sources = [("user", Path(config_dir) / "settings.json"), ("managed", managed_settings_path(environ or os.environ))]
     if worktree is not None:
@@ -287,6 +302,12 @@ def contradictions(config_dir, worktree=None, environ=None):
         bad = _contradictory_env(_mapping(data.get("env"), label + " settings env"))
         if bad:
             raise RoomError(label + " Claude settings override native routing knobs: " + ", ".join(bad))
+        if foreground:
+            _foreground_env(data.get("env"), label + " Claude settings")
+    if foreground and worktree is not None:
+        local = _settings_file(Path(worktree) / ".claude/settings.local.json")
+        if local is not None:
+            _foreground_env(local.get("env"), "Local settings")
     for name in MODELS:
         if (Path(config_dir) / "agents" / (name + ".md")).exists():
             raise RoomError("user-level agent definition " + name + " exists; the pinned worktree definition cannot be proven effective")
@@ -294,6 +315,26 @@ def contradictions(config_dir, worktree=None, environ=None):
         bad = _contradictory_env({key: environ[key] for key in environ if key in ENV or key in CONTRADICTORY_ENV})
         if bad:
             raise RoomError("Process environment overrides native routing knobs: " + ", ".join(bad))
+        if foreground:
+            _foreground_env(dict(environ), "Process environment")
+
+
+def _foreground_project(client, state):
+    raw = client.request("GET", "/projects/" + state["ao_project_id"])
+    project = raw.get("project", raw) if isinstance(raw, dict) else {}
+    if not isinstance(project, dict) or project.get("id", project.get("projectId")) != state["ao_project_id"]:
+        raise RoomError("AO project identity mismatch while checking foreground native delegation")
+    config = _mapping(project.get("config"), "AO project configuration")
+    _foreground_env(config.get("env"), "AO project environment")
+
+
+def foreground_configured(worktree, routing):
+    """Read the pinned settings choice; only the hook can check its inherited process environment."""
+    if routing.get("version") != 2:
+        return False
+    settings = _settings_file(Path(worktree) / ".claude/settings.local.json") or {}
+    env = _mapping(settings.get("env"), "Local settings env")
+    return all(env.get(key) == value for key, value in FOREGROUND_ENV.items())
 
 
 def _compaction_policy(value):
@@ -498,7 +539,8 @@ def prepare(service, directory, state, worktree, prepared):
             _target(worktree, relative)  # symlinked or special parents are refused before git is consulted
             _require_ignored(worktree, relative)
         stage = "settings"
-        contradictions(settings["claude_config_dir"], worktree, os.environ)
+        contradictions(settings["claude_config_dir"], worktree, os.environ, foreground=True)
+        _foreground_project(service.client(state), state)
         compaction = compaction_policy(service)
         _compaction_sources(compaction, settings["claude_config_dir"], worktree, os.environ)
         _compaction_project(service.client(state), state, compaction)
@@ -532,7 +574,7 @@ def prepare(service, directory, state, worktree, prepared):
         settings_path, _ = _target(worktree, ".claude/settings.local.json")
         existing_bytes = owned_bytes(settings_path) if settings_path.exists() else None
         existing = json.loads(existing_bytes) if existing_bytes is not None else None
-        merged = settings_document(existing, command)
+        merged = settings_document(existing, command, foreground=True)
         # Only fresh preparations receive this default. The unchanged renderer is
         # also used to reproduce immutable historical routing-adoption bundles.
         merged.update(autoCompactEnabled=True, autoCompactWindow=compaction["window"])
@@ -604,7 +646,8 @@ def validate_local(prepared, state=None, directory=None):
             from ao_executable_binding import effective
             replacement = effective(directory, state, prepared)
         check_claude(replacement or routing.get("claude") or {})
-        contradictions(routing["claude_config_dir"], worktree)
+        foreground = foreground_configured(worktree, routing)
+        contradictions(routing["claude_config_dir"], worktree, os.environ if foreground else None, foreground=foreground)
         if "compaction" in routing:
             _compaction_sources(routing["compaction"], routing["claude_config_dir"], worktree, os.environ)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -634,6 +677,8 @@ def before_dispatch(service, directory, state, prepared, purpose):
     if routing is None:
         return routing
     try:
+        if foreground_configured(prepared["worktree"], routing):
+            _foreground_project(service.client(state), state)
         if "compaction" in routing:
             _compaction_project(service.client(state), state, routing["compaction"])
         if purpose not in ("implementation", "correction"):

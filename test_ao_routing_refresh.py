@@ -37,7 +37,8 @@ class RoutingRefreshTests(Fixture):
             return OLD_GUARD if path == guard_source else original_bytes(path)
 
         with patch.object(Path, 'read_bytes', historical), patch.object(ao_routing, 'agent_definition',
-                side_effect=lambda name: original_definition(name) + '\nSynthetic archived worker instructions.\n'):
+                side_effect=lambda name: original_definition(name) + '\nSynthetic archived worker instructions.\n'), \
+                patch.object(ao_routing, 'foreground_settings', side_effect=lambda settings: settings):
             self.bind()
         self.agree()
         self.prepared = ao_delegates.preparation(self.directory(), self.state())

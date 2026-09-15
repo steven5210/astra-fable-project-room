@@ -323,11 +323,12 @@ class RoutingAdoptionTests(AdoptionFixture):
         # An audit embeds several kinds of evidence; unlike launch inputs its
         # combined size may exceed the unchanged launcher's individual limit.
         evidence = {'derived': 'x' * (routing.LEGACY_LAUNCH_LIMIT + 1)}
-        with patch.object(routing, '_inspect', return_value=evidence):
+        with patch.object(routing, '_inspect', return_value=evidence), patch.object(routing, '_foreground_sources'):
             result = routing.audit(self.service, self.room)
         self.assertEqual(routing._audit(self.directory(), result['audit_sha256'])['evidence'], evidence)
         previous = list((self.directory() / routing.BASE / 'audits').iterdir())
-        with patch.object(routing, '_inspect', return_value=evidence), patch.object(routing, 'MAX_EVIDENCE', 1024):
+        with patch.object(routing, '_inspect', return_value=evidence), patch.object(routing, '_foreground_sources'), \
+                patch.object(routing, 'MAX_EVIDENCE', 1024):
             with self.assertRaisesRegex(ao.RoomError, 'no audit was written'):
                 routing.audit(self.service, self.room)
         self.assertEqual(list((self.directory() / routing.BASE / 'audits').iterdir()), previous)

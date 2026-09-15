@@ -473,21 +473,36 @@ class CompletionPatchTests(unittest.TestCase):
                     assert(f.settled.length === 0, "unbound notice authorized success"); await f.end();'''
                              .replace('EXTRA', json.dumps(extra)))
 
-    def test_new_mode_preserves_old_intent_and_all_original_bytes(self):
+    def test_unsupported_install_preserves_prior_precedence_intent_and_bytes(self):
         module = self.root / 'acp.js'; module.write_bytes(SYNTHETIC_MODULE)
         evidence = self.root / 'evidence'
         old = acp.apply(str(module), str(evidence), True)
-        intent = (evidence / 'patch-intent.json').read_bytes()
+        before = {p.name: p.read_bytes() for p in evidence.iterdir()}
         prior_target = module.read_bytes()
-        result = acp.apply(str(module), str(evidence), True, True)
-        self.assertEqual((evidence / 'patch-intent.json').read_bytes(), intent)
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'installation is disabled'):
+                acp.apply(str(module), str(evidence), True, True)
+            self.assertEqual(module.read_bytes(), prior_target)
+            self.assertEqual({p.name: p.read_bytes() for p in evidence.iterdir()}, before)
         self.assertEqual(Path(old['backup']).read_bytes(), SYNTHETIC_MODULE)
-        self.assertEqual(Path(result['backup']).read_bytes(), prior_target)
-        self.assertEqual(result['source_sha256'], self.precedence_hash)
-        self.assertEqual(acp.apply(str(module), str(evidence), True, True), result)
-        self.assertEqual(result['patch_kind'], 'async_completion_barrier_v1')
-        self.assertTrue(result['native_controller_reload_required'])
-        self.assertEqual(result['model_calls'], 0)
+
+    def test_unsupported_install_refuses_pristine_source_before_any_evidence_write(self):
+        module = self.root / 'acp.js'; module.write_bytes(SYNTHETIC_MODULE)
+        evidence = self.root / 'evidence'
+        with self.assertRaisesRegex(ValueError, 'installation is disabled'):
+            acp.apply(str(module), str(evidence), True, True)
+        self.assertEqual(module.read_bytes(), SYNTHETIC_MODULE)
+        self.assertFalse(evidence.exists())
+
+    def test_prior_experimental_receipt_cannot_bypass_disabled_installation(self):
+        module = self.root / 'acp.js'; module.write_bytes(acp.patched(SYNTHETIC_MODULE, True))
+        evidence = self.root / 'evidence'; evidence.mkdir()
+        (evidence / 'completion-patch-intent.json').write_text(json.dumps({
+            'module': str(module), 'target_sha256': hashlib.sha256(module.read_bytes()).hexdigest()}))
+        before = module.read_bytes(), (evidence / 'completion-patch-intent.json').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'installation is disabled'):
+            acp.apply(str(module), str(evidence), True, True)
+        self.assertEqual((module.read_bytes(), (evidence / 'completion-patch-intent.json').read_bytes()), before)
 
     def test_pristine_and_precedence_routes_produce_identical_target(self):
         self.assertEqual(acp.patched(SYNTHETIC_MODULE, True),
@@ -505,6 +520,6 @@ class CompletionPatchTests(unittest.TestCase):
         module.write_bytes(altered)
         with patch.object(acp, 'SOURCE_SHA256', hashlib.sha256(altered).hexdigest()):
             with self.assertRaisesRegex(ValueError, 'completion anchor'):
-                acp.apply(str(module), str(self.root / 'evidence'), True, True)
+                acp.patched(altered, True)
         self.assertEqual(module.read_bytes(), altered)
         self.assertFalse((self.root / 'evidence').exists())

@@ -37,7 +37,10 @@ account exhaustion from a generic or model-specific 429, and it cannot undo work
 already launched. Missing or unsafe supplied transcript evidence blocks new
 submissions. Older hook calls with no transcript metadata retain the historical
 guard with an explicit diagnostic; native quota enforcement is unverified there.
-Project Room's semantic hold separately controls any authorized continuation.
+Project Room's semantic hold separately controls any authorized continuation. The native scan is bounded to 8 MiB and 20,000 records.
+If that window cannot establish the current human-turn boundary, new submissions
+are denied with an evidence-incomplete diagnosis. This is not a quota assertion;
+the operator should inspect the evidence instead of retrying through another tier.
 
 For a retained v2 engineer, the CLI-only `ao_routing_refresh.py` operation installs
 the reviewed definitions and guard through an immutable routing journal. Supply
@@ -57,7 +60,11 @@ grant cannot be refreshed. A crash leaves ordinary routing blocked until the
 identical request reconciles unchanged evidence. While its intent is pending,
 specification, instruction and grant changes, and sync observation writes, are
 blocked before they can invalidate recovery. Saved status remains readable.
-Unknown file changes are never overwritten. Reload the retained controller separately and verify native identity
+Unknown file changes are never overwritten. Keep the native controller stopped and
+its owner/evidence unchanged from intent publication until the refresh completes.
+A restart or concurrent lifecycle change during that interval can invalidate the
+exact retry and requires operator diagnosis; do not remove or rewrite the journal
+to unblock it. Reload the retained controller separately and verify native identity
 and loaded settings before an independently authorized prompt. Neither refresh nor
 reload grants continuation, clears quota, or proves live enforcement or savings.
 
@@ -164,24 +171,40 @@ writes a private original-byte backup and immutable patch intent, and refuses an
 unknown/new upstream module. It is not run by installation, dispatch or an
 updater. No model, effort, output budget or provider is changed.
 
-The opt-in `--completion-barrier` additionally prevents a confirmed asynchronous
-worker's interim answer from completing its parent turn before Fable processes
-that worker's result. It accepts the exact reviewed original module or the exact
-earlier quota-precedence patch. A separate immutable intent and backup preserve
-both histories. The bridge binds a structured async launch to a user message with
-the SDK's typed `task-notification` origin, matching leading task/tool IDs, and
-that message's corresponding terminal result. A typed task-start event can
-corroborate the tool ID when the normal cache is unavailable. Neither an empty
-background task list nor a worker's terminal event alone proves Fable has finished.
-A clean stream end with unmatched work fails as `async_completion_unverified`;
-thrown transport or result-handler failures preserve their error instead of
-promoting an interim answer. A matched worker follow-up cannot settle a queued
-successor or assign the parent's usage to it. If a previously submitted successor
-reaches the SDK before ownership can be resolved, both requests fail as unverified;
-neither is treated as unsent or automatically replayed. An uncorrelated,
-non-autonomous result while the parent is held with confirmed barrier debt also fails
-before it can overwrite the parent's result or usage, even with no queued successor. This patch makes no model
-call, does not import historical late reports, and does not authorize replay.
+The experimental completion barrier remains available as an offline transform for
+compatibility probes, but **installation with `--completion-barrier` is disabled**.
+Inspection of Claude Code 2.1.268 and source-derived consumer probes showed that a
+standalone task notification can omit both its SDK replay and result UUID. A
+notification injected during another turn can instead share that turn's primary
+result UUID. The proposed exact notification/result match therefore cannot finish
+these real paths. Widening the XML parser does not repair missing identity; a
+worker-terminal event or empty task list does not prove Fable processed the result.
+The rejected experiment and its tests remain inspectable without modifying a
+runtime, accepting an old completion, or rewriting any prior patch receipt.
+
+New preparations and the audited routing refresh set
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in ignored local settings, using
+[Claude's documented foreground option](https://code.claude.com/docs/en/subagents#run-subagents-in-foreground-or-background). The new guard
+requires that setting in its inherited environment before a native Agent launch
+and refuses an explicit background request. The pinned local Sonnet/Opus workers
+still execute delegated work with their own contexts and MAX settings; Fable waits
+for their result before continuing. The existing isolation, fork, team and nested
+worker restrictions remain intact. DeepSeek's external submit/status/result jobs
+are unchanged. The reviewed native version also disables automatic migration of
+long foreground workers; this is not a new task timeout or model budget.
+
+Keep the existing precedence-only ACP workaround. A stopped, positively quiescent
+retained controller must reload the audited settings and guard before new work;
+no daemon restart or experimental runtime switch is needed. Historical preparation
+and routing-policy records remain unchanged, and the refresh journal binds the
+new settings bytes. Old flagless configurations remain readable but are not
+relabelled as foreground-protected. A pending historical adoption still requires
+its exact recorded guard/wrapper payload for reconciliation; preserve the pinned
+controller version for that operation, then perform the reviewed refresh. A new
+installed guard must not be substituted into the old audit. The guard refuses new native submissions if
+the required flag did not actually reach it. Validate the selected Claude version
+against this behavior when upgrading; the environment setting alone does not
+prove that every historical or future version enforces it correctly.
 
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
 
@@ -198,14 +221,12 @@ bytes as a pristine vendor installation.
 Offline tests cover quota precedence, stale and ambiguous evidence, exact-once
 continuation, restart persistence, immutable failures, schema projection and
 one-time instruction delivery. They use fake AO and synthetic native evidence.
-The completion barrier also has offline probes of the exact reviewed vendor
-consumer. Those reproduce the early-completion and queued-successor races and
-check ordinary results, typed errors, cancellation and usage accounting.
-Notifications that do not request a query and unsupported or unbound identities
-cannot prove completion. The SDK does not declare a correlation UUID on its error
-result type; an autonomous error without that identity remains unverified.
-Native wire correlation still needs validation
-during useful authorized work; a missing correlation must hold rather than guess.
+The experimental completion barrier has offline probes of the exact reviewed
+vendor consumer, including source-derived missing-UUID paths. These demonstrate
+why the transform cannot be installed, rather than certify native asynchronous
+completion. Foreground delegation avoids that detached notification path. Its
+actual useful work, quality and parent result handling still need live observation;
+static source and synthetic tests are not a subscription-savings measurement.
 Useful live work after an authorized resume must still demonstrate actual
 quality, delegation and token savings. Retain MAX and existing delegate budgets.
 The 250K native compaction default controls context growth; it does not cap a

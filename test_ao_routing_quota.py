@@ -20,6 +20,8 @@ import ao_routing_guard as guard
 
 class NativeQuotaGuardTests(unittest.TestCase):
     def setUp(self):
+        foreground = mock.patch.dict(os.environ, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"})
+        foreground.start(); self.addCleanup(foreground.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()

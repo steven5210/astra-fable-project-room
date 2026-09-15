@@ -3,9 +3,11 @@
 Never run automatically during plugin installation or model dispatch. The caller
 supplies a verified idle runtime module and a private backup/receipt directory.
 Unknown/new upstream bytes refuse; updates require a fresh compatibility review.
-The optional completion barrier requires exact async launch/notification/result
-correlation; missing evidence holds the turn until cancellation or an audited
-failure. It neither imports a late report nor repairs an old completion receipt.
+The experimental completion transform is retained for offline compatibility
+probes only. Installation is disabled: the inspected Claude 2.1.268 runtime can
+omit a standalone notification's replay and result UUID, or attribute a mid-turn
+notification to its primary input. Such turns cannot satisfy the barrier.
+Use reviewed foreground native delegation, preserving the precedence-only patch.
 """
 import argparse
 import hashlib
@@ -195,6 +197,10 @@ def patched(raw, completion_barrier=False):
 
 
 def apply(module_path, evidence_directory, confirmed_idle, completion_barrier=False):
+    if completion_barrier:
+        raise ValueError('Completion barrier installation is disabled: the inspected native notification protocol '
+                         'does not supply the required result correlation. Keep foreground native delegation; '
+                         'patched(..., completion_barrier=True) is for offline compatibility probes only')
     if confirmed_idle is not True:
         raise ValueError('The operator must establish that the target runtime is idle before patching')
     path = Path(module_path)
@@ -267,7 +273,7 @@ if __name__ == '__main__':
     parser.add_argument('--evidence-directory', required=True)
     parser.add_argument('--confirmed-idle', action='store_true')
     parser.add_argument('--completion-barrier', action='store_true',
-                        help='Also prevent completion before owned async notification results; use a new immutable intent')
+                        help='Unavailable: retained only to reject unsafe completion-barrier installation explicitly')
     args = parser.parse_args()
     print(json.dumps(apply(args.module, args.evidence_directory, args.confirmed_idle,
                            args.completion_barrier), indent=2))

@@ -226,7 +226,8 @@ def _build(service, prepared, source):
     target['guard_sha256'] = ao.digest(guard.encode())
     target['guard_path'] = str(service.root / 'launchers' / (target['guard_sha256'] + '.py'))
     target['hook_command'] = ao_routing.hook_command(target['python'], target['guard_path'])
-    settings = json.loads(source_bundle['files']['.claude/settings.local.json'])
+    original_settings = json.loads(source_bundle['files']['.claude/settings.local.json'])
+    settings = ao_routing.foreground_settings(copy.deepcopy(original_settings))
     entry = {'matcher': source['matcher'], 'hooks': [{'type': 'command', 'command': source['hook_command'], 'timeout': 30}]}
     hooks = settings['hooks']['PreToolUse']
     if hooks.count(entry) != 1:
@@ -234,7 +235,7 @@ def _build(service, prepared, source):
     settings['hooks']['PreToolUse'] = [
         {'matcher': target['matcher'], 'hooks': [{'type': 'command', 'command': target['hook_command'], 'timeout': 30}]}
         if item == entry else item for item in hooks]
-    files = {'.claude/settings.local.json': (_json(settings).decode() if source['hook_command'] != target['hook_command']
+    files = {'.claude/settings.local.json': (_json(settings).decode() if settings != original_settings
              else source_bundle['files']['.claude/settings.local.json'])}
     files.update({'.claude/agents/' + name + '.md': ao_routing.agent_definition(name) for name in ao_routing.MODELS})
     target['files'] = {relative: ao.digest(text.encode()) for relative, text in files.items()}
@@ -422,6 +423,17 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                 raise RoomError('Pending routing refresh changed pinned policy or target identity')
             if ao.digest(owned_bytes(source['guard_path'])) != source['guard_sha256']:
                 raise RoomError('Original routing guard changed during refresh')
+        # Infer the new mode only from the immutable target settings; old pending
+        # records remain reproducible and an exact retry never acquires defaults.
+        target_env = json.loads(target_bundle['files']['.claude/settings.local.json']).get('env', {})
+        foreground = all(target_env.get(key) == value for key, value in ao_routing.FOREGROUND_ENV.items())
+
+        def check_foreground():
+            if foreground:
+                ao_routing.contradictions(source['claude_config_dir'], Path(prepared['worktree']), os.environ, foreground=True)
+                ao_routing._foreground_project(service.client(state), state)
+
+        check_foreground()
         evidence, observed_snapshot = _inspect(service, directory, state, inputs, prepared, source)
         record = existing or {'version': 1, 'room_id': room_id, 'inputs': inputs, 'recorded_at': time.time(),
             'before_state_sha256': ao.digest(state), 'engineer': state['bindings']['engineer'],
@@ -450,6 +462,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
         _place_guard(Path(target['guard_path']), target_bundle['guard'].encode())
         for name in ao_routing.FILES:
             _replace_runtime(Path(prepared['worktree']), name, source_bundle['files'][name].encode(), target_bundle['files'][name].encode())
+        check_foreground()
         if _inspect(service, directory, state, inputs, prepared, source)[0] != record['evidence']:
             raise RoomError('Routing refresh evidence changed before commit; leave the exact intent pending')
         effective(directory, proposed, prepared)

@@ -238,7 +238,17 @@ def decide(event):
         extra = sorted(str(key) for key in params if key not in AGENT_KEYS)
         if extra:
             return "Agent parameters " + ", ".join(extra) + " are refused (no model override, isolation, resume or team routing)"
-        return _quota_denial(event)
+        quota = _quota_denial(event)
+        if quota is not None:
+            return quota
+        if params.get("run_in_background") is True:
+            return "native agents must finish in the foreground; run_in_background=true is refused"
+        if "run_in_background" in params and params["run_in_background"] is not False:
+            return "run_in_background must be omitted or exactly false for foreground native delegation"
+        if os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") != "1":
+            return ("foreground native delegation requires inherited CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1; "
+                    "the current native process has not proven that setting")
+        return None
     if tool in DENIED_TOOLS or tool.startswith("Team"):
         return tool + " routes (workflows, teams, continuation or messaging) are not authorized in this bounded routing configuration"
     if tool == "Skill":
