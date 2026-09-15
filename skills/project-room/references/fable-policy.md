@@ -23,7 +23,10 @@ Do not impose arbitrary source-line or Write-call counts to control token use, o
 rewrite correct readable code just to meet them. Preserve explicit product and
 format constraints. Use operator collection for routine inventories and gates when
 no model judgment is needed. Keep complete metadata and logs in an authorized
-artifact, returning concise counts, relative paths, digests, failures and limitations.
+artifact outside the candidate worktree or in an already ignored path, returning
+concise counts, relative paths, digests, failures and limitations. Do not change ignore
+rules or add candidate files merely for operational logs; explicitly requested
+deliverables keep their authorized product paths.
 Avoid raw recursive listings and repeated absolute path prefixes by default.
 Read-only work does not acquire write permission; use existing evidence or ask the
 operator to collect it. Full evidence remains available for necessary review.

@@ -101,7 +101,10 @@ Let qualified delegates author supporting implementations and scripts from compl
 requirements; do not first dictate their source merely to delegate typing. Fable
 retains necessary judgment and checks the actual evidence. Bound work by functional
 units and verification, never arbitrary source-line or Write-call counts. Preserve
-complete inventories/logs in authorized artifacts and return concise relative-path
+complete inventories/logs in authorized artifacts outside the candidate worktree
+or in an already ignored path, without changing ignore rules or adding operational
+files to the candidate. Explicit deliverables retain their authorized product paths.
+Return concise relative-path
 summaries. Read-only tasks remain read-only. Explicit account/session quota failures
 stop further submissions in that native turn; they are not capability misses and do
 not authorize another model, provider or automatic retry to evade the same limit.

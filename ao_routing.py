@@ -109,7 +109,10 @@ def agent_definition(name):
             "Use complete functional units and verification requirements to bound work. Do not rewrite readable, "
             "correct source to satisfy an arbitrary source-line or Write-call count. Preserve explicit product and "
             "format requirements. For inventories and logs, keep complete metadata in an authorized artifact and "
-            "return counts, relative paths, digests, material findings and limitations. Do not repeat raw directory "
+            "place operational evidence outside the candidate worktree or in an already ignored path; do not "
+            "change ignore rules or add candidate files merely to store logs. Explicitly requested deliverables "
+            "still belong in their authorized product paths. "
+            "Return counts, relative paths, digests, material findings and limitations. Do not repeat raw directory "
             "listings, file contents or long absolute path prefixes by default. A read-only assignment never grants "
             "artifact-write permission: use an existing artifact or ask the operator to collect it. Report missing "
             "evidence honestly; concise reporting never replaces Fable's necessary independent inspection.\n")

@@ -19,6 +19,11 @@ Fable keeps MAX, necessary engineering judgment and final review. Pinned provide
 budgets, exact-spec review restrictions, data restrictions and semantic holds stay
 in force. Installing the update does not wake a paused session or grant a retry.
 Historical request bytes and earlier delivered contracts remain unchanged.
+Pinned historical policy files also remain unchanged; the new amendment is the
+delivery mechanism for this update in retained sessions. Store operational logs
+and inventories outside the candidate worktree or in an already ignored path.
+Do not change ignore rules or add candidate files merely to store operational
+evidence. Explicitly requested deliverables retain their authorized product paths.
 
 New preparations include the updated Sonnet definition and quota-aware routing
 guard. Existing preparations retain their pinned files; an instruction amendment

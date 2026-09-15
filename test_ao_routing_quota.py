@@ -76,6 +76,18 @@ class NativeQuotaGuardTests(unittest.TestCase):
     def inspect(self, **fields):
         return guard.inspect_quota(self.event(**fields))
 
+    def ambiguous_error_identities(self, error):
+        rows = []
+        for cwd in (None, str(self.root), str(self.worktree).upper(), str(self.worktree) + "/.",
+                    str(self.root) + "//worktree"):
+            row = copy.deepcopy(error); row["cwd"] = cwd; rows.append(row)
+        for model in (None, "<Synthetic>", "claude-fable-test"):
+            row = copy.deepcopy(error); row["message"]["model"] = model; rows.append(row)
+        row = copy.deepcopy(error); row.pop("cwd"); rows.append(row)
+        row = copy.deepcopy(error); row["message"].pop("model"); rows.append(row)
+        row = copy.deepcopy(error); row.pop("cwd"); row["message"].pop("model"); rows.append(row)
+        return rows
+
     def test_recorded_sonnet_failure_root_quota_then_opus_sequence(self):
         launch = self.record("assistant", "sonnet-launch", [{"type": "tool_use", "name": "Agent",
             "id": "sonnet-task", "input": {"subagent_type": "pr-sonnet"}}])
@@ -125,13 +137,11 @@ class NativeQuotaGuardTests(unittest.TestCase):
     def test_quoted_or_untyped_text_never_establishes_quota(self):
         quote = "You've hit your session limit · resets 7:50pm (America/Los_Angeles)"
         untyped = self.error(isApiErrorMessage=False)
-        ordinary = self.error()
-        ordinary["message"]["model"] = "claude-fable-test"
         wrong_role = self.error()
         wrong_role["message"]["role"] = "user"
         other_error = self.error(error="max_output_tokens")
         nested = self.record("assistant", "nested", [{"type": "text", "text": json.dumps(self.error())}])
-        for record in (self.tool_result(), untyped, ordinary, wrong_role, other_error, nested):
+        for record in (self.tool_result(), untyped, wrong_role, other_error, nested):
             self.write([self.caller(text=quote), record])
             self.assertEqual(self.inspect()["status"], "clear_current_turn")
         error = self.error()
@@ -141,20 +151,54 @@ class NativeQuotaGuardTests(unittest.TestCase):
             self.write([self.caller(), error])
             self.assertIsNone(guard.decide(self.event()))
 
-    def test_only_exact_session_and_worktree_root_errors_count(self):
+    def test_only_exact_session_root_errors_count(self):
         foreign = [{"sessionId": "00000000-0000-4000-8000-000000000002"},
-                   {"cwd": str(self.root)}, {"cwd": None}, {"isSidechain": True},
+                   {"sessionId": None}, {"sessionId": "urn:uuid:" + self.session}, {"isSidechain": True},
                    {"isSidechain": "false"}, {"agentId": "child"}, {"agent_id": "child"}]
         for fields in foreign:
-            self.write([self.caller(), self.error(**fields)])
-            self.assertEqual(self.inspect()["status"], "clear_current_turn")
+            for error in (self.error(**fields), *self.ambiguous_error_identities(self.error(**fields))):
+                self.write([self.caller(), error])
+                self.assertEqual(self.inspect()["status"], "clear_current_turn")
+
+    def test_positive_account_evidence_with_ambiguous_cwd_or_model_blocks_unverified(self):
+        errors = [self.error(quotaLimits={"status": "rejected", "rateLimitType": window})
+                  for window in ("five_hour", "seven_day")]
+        for error in errors:
+            error["message"]["content"] = "Typed account rejection without fallback wording."
+        fallback = self.error(); fallback.pop("quotaLimits"); errors.append(fallback)
+        for account in errors:
+            for error in self.ambiguous_error_identities(account):
+                with self.subTest(quota=error.get("quotaLimits"), cwd=error.get("cwd"), model=error["message"].get("model")):
+                    self.write([self.caller(), error])
+                    with self.assertRaisesRegex(ValueError, "account quota evidence has unverified"):
+                        self.inspect()
+                    for tool in guard.NEW_WORK_TOOLS:
+                        with self.assertRaisesRegex(ValueError, "account quota evidence has unverified"):
+                            guard.decide(self.event(tool))
+
+    def test_ambiguous_identity_does_not_promote_generic_or_per_model_limits(self):
+        generic = self.error(); generic.pop("quotaLimits")
+        generic["message"]["content"] = "429 rate_limit: Sonnet requests per minute exceeded"
+        untyped = self.error(isApiErrorMessage=False)
+        errors = [generic, untyped, self.error(quotaLimits={"status": "allowed", "rateLimitType": "five_hour"})]
+        for window in ("seven_day_opus", "seven_day_sonnet", "requests_per_minute", "unknown_window"):
+            errors.append(self.error(quotaLimits={"status": "rejected", "rateLimitType": window}))
+        for quota in ({}, []):
+            errors.append(self.error(quotaLimits=quota))
+        for other in errors:
+            for error in self.ambiguous_error_identities(other):
+                with self.subTest(quota=error.get("quotaLimits"), cwd=error.get("cwd"), model=error["message"].get("model")):
+                    self.write([self.caller(), error])
+                    self.assertEqual(self.inspect()["status"], "clear_current_turn")
+                    self.assertIsNone(guard.decide(self.event()))
 
     def test_new_true_human_continuation_has_a_new_window_without_mutating_history(self):
-        self.write([self.caller(), self.error(), self.caller("caller-two", "Continue once after the authorized reset.")])
-        original = self.transcript.read_bytes()
-        self.assertEqual(self.inspect(), {"status": "clear_current_turn", "caller_uuid": "caller-two", "error_uuids": []})
-        self.assertIsNone(guard.decide(self.event()))
-        self.assertEqual(self.transcript.read_bytes(), original)
+        for error in (self.error(), *self.ambiguous_error_identities(self.error())):
+            self.write([self.caller(), error, self.caller("caller-two", "Continue once after the authorized reset.")])
+            original = self.transcript.read_bytes()
+            self.assertEqual(self.inspect(), {"status": "clear_current_turn", "caller_uuid": "caller-two", "error_uuids": []})
+            self.assertIsNone(guard.decide(self.event()))
+            self.assertEqual(self.transcript.read_bytes(), original)
 
     def test_summaries_tool_results_meta_and_nonhuman_text_do_not_clear_quota(self):
         fake_callers = [self.caller("summary", isCompactSummary=True),
@@ -365,6 +409,14 @@ class NativeQuotaGuardTests(unittest.TestCase):
         decision = json.loads(denied.stdout)["hookSpecificOutput"]
         self.assertEqual((decision["hookEventName"], decision["permissionDecision"]), ("PreToolUse", "deny"))
         self.assertNotIn("PRIVATE_SYNTHETIC_CALLER", denied.stdout + denied.stderr)
+        self.write([self.caller(text="PRIVATE_SYNTHETIC_CALLER"), self.error(cwd=None)])
+        for tool in guard.NEW_WORK_TOOLS:
+            unverified = run(self.event(tool))
+            self.assertEqual((unverified.returncode, unverified.stdout), (2, ""))
+            self.assertIn("account quota evidence has unverified", unverified.stderr)
+            self.assertNotIn("PRIVATE_SYNTHETIC_CALLER", unverified.stderr)
+        inspected = run(self.event("mcp__deepseek__deepseek_result"))
+        self.assertEqual((inspected.returncode, inspected.stdout, inspected.stderr), (0, "", ""))
         self.transcript.unlink()
         missing = run(self.event())
         self.assertEqual((missing.returncode, missing.stdout), (2, ""))

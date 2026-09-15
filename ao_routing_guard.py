@@ -104,8 +104,8 @@ def _transcript_tail(path):
         os.close(directory)
 
 
-def _root_record(row, session_id, cwd):
-    return (row.get("sessionId") == session_id and row.get("cwd") == cwd
+def _root_session_record(row, session_id):
+    return (row.get("sessionId") == session_id
             and row.get("isSidechain") in (None, False) and row.get("agentId") is None
             and row.get("agent_id") is None)
 
@@ -130,11 +130,11 @@ def _human_caller(row):
 
 
 def _account_quota_error(row):
-    """Only native typed API failures can establish quota; tool/result text cannot."""
+    """Account evidence in a typed API failure; cwd/model identity is checked separately."""
     message = row.get("message")
     if (row.get("type") != "assistant" or row.get("isApiErrorMessage") is not True
             or row.get("error") != "rate_limit" or not isinstance(message, dict)
-            or message.get("role") != "assistant" or message.get("model") != "<synthetic>"):
+            or message.get("role") != "assistant"):
         return False
     quota = row.get("quotaLimits")
     if quota is not None:
@@ -174,14 +174,19 @@ def inspect_quota(event):
         row = json.loads(line)
         if not isinstance(row, dict):
             raise ValueError("native quota transcript record is malformed")
-        if not _root_record(row, session_id, cwd):
+        if not _root_session_record(row, session_id):
             continue
-        if _human_caller(row):
+        if row.get("cwd") == cwd and _human_caller(row):
             if not isinstance(row.get("uuid"), str) or not row["uuid"]:
                 raise ValueError("native quota caller lacks its identity")
             return {"status": "quota_in_current_turn" if errors else "clear_current_turn",
                     "caller_uuid": row["uuid"], "error_uuids": list(reversed(errors))}
         if _account_quota_error(row):
+            # Positive account evidence in this exact root session must not be
+            # silently cleared because a native identity field changed or is
+            # missing. Preserve the ambiguity; do not normalize or guess it.
+            if row.get("cwd") != cwd or row["message"].get("model") != "<synthetic>":
+                raise ValueError("native account quota evidence has unverified cwd or model identity")
             if not isinstance(row.get("uuid"), str) or not row["uuid"]:
                 raise ValueError("native quota error lacks its identity")
             errors.append(row["uuid"])

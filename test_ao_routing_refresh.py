@@ -612,6 +612,34 @@ class AcceptedFourthReviewRefreshTests(ReviewExtensionFixture):
         self.assertEqual(self.service.ao_room_status(self.room)['agreement']['request_id'], 'fourth-charter')
         ao_delegates.validate_preparation(self.directory(), self.state())
 
+    def test_refresh_before_grant_belongs_to_its_baseline_and_does_not_deadlock_fourth_review(self):
+        import ao_review_extension
+        self.assertNotIn('spec_review_extension', self.state())
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        result = refresh.refresh(self.service, self.room, 'before-fourth-grant', str(self.database),
+            'synthetic-native-owner', 'User authorizes this existing routing update.',
+            'Refresh before any fourth-review grant exists.')
+        pointer = self.state()['routing_refresh']
+        journal = self.directory() / result['path']; original = journal.read_bytes()
+        self.assertIsNone(refresh._read(self.directory(), pointer)['evidence']['review_extension'])
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        self.grant()
+        _, evidence = ao_review_extension.validate(self.service, self.state())
+        # _retained stops at this exact baseline pointer. A pre-grant refresh is
+        # never mistaken for a later change that needs consumed-grant proof.
+        self.assertEqual(evidence['state']['routing_refresh'], pointer)
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+        self.send('spec_review', 'fourth-after-refresh')
+        self.finish_fourth()
+        self.assertIsNotNone(ao_review_extension.validate(self.service, self.state()))
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_review_extension']['remaining_spec_reviews'], 0)
+        self.assertEqual(status['agreement']['request_id'], 'fourth-after-refresh')
+        self.assertEqual(journal.read_bytes(), original)
+        with self.assertRaises(ao.RoomError):
+            self.send('spec_review', 'fifth-after-refresh')
+
     def test_completed_accepted_fourth_review_can_refresh_without_new_allowance(self):
         self.accepted_fourth()
         self.refresh()
