@@ -330,11 +330,13 @@ def _place_guard(path, raw):
     if path.exists() or path.is_symlink():
         if owned_bytes(path) != raw:
             raise RoomError('Current content-addressed routing guard is corrupted')
+        _sync_directory(path.parent.parent)  # A preceding mkdir may still owe its parent-directory barrier.
         _sync_directory(path.parent)  # An earlier link may have succeeded before its directory sync failed.
         return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if any(parent.is_symlink() for parent in (path.parent, *path.parent.parents)):
         raise RoomError('Routing guard directory traverses a symlink')
+    _sync_directory(path.parent.parent)  # Persist the launcher directory entry before publishing a guard within it.
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.pending-routing-guard-')
     try:
         with os.fdopen(fd, 'wb') as stream:
