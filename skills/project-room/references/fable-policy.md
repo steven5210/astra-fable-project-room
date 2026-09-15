@@ -12,6 +12,25 @@ For an existing AO engineer session, author a routine continuation as only `Cont
 
 ## Context handling
 
+Supporting implementation includes authoring from requirements. A qualified Sonnet
+worker may choose routine local implementation details within the agreed interfaces;
+Fable need not supply a complete script for it to type. Escalate missing requirements,
+conflicting evidence and cross-module judgment. Preserve an actual exact-copy task
+when required. Fable's engineering specifications and final judgment remain its own.
+
+Bound worker tasks by complete functional units and their verification requirements.
+Do not impose arbitrary source-line or Write-call counts to control token use, or
+rewrite correct readable code just to meet them. Preserve explicit product and
+format constraints. Use operator collection for routine inventories and gates when
+no model judgment is needed. Keep complete metadata and logs in an authorized
+artifact outside the candidate worktree or in an already ignored path, returning
+concise counts, relative paths, digests, failures and limitations. Do not change ignore
+rules or add candidate files merely for operational logs; explicitly requested
+deliverables keep their authorized product paths.
+Avoid raw recursive listings and repeated absolute path prefixes by default.
+Read-only work does not acquire write permission; use existing evidence or ask the
+operator to collect it. Full evidence remains available for necessary review.
+
 Personal review means Fable owns the judgment and verdict. Do not expand it into personal authorship of all supporting documents or a ban on supporting delegation unless the user explicitly requires that. During authorized implementation, delegate document assembly and evidence indexing when suitable; Fable inspects the evidence required for its own review. Avoid repeating settled reasoning without new evidence or an identified gap. Keep historical accounting with the operator and current findings in the report. Follow the [compact report and continuation contract](../../../docs/efficient-continuation.md); it preserves MAX, quality, exact identities and independent acceptance.
 
 In authorized implementation, delegate detailed investigation, implementation and test drafting before recreating them in Fable's context. Fable provides the requirements, verified anchors, interfaces, acceptance criteria and unresolved decisions a suitable delegate needs; it need not reproduce the delegate's implementation work in its own context. Reuse a complete saved task packet only when the receiving worker's permitted read succeeds and its complete bytes match the recorded digest. A path, file-existence check or requested permission is not proof of readable context. Do not change permission settings merely to make the reference work. DeepSeek's `context_path` remains restricted to the verified worktree, so a path outside that boundary is not a valid substitute for supplying its input.
@@ -34,13 +53,21 @@ Astra files or links an enhancement issue in the feature project's GitHub reposi
 | --- | --- |
 | DeepSeek (DeepSeek rooms only) | Self-contained implementation, tests, and reviews against verifiable specs, plus bounded module design, debugging, or review when its demonstrated quality warrants it. First choice whenever it qualifies. Text output only, with no agentic file access. |
 | Qwen (legacy Qwen rooms only) | Specified implementation, tests, and reviews against verifiable specs with cheap gates; bulk summarization. First choice whenever it qualifies. Text output only, with no agentic file access. |
-| Sonnet subagent | Mechanical application of payloads/diffs, file operations, gates, and work beyond the room's first-tier delegate that is not judgment-heavy. Can run while the delegate is busy when the session supports it. In a prepared AO room this is only the pinned `pr-sonnet` native agent (`claude-sonnet-5`, effort max, no skills or delegation). |
+| Sonnet subagent | Bounded implementation, supporting scripts and tests from complete requirements; mechanical application of supplied payloads, file operations and gates. Makes routine local choices within verified interfaces and escalates unresolved requirements or cross-module design. Can run while the first-tier delegate is busy. In a prepared AO room this is only the pinned `pr-sonnet` native agent (`claude-sonnet-5`, effort max, no skills or delegation). |
 | Opus subagent | Bounded module design/debugging and deep review assistance that does not require Fable's cross-cutting judgment. In a prepared AO room this is only the pinned `pr-opus` native agent (`claude-opus-5`, effort max); its only permitted skill is the pinned browser skill when the AO browser capability is present. |
 | Fable | Cross-cutting design, specification, adjudication and final engineering review. Direct execution only as a justified exception when available delegates cannot meet the quality or capability requirement; record the reason. |
 
 A room offers DeepSeek or Qwen, never both. When subagents are unavailable, the ladder is the room's first-tier delegate (if any) and Fable. Do not claim unavailable delegates were used. Record the tier, reason, outcome, fixes needed, and escalation evidence for each routed subtask. In an AO room whose status reports native routing (`delegate.routing.status` other than `not_configured`), built-in agent types, forks, model overrides, workflows, teams, messaging routes and autonomous review skills are not authorized, and the guard denies them; in an AO room reported `not_configured`, or whenever the packet says routing is not configured, do not launch native subagents, workflows or review skills at all. Legacy rooms keep their recorded policies unchanged.
 
 Diagnose a failure before escalating. Repair spec/context gaps and retry the same tier only after the prior delivery is known and the room's recovery rules permit it. Escalate a demonstrated capability miss to the tier indicated by the evidence, skipping tiers when appropriate. Carry the spec and failure evidence forward. After two failed tiers on one subtask, Fable takes it over within the task's authorization and available capabilities. Quota, unavailable tools and uncertain delivery remain operational constraints; this ladder does not authorize retry loops or recovery bypasses. If the user requests a delegation Fable judges unsuitable, explain why and let the user decide.
+
+An explicit account/session quota failure stops new model/delegate submissions in
+that failed native turn. Do not try Opus after Sonnet, or change providers, merely
+to evade the same quota. Preserve the failure and use the existing audited
+continuation process only with actual authorization. A generic transient or
+model-specific rate limit needs its own diagnosis; neither the status code alone
+nor quoted source text establishes an account quota. Reading existing results and
+collecting local evidence remain available without a new inference request.
 
 ## Fixed DeepSeek operating parameters
 

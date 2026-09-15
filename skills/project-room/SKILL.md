@@ -13,6 +13,14 @@ Apply [Fable's quality-first delegation policy](references/fable-policy.md) when
 
 A request for Fable's personal review does not implicitly require personal authorship of every supporting document or prohibit supporting delegation. Preserve the actual user restriction narrowly. Apply [efficient reports and diagnosed continuation](../../docs/efficient-continuation.md): current findings and judgments belong in Fable's report; historical accounting and verified identity fields can be assembled locally. A completed AO transport is not permission to retry a quota, truncated or unknown result. Inspect the shared semantic hold; an authorized continuation preserves the native session and failed evidence. Stage actual operating changes without waking paused work.
 
+Have qualified delegates author supporting scripts, implementations and tests from
+requirements; do not have Fable write complete source just to delegate typing.
+Bound work by functional units and verification, without arbitrary source-line or
+Write-call counts. Keep routine inventory collection with the operator and return
+concise summaries backed by complete authorized artifacts. An explicit native
+account/session quota stops new submissions in that failed turn; it does not justify
+trying a different tier. Preserve MAX, data restrictions and actual recovery authority.
+
 Existing legacy rooms retain their recorded backend, authorization, pending jobs and exact review requirements. Never import or replay unfinished legacy work into AO to bypass a pause, uncertainty or exhausted review budget. If the user has not selected AO, keep the existing legacy workflow below. Backend adoption does not authorize new product scope or publication.
 
 New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable retains read-only inspection, planning, pinned DeepSeek tools and pinned native delegation; root shell commands, edits, tests, browser actions and other execution tools are denied. The assigned operator or native worker runs probes and gates, including checks Fable requests for its verdict. Fable does not duplicate work assigned to Astra. A capability gap is reported for resolution, never worked around through another tool. This keeps necessary Fable judgment and final review while requiring execution to remain delegated; it does not change MAX or delegate budgets. Older preparations retain their original guard and report `historical_unrestricted_root` instead of claiming this protection.

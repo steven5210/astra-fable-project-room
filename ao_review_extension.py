@@ -269,6 +269,34 @@ def _retained(directory, state, evidence):
             record = ao_executable_binding._read(directory, pointer)
             _same_owner(record['evidence']['native_owner'], evidence)
             pointer = record['previous']
+    if (state.get('routing_refresh') or baseline.get('routing_refresh')
+            or list((directory / 'routing-refresh').glob('*.json'))):
+        import ao_routing_refresh
+        prepared = _read(directory / state['preparation'])
+        # Routing validation separately blocks every unclaimed intent and mixed
+        # runtime file. Here only committed ancestry is inspected, allowing the
+        # exact interrupted refresh to validate its unchanged review evidence.
+        ao_routing_refresh._chain(directory, state, prepared, check_unclaimed=False)
+        pointer = state.get('routing_refresh')
+        consumed = _consumption(directory, state, state['spec_review_extension'])
+        while pointer != baseline.get('routing_refresh'):
+            if pointer is None:
+                raise RoomError('Review-extension original routing refresh is missing from its journal')
+            record = ao_routing_refresh._read(directory, pointer)
+            _same_owner(record['evidence']['native_owner'], evidence)
+            proof = record['evidence'].get('review_extension')
+            if consumed is None or not isinstance(proof, dict):
+                raise RoomError('Routing refresh lacks its consumed fourth-review compatibility evidence')
+            request = state['requests'][consumed['request_id']]
+            agreement = proof.get('agreement') or {}
+            if (proof.get('grant_receipt_sha256') != state['spec_review_extension']['receipt_sha256']
+                    or proof.get('consumed_by') != consumed['request_id']
+                    or proof.get('consumption_sha256') != request['review_extension_consumption_sha256']
+                    or agreement.get('agreed') is not True
+                    or agreement.get('request_id') != consumed['request_id']
+                    or agreement.get('receipt_sha256') != request['receipt_sha256']):
+                raise RoomError('Routing refresh changed the retained fourth-review agreement')
+            pointer = record['previous']
     for key in ('acceptances', 'verifications'):
         if state[key][:len(baseline[key])] != baseline[key]:
             raise RoomError('Review-extension retained acceptance or verification history changed')
@@ -325,8 +353,20 @@ def _anchor(directory, state):
     return evidence
 
 
-def guard_native_owner(service, state, owner):
+def guard_native_owner(service, state, owner, role='engineer'):
     """A source-path audit or executable repair may retain, never replace, this owner."""
+    if role == 'reviewer':
+        binding = state.get('bindings', {}).get('reviewer', {})
+        if (state.get('workflow') != 'astra_led' or state.get('spec_review_extension')
+                or binding.get('reasoning_effort') != 'max'
+                or binding.get('harness') != 'claude-code' or owner.get('id') != binding.get('session_id')
+                or owner.get('project_id') != state.get('ao_project_id')
+                or owner.get('ao_conversation_id') != binding.get('conversation_id')
+                or owner.get('active_branch_id') != binding.get('branch_id')):
+            raise RoomError('Reviewer source audit requires its exact Astra-led native owner at MAX without an engineer review grant')
+        return
+    if role != 'engineer':
+        raise RoomError('Native owner guard requires an exact engineer or reviewer role')
     if state.get('spec_review_extension'):
         _same_owner(owner, _anchor(service.root / 'rooms' / state['room_id'], state))
 
@@ -335,6 +375,34 @@ def guard_replacement(state, operation):
     if state.get('spec_review_extension'):
         raise RoomError('The committed fourth-review grant pins provider and routing identity; ' + operation
                         + ' is unsupported after that grant. No transition intent was written')
+
+
+def guard_routing_refresh(service, state, owner):
+    """A consumed, accepted fourth review may retain its owner through a routing refresh.
+
+    This is not a provider/preparation replacement or a new review allowance.
+    The refresh journal separately proves which ignored configuration bytes changed.
+    """
+    directory = service.root / 'rooms' / state['room_id']
+    guard_pending_receipts(directory, state)
+    committed = validate(service, state)
+    if committed is None:
+        return None
+    _, evidence = committed
+    _same_owner(owner, evidence)
+    consumed = _consumption(directory, state, state['spec_review_extension'])
+    if consumed is None:
+        raise RoomError('Routing refresh cannot change an unused fourth-review grant')
+    request = state['requests'][consumed['request_id']]
+    if request['state'] != 'completed':
+        raise RoomError('Routing refresh requires a completed accepted fourth review')
+    agreement = ao_workflow.agreement(service, directory, state)
+    if agreement['request_id'] != consumed['request_id']:
+        raise RoomError('Routing refresh must retain the exact accepted fourth-review agreement')
+    return {'grant_receipt_sha256': state['spec_review_extension']['receipt_sha256'],
+            'consumed_by': consumed['request_id'],
+            'consumption_sha256': request['review_extension_consumption_sha256'],
+            'agreement': agreement}
 
 
 def validate(service, state, allow_pending=False):

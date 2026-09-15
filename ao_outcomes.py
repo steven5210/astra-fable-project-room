@@ -176,7 +176,9 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
     observed = {**saved, 'turn': turns[0], 'sessionFailures': snapshot.get('sessionFailures', []),
                 'provider_failures': activities}
     native = None
-    source = state.get('native_outcome_source')
+    from ao_native_outcome import source_keys
+    source_key, source_evidence_key = source_keys(request['role'])
+    source = state.get(source_key)
     if source and source.get('session_id') == request['session_id']:
         from ao_native_outcome import inspect
         try:
@@ -186,8 +188,10 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
         if native and native.get('next_human_uuid'):
             native = {**native, 'unknown': 'A later native human packet follows this owned request; reconcile it first'}
     extra_turns = turn_ids(snapshot) - set(request['baseline']['turn_ids']) - {request['turn_id']}
-    if state['workflow'] == 'fable_engineering' and extra_turns:
-        proven_imports = {p['turn_id'] for p in (native or {}).get('compaction_imports', [])} if not (native or {}).get('unknown') else set()
+    if state['workflow'] == 'fable_engineering':
+        proven_imports = _unowned_context_turns(state, {
+            p['turn_id'] for field in ('compaction_imports', 'task_notification_imports')
+            for p in (native or {}).get(field, [])}) if not (native or {}).get('unknown') else set()
         if extra_turns - proven_imports:
             raise RoomError('Native history contains unverified recovered context; audit its exact source before continuing')
     value = {'version': 1, 'room_id': state['room_id'], 'request_id': request['request_id'],
@@ -238,7 +242,7 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
         atomic(directory / path, value)
     request.update(semantic_outcome=path, semantic_outcome_sha256=digest(value), semantic_status=value['outcome'])
     if source_verification is not None:
-        state['native_outcome_source_evidence'] = {'path': path, 'sha256': digest(value), 'request_id': request['request_id']}
+        state[source_evidence_key] = {'path': path, 'sha256': digest(value), 'request_id': request['request_id']}
     service.save(directory, state)
     return value
 
@@ -311,20 +315,22 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
     source_verification = None
     if ao_database_path:
         from ao_native_identity import read_owner
-        from ao_native_outcome import validate_source
+        from ao_native_outcome import validate_source, source_keys
         owner = read_owner(ao_database_path, request['session_id'])
         from ao_review_extension import guard_native_owner
-        guard_native_owner(service, state, owner)
+        guard_native_owner(service, state, owner, role=role)
         source = {'database': ao_database_path, 'transcript': native_transcript_path,
                   'session_id': request['session_id'], 'native_session_id': owner['provider_conversation_id']}
-        validate_source(state, source)
+        if role == 'reviewer':
+            source['workspace_path'] = owner['workspace_path']
+        validate_source(state, source, role)
         # Validate the complete exact-turn source before persisting a path. An explicit
         # read-only audit can correct a moved source; prior outcome records retain it.
         from ao_native_outcome import inspect
         snapshot = service.identity(service.client(state), state, request)
         verified = inspect(directory, state, request, source, snapshot)
         source_verification = {'source': source, 'native_owner': owner, 'native': verified}
-        state['native_outcome_source'] = source
+        state[source_keys(role)[0]] = source
     snapshot = service.identity(service.client(state), state, request)
     value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True,
                     source_verification=source_verification)
@@ -407,3 +413,45 @@ def known_compaction_turns(directory, state, snapshot):
             raise RoomError('Verified native compaction import changed; re-audit before continuing')
         result.add(proof['turn_id'])
     return result
+
+
+def known_task_notification_turns(directory, state, snapshot):
+    """Revalidate saved engineer notification context without changing any outcome or hold."""
+    from ao_native_outcome import inspect
+    request = latest_for_role(state, 'engineer')
+    binding = state.get('bindings', {}).get('engineer', {})
+    if (state.get('workflow') != 'fable_engineering' or not request or not request.get('semantic_outcome')
+            or not isinstance(request.get('session_id'), str) or not request['session_id']
+            or snapshot.get('sessionId') != request['session_id'] or binding.get('session_id') != request['session_id']):
+        return set()
+    record = load(directory, request)
+    native = record.get('native') or {}
+    proofs = native.get('task_notification_imports', [])
+    if not proofs:
+        return set()
+    source = native.get('source')
+    if (native.get('unknown') or native.get('next_human_uuid') or not isinstance(source, dict)
+            or source.get('session_id') != request['session_id'] or source != state.get('native_outcome_source')):
+        return set()
+    try:
+        current = inspect(directory, state, request, source, snapshot)
+        if (current.get('unknown') or current.get('next_human_uuid')
+                or current.get('task_notification_imports') != proofs):
+            raise RoomError('Saved notification imports no longer match the owned native source and AO history')
+    except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+        raise RoomError('Verified native task-notification import changed; re-audit before continuing') from exc
+    return {proof['turn_id'] for proof in proofs}
+
+
+def known_context_turns(directory, state, snapshot):
+    """Keep distinct audited context kinds separate from request and completion evidence."""
+    return _unowned_context_turns(state, known_compaction_turns(directory, state, snapshot)
+                                 | known_task_notification_turns(directory, state, snapshot))
+
+
+def _unowned_context_turns(state, imports):
+    """Context proof must never override any owned turn, including an earlier baseline turn."""
+    owned = {request['turn_id'] for request in state['requests'].values() if request.get('turn_id')}
+    if imports & owned:
+        raise RoomError('Native context import contradicts an owned request turn; preserve its receipt and diagnose history')
+    return imports

@@ -133,7 +133,24 @@ def probe_evidence(home, room_id):
 def _audit(directory, digest):
     if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
         raise RoomError('Use the exact saved routing-adoption audit digest')
-    return _load(directory, BASE + '/audits/' + digest + '.json', digest)
+    value = _load(directory, BASE + '/audits/' + digest + '.json', digest)
+    _foreground(value)
+    return value
+
+
+def _foreground(audit):
+    if 'foreground_env' not in audit:
+        return False
+    if audit['foreground_env'] != ao_routing.FOREGROUND_ENV:
+        raise RoomError('Routing-adoption foreground environment marker is unsupported')
+    return True
+
+
+def _foreground_sources(service, state, audit):
+    if _foreground(audit):
+        prepared = audit['evidence']['prepared']
+        ao_routing.contradictions(prepared['routing']['claude_config_dir'], Path(prepared['worktree']), os.environ, foreground=True)
+        ao_routing._foreground_project(service.client(state), state)
 
 
 def pending_gate(service, state):
@@ -266,7 +283,9 @@ def _inspect(service, directory, state):
 def audit(service, room_id):
     with service.locked(room_id) as (directory, state):
         evidence = _inspect(service, directory, state)
-        value = {'evidence': evidence, 'attachment_id': uuid.uuid4().hex, 'recorded_at': time.time()}
+        value = {'evidence': evidence, 'attachment_id': uuid.uuid4().hex, 'recorded_at': time.time(),
+                 'foreground_env': dict(ao_routing.FOREGROUND_ENV)}
+        _foreground_sources(service, state, value)
         if len(_json(value)) > MAX_EVIDENCE:
             raise RoomError('Routing-adoption audit exceeds the 96 MB evidence bound; no audit was written')
         sha = ao.digest(value)
@@ -291,7 +310,7 @@ def _bundle(directory, audit):
         raise RoomError('Original managed hook is missing or duplicated; do not weaken other hooks')
     settings['hooks']['PreToolUse'] = [h for h in hooks if h != entry]
     command = ao_routing.hook_command(old['python'], guard)
-    settings = ao_routing.settings_document(settings, command)
+    settings = ao_routing.settings_document(settings, command, foreground=_foreground(audit))
     runtime['.claude/settings.local.json'] = _json(settings).decode()
     new_config = copy.deepcopy(e['original_config'])
     new_config['agentRules'] += '\n\n' + INSTRUCTION
@@ -409,6 +428,7 @@ def stage(service, room_id, audit_sha256, authorization, diagnosis, request_id):
             record, saved = _pending(service, directory, state, ref)
         else:
             saved = _audit(directory, audit_sha256)
+            _foreground_sources(service, state, saved)
             prepared, runtime, config, files = _bundle(directory, saved)
             record = _record(room_id, inputs, state, prepared, runtime, files)
             relative = BASE + '/requests/' + request_id + '.json'
@@ -431,6 +451,7 @@ def stage(service, room_id, audit_sha256, authorization, diagnosis, request_id):
                 _store_once(directory / relative, record)
             state['routing_adoption'] = ref
             service.save(directory, state)  # Durable intent precedes every runtime write.
+        _foreground_sources(service, state, saved)
         prepared, runtime, config, files = _bundle(directory, saved)
         if record != _record(room_id, inputs, saved['evidence']['state'], prepared, runtime, files):
             raise RoomError('Staged routing-adoption bytes changed')
@@ -483,6 +504,7 @@ def activate(service, room_id, request_id):
         from ao_review_extension import guard_replacement
         guard_replacement(state, 'routing activation')
         record, saved = _pending(service, directory, state, ref)
+        _foreground_sources(service, state, saved)
         prepared, runtime, config, files = _bundle(directory, saved)
         if record != _record(room_id, record['inputs'], saved['evidence']['state'], prepared, runtime, files):
             raise RoomError('Staged routing-adoption intent changed')

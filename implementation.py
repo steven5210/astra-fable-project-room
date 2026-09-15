@@ -76,7 +76,7 @@ Quality always beats token savings. Use the cheapest delegate only when it deliv
 full quality: DeepSeek (deepseek_submit) for self-contained specified work such as
 implementation, tests and reviews against verifiable specs, and for bounded module
 design, debugging or review when its demonstrated quality warrants it; Sonnet for
-mechanical agentic work; Opus for bounded judgment; Fable for cross-cutting judgment
+bounded implementation from requirements and mechanical agentic work; Opus for bounded judgment; Fable for cross-cutting judgment
 and final review. Where subagents are unavailable, use DeepSeek/Fable and report it.
 DeepSeek is a text delegate: it returns code, tests, reviews and reasoning summaries
 but executes nothing, edits no files and invokes no tools; Sonnet applies and verifies.
@@ -97,6 +97,17 @@ resolves it at their own terminal; never work around it. Cite job_id in routing
 records; token facts come from the ledger. Never invoke local Qwen in this room. If
 DeepSeek is unavailable or rejects the pinned parameters, report it and route to an
 appropriate Claude tier, recording why; never substitute another model silently.
+Let qualified delegates author supporting implementations and scripts from complete
+requirements; do not first dictate their source merely to delegate typing. Fable
+retains necessary judgment and checks the actual evidence. Bound work by functional
+units and verification, never arbitrary source-line or Write-call counts. Preserve
+complete inventories/logs in authorized artifacts outside the candidate worktree
+or in an already ignored path, without changing ignore rules or adding operational
+files to the candidate. Explicit deliverables retain their authorized product paths.
+Return concise relative-path
+summaries. Read-only tasks remain read-only. Explicit account/session quota failures
+stop further submissions in that native turn; they are not capability misses and do
+not authorize another model, provider or automatic retry to evade the same limit.
 """ + COMMON_POLICY
 
 POLICY_NONE = """Fable is the implementation orchestrator and owns engineering judgments.

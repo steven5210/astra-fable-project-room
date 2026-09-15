@@ -23,6 +23,7 @@ RUNTIME_FILES = (
     "ao_native_identity.py", "ao_native_outcome.py", "ao_outcomes.py", "ao_project_room.py",
     "ao_provider_transition.py", "ao_report_contract.py", "ao_response_normalization.py",
     "ao_review_extension.py", "ao_reviewer_recovery.py", "ao_routing.py", "ao_routing_adoption.py", "ao_routing_guard.py",
+    "ao_routing_refresh.py",
     "ao_workflow.py", "deepseek_adapter.py", "handoff_status.py", "heartbeat.py",
     "implementation.py", "progress.py", "project_room.py", "project_room_mcp.py",
     "project_room_runtime.py", "qwen_guard.py", "recovery.py", "room.py",

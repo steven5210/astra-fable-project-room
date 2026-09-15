@@ -59,7 +59,7 @@ class Fixture(unittest.TestCase):
         self.claude_env = self.root / 'claude-env'; self.claude_env.mkdir()
         patcher = patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.claude_env)}); patcher.start(); self.addCleanup(patcher.stop)
         for key in list(os.environ):
-            if key in ao_routing.RECORDED_ENV:
+            if key in ao_routing.RECORDED_ENV or key in ao_routing.FOREGROUND_ENV:
                 del os.environ[key]
         self.fake = NativeFake(self.repo)
         self.service = ao.Service(self.home, lambda url: self.fake)
@@ -459,7 +459,8 @@ class RoutingTests(Fixture):
         return self.service.ao_room_status(self.room)['delegate']['routing']
 
     def decide(self, event):
-        return routing_guard.decide(event)
+        with patch.dict(os.environ, ao_routing.FOREGROUND_ENV):
+            return routing_guard.decide(event)
 
     def commit(self, message):
         # Stage only tracked changes so an ignore-rule edit never silently tracks the runtime files.
@@ -560,6 +561,8 @@ class RoutingTests(Fixture):
         self.assertFalse((self.repo / '.claude' / 'settings.local.json').exists())
 
     def test_guard_decisions_and_fail_closed_exit(self):
+        foreground = patch.dict(os.environ, ao_routing.FOREGROUND_ENV)
+        foreground.start(); self.addCleanup(foreground.stop)
         allow = {'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-sonnet', 'prompt': 'apply', 'description': 'x'}}
         self.assertIsNone(self.decide(allow))
         self.assertIsNone(self.decide({'tool_name': 'Agent', 'tool_input': {'subagent_type': 'pr-opus', 'prompt': 'review', 'run_in_background': False}}))

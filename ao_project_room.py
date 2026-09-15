@@ -325,7 +325,19 @@ class Service:
             raise RoomError("AO conversation branch changed from its binding; do not replace or replay it")
         return snapshot
 
+    def _routing_refresh_gate(self, state):
+        # Every room mutation must preserve the exact state needed to reconcile
+        # an unfinished routing refresh. Check immutable ancestry only: ordinary
+        # runtime drift must remain diagnosable through sync, and saved status
+        # plus the refresh's own exact reconciliation stay outside this gate.
+        from ao_routing_refresh import BASE, _chain
+        directory = self.root / "rooms" / state["room_id"]
+        journal = directory / BASE
+        if state.get("routing_refresh") is not None or journal.exists() or journal.is_symlink():
+            _chain(directory, state, ao_delegates.preparation(directory, state))
+
     def settled(self, state, pending_transition=False, outcome_request_id=None, pending_review_extension=False):
+        self._routing_refresh_gate(state)
         from ao_reviewer_recovery import validate
         validate(self, state)
         from ao_review_extension import validate as review_extension_validate
@@ -649,6 +661,7 @@ class Service:
 
     def ao_room_sync(self, room_id):
         with self.locked(room_id) as (directory, state):
+            self._routing_refresh_gate(state)  # Sync also persists observations and changes the pending intent's state.
             from ao_review_extension import validate as review_extension_validate
             review_extension_validate(self, state)  # Verify consumption before any reconciliation evidence is written.
             from ao_provider_transition import validate as transition_validate
@@ -966,7 +979,7 @@ R = {"room_id": S}
 ROLE = {"type": "string", "enum": ["engineer", "reviewer"]}
 TOOL_SCHEMAS = {
     "ao_room_instruction_stage": ("Save actual user-authorized operating changes for the next separately authorized engineer request, without model dispatch or unpausing work. Delivered once with immutable provenance. Do not repeat existing specs or use this to change product scope, provider settings, review attempts, or an uncertain delivery.", schema({**R, "request_id": S, "message": S, "authorization": S})),
-    "ao_room_outcome_audit": ("Read and preserve the latest owned terminal outcome without inference. Correlate typed errors before truncation or formatting. Optional explicit AO database and Claude transcript paths bind native evidence to the exact retained engineer; unknown evidence holds. Does not establish a quota reset or resume work.", schema({**R, "role": ROLE, "ao_database_path": S, "native_transcript_path": S}, ['room_id'])),
+    "ao_room_outcome_audit": ("Read and preserve the latest owned terminal outcome without inference. Correlate typed errors before truncation or formatting. Optional explicit AO database and Claude transcript paths bind native evidence to the exact retained engineer or Astra-led Claude reviewer; role sources stay separate and unknown evidence holds. Does not establish a quota reset or resume work.", schema({**R, "role": ROLE, "ao_database_path": S, "native_transcript_path": S}, ['room_id'])),
     "ao_room_outcome_resume": ("Record actual authorization for one new continuation after a freshly audited quota, provider, or output-truncation failure. Keep the same session, raw failures, specification and consumed review attempts. No model call; only the named unused successor request may pass this hold. Unknown delivery cannot be released. An exactly correlated native quota rejection may settle its known AO failed turn, retaining the original failure. A fresh authorization may supersede an unused release only for the same successor.", schema({**R, "request_id": S, "outcome_sha256": S, "resume_request_id": S, "diagnosis": S, "authorization": S})),
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}}, ["project_path", "feature", "ao_project_id", "authorization"])),

@@ -26,6 +26,9 @@ MODELS = {"pr-sonnet": "claude-sonnet-5", "pr-opus": "claude-opus-5"}
 EFFORT = "max"
 ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2",
        "CLAUDE_CODE_DISABLE_WORKFLOWS": "1", "CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS": "1"}
+# This setting is pinned by new local-settings bytes, not added to historical
+# routing env/rules snapshots that retained preparations must still reproduce.
+FOREGROUND_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 # A forced subagent model overrides explicit definitions; the plain default only
 # applies to agents without a model and is recorded, not treated as protection.
 CONTRADICTORY_ENV = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE",)
@@ -75,14 +78,19 @@ def _scalar(value):
 def agent_definition(name):
     model = MODELS[name]
     if name == "pr-sonnet":
-        description = ("Project Room mechanical implementation and test worker on Sonnet. Use only for exact, "
-                       "self-contained instructions from the Fable engineer: apply prepared edits or diffs, write or "
-                       "run the named tests and gates, and report results verbatim. No design decisions, delegation, "
+        description = ("Project Room bounded implementation and test worker on Sonnet. Implement from self-contained "
+                       "requirements, verified interfaces and acceptance checks supplied by Fable; apply an existing "
+                       "payload when supplied, and run the named gates. Make routine local implementation choices "
+                       "within the agreed contract; escalate unresolved requirements or cross-module design. No delegation, "
                        "skills or messaging.")
         disallowed = "Agent, Workflow, Task, Skill, SendMessage, TeamCreate, " + CHILD_DENIED
-        rules = ("- Do exactly the bounded task in the prompt; report anything ambiguous instead of deciding it.\n"
+        rules = ("- Author the bounded implementation, supporting script or tests from the supplied requirements. "
+                 "Fable need not dictate complete source. Preserve explicit exact-copy tasks when actually required.\n"
+                 "- Make routine local choices within verified interfaces; report missing requirements, conflicting "
+                 "evidence and cross-module decisions to Fable rather than inventing behavior.\n"
                  "- Verify the anchors, types and interfaces named in the task before editing.\n"
-                 "- Run only the tests and gates the task names and quote their actual output.\n"
+                 "- Run the named tests and gates. Preserve complete output in an authorized artifact; summarize "
+                 "the observed result, failures and evidence paths without repeating full logs.\n"
                  "- Never launch agents, workflows, skills or messages, publish, or touch other checkouts.\n"
                  "- Finish with what changed, what was verified, and every limitation you hit.")
     else:
@@ -100,7 +108,17 @@ def agent_definition(name):
     fields = {"name": name, "description": description, "model": model, "effort": EFFORT, "disallowedTools": disallowed}
     front = "".join(key + ": " + _scalar(fields[key]) + "\n" for key in FRONTMATTER)
     return ("---\n" + front + "---\n\nYou are a bounded Project Room native worker. The Fable engineer that launched "
-            "you verifies your result and owns the engineering verdict.\n\n" + rules + "\n")
+            "you verifies your result and owns the engineering verdict.\n\n" + rules + "\n\n"
+            "Use complete functional units and verification requirements to bound work. Do not rewrite readable, "
+            "correct source to satisfy an arbitrary source-line or Write-call count. Preserve explicit product and "
+            "format requirements. For inventories and logs, keep complete metadata in an authorized artifact and "
+            "place operational evidence outside the candidate worktree or in an already ignored path; do not "
+            "change ignore rules or add candidate files merely to store logs. Explicitly requested deliverables "
+            "still belong in their authorized product paths. "
+            "Return counts, relative paths, digests, material findings and limitations. Do not repeat raw directory "
+            "listings, file contents or long absolute path prefixes by default. A read-only assignment never grants "
+            "artifact-write permission: use an existing artifact or ask the operator to collect it. Report missing "
+            "evidence honestly; concise reporting never replaces Fable's necessary independent inspection.\n")
 
 
 def parse_definition(text):
@@ -176,7 +194,18 @@ def _model_policy(data, label):
         raise RoomError(label + " Claude settings restrict availableModels without both pinned worker models")
 
 
-def settings_document(existing, command):
+def _foreground_env(value, label):
+    env = _mapping(value, label + " env")
+    if any(key in env and env[key] != expected for key, expected in FOREGROUND_ENV.items()):
+        raise RoomError(label + " conflicts with foreground native delegation (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS must be exactly '1')")
+
+
+def foreground_settings(settings):
+    _foreground_env(settings.get("env"), "Local settings")
+    return {**settings, "env": {**_mapping(settings.get("env"), "Local settings env"), **FOREGROUND_ENV}}
+
+
+def settings_document(existing, command, *, foreground=False):
     existing = _mapping(existing, "Existing local settings")
     if existing.get("disableAllHooks") or existing.get("allowManagedHooksOnly"):
         raise RoomError("Existing local settings disable or suppress local hooks")
@@ -199,7 +228,8 @@ def settings_document(existing, command):
     entry = {"matcher": MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
     pre = list(pre) + ([] if entry in pre else [entry])
     hooks["PreToolUse"] = pre
-    return {**existing, "env": env, "permissions": permissions, "hooks": hooks}
+    result = {**existing, "env": env, "permissions": permissions, "hooks": hooks}
+    return foreground_settings(result) if foreground else result
 
 
 def check_settings(settings, routing):
@@ -255,7 +285,7 @@ def _settings_file(path):
     return _mapping(value, str(path))
 
 
-def contradictions(config_dir, worktree=None, environ=None):
+def contradictions(config_dir, worktree=None, environ=None, *, foreground=False):
     """Refuse configuration that would silently override or disable the routing protections."""
     sources = [("user", Path(config_dir) / "settings.json"), ("managed", managed_settings_path(environ or os.environ))]
     if worktree is not None:
@@ -272,6 +302,12 @@ def contradictions(config_dir, worktree=None, environ=None):
         bad = _contradictory_env(_mapping(data.get("env"), label + " settings env"))
         if bad:
             raise RoomError(label + " Claude settings override native routing knobs: " + ", ".join(bad))
+        if foreground:
+            _foreground_env(data.get("env"), label + " Claude settings")
+    if foreground and worktree is not None:
+        local = _settings_file(Path(worktree) / ".claude/settings.local.json")
+        if local is not None:
+            _foreground_env(local.get("env"), "Local settings")
     for name in MODELS:
         if (Path(config_dir) / "agents" / (name + ".md")).exists():
             raise RoomError("user-level agent definition " + name + " exists; the pinned worktree definition cannot be proven effective")
@@ -279,6 +315,26 @@ def contradictions(config_dir, worktree=None, environ=None):
         bad = _contradictory_env({key: environ[key] for key in environ if key in ENV or key in CONTRADICTORY_ENV})
         if bad:
             raise RoomError("Process environment overrides native routing knobs: " + ", ".join(bad))
+        if foreground:
+            _foreground_env(dict(environ), "Process environment")
+
+
+def _foreground_project(client, state):
+    raw = client.request("GET", "/projects/" + state["ao_project_id"])
+    project = raw.get("project", raw) if isinstance(raw, dict) else {}
+    if not isinstance(project, dict) or project.get("id", project.get("projectId")) != state["ao_project_id"]:
+        raise RoomError("AO project identity mismatch while checking foreground native delegation")
+    config = _mapping(project.get("config"), "AO project configuration")
+    _foreground_env(config.get("env"), "AO project environment")
+
+
+def foreground_configured(worktree, routing):
+    """Read the pinned settings choice; only the hook can check its inherited process environment."""
+    if routing.get("version") != 2:
+        return False
+    settings = _settings_file(Path(worktree) / ".claude/settings.local.json") or {}
+    env = _mapping(settings.get("env"), "Local settings env")
+    return all(env.get(key) == value for key, value in FOREGROUND_ENV.items())
 
 
 def _compaction_policy(value):
@@ -483,7 +539,8 @@ def prepare(service, directory, state, worktree, prepared):
             _target(worktree, relative)  # symlinked or special parents are refused before git is consulted
             _require_ignored(worktree, relative)
         stage = "settings"
-        contradictions(settings["claude_config_dir"], worktree, os.environ)
+        contradictions(settings["claude_config_dir"], worktree, os.environ, foreground=True)
+        _foreground_project(service.client(state), state)
         compaction = compaction_policy(service)
         _compaction_sources(compaction, settings["claude_config_dir"], worktree, os.environ)
         _compaction_project(service.client(state), state, compaction)
@@ -517,7 +574,7 @@ def prepare(service, directory, state, worktree, prepared):
         settings_path, _ = _target(worktree, ".claude/settings.local.json")
         existing_bytes = owned_bytes(settings_path) if settings_path.exists() else None
         existing = json.loads(existing_bytes) if existing_bytes is not None else None
-        merged = settings_document(existing, command)
+        merged = settings_document(existing, command, foreground=True)
         # Only fresh preparations receive this default. The unchanged renderer is
         # also used to reproduce immutable historical routing-adoption bundles.
         merged.update(autoCompactEnabled=True, autoCompactWindow=compaction["window"])
@@ -560,6 +617,9 @@ def validate_local(prepared, state=None, directory=None):
     if not routing:
         return None
     try:
+        if state is not None and directory is not None:
+            from ao_routing_refresh import effective as refreshed_routing
+            routing = refreshed_routing(directory, state, prepared) or routing
         version = routing.get("version", 1)
         if type(version) is not int or version not in (1, 2):
             raise RoomError("Unsupported native routing version")
@@ -586,7 +646,8 @@ def validate_local(prepared, state=None, directory=None):
             from ao_executable_binding import effective
             replacement = effective(directory, state, prepared)
         check_claude(replacement or routing.get("claude") or {})
-        contradictions(routing["claude_config_dir"], worktree)
+        foreground = foreground_configured(worktree, routing)
+        contradictions(routing["claude_config_dir"], worktree, os.environ if foreground else None, foreground=foreground)
         if "compaction" in routing:
             _compaction_sources(routing["compaction"], routing["claude_config_dir"], worktree, os.environ)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -616,6 +677,8 @@ def before_dispatch(service, directory, state, prepared, purpose):
     if routing is None:
         return routing
     try:
+        if foreground_configured(prepared["worktree"], routing):
+            _foreground_project(service.client(state), state)
         if "compaction" in routing:
             _compaction_project(service.client(state), state, routing["compaction"])
         if purpose not in ("implementation", "correction"):
@@ -669,7 +732,13 @@ def status(prepared, state, directory=None):
         summary["compaction"] = routing["compaction"]
         summary["compaction_meaning"] = "Configured native window; actual compaction, continuity, quality and usage need observation."
     try:
-        validate_local(prepared, state, directory)
+        current = validate_local(prepared, state, directory)
+        if directory is not None and state.get("routing_refresh"):
+            summary["original_guard_sha256"] = routing["guard_sha256"]
+            summary["original_files"] = routing["files"]
+            summary["guard_sha256"] = current["guard_sha256"]
+            summary["files"] = current["files"]
+            summary["routing_refresh"] = state["routing_refresh"]
         if directory is not None and state.get("executable_binding"):
             from ao_executable_binding import effective
             summary["original_claude"] = claude
@@ -699,6 +768,7 @@ def status(prepared, state, directory=None):
 def packet_text(prepared):
     if prepared and prepared.get("routing"):
         agents = prepared["routing"]["agents"]
+        sonnet_work = "bounded implementation" if prepared["routing"].get("version") == 2 else "mechanical implementation"
         ownership = ("Fable is the orchestrator: inspect evidence with Read/Grep/Glob, direct the pinned provider and "
                      "native workers, adjudicate results and give the final engineering verdict. The guard denies root "
                      "shell commands, edits, tests, browser work and unknown execution tools. Routine implementation "
@@ -710,7 +780,7 @@ def packet_text(prepared):
                      "tools cannot achieve the quality bar, report the capability gap instead of bypassing the guard. "
                      if prepared["routing"].get("version") == 2 else "")
         return (ownership + "Native delegation routing is configured for this worktree: launch only the pinned native agents pr-sonnet ("
-                + agents["pr-sonnet"] + ", mechanical implementation and tests) and pr-opus (" + agents["pr-opus"]
+                + agents["pr-sonnet"] + ", " + sonnet_work + " and tests) and pr-opus (" + agents["pr-opus"]
                 + ", bounded judgment/review and the pinned browser skill when the AO browser capability is present); "
                 "one layer, at most two concurrent, no model overrides, built-in agent types, forks, isolation, resume, "
                 "messaging, workflows, teams or review skills; the routing guard denies other routes. Record each native "

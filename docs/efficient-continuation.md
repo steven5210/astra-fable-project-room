@@ -9,6 +9,65 @@ non-delegating; evidence can be prepared beforehand.
 
 ## Compact engineering reports
 
+The additional `delegation_efficiency_v2` amendment is delivered once to new or
+retained native engineer sessions on their next separately authorized request.
+It permits qualified supporting workers to author code from complete requirements,
+removes arbitrary source-line and Write-call limits, keeps routine inventories with
+the operator, and requests concise summaries backed by complete authorized artifacts.
+It also forbids model escalation merely to evade an explicit account/session quota.
+Fable keeps MAX, necessary engineering judgment and final review. Pinned provider
+budgets, exact-spec review restrictions, data restrictions and semantic holds stay
+in force. Installing the update does not wake a paused session or grant a retry.
+Historical request bytes and earlier delivered contracts remain unchanged.
+Pinned historical policy files also remain unchanged; the new amendment is the
+delivery mechanism for this update in retained sessions. Store operational logs
+and inventories outside the candidate worktree or in an already ignored path.
+Do not change ignore rules or add candidate files merely to store operational
+evidence. Explicitly requested deliverables retain their authorized product paths.
+
+New preparations include the updated Sonnet definition and quota-aware routing
+guard. Existing preparations retain their pinned files; an instruction amendment
+alone is not evidence that an already loaded native guard has changed. Verify an
+audited idle configuration transition before claiming native enforcement there.
+
+The quota guard checks only the exact current native human turn. A typed
+account/session quota error blocks further native-worker and DeepSeek submissions
+from that turn; result/status inspection remains available. It does not infer
+account exhaustion from a generic or model-specific 429, and it cannot undo work
+already launched. Missing or unsafe supplied transcript evidence blocks new
+submissions. Older hook calls with no transcript metadata retain the historical
+guard with an explicit diagnostic; native quota enforcement is unverified there.
+Project Room's semantic hold separately controls any authorized continuation. The native scan is bounded to 8 MiB and 20,000 records.
+If that window cannot establish the current human-turn boundary, new submissions
+are denied with an evidence-incomplete diagnosis. This is not a quota assertion;
+the operator should inspect the evidence instead of retrying through another tier.
+
+For a retained v2 engineer, the CLI-only `ao_routing_refresh.py` operation installs
+the reviewed definitions and guard through an immutable routing journal. Supply
+`--home`, `--room-id`, an unused `--request-id`, `--database-path`,
+`--native-session-id`, `--authorization` and `--diagnosis`. It requires the exact
+stopped Fable MAX owner, settled requests and delegates, complete native history,
+unchanged candidate and provider attachment, and the existing ignored runtime
+paths. Stop only after independently checking native quiescence; an AO idle label
+alone is insufficient when diagnosing premature completion.
+
+The operation changes only the three ignored routing files and their
+content-addressed guard, recording original and replacement bytes before writes.
+It retains the original preparation, executable binding, provider epochs, quota
+holds, requests and review counts. An existing fourth-review grant must already be consumed
+by the completed accepted review of the current exact spec; an unused or rejected
+grant cannot be refreshed. A crash leaves ordinary routing blocked until the
+identical request reconciles unchanged evidence. While its intent is pending,
+specification, instruction and grant changes, and sync observation writes, are
+blocked before they can invalidate recovery. Saved status remains readable.
+Unknown file changes are never overwritten. Keep the native controller stopped and
+its owner/evidence unchanged from intent publication until the refresh completes.
+A restart or concurrent lifecycle change during that interval can invalidate the
+exact retry and requires operator diagnosis; do not remove or rewrite the journal
+to unblock it. Reload the retained controller separately and verify native identity
+and loaded settings before an independently authorized prompt. Neither refresh nor
+reload grants continuation, clears quota, or proves live enforcement or savings.
+
 New and retained native engineer sessions receive `efficiency_contract_v1` once.
 This is an actual operating/reporting update, not a specification replay. It
 retires routine repetition of historical provider attempts, tool counts and
@@ -77,13 +136,38 @@ reads, not model calls or proof of a quota reset.
 
 When the bridge omitted error details, the operator can provide both
 `ao_database_path` and `native_transcript_path`. The adapter validates the exact
-retained Claude engineer, AO project/conversation/branch and prepared workspace
-against read-only native ownership storage. It binds those paths for future
-observations of that engineer. It reads the explicit owned transcript only,
+retained Claude role and AO project/conversation/branch against read-only native
+ownership storage. An engineer keeps its immutable prepared-workspace check. An
+Astra-led Claude reviewer must be bound at MAX and needs no engineer preparation: the exact native caller
+and every correlated root assistant row must carry the retained owner's workspace,
+and the request, binding and observed model/effort must match. Every correlated root
+assistant row needs an exactly matching `cwd`, and each non-synthetic,
+non-API-error row must name the pinned model even without a terminal stop. Missing
+`cwd` on an error row makes the source unknown; it cannot establish a quota diagnosis.
+These comparisons do not normalize paths or infer missing fields. Reviewer source
+paths and workspace are saved separately from engineer evidence; later path
+audits cannot replace that reviewer native identity or workspace. It reads the explicit owned transcript only,
 never credentials or account settings. Correlation uses the caller's exact
 digest, native session and bounded human-message interval; compaction summaries,
 tool results, queue metadata and child sessions are not caller messages.
 Malformed, changed or ambiguous evidence holds rather than authorizing work.
+
+The explicit operator-supplied read-only owner storage and matching transcript are
+the first reviewer workspace trust anchor. This is not an independent preexisting
+room proof or a candidate-directory inference, and the workspace need not still
+exist. The first audit pins that identity and workspace; later supported calls may
+move evidence paths but cannot replace the owner or workspace. Mutually consistent
+forged local evidence is outside this trust model. A wrong first pin requires
+operator diagnosis, never editing saved state to bypass it.
+
+Establishing an explicit source preserves an existing unknown hold. Run a second
+`ao_room_outcome_audit` for the same role without source paths to reassess the
+unchanged verified source. A proven native `end_turn` can then establish that an
+unstructured response finished. An operator must still review the complete raw
+response and submit exact receipt/text hashes and a JSON span to
+`ao_room_response_normalize`; exact candidate, gates, verdict and review-budget
+checks remain required for acceptance. Neither audit parses an approval from prose,
+accepts the candidate, clears a known quota failure, or grants another review.
 
 After diagnosing the failure and obtaining actual authorization to continue,
 call `ao_room_outcome_resume` with the failed `request_id`, the fresh audit's
@@ -112,6 +196,41 @@ writes a private original-byte backup and immutable patch intent, and refuses an
 unknown/new upstream module. It is not run by installation, dispatch or an
 updater. No model, effort, output budget or provider is changed.
 
+The experimental completion barrier remains available as an offline transform for
+compatibility probes, but **installation with `--completion-barrier` is disabled**.
+Inspection of Claude Code 2.1.268 and source-derived consumer probes showed that a
+standalone task notification can omit both its SDK replay and result UUID. A
+notification injected during another turn can instead share that turn's primary
+result UUID. The proposed exact notification/result match therefore cannot finish
+these real paths. Widening the XML parser does not repair missing identity; a
+worker-terminal event or empty task list does not prove Fable processed the result.
+The rejected experiment and its tests remain inspectable without modifying a
+runtime, accepting an old completion, or rewriting any prior patch receipt.
+
+New preparations and the audited routing refresh set
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in ignored local settings, using
+[Claude's documented foreground option](https://code.claude.com/docs/en/subagents#run-subagents-in-foreground-or-background). The new guard
+requires that setting in its inherited environment before a native Agent launch
+and refuses an explicit background request. The pinned local Sonnet/Opus workers
+still execute delegated work with their own contexts and MAX settings; Fable waits
+for their result before continuing. The existing isolation, fork, team and nested
+worker restrictions remain intact. DeepSeek's external submit/status/result jobs
+are unchanged. The reviewed native version also disables automatic migration of
+long foreground workers; this is not a new task timeout or model budget.
+
+Keep the existing precedence-only ACP workaround. A stopped, positively quiescent
+retained controller must reload the audited settings and guard before new work;
+no daemon restart or experimental runtime switch is needed. Historical preparation
+and routing-policy records remain unchanged, and the refresh journal binds the
+new settings bytes. Old flagless configurations remain readable but are not
+relabelled as foreground-protected. A pending historical adoption still requires
+its exact recorded guard/wrapper payload for reconciliation; preserve the pinned
+controller version for that operation, then perform the reviewed refresh. A new
+installed guard must not be substituted into the old audit. The guard refuses new native submissions if
+the required flag did not actually reach it. Validate the selected Claude version
+against this behavior when upgrading; the environment setting alone does not
+prove that every historical or future version enforces it correctly.
+
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
 
 Verify that the affected runtime is idle before using the tool. Existing native
@@ -127,6 +246,12 @@ bytes as a pristine vendor installation.
 Offline tests cover quota precedence, stale and ambiguous evidence, exact-once
 continuation, restart persistence, immutable failures, schema projection and
 one-time instruction delivery. They use fake AO and synthetic native evidence.
+The experimental completion barrier has offline probes of the exact reviewed
+vendor consumer, including source-derived missing-UUID paths. These demonstrate
+why the transform cannot be installed, rather than certify native asynchronous
+completion. Foreground delegation avoids that detached notification path. Its
+actual useful work, quality and parent result handling still need live observation;
+static source and synthetic tests are not a subscription-savings measurement.
 Useful live work after an authorized resume must still demonstrate actual
 quality, delegation and token savings. Retain MAX and existing delegate budgets.
 The 250K native compaction default controls context growth; it does not cap a
@@ -153,6 +278,27 @@ turns, lookalike summary prose, extra replies and changed bytes remain blocked.
 This compaction-import allowance applies to continuation within an already
 committed provider epoch. It does not broaden initial provider-transition
 eligibility or recompute an existing epoch's frozen history digest.
+
+AO can also import a typed SDK task notification as a recovered human turn on
+reload. The engineer outcome audit records this separately as
+`task_notification_imports`; it is not compaction. The supported shape is narrow:
+an owned same-native user event with exact task-notification origin, SDK metadata,
+workspace, UUID and a plain six-field notification envelope whose status is
+`failed`. Its complete native-row and text hashes must match one nonstreaming
+recovered user message and the exact branch-derived provider identity. The
+notification's output path is never opened. Before provider history uses the
+proof, the owned source and the exact imported turn/message bytes are rechecked.
+
+This proves only where existing context came from. It does not prove worker
+completion, authorize new work, establish acceptance or release any quota/error
+hold. Launch correlation is not required for this context identity; it would
+still be necessary for a separate worker-settlement claim. Reviewer imports,
+other statuses or envelopes, human lookalikes, duplicate identities and changed
+or unverified evidence remain unsupported. Preserve the original failure and
+audit records and diagnose the exact source instead of rewriting recovered
+turns. As with compaction, provider history admits these proofs only within an
+already committed epoch; initial transition eligibility and frozen history stay
+unchanged.
 
 
 ## A pinned Claude executable disappeared

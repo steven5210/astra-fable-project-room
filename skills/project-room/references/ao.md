@@ -279,7 +279,7 @@ repository must already ignore: `.claude/settings.local.json`,
 tracked, unignored, symlinked or conflicting files before writing either agent
 file, never edits `.gitignore` or shared Git exclusions, and preserves unrelated
 keys of an existing local settings file. The definitions pin `pr-sonnet`
-(`claude-sonnet-5`, effort max, mechanical implementation and tests, no skills)
+(`claude-sonnet-5`, effort max, bounded implementation and tests from complete requirements, no skills)
 and `pr-opus` (`claude-opus-5`, effort max, bounded judgment/review plus the
 pinned browser skill when the AO browser capability is present); both refuse
 further delegation, workflows and messaging, and both disallow the inherited
