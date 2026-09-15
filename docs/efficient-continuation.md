@@ -9,6 +9,51 @@ non-delegating; evidence can be prepared beforehand.
 
 ## Compact engineering reports
 
+The additional `delegation_efficiency_v2` amendment is delivered once to new or
+retained native engineer sessions on their next separately authorized request.
+It permits qualified supporting workers to author code from complete requirements,
+removes arbitrary source-line and Write-call limits, keeps routine inventories with
+the operator, and requests concise summaries backed by complete authorized artifacts.
+It also forbids model escalation merely to evade an explicit account/session quota.
+Fable keeps MAX, necessary engineering judgment and final review. Pinned provider
+budgets, exact-spec review restrictions, data restrictions and semantic holds stay
+in force. Installing the update does not wake a paused session or grant a retry.
+Historical request bytes and earlier delivered contracts remain unchanged.
+
+New preparations include the updated Sonnet definition and quota-aware routing
+guard. Existing preparations retain their pinned files; an instruction amendment
+alone is not evidence that an already loaded native guard has changed. Verify an
+audited idle configuration transition before claiming native enforcement there.
+
+The quota guard checks only the exact current native human turn. A typed
+account/session quota error blocks further native-worker and DeepSeek submissions
+from that turn; result/status inspection remains available. It does not infer
+account exhaustion from a generic or model-specific 429, and it cannot undo work
+already launched. Missing or unsafe supplied transcript evidence blocks new
+submissions. Older hook calls with no transcript metadata retain the historical
+guard with an explicit diagnostic; native quota enforcement is unverified there.
+Project Room's semantic hold separately controls any authorized continuation.
+
+For a retained v2 engineer, the CLI-only `ao_routing_refresh.py` operation installs
+the reviewed definitions and guard through an immutable routing journal. Supply
+`--home`, `--room-id`, an unused `--request-id`, `--database-path`,
+`--native-session-id`, `--authorization` and `--diagnosis`. It requires the exact
+stopped Fable MAX owner, settled requests and delegates, complete native history,
+unchanged candidate and provider attachment, and the existing ignored runtime
+paths. Stop only after independently checking native quiescence; an AO idle label
+alone is insufficient when diagnosing premature completion.
+
+The operation changes only the three ignored routing files and their
+content-addressed guard, recording original and replacement bytes before writes.
+It retains the original preparation, executable binding, provider epochs, quota
+holds, requests and review counts. A fourth-review grant must already be consumed
+by the completed accepted review of the current exact spec; an unused or rejected
+grant cannot be refreshed. A crash leaves ordinary routing blocked until the
+identical request reconciles unchanged evidence. Unknown file changes are never
+overwritten. Reload the retained controller separately and verify native identity
+and loaded settings before an independently authorized prompt. Neither refresh nor
+reload grants continuation, clears quota, or proves live enforcement or savings.
+
 New and retained native engineer sessions receive `efficiency_contract_v1` once.
 This is an actual operating/reporting update, not a specification replay. It
 retires routine repetition of historical provider attempts, tool counts and
@@ -112,6 +157,17 @@ writes a private original-byte backup and immutable patch intent, and refuses an
 unknown/new upstream module. It is not run by installation, dispatch or an
 updater. No model, effort, output budget or provider is changed.
 
+The opt-in `--completion-barrier` additionally prevents a confirmed asynchronous
+worker's interim answer from completing its parent turn before Fable processes
+that worker's result. It accepts the exact reviewed original module or the exact
+earlier quota-precedence patch. A separate immutable intent and backup preserve
+both histories. The bridge binds a structured async launch to the SDK's typed task
+notification and its corresponding terminal result; neither an empty background
+task list nor a worker's terminal event alone proves Fable has finished. A lost
+stream with unmatched work fails as `async_completion_unverified`, preserving
+uncertainty instead of promoting an interim answer. This patch makes no model
+call, does not import historical late reports, and does not authorize replay.
+
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
 
 Verify that the affected runtime is idle before using the tool. Existing native
@@ -127,6 +183,10 @@ bytes as a pristine vendor installation.
 Offline tests cover quota precedence, stale and ambiguous evidence, exact-once
 continuation, restart persistence, immutable failures, schema projection and
 one-time instruction delivery. They use fake AO and synthetic native evidence.
+The completion barrier also has offline probes of the exact reviewed vendor
+consumer. Those reproduce the early-completion race and preserve ordinary results,
+typed errors and usage accounting. Native wire correlation still needs validation
+during useful authorized work; a missing correlation must hold rather than guess.
 Useful live work after an authorized resume must still demonstrate actual
 quality, delegation and token savings. Retain MAX and existing delegate budgets.
 The 250K native compaction default controls context growth; it does not cap a

@@ -75,14 +75,19 @@ def _scalar(value):
 def agent_definition(name):
     model = MODELS[name]
     if name == "pr-sonnet":
-        description = ("Project Room mechanical implementation and test worker on Sonnet. Use only for exact, "
-                       "self-contained instructions from the Fable engineer: apply prepared edits or diffs, write or "
-                       "run the named tests and gates, and report results verbatim. No design decisions, delegation, "
+        description = ("Project Room bounded implementation and test worker on Sonnet. Implement from self-contained "
+                       "requirements, verified interfaces and acceptance checks supplied by Fable; apply an existing "
+                       "payload when supplied, and run the named gates. Make routine local implementation choices "
+                       "within the agreed contract; escalate unresolved requirements or cross-module design. No delegation, "
                        "skills or messaging.")
         disallowed = "Agent, Workflow, Task, Skill, SendMessage, TeamCreate, " + CHILD_DENIED
-        rules = ("- Do exactly the bounded task in the prompt; report anything ambiguous instead of deciding it.\n"
+        rules = ("- Author the bounded implementation, supporting script or tests from the supplied requirements. "
+                 "Fable need not dictate complete source. Preserve explicit exact-copy tasks when actually required.\n"
+                 "- Make routine local choices within verified interfaces; report missing requirements, conflicting "
+                 "evidence and cross-module decisions to Fable rather than inventing behavior.\n"
                  "- Verify the anchors, types and interfaces named in the task before editing.\n"
-                 "- Run only the tests and gates the task names and quote their actual output.\n"
+                 "- Run the named tests and gates. Preserve complete output in an authorized artifact; summarize "
+                 "the observed result, failures and evidence paths without repeating full logs.\n"
                  "- Never launch agents, workflows, skills or messages, publish, or touch other checkouts.\n"
                  "- Finish with what changed, what was verified, and every limitation you hit.")
     else:
@@ -100,7 +105,14 @@ def agent_definition(name):
     fields = {"name": name, "description": description, "model": model, "effort": EFFORT, "disallowedTools": disallowed}
     front = "".join(key + ": " + _scalar(fields[key]) + "\n" for key in FRONTMATTER)
     return ("---\n" + front + "---\n\nYou are a bounded Project Room native worker. The Fable engineer that launched "
-            "you verifies your result and owns the engineering verdict.\n\n" + rules + "\n")
+            "you verifies your result and owns the engineering verdict.\n\n" + rules + "\n\n"
+            "Use complete functional units and verification requirements to bound work. Do not rewrite readable, "
+            "correct source to satisfy an arbitrary source-line or Write-call count. Preserve explicit product and "
+            "format requirements. For inventories and logs, keep complete metadata in an authorized artifact and "
+            "return counts, relative paths, digests, material findings and limitations. Do not repeat raw directory "
+            "listings, file contents or long absolute path prefixes by default. A read-only assignment never grants "
+            "artifact-write permission: use an existing artifact or ask the operator to collect it. Report missing "
+            "evidence honestly; concise reporting never replaces Fable's necessary independent inspection.\n")
 
 
 def parse_definition(text):
@@ -560,6 +572,9 @@ def validate_local(prepared, state=None, directory=None):
     if not routing:
         return None
     try:
+        if state is not None and directory is not None:
+            from ao_routing_refresh import effective as refreshed_routing
+            routing = refreshed_routing(directory, state, prepared) or routing
         version = routing.get("version", 1)
         if type(version) is not int or version not in (1, 2):
             raise RoomError("Unsupported native routing version")
@@ -669,7 +684,13 @@ def status(prepared, state, directory=None):
         summary["compaction"] = routing["compaction"]
         summary["compaction_meaning"] = "Configured native window; actual compaction, continuity, quality and usage need observation."
     try:
-        validate_local(prepared, state, directory)
+        current = validate_local(prepared, state, directory)
+        if directory is not None and state.get("routing_refresh"):
+            summary["original_guard_sha256"] = routing["guard_sha256"]
+            summary["original_files"] = routing["files"]
+            summary["guard_sha256"] = current["guard_sha256"]
+            summary["files"] = current["files"]
+            summary["routing_refresh"] = state["routing_refresh"]
         if directory is not None and state.get("executable_binding"):
             from ao_executable_binding import effective
             summary["original_claude"] = claude
@@ -699,6 +720,7 @@ def status(prepared, state, directory=None):
 def packet_text(prepared):
     if prepared and prepared.get("routing"):
         agents = prepared["routing"]["agents"]
+        sonnet_work = "bounded implementation" if prepared["routing"].get("version") == 2 else "mechanical implementation"
         ownership = ("Fable is the orchestrator: inspect evidence with Read/Grep/Glob, direct the pinned provider and "
                      "native workers, adjudicate results and give the final engineering verdict. The guard denies root "
                      "shell commands, edits, tests, browser work and unknown execution tools. Routine implementation "
@@ -710,7 +732,7 @@ def packet_text(prepared):
                      "tools cannot achieve the quality bar, report the capability gap instead of bypassing the guard. "
                      if prepared["routing"].get("version") == 2 else "")
         return (ownership + "Native delegation routing is configured for this worktree: launch only the pinned native agents pr-sonnet ("
-                + agents["pr-sonnet"] + ", mechanical implementation and tests) and pr-opus (" + agents["pr-opus"]
+                + agents["pr-sonnet"] + ", " + sonnet_work + " and tests) and pr-opus (" + agents["pr-opus"]
                 + ", bounded judgment/review and the pinned browser skill when the AO browser capability is present); "
                 "one layer, at most two concurrent, no model overrides, built-in agent types, forks, isolation, resume, "
                 "messaging, workflows, teams or review skills; the routing guard denies other routes. Record each native "

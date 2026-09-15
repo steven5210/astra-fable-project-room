@@ -16,7 +16,8 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
-PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1")
+PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
+         "delegation_efficiency_v2")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -480,8 +481,9 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
         ao_routing.before_dispatch(service, directory, state, prepared, purpose)
     policy = ao_delegates.validate_provider(directory, state)
     texts = part_texts(prepared, policy)
-    from ao_report_contract import PART, INSTRUCTION
+    from ao_report_contract import PART, INSTRUCTION, DELEGATION_PART, DELEGATION_INSTRUCTION
     texts[PART] = INSTRUCTION  # A new one-time amendment, never a rewrite of frozen workflow bytes.
+    texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}

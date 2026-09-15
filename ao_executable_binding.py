@@ -167,7 +167,14 @@ def _inspect(service, directory, state, inputs, prepared, source):
         raise RoomError('Replacement executable changed during its version probe')
     target.update(version=version['version'], error=None)
     launch = _launch(inputs['launch_path'], target['path'])
+    from ao_routing_refresh import effective as refreshed_routing
+    # Validate routing ancestry against the original immutable preparation before
+    # using its current file pins in this local replacement-executable probe.
+    # Neither journal may receive the synthetic preparation below.
+    routing = refreshed_routing(directory, state, prepared)
     current = copy.deepcopy(prepared)
+    if routing is not None:
+        current['routing'] = routing
     current['routing']['claude'] = target
     ao_routing.validate_local(current)  # All existing guard/configuration checks remain required.
     engineer = state['bindings']['engineer']
