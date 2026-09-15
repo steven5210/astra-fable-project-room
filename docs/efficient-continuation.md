@@ -179,8 +179,8 @@ promoting an interim answer. A matched worker follow-up cannot settle a queued
 successor or assign the parent's usage to it. If a previously submitted successor
 reaches the SDK before ownership can be resolved, both requests fail as unverified;
 neither is treated as unsent or automatically replayed. An uncorrelated,
-non-autonomous result while the parent is held also fails before it can overwrite
-the parent's result or usage, even with no queued successor. This patch makes no model
+non-autonomous result while the parent is held with confirmed barrier debt also fails
+before it can overwrite the parent's result or usage, even with no queued successor. This patch makes no model
 call, does not import historical late reports, and does not authorize replay.
 
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.

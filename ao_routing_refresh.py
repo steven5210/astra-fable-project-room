@@ -317,11 +317,20 @@ def _inspect(service, directory, state, inputs, prepared, routing):
             'rules': observed, 'executable_binding': state.get('executable_binding'), 'current_executable': replacement}, snapshot
 
 
+def _sync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def _place_guard(path, raw):
     """Publish a complete content-addressed file; a partial temp is never its pin."""
     if path.exists() or path.is_symlink():
         if owned_bytes(path) != raw:
             raise RoomError('Current content-addressed routing guard is corrupted')
+        _sync_directory(path.parent)  # An earlier link may have succeeded before its directory sync failed.
         return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if any(parent.is_symlink() for parent in (path.parent, *path.parent.parents)):
@@ -335,11 +344,7 @@ def _place_guard(path, raw):
         except FileExistsError:
             if owned_bytes(path) != raw:
                 raise RoomError('Routing guard appeared with different bytes')
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _sync_directory(path.parent)
     finally:
         os.unlink(temporary)
 
@@ -357,16 +362,12 @@ def _replace_runtime(worktree, relative, source, target):
     ao_routing._target(worktree, relative)
     ao_routing._require_ignored(worktree, relative)
     actual = owned_bytes(path)
-    if actual == target:
-        return
-    if actual != source:
-        raise RoomError('Routing refresh file matches neither recorded source nor target: ' + relative)
-    ao_routing._write(worktree, relative, target, previous=source)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    if actual != target:
+        if actual != source:
+            raise RoomError('Routing refresh file matches neither recorded source nor target: ' + relative)
+        ao_routing._write(worktree, relative, target, previous=source)
+    # Exact target bytes do not prove that a previous rename is durable.
+    _sync_directory(path.parent)
 
 
 def refresh(service, room_id, request_id, database_path, native_session_id, authorization, diagnosis):
@@ -386,6 +387,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
         pointer = {'path': relative, 'sha256': ao.digest(existing)} if existing is not None else None
         if existing is not None and state.get('routing_refresh') == pointer:
             effective(directory, state, prepared)
+            _sync_directory(directory)  # Retry a state replacement whose final directory sync failed.
             return {**pointer, 'model_dispatch': False, 'idempotent': True}
         prior = _chain(directory, state, prepared, check_unclaimed=existing is None)
         source = prior['target'] if prior else prepared.get('routing')
