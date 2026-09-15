@@ -434,6 +434,15 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
         launcher_compatibility(service, proposed, prepared)
         if existing is None:
             _publish_intent(path, record)
+        else:
+            # A prior process may have stopped after linking the complete file
+            # but before persisting its directory entry. Reestablish that
+            # durability barrier before the exact retry changes runtime files.
+            journal_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                os.fsync(journal_fd)
+            finally:
+                os.close(journal_fd)
         _place_guard(Path(target['guard_path']), target_bundle['guard'].encode())
         for name in ao_routing.FILES:
             _replace_runtime(Path(prepared['worktree']), name, source_bundle['files'][name].encode(), target_bundle['files'][name].encode())

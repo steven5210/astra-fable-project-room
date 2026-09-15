@@ -344,6 +344,45 @@ refresh._publish_intent(Path(sys.argv[1]), json.loads(sys.argv[2]))
         self.assertEqual(path.read_bytes(), b'{"partial":')
         self.assertEqual(self.state(), self.original)
 
+    def test_complete_intent_after_directory_sync_failure_is_synced_before_retry_mutates_runtime(self):
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        fsync = os.fsync
+
+        def journal_fd(fd):
+            return path.parent.exists() and os.fstat(fd).st_ino == path.parent.stat().st_ino
+
+        def sync_failure(fd):
+            if path.exists() and journal_fd(fd):
+                raise OSError('synthetic journal directory sync failure')
+            return fsync(fd)
+
+        with patch.object(refresh.os, 'fsync', side_effect=sync_failure), \
+                patch.object(refresh, '_place_guard', wraps=refresh._place_guard) as place_guard:
+            with self.assertRaisesRegex(OSError, 'directory sync failure'):
+                self.do_refresh()
+            place_guard.assert_not_called()
+        raw = path.read_bytes()
+        self.assertIsInstance(json.loads(raw), dict)
+        self.assertEqual(self.state(), self.original)
+        self.assertEqual({name: (self.repo / name).read_bytes() for name in ao_routing.FILES}, self.original_files)
+        synced = []
+        place_guard = refresh._place_guard
+
+        def sync_retry(fd):
+            if journal_fd(fd):
+                synced.append(True)
+            return fsync(fd)
+
+        def require_sync(*args):
+            self.assertTrue(synced)
+            return place_guard(*args)
+
+        with patch.object(refresh.os, 'fsync', side_effect=sync_retry), \
+                patch.object(refresh, '_place_guard', side_effect=require_sync):
+            self.do_refresh()
+        self.assertEqual(path.read_bytes(), raw)
+        ao_delegates.validate_preparation(self.directory(), self.state())
+
     def test_intent_publication_size_bound_precedes_directory_or_file_creation(self):
         path = self.directory() / refresh.BASE / 'refresh-one.json'
         with patch.object(refresh, 'MAX_RECORD_BYTES', 32):
