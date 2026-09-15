@@ -279,6 +279,27 @@ This compaction-import allowance applies to continuation within an already
 committed provider epoch. It does not broaden initial provider-transition
 eligibility or recompute an existing epoch's frozen history digest.
 
+AO can also import a typed SDK task notification as a recovered human turn on
+reload. The engineer outcome audit records this separately as
+`task_notification_imports`; it is not compaction. The supported shape is narrow:
+an owned same-native user event with exact task-notification origin, SDK metadata,
+workspace, UUID and a plain six-field notification envelope whose status is
+`failed`. Its complete native-row and text hashes must match one nonstreaming
+recovered user message and the exact branch-derived provider identity. The
+notification's output path is never opened. Before provider history uses the
+proof, the owned source and the exact imported turn/message bytes are rechecked.
+
+This proves only where existing context came from. It does not prove worker
+completion, authorize new work, establish acceptance or release any quota/error
+hold. Launch correlation is not required for this context identity; it would
+still be necessary for a separate worker-settlement claim. Reviewer imports,
+other statuses or envelopes, human lookalikes, duplicate identities and changed
+or unverified evidence remain unsupported. Preserve the original failure and
+audit records and diagnose the exact source instead of rewriting recovered
+turns. As with compaction, provider history admits these proofs only within an
+already committed epoch; initial transition eligibility and frozen history stay
+unchanged.
+
 
 ## A pinned Claude executable disappeared
 

@@ -3,7 +3,10 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import stat
+import uuid
+import xml.etree.ElementTree as ET
 
 from room import RoomError
 
@@ -125,6 +128,101 @@ def compaction_imports(events, session_id, snapshot):
     return sorted(result, key=lambda x: x['turn_id'])
 
 
+def _failed_task_notification(row, session_id, workspace):
+    """Recognize one observed SDK envelope; its text is never task-result authority."""
+    if (row.get('type') != 'user' or row.get('sessionId') != session_id or row.get('cwd') != workspace
+            or row.get('isSidechain') is not False or row.get('origin') != {'kind': 'task-notification'}
+            or row.get('promptSource') != 'sdk' or row.get('queueSkipAttachments') is not True
+            or row.get('userType') != 'external' or row.get('entrypoint') != 'sdk-ts'
+            or any(key in row for key in ('isCompactSummary', 'isVisibleInTranscriptOnly'))
+            or any(row.get(key) is not None for key in ('agentId', 'agent_id'))):
+        return None
+    message = row.get('message')
+    content = message.get('content') if isinstance(message, dict) and message.get('role') == 'user' else None
+    if (not isinstance(content, str) or not re.match(r'<task-notification>\r?\n', content)
+            or not re.search(r'\r?\n</task-notification>\Z', content) or '<!' in content or '<?' in content):
+        return None
+    try:
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True, insert_pis=True))
+        root = ET.fromstring(content, parser=parser)
+    except ET.ParseError:
+        return None
+    fields = ('task-id', 'tool-use-id', 'output-file', 'status', 'summary', 'note')
+    if (root.tag != 'task-notification' or root.attrib or root.text != '\n' or root.tail
+            or tuple(child.tag for child in root) != fields
+            or any(child.attrib or len(child) or not isinstance(child.text, str) or not child.text
+                   or child.tail != '\n' for child in root)
+            or not re.fullmatch(r'[A-Za-z0-9]+', root[0].text)
+            or not re.fullmatch(r'toolu_[A-Za-z0-9]+', root[1].text)
+            or root[3].text != 'failed'):
+        return None
+    return content
+
+
+def task_notification_imports(events, session_id, snapshot, workspace):
+    """Prove recovered notification history, never worker completion or new caller authority."""
+    from ao_project_room import digest
+    if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
+        raise RoomError('Task-notification native events are malformed')
+    namespace = snapshot.get('activeBranchId')
+    if snapshot.get('history_truncated') is not False or any(not isinstance(value, str) or not value for value in
+           (session_id, workspace, namespace, snapshot.get('sessionId'), snapshot.get('conversationId'))):
+        return []
+    counts = {}
+    for row in events:
+        identity = row.get('uuid')
+        if row.get('sessionId') == session_id and isinstance(identity, str):
+            counts[identity] = counts.get(identity, 0) + 1
+    candidates = {}
+    for row in events:
+        content = _failed_task_notification(row, session_id, workspace)
+        identity = row.get('uuid')
+        if content is None:
+            continue
+        try:
+            if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+                continue
+        except ValueError:
+            continue
+        provider_id = 'acp-history-turn:' + str(len(namespace.encode())) + ':' + namespace + str(len(identity.encode())) + ':' + identity
+        candidates[provider_id] = (row, content)
+    turns, messages = snapshot.get('turns'), snapshot.get('messages')
+    matching = {turn['providerTurnId'] for turn in (turns if isinstance(turns, list) else [])
+                if isinstance(turn, dict) and turn.get('state') == 'recovered'
+                and isinstance(turn.get('providerTurnId'), str) and turn['providerTurnId'] in candidates}
+    if not matching:
+        # Unimported notifications do not change historical observation rules.
+        # Enforce this proof's extra uniqueness checks only for an import candidate.
+        return []
+    if any(counts[candidates[provider_id][0]['uuid']] != 1 for provider_id in matching):
+        raise RoomError('Duplicate native task-notification identity')
+    if (not isinstance(turns, list) or not isinstance(messages, list)
+            or any(not isinstance(item, dict) for item in turns + messages)):
+        raise RoomError('Task-notification history requires complete turn and message arrays')
+    for label, values in (('turn', [turn.get('id') for turn in turns]),
+                          ('provider turn', [turn.get('providerTurnId') for turn in turns]),
+                          ('message', [message.get('id') for message in messages])):
+        if any(not isinstance(value, str) or not value for value in values) or len(set(values)) != len(values):
+            raise RoomError('Task-notification history has ambiguous ' + label + ' identities')
+    result = []
+    for turn in turns:
+        candidate = candidates.get(turn.get('providerTurnId'))
+        if turn.get('state') != 'recovered' or candidate is None:
+            continue
+        row, content = candidate
+        imported = [message for message in messages if message.get('turnId') == turn['id']]
+        if (len(imported) != 1 or imported[0].get('role') != 'user' or imported[0].get('origin') != 'human'
+                or imported[0].get('streaming') is not False or imported[0].get('text') != content):
+            continue
+        result.append({'kind': 'task_notification_history_import', 'version': 1, 'notification_status': 'failed',
+                       'session_id': snapshot['sessionId'], 'native_session_id': session_id,
+                       'conversation_id': snapshot['conversationId'], 'branch_id': namespace,
+                       'turn_id': turn['id'], 'provider_turn_id': turn['providerTurnId'], 'message_id': imported[0]['id'],
+                       'native_uuid': row['uuid'], 'native_event_sha256': digest(row), 'text_sha256': digest(content.encode()),
+                       'turn_sha256': digest(turn), 'messages_sha256': digest(imported)})
+    return sorted(result, key=lambda proof: proof['turn_id'])
+
+
 def source_keys(role):
     if role == 'engineer':
         return 'native_outcome_source', 'native_outcome_source_evidence'
@@ -208,5 +306,11 @@ def inspect(directory, state, request, source, snapshot):
     events = [json.loads(line) for line in raw.splitlines() if line.strip()]
     result = events_outcome(events, request, source['native_session_id'],
                             workspace=workspace if role == 'reviewer' else None)
-    return {**result, 'source': source, 'source_sha256': digest(raw),
-            'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
+    result = {**result, 'source': source, 'source_sha256': digest(raw),
+              'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
+    if (role == 'engineer' and state.get('workflow') == 'fable_engineering'
+            and snapshot.get('sessionId') == source['session_id'] == request['session_id']):
+        notifications = task_notification_imports(events, source['native_session_id'], snapshot, workspace)
+        if notifications:  # Do not change unrelated historical observation/digest shapes.
+            result['task_notification_imports'] = notifications
+    return result

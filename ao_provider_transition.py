@@ -300,8 +300,8 @@ def _native(state, binding, snapshot, directory=None):
     turns, messages = snapshot.get("turns"), snapshot.get("messages")
     if not isinstance(turns, list) or not isinstance(messages, list):
         raise RoomError("Provider transition requires explicit native turn and message arrays")
-    from ao_outcomes import known_compaction_turns
-    imports = known_compaction_turns(directory, state, snapshot) if state.get('provider_transition') and directory else set()
+    from ao_outcomes import known_context_turns
+    imports = known_context_turns(directory, state, snapshot) if state.get('provider_transition') and directory else set()
     settled = {}
     if state.get('provider_transition') and directory is not None:
         from ao_outcomes import validate_settlement
@@ -312,8 +312,8 @@ def _native(state, binding, snapshot, directory=None):
                 settled[request['turn_id']] = request
     for turn in turns:
         settled_quota = (isinstance(turn, dict) and turn.get('id') in settled and turn.get('state') == 'failed')
-        compact_summary = isinstance(turn, dict) and turn.get('id') in imports and turn.get('state') == 'recovered'
-        if not settled_quota and not compact_summary and (not isinstance(turn, dict) or turn.get("state") != "completed"):
+        context_import = isinstance(turn, dict) and turn.get('id') in imports and turn.get('state') == 'recovered'
+        if not settled_quota and not context_import and (not isinstance(turn, dict) or turn.get("state") != "completed"):
             value = turn.get("state") if isinstance(turn, dict) else None
             raise RoomError("Native history contains a turn that is not completed (state " + str(value) + "); failed, interrupted, cancelled, recovered or active work refuses")
     ids = [t.get("id") for t in turns]
@@ -759,8 +759,8 @@ def dispatch_gate(service, directory, state, snapshot):
     original = {t["turn_id"] for t in epoch["native"]["owned_turns"] + epoch["native"]["unowned_completed_turns"]}
     allowed = original | {r["turn_id"] for r in state["requests"].values()
                           if r.get("provider_epoch") == EPOCH and r.get("turn_id") and r.get("session_id") == engineer["session_id"]}
-    from ao_outcomes import known_compaction_turns
-    allowed |= known_compaction_turns(directory, state, snapshot)
+    from ao_outcomes import known_context_turns
+    allowed |= known_context_turns(directory, state, snapshot)
     ids = {t["id"] for t in snapshot["turns"]}
     if allowed - ids:
         raise RoomError("Pinned native turns are missing from the observed history")
