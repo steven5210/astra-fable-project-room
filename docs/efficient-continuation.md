@@ -138,15 +138,27 @@ When the bridge omitted error details, the operator can provide both
 `ao_database_path` and `native_transcript_path`. The adapter validates the exact
 retained Claude role and AO project/conversation/branch against read-only native
 ownership storage. An engineer keeps its immutable prepared-workspace check. An
-Astra-led Claude reviewer needs no engineer preparation: the exact native caller
+Astra-led Claude reviewer must be bound at MAX and needs no engineer preparation: the exact native caller
 and every correlated root assistant row must carry the retained owner's workspace,
-and the request, binding and observed model/effort must match. Reviewer source
+and the request, binding and observed model/effort must match. Every correlated root
+assistant row needs an exactly matching `cwd`, and each non-synthetic,
+non-API-error row must name the pinned model even without a terminal stop. Missing
+`cwd` on an error row makes the source unknown; it cannot establish a quota diagnosis.
+These comparisons do not normalize paths or infer missing fields. Reviewer source
 paths and workspace are saved separately from engineer evidence; later path
 audits cannot replace that reviewer native identity or workspace. It reads the explicit owned transcript only,
 never credentials or account settings. Correlation uses the caller's exact
 digest, native session and bounded human-message interval; compaction summaries,
 tool results, queue metadata and child sessions are not caller messages.
 Malformed, changed or ambiguous evidence holds rather than authorizing work.
+
+The explicit operator-supplied read-only owner storage and matching transcript are
+the first reviewer workspace trust anchor. This is not an independent preexisting
+room proof or a candidate-directory inference, and the workspace need not still
+exist. The first audit pins that identity and workspace; later supported calls may
+move evidence paths but cannot replace the owner or workspace. Mutually consistent
+forged local evidence is outside this trust model. A wrong first pin requires
+operator diagnosis, never editing saved state to bypass it.
 
 Establishing an explicit source preserves an existing unknown hold. Run a second
 `ao_room_outcome_audit` for the same role without source paths to reassess the

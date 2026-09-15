@@ -19,6 +19,7 @@ import test_ao_project_room as fixtures
 
 
 class ReviewerNativeFixture(unittest.TestCase):
+    REVIEW_EFFORT = 'max'
     commit = fixtures.AdapterTests.commit
     state = fixtures.AdapterTests.state
 
@@ -32,7 +33,8 @@ class ReviewerNativeFixture(unittest.TestCase):
         self.transcript = self.native_directory / 'native-reviewer.jsonl'
         self.fake.add('reviewer', harness='claude-code')
         self.fake.snapshots['reviewer']['settings']['model'] = ao_workflow.FABLE_MODEL
-        self.service.ao_room_bind(self.room, 'reviewer', 'reviewer', ao_workflow.FABLE_MODEL, 'max',
+        self.fake.snapshots['reviewer']['settings']['reasoningEffort'] = self.REVIEW_EFFORT
+        self.service.ao_room_bind(self.room, 'reviewer', 'reviewer', ao_workflow.FABLE_MODEL, self.REVIEW_EFFORT,
                                   fable_reason='Explicit independent Fable review of this exact candidate')
         self.service.ao_room_verify(self.room, str(self.repo))
         self.service.ao_room_send(self.room, 'reviewer', 'Read-only independent review.', 'review-1')
@@ -302,6 +304,146 @@ class ReviewerNativeOutcomeTests(ReviewerNativeFixture):
         with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
             self.service.ao_room_response_normalize(**self.normalization())
         self.assertEqual(len(self.fake.posts), 1)
+
+    def test_saved_source_without_end_turn_cannot_reuse_prior_completion(self):
+        self.prove_final()
+        original = self.files()
+        final = copy.deepcopy(self.final); final['message'].pop('stop_reason')
+        self.write_events([self.anchor, final])
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                result = self.audit(explicit)
+                self.assertEqual(result['native']['stop_reasons'], [])
+                self.assertEqual(result['outcome']['kind'], 'unknown')
+                self.assertTrue(result['outcome']['hold'])
+                self.assertEqual(self.state()['requests']['review-1']['semantic_status'], result['outcome'])
+                with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
+                    self.service.ao_room_response_normalize(**self.normalization())
+        self.assertEqual(len(self.fake.posts), 1)
+        for path, content in original.items():
+            if path != 'state.json': self.assertEqual((self.directory() / path).read_bytes(), content)
+
+    def test_no_path_audit_rechecks_saved_workspace_and_revokes_available_outcome(self):
+        self.prove_final()
+        source = copy.deepcopy(self.state()['native_reviewer_outcome_source'])
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET workspace_path='/different-reviewer-workspace'")
+        result = self.audit(False)
+        self.assertEqual(result['outcome']['kind'], 'unknown')
+        self.assertTrue(result['outcome']['hold'])
+        self.assertIn('workspace', result['native']['unknown'])
+        self.assertEqual(self.state()['native_reviewer_outcome_source'], source)
+        with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
+            self.service.ao_room_response_normalize(**self.normalization())
+        self.assertEqual(len(self.fake.posts), 1)
+
+    def test_legacy_binding_without_conversation_ids_refuses_before_source_registration(self):
+        state = self.state()
+        state['bindings']['reviewer'].pop('conversation_id')
+        state['bindings']['reviewer'].pop('branch_id')
+        self.service.save(self.directory(), state)
+        with patch.object(ao_review_extension, 'guard_native_owner', wraps=ao_review_extension.guard_native_owner) as guard:
+            self.assert_audit_refuses_unchanged('exact Astra-led native owner')
+            guard.assert_called_once()
+        self.assertNotIn('native_reviewer_outcome_source', self.state())
+
+    def test_direct_inspect_rejects_mutated_public_identity_before_reading_native_events(self):
+        source = {'database': str(self.database), 'transcript': str(self.transcript), 'session_id': 'reviewer',
+                  'native_session_id': 'native-reviewer', 'workspace_path': str(self.workspace)}
+        mutations = [({'settings': {'model': 'foreign', 'reasoningEffort': 'max'}}, 'request/model/history'),
+                     ({'settings': {'model': ao_workflow.FABLE_MODEL, 'reasoningEffort': 'high'}}, 'request/model/history'),
+                     ({'sessionId': 'foreign'}, 'request/model/history'),
+                     ({'history_truncated': True}, 'request/model/history'),
+                     ({'activeBranchId': 'foreign'}, 'workspace/conversation identity'),
+                     ({'conversationId': 'foreign'}, 'workspace/conversation identity')]
+        original = self.files()
+        with patch.object(native, 'events_outcome', side_effect=AssertionError('Invalid snapshot reached native event parsing')):
+            for changes, expected in mutations:
+                with self.subTest(changes=changes):
+                    snapshot = {**self.fake.conversation('reviewer'), **changes}
+                    with self.assertRaisesRegex(ao.RoomError, expected):
+                        native.inspect(self.directory(), self.state(), self.request, source, snapshot)
+        self.assertEqual(self.files(), original)
+
+    def test_codex_astra_led_reviewer_keeps_ordinary_outcome_and_refuses_native_claude_source(self):
+        other = fixtures.AdapterTests(); other.setUp(); self.addCleanup(other.doCleanups)
+        other.bind('reviewer')
+        other.service.ao_room_verify(other.room, str(other.repo))
+        other.send('reviewer')
+        other.fake.finish('reviewer', other.verdict())
+        other.service.ao_room_sync(other.room)
+        directory = other.service.root / 'rooms' / other.room
+        files = {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(other.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'exact Astra-led native owner'):
+            other.service.ao_room_outcome_audit(other.room, role='reviewer', ao_database_path=str(self.database),
+                                               native_transcript_path=str(self.transcript))
+        self.assertEqual({str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}, files)
+        self.assertEqual(other.fake.posts, posts)
+        self.assertNotIn('native_reviewer_outcome_source', other.state())
+        self.assertEqual(other.service.ao_room_outcome_audit(other.room, role='reviewer')['outcome']['kind'], 'final_available')
+
+    def test_normal_codex_reviewer_never_enters_native_claude_source_lane(self):
+        import test_ao_normal
+        other = test_ao_normal.Fixture(); other.setUp(); self.addCleanup(other.doCleanups)
+        other.room = other.open(); other.spec(); other.bind(); other.agree(); other.implement(); other.review()
+        directory = other.directory()
+        files = {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}
+        posts = copy.deepcopy(other.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'exact Astra-led native owner'):
+            other.service.ao_room_outcome_audit(other.room, role='reviewer', ao_database_path=str(self.database),
+                                               native_transcript_path=str(self.transcript))
+        self.assertEqual({str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}, files)
+        self.assertEqual(other.fake.posts, posts)
+        self.assertNotIn('native_reviewer_outcome_source', other.state())
+        self.assertEqual(other.service.ao_room_outcome_audit(other.room, role='reviewer')['outcome']['kind'], 'final_available')
+
+    def test_cwd_less_native_error_is_unknown_and_cannot_reuse_completed_source(self):
+        self.prove_final()
+        error = {'type': 'assistant', 'uuid': 'error', 'sessionId': 'native-reviewer', 'timestamp': self.time(3),
+                 'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+                 'message': {'model': '<synthetic>'}}
+        self.write_events([self.anchor, self.final, error])
+        result = self.audit(False)
+        self.assertEqual(result['outcome']['kind'], 'unknown')
+        self.assertIn('workspace', result['native']['unknown'])
+        self.assertFalse(result['resume_eligible'])
+        with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
+            self.service.ao_room_response_normalize(**self.normalization())
+        self.assertEqual(len(self.fake.posts), 1)
+
+    def test_first_workspace_pin_trusts_explicit_storage_without_existence_or_candidate_inference(self):
+        self.workspace.rmdir()
+        self.assertFalse(self.workspace.exists())
+        self.assertNotEqual(self.workspace, self.repo.resolve())
+        self.prove_final()
+        self.assertEqual(self.state()['native_reviewer_outcome_source']['workspace_path'], str(self.workspace))
+        self.assertFalse(self.workspace.exists())
+        self.assertEqual(len(self.fake.posts), 1)
+
+
+class ReviewerNonMaxNativeOutcomeTests(ReviewerNativeFixture):
+    REVIEW_EFFORT = 'high'
+
+    def test_consistently_non_max_reviewer_refuses_direct_and_supported_source_admission(self):
+        from ao_native_identity import read_owner
+        state = self.state(); binding = state['bindings']['reviewer']
+        self.assertEqual(binding['reasoning_effort'], 'high')
+        self.assertEqual(self.request['reasoning_effort'], 'high')
+        self.assertEqual(self.fake.snapshots['reviewer']['settings']['reasoningEffort'], 'high')
+        source = {'database': str(self.database), 'transcript': str(self.transcript), 'session_id': 'reviewer',
+                  'native_session_id': 'native-reviewer', 'workspace_path': str(self.workspace)}
+        files, posts = self.files(), copy.deepcopy(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'MAX'):
+            native.validate_source(state, source, 'reviewer')
+        with self.assertRaisesRegex(ao.RoomError, 'MAX'):
+            native.inspect(self.directory(), state, self.request, source, self.fake.conversation('reviewer'))
+        with self.assertRaisesRegex(ao.RoomError, 'MAX'):
+            ao_review_extension.guard_native_owner(self.service, state, read_owner(self.database, 'reviewer'), role='reviewer')
+        self.assert_audit_refuses_unchanged('MAX')
+        self.assertEqual(self.files(), files); self.assertEqual(self.fake.posts, posts)
+        self.assertEqual(self.state()['requests']['review-1']['semantic_status']['kind'], 'unknown')
+        self.assertNotIn('native_reviewer_outcome_source', self.state())
 
 
 if __name__ == '__main__':

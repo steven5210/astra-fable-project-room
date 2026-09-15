@@ -153,13 +153,14 @@ def validate_source(state, source, role='engineer'):
         raise RoomError('Native outcome owner changed')
     if role == 'reviewer':
         if (state.get('workflow') != 'astra_led' or state.get('spec_review_extension')
+                or binding.get('reasoning_effort') != 'max'
                 or any(other != role and value.get('session_id') == binding['session_id']
                        for other, value in state['bindings'].items())
                 or owner['ao_conversation_id'] != binding.get('conversation_id')
                 or owner['active_branch_id'] != binding.get('branch_id')
                 or owner['workspace_path'] != source['workspace_path']
                 or not isinstance(source['workspace_path'], str) or not Path(source['workspace_path']).is_absolute()):
-            raise RoomError('Native reviewer owner/workspace contradicts its exact Astra-led binding')
+            raise RoomError('Native reviewer owner/workspace contradicts its exact Astra-led binding at MAX')
         previous = state.get(key)
         if previous is not None and (not isinstance(previous, dict) or set(previous) != expected
                 or any(previous[k] != source[k] for k in ('session_id', 'native_session_id', 'workspace_path'))):

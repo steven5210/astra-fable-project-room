@@ -358,11 +358,12 @@ def guard_native_owner(service, state, owner, role='engineer'):
     if role == 'reviewer':
         binding = state.get('bindings', {}).get('reviewer', {})
         if (state.get('workflow') != 'astra_led' or state.get('spec_review_extension')
+                or binding.get('reasoning_effort') != 'max'
                 or binding.get('harness') != 'claude-code' or owner.get('id') != binding.get('session_id')
                 or owner.get('project_id') != state.get('ao_project_id')
                 or owner.get('ao_conversation_id') != binding.get('conversation_id')
                 or owner.get('active_branch_id') != binding.get('branch_id')):
-            raise RoomError('Reviewer source audit requires its exact Astra-led native owner without an engineer review grant')
+            raise RoomError('Reviewer source audit requires its exact Astra-led native owner at MAX without an engineer review grant')
         return
     if role != 'engineer':
         raise RoomError('Native owner guard requires an exact engineer or reviewer role')
