@@ -168,6 +168,15 @@ Codex task discovers updated MCP tools after plugin installation.
    non-result, and an unresolved, active or foreign job refuses. Acceptance requires
    completed, true and no remaining gaps. Optional proposals remain proposals until
    approved.
+   Inspect `review_followups` in saved room status after spec review and engineering
+   completion. Present worthwhile `enhancement_proposals` with benefits, tradeoffs
+   and Astra's recommendation; preserve the user's decision and check for duplicate
+   tracker items under existing filing authority. Do not invent proposals or infer
+   "none" from missing legacy fields. Read full receipts before acting on bounded
+   previews. Pending `operator_requests` block acceptance even with completed/true:
+   perform only authorized execution, return new evidence, and obtain the subsequent
+   Fable judgment. A request or optional proposal adds no scope authority. See the
+   [report contract](../../../docs/efficient-continuation.md#personal-review-operator-handoffs-and-enhancements).
 7. For a confirmed completed turn, a new `correction` request may repair the
    implementation or missing/malformed report in the same session. The correction
    message is exactly the caller's new instruction, `Continue.` when there is

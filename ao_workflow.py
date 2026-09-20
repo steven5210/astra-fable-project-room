@@ -17,7 +17,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
-         "delegation_efficiency_v2")
+         "delegation_efficiency_v2", "review_first_routing_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -73,21 +73,28 @@ def latest(state, purposes):
     return max(items, key=lambda r: r["created_order"]) if items else None
 
 
-def agreement(service, directory, state):
+def spec_review_report(service, directory, state, request):
     spec = service.spec(directory, state)
-    request = latest(state, {"spec_review"})
     if not request or request["spec_record_sha256"] != state["spec_record_sha256"]:
         raise RoomError("The current exact spec requires completed Fable agreement")
     from ao_outcomes import usable
     usable(directory, request)
     verdict = final_json(directory, request)
     if (request["role"] != "engineer" or request["harness"] != "claude-code" or request["model"] != FABLE_MODEL
-            or verdict.get("decision") != "accept" or type(verdict.get("spec_revision")) is not int
+            or verdict.get("decision") not in ("accept", "changes_required") or type(verdict.get("spec_revision")) is not int
             or verdict["spec_revision"] != spec["revision"] or verdict.get("spec_sha256") != spec["sha256"]
             or not isinstance(verdict.get("interpretation"), str) or not verdict["interpretation"].strip()
-            or not isinstance(verdict.get("findings"), list) or not all(isinstance(f, str) for f in verdict["findings"])
-            or any(f.startswith("BLOCKER:") for f in verdict["findings"])):
+            or not isinstance(verdict.get("findings"), list) or not all(isinstance(f, str) for f in verdict["findings"])):
         raise RoomError("Fable rejected, incompletely reviewed, or did not accept the exact current spec")
+    return verdict
+
+
+def agreement(service, directory, state):
+    request = latest(state, {"spec_review"})
+    verdict = spec_review_report(service, directory, state, request)
+    if verdict['decision'] != 'accept' or any(f.startswith('BLOCKER:') for f in verdict['findings']):
+        raise RoomError("Fable rejected, incompletely reviewed, or did not accept the exact current spec")
+    spec = service.spec(directory, state)
     return {"agreed": True, "spec_revision": spec["revision"], "spec_sha256": spec["sha256"],
             "request_id": request["request_id"], "receipt_sha256": request["receipt_sha256"], "astra_approval": spec["approval"]}
 
@@ -162,6 +169,8 @@ def engineering_report(directory, state, request, report=None):
         report = final_json(directory, request)
     from ao_report_contract import project
     report = project(directory, state, request, report)
+    from ao_review_followups import validate
+    validate(report, fields=('operator_requests',))
     if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
             or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
@@ -245,6 +254,9 @@ def engineering_ready(service, directory, state):
     report = engineering_report(directory, state, request)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")
+    from ao_review_followups import pending_operator_work
+    if pending_operator_work(directory, state, request, report):
+        raise RoomError("Engineering has pending operator requests; complete authorized work and obtain the subsequent engineering verdict")
     # Re-verify the named delegate jobs live; a record captured before this evidence existed is verified live only.
     evidence = ao_delegates.verify_delegation(service.root.parent, directory, state, report)
     record = read(directory / request["engineering_record"])
@@ -484,6 +496,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     from ao_report_contract import PART, INSTRUCTION, DELEGATION_PART, DELEGATION_INSTRUCTION
     texts[PART] = INSTRUCTION  # A new one-time amendment, never a rewrite of frozen workflow bytes.
     texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
+    from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
+    texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
     held = delivered(state, binding["session_id"], directory)
     sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
