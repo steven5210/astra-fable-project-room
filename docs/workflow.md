@@ -16,6 +16,16 @@ Use the room from the Astra task where the feature is being shaped. That task re
 
 Astra need not read every delegate transcript. It inspects the code, behavior, engineering verdict, gate output, and remaining risks, then drills into routing or delegate details when a concern requires it. Fable remains accountable for every engineering verdict.
 
-Filing an enhancement issue is separate from approving its implementation. Astra checks for an existing issue before creating one, shows the user its verified link, and continues agreed work while awaiting the user's answer. Approved scope is recorded in a revised specification and reviewed before implementation; optional ideas must not disappear silently into a backlog.
+## Enhancement issue handoff
+
+Under the user's existing filing authorization, Astra opens or links a GitHub issue for each worthwhile enhancement in the feature project's repository. Check both open and closed issues and the current implementation first; reuse an existing issue and record completed or superseded proposals rather than opening stale duplicates. A local backlog entry alone is not a filed issue.
+
+Inspect the repository's labels and apply `enhancement` (or its established equivalent), relevant feature/area labels, and an accurate workflow status where that taxonomy exists. For example, a research proposal awaiting a scope decision can use existing `enhancement`, `research`, feature-area and `pending` labels. Preserve existing labels; do not invent urgency, mark unapproved work ready/in-progress, or assume issue creation approves implementation. If a needed label is unavailable, use the closest established label and state the missing classification explicitly in the issue body.
+
+Make each issue usable for pickup: describe the problem and evidence, proposed outcome, benefit, tradeoff, acceptance criteria, dependencies and scope-decision status. Keep private project material in the appropriate private tracker. Fable supplies proposal data; Astra checks the content and performs issue operations through trusted tools.
+
+Read back the issue after creation or labeling. Retain its verified URL, labels, source proposal and user-decision status in the room's proposal record or linked operator artifact, and show the user the issue link. If creation or labeling is blocked, preserve the draft and report exactly what remains pending; do not claim filing is complete.
+
+Filing an enhancement issue is separate from approving its implementation. Continue agreed work while awaiting any needed scope decision. Approved scope is recorded in a revised specification and reviewed before implementation; optional ideas must not disappear silently into a backlog.
 
 The shared room avoids using chat history as the only source of truth. Existing app conversations remain available; the plugin resumes dedicated worker sessions and explicit room records. The MCP server is a local tool surface, and the skill in the active Astra conversation drives the workflow. Jobs can outlive the connection, but the plugin does not create a future Astra wakeup automatically.

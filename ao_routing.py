@@ -719,6 +719,34 @@ def observe_on_sync(service, directory, state):
 
 
 def status(prepared, state, directory=None):
+    from ao_project_room import digest
+    result = routing_status(prepared, state, directory)
+    configured = result['status'] in ('configured', 'verified')
+    try:
+        current_guard_sha256 = digest(Path(__file__).with_name('ao_routing_guard.py').read_bytes())
+    except OSError:
+        current_guard_sha256 = None
+    known_guard = (configured and (prepared.get('routing') or {}).get('version') == 2
+                   and current_guard_sha256 is not None and result.get('guard_sha256') == current_guard_sha256)
+    result['worker_recovery'] = {
+        'native_child_context_resume': False if known_guard else None,
+        'native_child_messaging': False if known_guard else None,
+        'capability_basis': ('verified_current_guard_for_root_engineer' if known_guard
+                             else 'not_configured' if result['status'] == 'not_configured' else 'unverified_guard_capability'),
+        'fresh_pinned_worker': ('conditional' if configured
+                                else 'blocked' if result['status'] == 'unverified' else 'not_configured'),
+        'strategy': ('inspect_preserved_artifacts_then_operator_or_fresh_pinned_worker' if configured
+                     else 'inspect_preserved_artifacts_then_operator'),
+        'dispatch_authorized': False,
+        'meaning': 'Static guard capability for the root engineer managing its children, not a live recovery attestation. '
+                   'Null means unverified or not configured, never permission to resume or message. '
+                   'A fresh worker does not retain the old child context. Verify complete artifact access and '
+                   'inputs first; normal routing, quota, ownership and authorization gates still apply. '
+                   'Retained parent-session continuation is a separate audited operation.'}
+    return result
+
+
+def routing_status(prepared, state, directory=None):
     if not prepared or not prepared.get("routing"):
         return {"status": "not_configured", "error": None, "meaning": NOT_CONFIGURED}
     routing = prepared["routing"]

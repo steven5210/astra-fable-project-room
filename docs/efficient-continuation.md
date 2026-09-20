@@ -7,6 +7,92 @@ Fable. Delegate those tasks when the full quality bar is met. Preserve explicit
 user restrictions narrowly. Exact-spec review itself remains read-only and
 non-delegating; evidence can be prepared beforehand.
 
+## Personal review, operator handoffs and enhancements
+
+The `review_first_routing_v1` amendment reaches new and retained engineer sessions
+once, on their next separately authorized request. Fable keeps personal spec
+review, pushback, useful enhancement suggestions and final engineering judgment
+at MAX. A large review is not evidence of waste by itself. Qualified delegates
+author substantive supporting work from requirements. Fully specified copying,
+byte application, inventories, hashing and exact gate execution belong with the
+assigned operator when no further model judgment is needed. Record a concrete
+quality or capability reason for choosing a model instead; preserve all quality
+checks, provider budgets and data restrictions.
+
+Engineering reports support `operator_requests`, a list of pending handoffs:
+
+```json
+{
+  "operator_requests": [{
+    "task": "Run the agreed gate against the supplied candidate.",
+    "inputs": ["The candidate and the agreed gate argv"],
+    "verification": ["Save the complete output and exit status against the candidate digest."]
+  }],
+  "enhancement_proposals": [{
+    "title": "Export comparison results",
+    "benefit": "Reviewers can compare runs.",
+    "tradeoff": "An additional format to maintain.",
+    "basis": "Repeated manual comparisons during the review."
+  }]
+}
+```
+
+These are optional additions to the existing report, not a complete report or
+executable instructions. All object fields shown are required when an entry is
+present; strings must be nonempty, inputs is a list and verification is a nonempty
+list. A nonempty `operator_requests` list blocks verification and acceptance even
+if the report mistakenly claims `completed/true`. The operator reads the complete
+request, checks existing authority, performs authorized work and provides new
+evidence. A subsequent truthful Fable report can clear the pending list. Omitting
+the field does not clear previously reported pending work. Prior reports and
+receipts remain unchanged; a handoff never grants new permission.
+The controller also retains explicit pending requests from a parseable report
+that failed some other engineering validation. Intact non-JSON replies never
+clear an earlier structured statement; missing or corrupt evidence is unknown
+and blocks an implicit clearance. An explicit new list requires Fable's truthful
+disposition and the ordinary candidate and acceptance checks.
+
+Both spec-review and engineering reports support `enhancement_proposals`. Suggest
+worthwhile improvements, without manufacturing a required number. Return `[]`
+when there are no new proposals. Astra presents grounded proposals with benefits,
+tradeoffs and its recommendation, and files or links each worthwhile proposal under
+existing filing authority. Use the repository's enhancement, relevant area and accurate
+status labels; verify and record the issue URL and labels with the user's decision
+as specified in the [enhancement issue handoff](workflow.md#enhancement-issue-handoff).
+Filing and implementation
+retain their separate authorization requirements. Optional proposals do not block
+acceptance or amend the specification; unmet agreed requirements remain findings
+or gaps. Legacy reports may omit either field, which means **not reported**, never
+"no findings". Older proposals can still be present in backlog or findings.
+Malformed optional enhancement data is exposed as `assessment: invalid`; it does
+not invalidate the core verdict or consume another spec review just to repair
+advisory formatting. Malformed engineering `operator_requests` refuse the report
+because pending execution affects readiness. Operator requests in a spec review
+are exposed as unexpected data with no execution authority; that phase remains
+read-only and its core interpretation, findings and decision govern agreement.
+
+Saved `ao_room_status.review_followups` exposes the latest spec-review and engineering
+reports without AO/model calls or writes. Counts and bounded previews point to each
+complete receipt and digest. A pending, stale or unusable latest result is explicit;
+status never falls back to an older all-clear. Previews are not complete task inputs,
+scope decisions or live candidate verification.
+
+`delegate.routing.worker_recovery` distinguishes verified current guard capability
+from unverified, historical or unconfigured routing. Only matching current v2
+guard bytes establish the reported protection for the root engineer managing its
+children. Null capability values mean unknown, never permission. Unconfigured
+or unverified routing offers the operator path, not a native dispatch. Under the
+bounded contract, child context resume, `SendMessage` and root `ListAgents` remain
+unsupported; this does not claim every child tool is denied by historical guards.
+Continuing the retained Fable parent session is a separate audited operation and
+does not resume a child's context. After an authorized continuation, inspect and
+verify preserved artifacts, then use the operator for settled execution or a fresh
+pinned worker for substantive remaining work when routing and normal dispatch gates
+permit it. Supply the new worker's complete necessary context and verify artifact
+access; a path alone is insufficient. Do not retry a denied resume through another
+tool or weaken the guard. This amendment does not wake work, clear quota/uncertainty
+holds, renew reviews, modify native configuration or prove live usage savings.
+
 ## Compact engineering reports
 
 The additional `delegation_efficiency_v2` amendment is delivered once to new or

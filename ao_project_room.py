@@ -928,6 +928,7 @@ class Service:
         if ao_workflow.normal(state):
             import ao_provider_transition
             import ao_review_extension
+            import ao_review_followups
             try:
                 agreed = ao_workflow.agreement(self, directory, state)
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -937,7 +938,8 @@ class Service:
                          provider_transition=ao_provider_transition.summary(self, directory, state, delegate),
                          spec_review_extension=ao_review_extension.summary(self, state),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
-                         engineer_context=ao_workflow.context_summary(state))
+                         engineer_context=ao_workflow.context_summary(state),
+                         review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
