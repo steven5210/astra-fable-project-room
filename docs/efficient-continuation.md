@@ -55,8 +55,11 @@ disposition and the ordinary candidate and acceptance checks.
 Both spec-review and engineering reports support `enhancement_proposals`. Suggest
 worthwhile improvements, without manufacturing a required number. Return `[]`
 when there are no new proposals. Astra presents grounded proposals with benefits,
-tradeoffs and its recommendation, checks existing tracker items, and preserves the
-user's decision under the existing enhancement workflow. Filing and implementation
+tradeoffs and its recommendation, and files or links each worthwhile proposal under
+existing filing authority. Use the repository's enhancement, relevant area and accurate
+status labels; verify and record the issue URL and labels with the user's decision
+as specified in the [enhancement issue handoff](workflow.md#enhancement-issue-handoff).
+Filing and implementation
 retain their separate authorization requirements. Optional proposals do not block
 acceptance or amend the specification; unmet agreed requirements remain findings
 or gaps. Legacy reports may omit either field, which means **not reported**, never
