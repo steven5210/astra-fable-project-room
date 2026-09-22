@@ -469,10 +469,15 @@ must inspect independently, stay read-only, and finish with one JSON object:
 Use `rejected` with actionable findings when appropriate. Sync its terminal native
 response, investigate findings, repair and reverify if needed. `ao_room_accept`
 accepts only an actual completed independent reviewer response with matching
-identities, intact logs and unchanged candidate bytes. There are at most three
-review requests per room across revisions. If exhausted, surface the unresolved
-decision to the user; this initial adapter has no automatic budget-renewal lane.
-Do not create another room/session to bypass that limit. An explicit AO model
+identities, intact logs and unchanged candidate bytes. The ordinary allowance is
+three acceptance-review requests per room across revisions. Further necessary
+reviews require actual user authorization and a fresh
+[single-use acceptance-review audit and grant](../../../docs/acceptance-review-continuation.md)
+for each exact named request/message. Settle recovery and engineering first,
+verify the candidate, audit both retained owners and all prior evidence, then
+extend and send the one named review. Broad applicable authorization may support
+later separately audited grants; there is no automatic renewal or global cap
+increase. Do not create another room/session to bypass that limit. An explicit AO model
 reroute is preserved and blocks acceptance if it contradicts the pinned model.
 Normal rooms also audit engineer identity before new dispatch, handoff and acceptance. Sync persists the contradiction immediately when observed,
 including during a running turn, and retains it even if later metadata names the

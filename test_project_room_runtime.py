@@ -134,6 +134,8 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         status = self.tool(server, "ao_room_status", {"room_id": "ao-runtime-fixture"})
         self.assertEqual(status["room_id"], "ao-runtime-fixture")
         self.assertEqual(status["delegate"]["provider"], "none")
+        self.assertIsNone(status["acceptance_review_extension"])
+        self.assertEqual(status["acceptance_review_attempts"], 0)
         self.assertEqual(self.tool(server, "ao_room_list")["count"], 1)
         self.assertEqual(self.request(server, "ping"), {})
         self.assertEqual(state.read_bytes(), original)

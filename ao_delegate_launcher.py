@@ -29,7 +29,9 @@ def owned_bytes(path, maximum=4_000_000):
     for parent in (path, *path.parents):
         if parent.is_symlink():
             raise ValueError("Private launch evidence traverses a symlink")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # Inspect the opened object before reading; a FIFO must not block open()
+    # before the regular-file check can reject it.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > maximum:

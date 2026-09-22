@@ -72,3 +72,43 @@ def verify_resume(before, after):
 QUERY_COLUMNS = ('id', 'project_id', 'harness', 'session_mode', 'is_terminated', 'activity_state', 'workspace_path',
                  'provider_conversation_id', 'controller_generation', 'ao_conversation_id', 'active_branch_id',
                  'branch_provider_conversation_id', 'branch_session_id', 'strategy', 'replay_truncated')
+
+
+def read_codex_owner(database, session_id):
+    """Separate read-only evidence for a retained native Codex reviewer.
+
+    Never relaxes the Claude-only `read_owner`, which stays untouched.
+    """
+    path = Path(database)
+    if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('Use the verified absolute AO database path without symlinks')
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError('AO database ownership is unsafe')
+    try:
+        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute('BEGIN')
+            rows = connection.execute(QUERY, (session_id,)).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError('AO owner storage is unavailable or its schema changed') from exc
+    if len(rows) != 1:
+        raise ValueError('AO native owner evidence is missing or ambiguous')
+    return _validated_codex(dict(rows[0]), session_id)
+
+
+def _validated_codex(owner, session_id):
+    if not isinstance(owner, dict) or set(owner) != set(QUERY_COLUMNS):
+        raise ValueError('AO owner evidence has an unexpected shape')
+    if (owner['id'] != session_id or owner['branch_session_id'] != session_id
+            or type(owner['is_terminated']) is not int or owner['is_terminated'] != 0 or owner['harness'] != 'codex'
+            # AO normalizes only the legacy empty strategy to native. Keep the
+            # raw value in the evidence; never normalize an unknown nonempty one.
+            or owner['session_mode'] != 'chat' or owner['strategy'] not in ('', 'native')
+            or type(owner['replay_truncated']) is not int or owner['replay_truncated'] != 0
+            or not isinstance(owner['controller_generation'], str) or not owner['controller_generation'].strip()
+            or not isinstance(owner['provider_conversation_id'], str) or not owner['provider_conversation_id']
+            or owner['branch_provider_conversation_id'] != owner['provider_conversation_id']
+            or any(not isinstance(owner[k], str) or not owner[k] for k in ('project_id', 'workspace_path', 'ao_conversation_id', 'active_branch_id'))):
+        raise ValueError('AO storage does not prove a retained native Codex owner')
+    return owner

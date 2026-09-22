@@ -226,6 +226,8 @@ def bind(service, room_id, request_id, executable_path, launch_path, database_pa
         evidence = _inspect(service, directory, state, inputs, prepared, source)
         from ao_review_extension import guard_native_owner
         guard_native_owner(service, state, evidence['native_owner'])
+        import ao_acceptance_extension
+        ao_acceptance_extension.guard_unused(service, state, 'executable binding repair')
         record = existing or {'version': 1, 'room_id': room_id, 'inputs': inputs,
             'recorded_at': time.time(), 'before_state_sha256': ao.digest(state),
             'engineer': state['bindings']['engineer'], 'preparation': state['preparation'],
