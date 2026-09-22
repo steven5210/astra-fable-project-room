@@ -15,10 +15,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
-    # The 778-test offline suite reached 20 minutes on a macOS runner while passing.
-    # Allow setup, recovery timeout probes and cleanup enough time to finish.
+    # The 1,129-test offline suite exceeded 30 minutes on a macOS runner while
+    # still passing tests. Allow setup, recovery timeout probes and cleanup to finish.
     # This is a CI budget, not a Fable, model or gate deadline.
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
