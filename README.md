@@ -127,6 +127,15 @@ decision can authorize [one additional exact charter review](docs/one-charter-re
 The audited operation preserves the same native session and prior evidence. It
 is available once per room and grants no extra source or acceptance reviews.
 
+After the ordinary three acceptance-review attempts, the operator can use an
+[audited single-use acceptance-review continuation](docs/acceptance-review-continuation.md)
+when the user has authorized further necessary reviews. Each grant names one
+exact review request and message over the current verified candidate, preserves
+all prior attempts and native owners, and is consumed before dispatch. Later
+reviews require separately audited grants; no counter reset, automatic renewal,
+hold release or acceptance waiver is added. A stale unused grant remains
+visible and cannot be retired in this version.
+
 Fable owns delegation decisions, and quality always beats token savings. In DeepSeek rooms, DeepSeek is the first choice for substantive work whenever it can meet the full quality bar: self-contained implementation, tests, research and reviews against verifiable requirements, plus bounded module design or debugging when its demonstrated quality warrants it. Fable chooses Sonnet, Opus or itself when better suited and routes up when in doubt; it does not need to force a lower-tier failure first. Sonnet supplies agentic execution, Opus supplies bounded judgment or appropriate browser work, and Fable retains cross-cutting judgment, adjudication and the final engineering verdict. Delegates perform routine execution; Fable maintains quality through clear task requirements, suitable routing, checking results and its final verdict. In newly prepared AO rooms, Fable can retain judgment work itself but execution tools stay with the operator or pinned workers. A quality or capability gap must be reported for resolution. Older AO and legacy rooms retain their recorded direct-execution exception; it never overrides an explicit task restriction. Each routing choice records its reason and outcome.
 
 Supply this quality-first policy when establishing the session, then send only actual policy changes. Conserve Fable tokens by delegating suitable work and reusing complete context and evidence, while preserving the review needed for a sound verdict. A request to save tokens does not create a blanket ban on justified Fable work. Explicit task restrictions still apply. The adapter remains text-only; existing rooms retain their pinned policy, provider settings and original routing unless the explicit [retained adoption procedure](docs/provider-transition.md) is completed. See [Fable's policy](skills/project-room/references/fable-policy.md) for diagnosis, escalation and verification duties.

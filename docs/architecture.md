@@ -5,6 +5,7 @@ The package separates the agent workflow from durable execution:
 - `skills/project-room/SKILL.md` supplies Astra's roles, review loop, handoff, and product acceptance workflow.
 - `project_room_mcp.py` exposes local stdio tools. The plugin manifest starts it from the installed plugin root.
 - `project_room.py` provides setup, diagnostics, a project/feature room registry, and the CLI equivalent of the MCP operations.
+- `ao_acceptance_extension.py` audits and grants one exact additional independent acceptance review after the ordinary AO allowance. Its append-only grant/consumption journal preserves native ownership, prior evidence and single-use dispatch semantics; see [acceptance-review continuation](acceptance-review-continuation.md).
 - `room.py` supplies the underlying specification-review engine: immutable specs, exact digests, persistent Claude identity, idempotency, verification, audited recovery, and bounded review rounds continued by recorded user decisions.
 - `implementation.py` supplies the authorized implementation lifecycle and validation evidence, saving each model or gate stage start before the child runs so status can report accurate countdowns.
 - `progress.py` derives the additive read-only `progress` object for job status from owned registry, review-turn, and handoff state plus a bounded scan of the exact owned session transcript; it never spawns, calls a model, or edits state. See [progress](progress.md).

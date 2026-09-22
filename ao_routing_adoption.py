@@ -242,6 +242,8 @@ def _inspect(service, directory, state):
     from ao_review_extension import guard_pending_receipts, guard_replacement
     guard_pending_receipts(directory, state)
     guard_replacement(state, 'routing adoption')
+    import ao_acceptance_extension
+    ao_acceptance_extension.guard_unused(service, state, 'routing adoption')
     import ao_provider_transition
     if state.get('routing_adoption') or list((directory / BASE / 'requests').glob('*.json')):
         raise RoomError('Routing adoption is already used or pending')
@@ -419,6 +421,8 @@ def stage(service, room_id, audit_sha256, authorization, diagnosis, request_id):
             from ao_review_extension import guard_pending_receipts, guard_replacement
             guard_pending_receipts(directory, state)
             guard_replacement(state, 'routing adoption')
+            import ao_acceptance_extension
+            ao_acceptance_extension.guard_unused(service, state, 'routing adoption')
         if ref:
             if ref.get('request_id') != request_id or ref.get('key') != ao.digest(inputs):
                 raise RoomError('Routing adoption already belongs to another request')
@@ -503,6 +507,8 @@ def activate(service, room_id, request_id):
             return _result(directory, state, ref)
         from ao_review_extension import guard_replacement
         guard_replacement(state, 'routing activation')
+        import ao_acceptance_extension
+        ao_acceptance_extension.guard_unused(service, state, 'routing adoption')
         record, saved = _pending(service, directory, state, ref)
         _foreground_sources(service, state, saved)
         prepared, runtime, config, files = _bundle(directory, saved)

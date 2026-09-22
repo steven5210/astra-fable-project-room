@@ -363,6 +363,8 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
         if prior['resume_request_id'] != resume_request_id:
             raise RoomError('This outcome already has a different immutable continuation')
         inputs['previous_resume_sha256'] = request['outcome_resume_sha256']
+    import ao_acceptance_extension
+    ao_acceptance_extension.guard_outcome_resume(service, state, request, resume_request_id)
     if request_id == resume_request_id or resume_request_id in state['requests']:
         raise RoomError('Continuation requires one unused request identity')
     snapshot = service.identity(service.client(state), state, request)

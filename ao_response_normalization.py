@@ -224,6 +224,8 @@ def normalize(service, directory, state, request_id, receipt_sha256, final_text_
         validate_current(service, directory, state, request, value)
         return {"normalized": True, "request_id": request_id, "normalization_sha256": request["response_normalization_sha256"],
                 "model_dispatch": False}
+    import ao_acceptance_extension
+    ao_acceptance_extension.guard_unused(service, state, 'a new response normalization')
     try:
         strict_object(raw)
     except ResponseFormatError:

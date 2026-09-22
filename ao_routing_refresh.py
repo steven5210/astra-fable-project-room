@@ -296,6 +296,8 @@ def _inspect(service, directory, state, inputs, prepared, routing):
             or owner['active_branch_id'] != engineer['branch_id'] or owner['activity_state'] not in ('idle', 'exited')):
         raise RoomError('Routing refresh requires the same stopped native owner, workspace and branch')
     extension = guard_routing_refresh(service, state, owner)
+    import ao_acceptance_extension
+    ao_acceptance_extension.guard_unused(service, state, 'routing refresh')
     from ao_executable_binding import effective as executable
     replacement = executable(directory, state, prepared)  # Always the unchanged original preparation.
     ao_routing.check_claude(replacement or routing.get('claude') or {})
