@@ -273,6 +273,7 @@ class ContinuationTests(Fixture):
         state = self.state(); req = state['requests']['spec_review']
         spec = self.service.spec(self.directory(), state)
         req.pop('carried')
+        req.pop('prompt_projection', None)  # Pre-instrumentation requests never had a projection.
         req['text'] = ('[Project Room historical request spec_review]\nWorkflow: Fable engineering with independent Astra acceptance.\n'
                        'Fable owns engineering interpretation. Review this exact specification read-only, without implementation or delegates.\n'
                        'Exact specification revision 1, SHA256 ' + spec['sha256'] + '\n<specification>\n' + spec['content']
@@ -308,6 +309,7 @@ class ContinuationTests(Fixture):
             state = self.state(); req = state['requests']['old-' + purpose]
             spec = self.service.spec(self.directory(), state)
             req.pop('carried')
+            req.pop('prompt_projection', None)  # Match the historical format before replacing its bytes.
             # The canonical substring is the pre-upgrade implementation/correction template, also verified
             # against a retained real implementation packet during review. Other old instructions stay opaque.
             req['text'] = ('[Project Room historical request ' + purpose + ']\nHistorical workflow/policy/report/settings/routing.\n'
