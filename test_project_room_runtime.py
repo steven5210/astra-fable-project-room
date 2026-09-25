@@ -197,6 +197,25 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         expected = {path.name for path in ROOT.glob("*.py") if not path.name.startswith("test_")}
         self.assertEqual(set(runtime.RUNTIME_FILES), expected)
 
+    def test_quality_status_imports_cold_after_eviction_without_mutation(self):
+        state_path = self.synthetic_room()
+        state = json.loads(state_path.read_bytes())
+        state['bindings']['engineer'] = {'session_id': 'synthetic-engineer'}
+        state_path.write_text(json.dumps(state))
+        before = state_path.read_bytes()
+        server = self.start_server()
+        retained = self.initialize(server)
+        self.assertTrue((Path(retained['path']) / 'ao_quality_review.py').is_file())
+        shutil.rmtree(self.source)
+        result = self.tool(server, 'ao_room_status', {'room_id': 'ao-runtime-fixture'})
+        quality = result['engineer_context']['quality_first_review']
+        self.assertEqual(quality['delivery'], 'undelivered')
+        self.assertEqual(quality['reasons'], [])
+        self.assertIsNone(quality['source'])
+        self.assertEqual(quality['instruction_sha256'],
+                         '6d043563ae4c27854dbaad53b9762476efa189c9fb6565dfb5670e24cee47a4e')
+        self.assertEqual(state_path.read_bytes(), before)
+
     def test_evicted_installation_still_serves_cold_status_and_retained_reconnect(self):
         state = self.synthetic_room()
         original = state.read_bytes()

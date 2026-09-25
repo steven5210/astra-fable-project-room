@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -24,6 +25,170 @@ PIN_FIELDS = ('room_id', 'project_path', 'git_common_dir', 'ao_project_id', 'ao_
 # Their original files stay in the audit manifest; this grant never releases them.
 OBSERVATIONS = {'semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'semantic_observation_error',
                 'outcome_resume', 'outcome_resume_sha256', 'model_reroute', 'reroute_evidence', 'reroute_history'}
+HISTORY_POINTERS = {'history_reconciliation_sha256', 'history_reconciliation_invalidation_sha256'}
+MAX_HISTORY_RECORD_BYTES = 8 * 1024 * 1024
+MAX_HISTORY_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_HISTORY_INVALIDATIONS = 1000
+
+
+def _history_require(condition):
+    if not condition:
+        raise RoomError('Review-extension retained history evidence is inconsistent')
+
+
+class _HistoryEvidence:
+    """Bounded local retention only; stale proofs never grant delivery authority."""
+    def __init__(self, directory, native_session_id):
+        import ao_evidence_audit_io as io
+        self.io, self.directory, self.native_session_id = io, Path(directory), native_session_id
+        self.root, self.total, self.cache, self.raw_hashes = None, 0, {}, {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        try:
+            if kind is None and self.root is not None:
+                self.root.recheck_bindings('retained_history_changed')
+        except (self.io.SourceError, OSError, ValueError) as exc:
+            raise RoomError('Review-extension retained history evidence changed') from exc
+        finally:
+            if self.root is not None:
+                self.root.close()
+
+    def record(self, area, request, sha):
+        _history_require(area in ('history-reconciliations', 'history-reconciliation-invalidations', 'outcomes'))
+        name = ao.identifier(request['request_id'])
+        _hash(sha, 'retained history record')
+        parts = (area, name, sha + '.json')
+        path = '/'.join(parts)
+        if path not in self.cache:
+            opened = None
+            try:
+                if self.root is None:
+                    self.root = self.io.Root(self.directory, 'retained_history_missing', 'retained_history_unsafe')
+                opened = self.root.open_file(parts, min(MAX_HISTORY_RECORD_BYTES, MAX_HISTORY_TOTAL_BYTES - self.total),
+                    'retained_history_missing', 'retained_history_unsafe', 'retained_history_limit')
+                _history_require(opened.info.st_nlink == 1)
+                left, chunks = opened.info.st_size, []
+                while left:
+                    chunk = opened.handle.read(min(65536, left))
+                    if not chunk:
+                        raise RoomError('Review-extension retained history evidence changed')
+                    self.total += len(chunk)
+                    left -= len(chunk)
+                    chunks.append(chunk)
+                signature = self.io.signature(opened.info)
+                _history_require(opened.verify(signature) and os.fstat(opened.handle.fileno()).st_nlink == 1)
+                raw = b''.join(chunks)
+                row = self.io.parse_json(raw, 64, 'retained_history_malformed')
+                _history_require(isinstance(row, dict) and ao.digest(row) == sha
+                    and type(row.get('version')) is int and row['version'] == 1
+                    and row.get('room_id') == self.directory.name and row.get('request_id') == name)
+                self.root.bindings[parts] = signature
+                self.cache[path], self.raw_hashes[path] = row, ao.digest(raw)
+            except (self.io.SourceError, OSError, ValueError, TypeError, UnicodeError, RecursionError) as exc:
+                raise RoomError('Review-extension retained history evidence is unavailable, unsafe or over its bound') from exc
+            finally:
+                if opened is not None:
+                    opened.close()
+        return self.cache[path]
+
+    def proof(self, request, receipt, sha):
+        row = self.record('history-reconciliations', request, sha)
+        _history_require(request.get('state') == 'completed' and request.get('role') == 'engineer'
+            and request.get('harness') == 'claude-code' and receipt.get('history_truncated') is True
+            and row.get('kind') == 'complete_history_native_quota' and row.get('saved_history_truncated') is True
+            and all(row.get(k) == request.get(k) for k in ('receipt_sha256', 'text_sha256')))
+        inputs = row.get('inputs')
+        _history_require(isinstance(inputs, dict))
+        anchors = {key: request[key] for key in ('session_id', 'role', 'turn_id', 'provider_turn_id',
+                                                'conversation_id', 'branch_id')}
+        anchors.update(baseline_sha256=ao.digest(request['baseline']), messages_sha256=ao.digest(receipt['messages']))
+        _history_require(all(inputs.get(key) == value for key, value in anchors.items()))
+        for key in ('turns_sha256', 'ao_terminal_sha256', 'provider_failures_sha256', 'session_failures_sha256'):
+            _hash(inputs.get(key), 'retained proof input')
+        native = inputs.get('native')
+        _history_require(isinstance(native, dict) and not native.get('unknown')
+            and isinstance(native.get('anchor_uuid'), str) and bool(native['anchor_uuid'].strip())
+            and native.get('next_human_uuid') is None)
+        _hash(native.get('source_sha256'), 'retained native source')
+        source = native.get('source')
+        _history_require(isinstance(source, dict)
+            and set(source) == {'database', 'transcript', 'session_id', 'native_session_id'}
+            and all(isinstance(value, str) and value.strip() and '\x00' not in value for value in source.values())
+            and source['session_id'] == request['session_id'] and source['native_session_id'] == self.native_session_id
+            and Path(source['database']).is_absolute() and Path(source['transcript']).is_absolute()
+            and Path(source['transcript']).name == self.native_session_id + '.jsonl')
+        for key in ('invalidation_sha256', 'supersedes_outcome_sha256'):
+            if row.get(key) is not None:
+                _hash(row[key], 'retained proof link')
+        return row
+
+    def lineage(self, request, receipt):
+        from ao_history_reconciliation import PROOF, INVALIDATION
+        proof_sha = request.get(PROOF)
+        _hash(proof_sha, 'retained proof')
+        cursor, invalidations, outcomes = request.get(INVALIDATION), {}, set()
+        while cursor is not None:
+            _hash(cursor, 'retained invalidation')
+            _history_require(cursor not in invalidations and len(invalidations) < MAX_HISTORY_INVALIDATIONS)
+            row = self.record('history-reconciliation-invalidations', request, cursor)
+            _history_require(row.get('kind') == 'invalidation')
+            _hash(row.get('proof_sha256'), 'invalidated proof')
+            if row.get('outcome_sha256') is not None:
+                _hash(row['outcome_sha256'], 'invalidated outcome'); outcomes.add(row['outcome_sha256'])
+            invalidations[cursor] = row
+            cursor = row.get('previous_sha256')
+        proofs, cursor = {}, proof_sha
+        while cursor is not None:
+            _history_require(cursor not in proofs and len(proofs) <= MAX_HISTORY_INVALIDATIONS)
+            proof = self.proof(request, receipt, cursor)
+            proofs[cursor] = proof
+            if proof.get('supersedes_outcome_sha256') is not None:
+                outcomes.add(proof['supersedes_outcome_sha256'])
+            head = proof.get('invalidation_sha256')
+            if head is None:
+                break
+            _history_require(head in invalidations)
+            edge = invalidations[head]
+            previous = self.proof(request, receipt, edge['proof_sha256'])
+            _history_require(edge.get('previous_sha256') == previous.get('invalidation_sha256'))
+            cursor = edge['proof_sha256']
+        head = request.get(INVALIDATION)
+        recorded = proofs[proof_sha].get('invalidation_sha256')
+        if head != recorded:
+            _history_require(head in invalidations and invalidations[head]['proof_sha256'] == proof_sha
+                             and invalidations[head].get('previous_sha256') == recorded)
+        _history_require(all(row['proof_sha256'] in proofs and row.get('previous_sha256') ==
+                             proofs[row['proof_sha256']].get('invalidation_sha256') for row in invalidations.values()))
+        for sha in sorted(outcomes):
+            row = self.record('outcomes', request, sha)
+            _history_require(all(row.get(key) == request.get(key) for key in
+                                 ('receipt_sha256', 'text_sha256', 'turn_id', 'provider_turn_id')))
+            claimed = row.get(PROOF)
+            if claimed is not None:
+                _hash(claimed, 'retained outcome proof')
+                _history_require(claimed in proofs)
+                inputs = proofs[claimed]['inputs']
+                _history_require(inputs['native'] == row.get('native')
+                    and inputs['ao_terminal_sha256'] == ao.digest(row.get('ao_terminal'))
+                    and inputs['provider_failures_sha256'] == ao.digest(row.get('provider_failures'))
+                    and inputs['session_failures_sha256'] == ao.digest(row.get('session_failures')))
+        return proofs, invalidations
+
+    def retained(self, original, current, receipt):
+        from ao_history_reconciliation import PROOF, INVALIDATION
+        if not any(key in original for key in HISTORY_POINTERS):
+            return set()
+        _history_require(all(key in current and current[key] is not None for key in HISTORY_POINTERS if key in original))
+        original_proofs, original_heads = self.lineage(original, receipt)
+        proofs, heads = self.lineage(current, receipt)
+        _history_require(original[PROOF] in proofs and set(original_proofs) <= set(proofs)
+                         and set(original_heads) <= set(heads))
+        if original.get(INVALIDATION) is not None:
+            _history_require(original[INVALIDATION] in heads)
+        return HISTORY_POINTERS
 
 
 def _hash(value, label):
@@ -126,6 +291,23 @@ def _manifest(directory, state):
             for path in sorted(paths)}
 
 
+
+def _grant_manifest(directory, state, native_session_id):
+    """Add authenticated history only to a grant's explicitly owned baseline.
+
+    Routing-refresh intents retain the legacy two-argument manifest unchanged.
+    Their existing grant guards separately validate retained history authority.
+    """
+    result = _manifest(directory, state)
+    with _HistoryEvidence(directory, native_session_id) as history:
+        for request in state['requests'].values():
+            if any(key in request for key in HISTORY_POINTERS):
+                receipt = ao_workflow.completed_receipt(directory, request)
+                history.retained(request, request, receipt)
+        result.update(history.raw_hashes)
+        return result
+
+
 def _acceptance(directory, state, candidate_sha256, actual):
     if not state['acceptances'] or state['acceptances'][-1]['candidate_sha256'] != candidate_sha256:
         raise RoomError('Use the exact retained accepted candidate identity')
@@ -214,7 +396,7 @@ def _inspect(service, directory, state, target, reconcile=False):
     retained = _acceptance(directory, state, target['retained_candidate_sha256'], actual)
     evidence = {'state_sha256': ao.digest(state), 'state': copy.deepcopy(state), 'target': target,
                 'spec_record_sha256': state['spec_record_sha256'], 'retained': retained,
-                'native': native, 'native_owner': owner, 'manifest': _manifest(directory, state)}
+                'native': native, 'native_owner': owner, 'manifest': _grant_manifest(directory, state, target['native_session_id'])}
     return evidence, snapshots
 
 
@@ -300,13 +482,24 @@ def _retained(directory, state, evidence):
     for key in ('acceptances', 'verifications'):
         if state[key][:len(baseline[key])] != baseline[key]:
             raise RoomError('Review-extension retained acceptance or verification history changed')
-    for request_id, original in baseline['requests'].items():
-        current = state['requests'].get(request_id)
-        if not current or any(current.get(k) != v for k, v in original.items() if k not in OBSERVATIONS):
-            raise RoomError('Review-extension prior requests, receipts or counters changed')
-    for path, expected in evidence['manifest'].items():
-        if ao.digest(ao_delegates.owned_bytes(_relative(directory, path), 96_000_000)) != expected:
-            raise RoomError('Review-extension retained evidence is missing or modified')
+    with _HistoryEvidence(directory, evidence['target']['native_session_id']) as history:
+        for request_id, original in baseline['requests'].items():
+            current = state['requests'].get(request_id)
+            if not current or any(current.get(k) != v for k, v in original.items()
+                                  if k not in OBSERVATIONS and k not in HISTORY_POINTERS):
+                raise RoomError('Review-extension prior requests, receipts or counters changed')
+            if any(key in original for key in HISTORY_POINTERS):
+                receipt = ao_workflow.completed_receipt(directory, original)
+                history.retained(original, current, receipt)
+        for path, expected in evidence['manifest'].items():
+            if path in history.raw_hashes:
+                actual = history.raw_hashes[path]
+            else:
+                if path.split('/')[0] in ('history-reconciliations', 'history-reconciliation-invalidations'):
+                    raise RoomError('Review-extension retained history manifest has an unanchored record')
+                actual = ao.digest(ao_delegates.owned_bytes(_relative(directory, path), 96_000_000))
+            if actual != expected:
+                raise RoomError('Review-extension retained evidence is missing or modified')
     ao_workflow.spec_record_file(directory, evidence['spec_record_sha256'])
 
 
@@ -507,16 +700,25 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
         if prior and (pending[0].name != request_id + '.json' or prior.get('inputs') != inputs):
             raise RoomError('An uncommitted review extension belongs to another payload')
         saved = _audit(directory, audit_sha256)
-        evidence, _ = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
-        if evidence != saved['evidence']:
-            raise RoomError('Review-extension audit is stale; charter, retained evidence or native metadata changed')
+        full_evidence, _ = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
+        evidence = full_evidence
+        if ao.digest(evidence) != ao.digest(saved['evidence']):
+            # Only an already durable legacy receipt may keep its original
+            # evidence. _inspect authenticated every newly inventoried record;
+            # exact equality here excludes partial/modern saved inventories and
+            # any difference outside those additive history entries.
+            legacy = {**evidence, 'manifest': {path: sha for path, sha in evidence['manifest'].items()
+                if not path.startswith(('history-reconciliations/', 'history-reconciliation-invalidations/'))}}
+            if not prior or legacy == evidence or ao.digest(legacy) != ao.digest(saved['evidence']):
+                raise RoomError('Review-extension audit is stale; charter, retained evidence or native metadata changed')
+            evidence = saved['evidence']
         record = {'version': 1, 'room_id': room_id, 'inputs': inputs, 'additional_spec_reviews': 1,
                   'maximum_spec_review_attempts': LIMIT + 1, 'before_state_sha256': evidence['state_sha256'],
                   'evidence_sha256': ao.digest(evidence), 'recorded_at': prior['recorded_at'] if prior else time.time()}
-        if prior and prior != record:
+        if prior and ao.digest(prior) != ao.digest(record):
             raise RoomError('Pending review-extension receipt differs from the recomputed grant')
         repeated, _ = _inspect(service, directory, state, evidence['target'], reconcile=bool(prior))
-        if repeated != evidence:
+        if ao.digest(repeated) != ao.digest(full_evidence):
             raise RoomError('Review-extension evidence changed before commit')
         relative = BASE + '/requests/' + request_id + '.json'
         if not prior:

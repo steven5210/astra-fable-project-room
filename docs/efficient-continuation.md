@@ -7,6 +7,53 @@ Fable. Delegate those tasks when the full quality bar is met. Preserve explicit
 user restrictions narrowly. Exact-spec review itself remains read-only and
 non-delegating; evidence can be prepared beforehand.
 
+## Shared quality-first review instruction
+
+Normal AO engineer sessions receive `quality_first_review_v1` once on a separately
+authorized send. Delegates prepare source-grounded facts, proposed changes and
+supporting evidence; the assigned operator verifies mechanical anchors, hashes,
+schemas and test receipts. Fable reviews the actual changes and original evidence
+needed for meaning, correctness, conflicts and omissions. Fable retains MAX,
+personal specification review, pushback, enhancement judgment, routing discretion
+and the final engineering verdict. Passing tests or summaries alone never approve
+work, and necessary deeper review takes priority over savings.
+
+The instruction has immutable versioned bytes. A verified earlier operating
+amendment with exactly the same bytes satisfies the new part. When identical
+amendments are pending with an undelivered part, one copy is sent and each actual
+delivery is recorded. When the part is already held, an identical later amendment
+is satisfied through explicit provenance naming the original verified receipt.
+A one-byte change is a different instruction; caller text and a matching hash by
+themselves do not establish delivery. Earlier requests and receipts are not
+rewritten, and derived equivalence never becomes a new independent delivery root.
+
+Saved status adds `engineer_context.quality_first_review`, with the frozen part
+identity, verified delivery source, equivalent amendment digests and closed refusal
+reasons. Delivery is `verified_delivered`, `verified_equivalent`, `undelivered` or
+`unavailable_integrity`. Historical `undelivered_parts` reports carried-part
+metadata only: an earlier equivalent amendment may leave this list unchanged.
+Use `quality_first_review.delivery` and its verified source to determine whether
+this instruction was delivered. The other historical context fields also retain
+their existing meaning. Missing, contradictory or changed proof prevents a new
+send before it records intent; status does not repair the evidence or release an
+existing hold.
+Failed mutating operations still invalidate an existing history-reconciliation
+proof under the established recovery checks. Status projection remains read-only.
+
+Proof reads are local, owned and no-follow: 8 MiB per binding JSON file, 64 MiB of
+actual reads per proof, 4,096 requests, 256 amendment pointers and container depth
+64. Existing admission and semantic-hold checks retain their precedence. This new
+proof does not turn their older read paths into the new bounded interface. No
+model, network, transcript scan or new subprocess is needed by the proof.
+
+After this information and the other required parts are delivered, an ordinary
+continuation remains exactly `Continue.` or the caller's actual new instruction.
+The part changes neither Astra-led exception packets nor acceptance-review
+wrappers. It grants no installation, continuation, recovery or review allowance.
+Validate the allocation at a bounded useful milestone with the same correctness
+and acceptance requirements; smaller packets alone do not establish subscription
+savings or restored quota.
+
 ## Personal review, operator handoffs and enhancements
 
 The `review_first_routing_v1` amendment reaches new and retained engineer sessions
@@ -321,6 +368,23 @@ evidence and restore only a trusted backup whose bytes match the originally
 recorded digest. Missing or unverified backups remain a blocker; do not invent
 replacement records or remove the invalidation chain. Even after exact restoration,
 run a fresh supported outcome audit and bind any new release to its new digest.
+
+An existing one-charter review grant retains its original proof and invalidation
+ancestry when an explicit audit renews them. Local retention checks authenticate
+the original records and subsequent links; missing, altered or unrelated history
+still refuses. New grants inventory this history, while earlier grant records
+remain unchanged. A legitimate stale proof can reach explicit audit, but this
+check cannot establish current delivery, release a hold or add a review allowance.
+The added traversal reads at most 8 MiB per record and 64 MiB total, with at most
+1,000 invalidations per chain. Current native evidence and the named release remain required
+before a successor can run.
+
+If an upgrade follows an interruption after an older grant receipt was saved,
+the identical pending request can still finish using its original audit and
+receipt. Compatibility permits only the newly authenticated history inventory;
+all other evidence must be unchanged and pass the second inspection before
+commit. A changed payload, a partial history inventory or an old audit without
+an existing pending receipt receives no such exception.
 
 This lane does not establish quota availability, clear a provider safety refusal,
 resume an uncertain failed transport or reset review budgets. An active delegate
