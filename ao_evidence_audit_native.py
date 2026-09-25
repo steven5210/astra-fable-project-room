@@ -448,15 +448,16 @@ class Interval:
         self.end_timestamp = end_timestamp
 
     def contains(self, number, timestamp):
-        if timestamp is None or timestamp < self.anchor_timestamp:
+        if not self.contains_time(timestamp):
             return False
         if self.kind == "boundary":
-            return (self.anchor_number < number < self.end_number
-                    and self.anchor_timestamp <= timestamp <= self.end_timestamp)
-        return number > self.anchor_number and self.anchor_timestamp <= timestamp <= self.end_timestamp
+            return self.anchor_number < number < self.end_number
+        return number > self.anchor_number
 
     def contains_time(self, timestamp):
-        return timestamp is not None and self.anchor_timestamp <= timestamp <= self.end_timestamp
+        if timestamp is None or timestamp < self.anchor_timestamp:
+            return False
+        return timestamp < self.end_timestamp if self.kind == "boundary" else timestamp <= self.end_timestamp
 
     def covers_child(self, launch_number, launch_timestamp, result_number, result_timestamp):
         if launch_timestamp is None or result_timestamp is None or launch_timestamp > result_timestamp:
@@ -498,12 +499,14 @@ class ChildInterval:
 
 
 class Candidate:
-    __slots__ = ("agent_id", "interval", "reason")
+    __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids")
 
-    def __init__(self, agent_id, interval, reason):
+    def __init__(self, agent_id, interval, reason, launch_uuid=None, parent_launch_uuids=()):
         self.agent_id = agent_id
         self.interval = interval
         self.reason = reason
+        self.launch_uuid = launch_uuid
+        self.parent_launch_uuids = parent_launch_uuids
 
 
 def human_candidate(record):
@@ -525,7 +528,8 @@ def looks_human(record):
 class RecordScanner:
     """One actor's bounded record scan: supported observations, boundaries and source notes."""
 
-    def __init__(self, collector, actor_sha256, kind, agent_id, native_session_id, workspace, evidence_root):
+    def __init__(self, collector, actor_sha256, kind, agent_id, native_session_id, workspace, evidence_root,
+                 *, launch_uuid=None, parent_launch_uuids=()):
         self.collector = collector
         self.actor_sha256 = actor_sha256
         self.kind = kind
@@ -533,6 +537,8 @@ class RecordScanner:
         self.session_id = native_session_id
         self.workspace = workspace
         self.evidence_root = evidence_root
+        self.launch_uuid = launch_uuid
+        self.parent_launch_uuids = parent_launch_uuids
         self.notes = set()
         self.failure = None
         self.torn = False
@@ -660,6 +666,12 @@ class RecordScanner:
                 self.contradictory = True
                 self.note("child_attribution_ambiguous")
                 return
+            source_uuid = value.get("sourceToolAssistantUUID")
+            if (bounded_text(source_uuid) and source_uuid in self.parent_launch_uuids
+                    and source_uuid != self.launch_uuid):
+                self.contradictory = True
+                self.note("child_attribution_ambiguous")
+                return
         if not isinstance(message, dict) or message.get("role") != kind:
             self.note("source_malformed")
             self._human(value, number, timestamp, uuid_value, False, human_text)
@@ -672,6 +684,12 @@ class RecordScanner:
             self._assistant(content, uuid_value, timestamp, number)
         else:
             self._user(value, content, uuid_value, timestamp, number, unique)
+
+    def _admit_tool_id(self, tool_id):
+        # Actor-local union: results may precede uses or have no use at all.
+        # Charge before either table retains a new identity.
+        if tool_id not in self.tool_entries and tool_id not in self.results:
+            self.collector.count_tool_id()
 
     def _assistant(self, content, uuid_value, timestamp, number):
         if isinstance(content, str):
@@ -697,9 +715,9 @@ class RecordScanner:
                 return
             entry = self.tool_entries.get(tool_id)
             if entry is None:
+                self._admit_tool_id(tool_id)
                 entry = ToolEntry(tool_id)
                 self.tool_entries[tool_id] = entry
-                self.collector.count_tool_id()
             classified = None
             unsupported = False
             if name == READ_TOOL:
@@ -763,6 +781,7 @@ class RecordScanner:
             if not bounded_text(tool_use_id):
                 self.note("result_unclassifiable")
                 continue
+            self._admit_tool_id(tool_use_id)
             canonical = canonical_result_block(block)
             classification = result_classification(block) if canonical is not None else None
             observation = ResultObs(number, timestamp, uuid_value, canonical, classification, source_uuid)
@@ -820,9 +839,10 @@ def launch_candidates(scan, scope):
         for occurrence in entry.occurrences:
             if occurrence.name in AGENT_TOOLS:
                 launch_uuids.add(occurrence.uuid)
+    launch_uuids = frozenset(launch_uuids)
     candidates = []
-    # A tool-limit refusal can leave the just-created entry without any admitted
-    # occurrence. Partial negative projections must not invent that launch.
+    # Only admitted occurrences can supply launch evidence; an empty entry has
+    # no identity or timestamp suitable for ordering a partial projection.
     ordered = sorted((entry for entry in scan.tool_entries.values() if entry.occurrences),
                      key=lambda item: item.occurrences[0].number)
     for entry in ordered:
@@ -878,7 +898,8 @@ def launch_candidates(scan, scope):
         if not scope.covers_child(first.number, first.timestamp, completion.number, completion.timestamp):
             candidates.append(Candidate(agent_id, None, "child_interval_unbound"))
             continue
-        candidates.append(Candidate(agent_id, scope.child(first.timestamp, completion.timestamp), None))
+        candidates.append(Candidate(agent_id, scope.child(first.timestamp, completion.timestamp), None,
+                                    first.uuid, launch_uuids))
     return candidates
 
 

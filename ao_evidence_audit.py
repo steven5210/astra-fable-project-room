@@ -764,7 +764,9 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                         child_problems.add("directory_entry_limit")
                         collector.note("directory_entry_limit")
                 child_scan = native.RecordScanner(collector, entry["actor_sha256"], "child", candidate.agent_id,
-                                                  native_id, binding["workspace"], binding["evidence_norm"])
+                                                  native_id, binding["workspace"], binding["evidence_norm"],
+                                                  launch_uuid=candidate.launch_uuid,
+                                                  parent_launch_uuids=candidate.parent_launch_uuids)
                 child_parts = ("projects", project_dir, native_id, "subagents", "agent-" + candidate.agent_id + ".jsonl")
                 child_result = _scan(collector, config_root, child_parts, child_scan, limits)
                 if child_result is None:

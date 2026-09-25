@@ -382,7 +382,7 @@ class NegativeClaimTests(AuditFixture, unittest.TestCase):
         self.assertEqual(actors[key("a9")]["coverage"], "complete")
         self.assertIn("transcript_bytes_limit", report["reasons"])
 
-    def test_tool_limit_partial_entry_is_not_a_launch_candidate(self):
+    def test_tool_limit_refuses_entry_before_retention_and_preserves_partial_projection(self):
         import ao_evidence_audit
         self.graph(("a1",), {"a1": ("a5", "a9")})
         limits = ao_evidence_audit._limits()
@@ -397,7 +397,7 @@ class NegativeClaimTests(AuditFixture, unittest.TestCase):
             scan.record(json.dumps(records[2]).encode(), True, 3)
         self.assertEqual(caught.exception.reason, "tool_id_limit")
         self.assertEqual(collector.tool_ids, 2)
-        self.assertEqual(scan.tool_entries["claim-1"].occurrences, [])
+        self.assertNotIn("claim-1", scan.tool_entries)
         scope = native.Interval("terminal", 0, native.parse_timestamp("2026-01-01T00:00:10+00:00"),
                                 None, native.parse_timestamp("2026-01-01T00:00:40+00:00"))
         candidates = native.launch_candidates(scan, scope)

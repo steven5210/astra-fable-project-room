@@ -81,12 +81,19 @@ preparation evidence report unavailable; the command accepts no transcript, nati
 UUID or configuration-root override.
 
 The native parent interval needs an exact genuine human input within the bounded
-controller time window and an unambiguous next human boundary. A last-turn terminal
+controller time window and an unambiguous next human boundary. The next human's
+timestamp is exclusive, including for descendant events. A last-turn terminal
 receipt can close it only with the specified timestamp and unchanged idle owner;
-malformed later human records prevent that fallback. Compaction summaries and inline
+that terminal timestamp is inclusive for parent and descendant events.
+Malformed later human records prevent that fallback. Compaction summaries and inline
 sidechain copies cannot anchor the parent. Children require a uniquely correlated
 structured Agent/Task result and a proven bounded synchronous interval. Missing,
 background, reused or ambiguous children stay incomplete with null observations.
+If a child user or assistant record supplies `sourceToolAssistantUUID` naming a
+known launch in its immediate parent, it must match the launch that authorized that
+child. A contradiction makes the child ambiguous and removes its authority to open
+descendants. Known parent launches include validated observations outside the selected
+interval; other child-owned UUIDs provide no parent linkage or path authority.
 
 Only supported logged `Read` tool inputs and their correlated result blocks are
 counted. Path classification is lexical: the audit never opens the evidence target.
@@ -111,7 +118,7 @@ or a diagnostic error. Errors use fixed codes rather than arbitrary exception te
 | Transcript passes | Two; at most 512 MiB total admitted data. |
 | JSONL line | 4 MiB. |
 | Records and record IDs | 100,000 each, aggregate. |
-| Tool IDs | 50,000 aggregate. |
+| Tool IDs | 50,000 aggregate across actor-local tool-use and tool-result ID unions, including orphan results. |
 | Child actors and files | 32; missing authorized actors also consume the actor limit. |
 | Discovery directory | 256 entries, including nonmatching entries. |
 | JSON container depth | 64. |
@@ -123,6 +130,9 @@ and checks their complete extent, hash, descriptor/name identity and mutation
 metadata. Required directory inventories and the owner tuple are rechecked. Rejected
 reads still consume the applicable byte budget. Changed, active, torn or ambiguous
 sources prevent complete coverage. Missing evidence is never converted into zero.
+Each actor's first tool-use or tool-result occurrence charges its ID before retention.
+Repeated results and a matching use/result pair charge once, in either order; the same
+ID in another actor charges separately.
 Known child-ID reuse remains a warning after the launching actor loses authority or
 its scan fails. A failed partial scan cannot authorize another file or establish a
 complete-source digest. The audit retains warnings from already-read records when
