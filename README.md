@@ -247,6 +247,10 @@ python3 project_room.py setup --qwen-config /absolute/private/path/to/qwen-confi
 
 The intended Qwen3.8-27B server window is 262,144 tokens, split between prompt and thinking plus answer; the upstream server owns the prompt-size precheck. Tool discovery, health and successful inference are different checks; report the actual evidence and never weaken the guard settings or claim a delegate ran when it did not.
 
+## Deterministic change-set application
+
+The standalone [change-set tool](docs/changesets.md) plans and mechanically applies approved JSON or anchored-text edits, with exact source pins, copy-and-fill receipt templates, preserved metadata and explicit interrupted-run audit/resume. It runs no models or project checks. Mechanical completion remains separate from engineering review and acceptance. State and input directories must stay private and outside the candidate; unsupported metadata or durability capabilities refuse before target replacement.
+
 ## Private state
 
 The default data directory is `~/.project-room`; set `PROJECT_ROOM_HOME` to use another private directory and keep it outside the source checkout and the installed plugin cache so reinstalling never replaces your rooms. It holds `config.json`, `registry.sqlite3` and `rooms/<id>/` for the legacy controller; `ao/config.json`, `ao/rooms/<id>/`, `ao/launchers/` (the content-addressed DeepSeek launcher and routing guard) and `ao/version-check.json` for AO; and, for the DeepSeek delegate, `deepseek/` (the shared `ledger.sqlite3` with room-scoped rows, per-job artifacts, per-room `exports/` and probe receipts) plus the separate default key files `secrets/deepseek-api-key` and `secrets/deepinfra-api-key`. Room directories contain spec revisions, receipts, verification logs and acceptance records. A room's export directory holds one answer file per job, named by job ID and checked against its recorded digest on every read.

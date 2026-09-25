@@ -145,6 +145,24 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         self.assertEqual(self.initialize(reopened), pinned)
         self.assertEqual(self.tool(reopened, "ao_room_status", {"room_id": "ao-runtime-fixture"})["room_id"], "ao-runtime-fixture")
 
+    def test_changeset_cli_imports_after_installation_eviction(self):
+        retained = runtime.retain(self.source, self.home)
+        directory = Path(retained["path"])
+        expected = {name for name in runtime.RUNTIME_FILES if name.startswith("changeset_")}
+        self.assertEqual(len(expected), 8)
+        self.assertTrue(all((directory / name).is_file() for name in expected))
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        shutil.rmtree(self.source)
+        # A cold process must resolve every changeset dependency from the
+        # retained package, with no source checkout or inherited Python path.
+        result = subprocess.run([sys.executable, "-E", "-s", "-B",
+                                 str(directory / "changeset_tool.py"), "--help"],
+                                cwd=self.base, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("{plan,apply,audit,resume}", result.stdout)
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+
     def test_new_release_preserves_old_connection_and_identifies_both_exact_copies(self):
         self.synthetic_room()
         old_server = self.start_server()

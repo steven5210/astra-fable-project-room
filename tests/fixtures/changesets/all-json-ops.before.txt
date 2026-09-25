@@ -1,0 +1,16 @@
+{
+  "title": "prefix old suffix",
+  "whole": "start untouched interior end",
+  "flag": true,
+  "rows": [
+    {
+      "id": "a",
+      "n": 1
+    },
+    {
+      "id": "z",
+      "n": 2
+    }
+  ],
+  "tail": []
+}
