@@ -16,6 +16,15 @@ from room import RoomError
 import ao_routing
 
 
+class MalformedDelegateAttributionError(RoomError):
+    """Invalid attribution strings; all well-formed provider claims were verified."""
+
+    def __init__(self, rejected_ids, verified_jobs):
+        super().__init__("Engineering report names a malformed delegate job identifier")
+        self.rejected_ids = rejected_ids
+        self.verified_jobs = verified_jobs
+
+
 def initialize(service, directory, state, provider):
     from ao_project_room import atomic, digest
     if provider not in ("deepseek", "none"):
@@ -335,6 +344,7 @@ def verify_delegation(home, directory, state, report):
     inventory = state["delegate"]["inventory"]
     profile = expected_profile(inventory)
     evidence = []
+    rejected_ids = [job_id for job_id in ids if not deepseek_adapter.JOB_ID.fullmatch(job_id)]
     try:
         config_path = next(p for p in inventory["files"] if Path(p).name == "deepseek.json")
         config, config_hash = deepseek_adapter.load_config(config_path, home)
@@ -343,7 +353,7 @@ def verify_delegation(home, directory, state, report):
         ledger = deepseek_adapter.Ledger(home, initialize=False)
         for job_id in ids:
             if not deepseek_adapter.JOB_ID.fullmatch(job_id):
-                raise RoomError("Engineering report names a malformed delegate job identifier")
+                continue  # Verify every provider-shaped claim before classifying this as report-only damage.
             try:
                 row = ledger.job(job_id, state["room_id"])
             except deepseek_adapter.AdapterError as exc:
@@ -369,6 +379,8 @@ def verify_delegation(home, directory, state, report):
                              "requested_model": row["requested_model"], "profile_sha256": row["profile_sha256"]})
     except (OSError, sqlite3.Error, deepseek_adapter.AdapterError) as exc:
         raise RoomError("Delegate ledger is unavailable; reported delegate jobs cannot be verified") from exc
+    if rejected_ids:
+        raise MalformedDelegateAttributionError(rejected_ids, evidence)
     return evidence
 
 
