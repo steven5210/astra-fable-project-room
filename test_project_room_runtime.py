@@ -28,7 +28,15 @@ def offline_only(event, args):
         raise RuntimeError('Read-only fixture denied ' + event)
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = os.path.abspath(os.fsdecode(args[0]))
-        if path == actual_home or path.startswith(actual_home + os.sep):
+        flags = args[2]
+        # The audit walks from a no-follow root directory descriptor, even
+        # when an unmapped container user's home is '/'. Never allow a file
+        # or mutating open through this directory-only traversal exception.
+        root_traversal = (actual_home == path == os.sep
+                          and flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW
+                          and flags & os.O_ACCMODE == os.O_RDONLY
+                          and not flags & (os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_EXCL))
+        if (path == actual_home or path.startswith(actual_home + os.sep)) and not root_traversal:
             raise RuntimeError('Read-only fixture denied real-home access')
 sys.addaudithook(offline_only)
 runpy.run_path(sys.argv[1], run_name='__main__')
@@ -42,6 +50,74 @@ def copy_package(target):
     (target / ".codex-plugin").mkdir()
     shutil.copyfile(ROOT / ".codex-plugin/plugin.json", target / ".codex-plugin/plugin.json")
     return target
+
+
+class ReadOnlyBootstrapTests(unittest.TestCase):
+    def run_guard(self, protected_home, body):
+        bootstrap = READ_ONLY_BOOTSTRAP.replace(
+            "runpy.run_path(sys.argv[1], run_name='__main__')", body)
+        result = subprocess.run(
+            [sys.executable, "-E", "-s", "-B", "-c", bootstrap, "unused", str(protected_home)],
+            cwd=ROOT, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_root_home_allows_only_readonly_nofollow_directory_anchor(self):
+        self.run_guard(os.sep, r'''
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+fd = os.open(os.sep, flags)
+try:
+    assert os.fstat(fd).st_mode & 0o170000 == 0o040000
+finally:
+    os.close(fd)
+for denied in (os.O_RDONLY, os.O_RDONLY | os.O_DIRECTORY,
+               os.O_RDONLY | os.O_NOFOLLOW,
+               flags | os.O_WRONLY, flags | os.O_RDWR,
+               flags | os.O_CREAT, flags | os.O_TRUNC,
+               flags | os.O_APPEND, flags | os.O_EXCL):
+    # Emit the real open event shape without risking a mutating syscall.
+    try:
+        sys.audit('open', os.sep, None, denied)
+    except RuntimeError as exc:
+        assert str(exc) == 'Read-only fixture denied real-home access'
+    else:
+        raise AssertionError('Root file or write access was not denied')
+''')
+
+    def test_guard_still_denies_protected_home_file_reads_and_writes(self):
+        with tempfile.TemporaryDirectory(prefix="protected-home-fixture-") as directory:
+            protected_home = Path(directory).resolve()
+            sentinel = protected_home / "private.fixture"
+            sentinel.write_bytes(b"synthetic private fixture")
+            self.run_guard(protected_home, r'''
+for mode in ('rb', 'wb', 'ab', 'r+b'):
+    try:
+        with open(os.path.join(actual_home, 'private.fixture'), mode):
+            pass
+    except RuntimeError as exc:
+        assert str(exc) == 'Read-only fixture denied real-home access'
+    else:
+        raise AssertionError('Protected-home file access was not denied')
+try:
+    sys.audit('open', actual_home, None, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except RuntimeError as exc:
+    assert str(exc) == 'Read-only fixture denied real-home access'
+else:
+    raise AssertionError('Protected-home directory access was not denied')
+''')
+            self.assertEqual(sentinel.read_bytes(), b"synthetic private fixture")
+
+    def test_guard_still_denies_network_and_process_events(self):
+        self.run_guard(os.sep, r'''
+for event in ('subprocess.Popen', 'os.system', 'os.posix_spawn', 'socket.__new__', 'socket.connect'):
+    try:
+        sys.audit(event)
+    except RuntimeError as exc:
+        assert str(exc) == 'Read-only fixture denied ' + event
+    else:
+        raise AssertionError('Network or process event was not denied')
+''')
 
 
 class StdioFixture:
@@ -179,20 +255,23 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
             "runpy.run_path(sys.argv[1], run_name='__main__')",
             "entry = sys.argv[1]\nsys.path.insert(0, os.path.dirname(entry))\n"
             "sys.argv = [entry] + sys.argv[3:]\nrunpy.run_path(entry, run_name='__main__')")
-        result = subprocess.run(
-            [sys.executable, "-E", "-s", "-B", "-c", bootstrap,
-             str(directory / "project_room.py"), str(Path.home()), "ao-evidence-read-audit",
-             "--home", str(absent), "--room", "fixture-room", "--request", "fixture-request",
-             "--ao-database", str(self.base / "absent.db"), "--evidence-root", str(self.base / "evidence")],
-            cwd=self.base, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stderr, "")
-        report = json.loads(result.stdout)
-        self.assertEqual(report["coverage"], "unavailable")
-        self.assertEqual(report["reasons"], ["request_unbound"])
-        self.assertFalse(absent.exists())
-        self.assertFalse((self.base / "absent.db").exists())
-        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+        # Numeric container users without a passwd home can receive HOME='/'.
+        for protected_home in dict.fromkeys((str(Path.home()), os.sep)):
+            with self.subTest(protected_home=protected_home):
+                result = subprocess.run(
+                    [sys.executable, "-E", "-s", "-B", "-c", bootstrap,
+                     str(directory / "project_room.py"), protected_home, "ao-evidence-read-audit",
+                     "--home", str(absent), "--room", "fixture-room", "--request", "fixture-request",
+                     "--ao-database", str(self.base / "absent.db"), "--evidence-root", str(self.base / "evidence")],
+                    cwd=self.base, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stderr, "")
+                report = json.loads(result.stdout)
+                self.assertEqual(report["coverage"], "unavailable")
+                self.assertEqual(report["reasons"], ["request_unbound"])
+                self.assertFalse(absent.exists())
+                self.assertFalse((self.base / "absent.db").exists())
+                self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
 
     def test_new_release_preserves_old_connection_and_identifies_both_exact_copies(self):
         self.synthetic_room()
