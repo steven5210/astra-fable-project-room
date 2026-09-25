@@ -773,7 +773,8 @@ class AcceptanceMatrixTests(MatrixFixture):
                 'Acceptance-review retained acceptance or verification history changed'),
             'prior_reviewer_text': (
                 'Owning native request differs from its completed receipt or observed message',
-                'A prior request, receipt, verdict or counter changed since the acceptance-review audit'),
+                # Modern prompt integrity is checked before acceptance-grant admission.
+                'A saved prompt projection is invalid; preserve it and reconcile before dispatch'),
             'spec_record_pointer': (
                 'Immutable specification was modified',
                 'The unused acceptance-review grant pins spec_record_sha256; it changed, so nothing may be dispatched until it is diagnosed'),
