@@ -1,5 +1,13 @@
 # Architecture
 
+`ao_prompt_metrics.py` records tagged components of the actual outgoing packet and
+projects saved status with a separately verified selected receipt. It keeps prompt
+bytes distinct from delivery, native usage and quota. The explicit
+`ao_evidence_audit*` modules read one saved request's bound Claude evidence through
+bounded ownership and source checks before emitting only the closed diagnostic
+schema. They do not participate in dispatch or acceptance. See
+[AO diagnostics](diagnostics.md) for the schemas, limits and read-only boundary.
+
 The package separates the agent workflow from durable execution:
 
 - `skills/project-room/SKILL.md` supplies Astra's roles, review loop, handoff, and product acceptance workflow.

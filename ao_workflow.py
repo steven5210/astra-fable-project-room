@@ -492,8 +492,23 @@ def spec_changes(previous, spec):
     return "--- revision " + str(previous["revision"]) + "\n+++ revision " + str(spec["revision"]) + body
 
 
-def packet(service, directory, state, role, purpose, message, snapshot=None):
-    """One native message. Every controller check stays; only text the session already holds is omitted."""
+def _assembly(gather, join):
+    """Use the caller's tagged accumulator, or a fresh one, so the real assembly is measured only once."""
+    from ao_prompt_metrics import PromptAssembly
+    if gather is None:
+        return PromptAssembly(join)
+    if not isinstance(gather, PromptAssembly) or gather.join != join:
+        raise RoomError("Prompt fragments must use the assembly separator of this packet path")
+    return gather
+
+
+def packet(service, directory, state, role, purpose, message, snapshot=None, gather=None):
+    """One native message. Every controller check stays; only text the session already holds is omitted.
+
+    The real assembly runs once through tagged fragments (``gather`` when the caller supplies it),
+    so the controller projects the exact outgoing bytes without rebuilding a measurement prompt.
+    The public return shape stays ``(text, carried)``.
+    """
     from ao_project_room import digest
     spec = service.spec(directory, state)
     # Specification and acceptance stay read-only. Live routing-rule observations apply to delegation-capable
@@ -507,15 +522,19 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
     ao_delegates.assert_settled(service.root.parent, state, directory)
+    assembly = _assembly(gather, "\n" if role == "engineer" else "")
     if role == "reviewer":
         if purpose != "acceptance_review":
             raise RoomError("Reviewer purpose must be acceptance_review")
         engineering_ready(service, directory, state)
         instruction = "Astra independently reviews the exact Fable candidate and gate evidence. Stay read-only; do not delegate."
-        return ("Workflow: Fable engineering with independent Astra acceptance.\n" + instruction
-                + "\nExact specification revision " + str(spec["revision"]) + ", SHA256 " + spec["sha256"]
-                + "\n<specification>\n" + spec["content"] + "\n</specification>\nAgreed gates: "
-                + json.dumps(spec["gates"]) + "\nTask instruction:\n" + message), None
+        assembly.add("workflow", "Workflow: Fable engineering with independent Astra acceptance.\n" + instruction)
+        assembly.add("separator", "\n")
+        assembly.add("specification", "Exact specification revision " + str(spec["revision"]) + ", SHA256 " + spec["sha256"]
+                      + "\n<specification>\n" + spec["content"] + "\n</specification>\nAgreed gates: " + json.dumps(spec["gates"]))
+        assembly.add("workflow", "\nTask instruction:\n")
+        assembly.add("caller", message)
+        return assembly.text, None
     if purpose == "spec_review":
         from ao_review_extension import admission
         review_extension = admission(service, directory, state)
@@ -577,7 +596,6 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
     from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
     texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
     held = delivered(state, binding["session_id"], directory)
-    sections = []
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
     if review_extension is not None:
         carried['spec_review_extension_sha256'] = review_extension  # Audited allowance, never native prompt text.
@@ -587,25 +605,25 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
         carried["report_correction_admission"] = attribution_admission
     for name in PARTS:
         if name not in held["parts"]:
-            sections.append(texts[name])
+            assembly.add("workflow", texts[name])
             carried["parts"].append(name)
             carried["part_sha256"][name] = digest(texts[name].encode())
     if epoch is not None:
         import ao_provider_transition
         if not ao_provider_transition.amendment_delivered(directory, state):
-            sections.append(ao_provider_transition.amendment_text(epoch))
+            assembly.add("workflow", ao_provider_transition.amendment_text(epoch))
             carried["provider_amendment_sha256"] = state["provider_transition"]["epoch_sha256"]
             if state.get("routing_adoption"):
                 from ao_routing_adoption import INSTRUCTION
-                sections.append(INSTRUCTION)
+                assembly.add("workflow", INSTRUCTION)
                 carried["routing_amendment_sha256"] = digest(INSTRUCTION.encode())
                 carried["routing_adoption_sha256"] = state["routing_adoption"]["receipt_sha256"]
     if held["spec_record_sha256"] != state["spec_record_sha256"]:
         carried["spec_record_sha256"] = state["spec_record_sha256"]
         if held["spec_record_sha256"] is None:
             carried["spec_delivery"] = "full"
-            sections.append("Exact specification revision " + str(spec["revision"]) + ", SHA256 " + spec["sha256"]
-                            + "\n<specification>\n" + spec["content"] + "\n</specification>\nAgreed gates: " + json.dumps(spec["gates"]))
+            assembly.add("specification", "Exact specification revision " + str(spec["revision"]) + ", SHA256 " + spec["sha256"]
+                          + "\n<specification>\n" + spec["content"] + "\n</specification>\nAgreed gates: " + json.dumps(spec["gates"]))
         else:
             previous = spec_record_file(directory, held["spec_record_sha256"])
             carried.update(spec_delivery="changes", base_revision=previous["revision"])
@@ -615,11 +633,12 @@ def packet(service, directory, state, role, purpose, message, snapshot=None):
                      + "</specification-changes>")
             if previous["gates"] != spec["gates"]:
                 block += "\nAgreed gates: " + json.dumps(spec["gates"])
-            sections.append(block)
+            assembly.add("specification", block)
     from ao_instruction_amendments import pending
     amendments = pending(directory, state, binding['session_id'])
     if amendments:
-        sections.extend(text for text, _ in amendments)
+        for amendment, _ in amendments:
+            assembly.add("workflow", amendment)
         carried['instruction_amendments'] = [sha for _, sha in amendments]
-    sections.append(message)
-    return "\n".join(sections), carried
+    assembly.add("caller", message)
+    return assembly.text, carried

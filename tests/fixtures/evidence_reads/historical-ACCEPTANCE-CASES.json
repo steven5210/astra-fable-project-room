@@ -1,0 +1,139 @@
+{
+  "basis": "Independent synthetic acceptance examples; not implementation test results.",
+  "prompt_cases": [
+    {
+      "name": "bare_continue",
+      "components": [
+        "Continue."
+      ],
+      "expected_packet_bytes": 9,
+      "expected_separator_bytes": 0
+    },
+    {
+      "name": "initial_synthetic_parts",
+      "components": [
+        "P",
+        "S",
+        "Continue."
+      ],
+      "expected_packet_bytes": 13,
+      "expected_separator_bytes": 2
+    },
+    {
+      "name": "unicode_delta",
+      "components": [
+        "Δ",
+        "Continue."
+      ],
+      "expected_packet_bytes": 12,
+      "expected_separator_bytes": 1
+    },
+    {
+      "name": "unicode_caller_with_final_lf",
+      "components": [
+        "Add café.\n"
+      ],
+      "expected_packet_bytes": 11,
+      "expected_separator_bytes": 0
+    },
+    {
+      "name": "crlf_preserved",
+      "components": [
+        "x\r\ny"
+      ],
+      "expected_packet_bytes": 4,
+      "expected_separator_bytes": 0
+    }
+  ],
+  "read_cases": [
+    {
+      "name": "same_file_different_slices",
+      "tool_calls": [
+        {
+          "id": "r1",
+          "name": "Read",
+          "relative_test_target": "evidence/a.txt",
+          "offset": 1,
+          "limit": 10
+        },
+        {
+          "id": "r2",
+          "name": "Read",
+          "relative_test_target": "evidence/a.txt",
+          "offset": 11,
+          "limit": 10
+        }
+      ],
+      "expected_distinct_read_calls": 2,
+      "expected_redundant_read_verdict": "not_established"
+    },
+    {
+      "name": "duplicate_native_record",
+      "record_uuids": [
+        "u1",
+        "u1"
+      ],
+      "tool_ids": [
+        "r1",
+        "r1"
+      ],
+      "identical_bytes": true,
+      "expected_distinct_read_calls": 1,
+      "expected_duplicate_records": 1
+    },
+    {
+      "name": "conflicting_native_record",
+      "record_uuids": [
+        "u1",
+        "u1"
+      ],
+      "tool_ids": [
+        "r1",
+        "r2"
+      ],
+      "identical_bytes": false,
+      "expected_coverage": "incomplete"
+    },
+    {
+      "name": "missing_child_file",
+      "launched_children": [
+        "worker-1"
+      ],
+      "present_child_files": [],
+      "expected_coverage": "incomplete",
+      "expected_child_read_count": null
+    },
+    {
+      "name": "failed_read",
+      "tool_id": "r1",
+      "result_is_error": true,
+      "expected_read_requests": 1,
+      "expected_successful_read_results": 0,
+      "expected_failed_read_results": 1
+    },
+    {
+      "name": "missing_result",
+      "tool_id": "r1",
+      "tool_result_present": false,
+      "expected_read_requests": 1,
+      "expected_successful_read_results": 0,
+      "expected_unresolved_read_results": 1
+    },
+    {
+      "name": "bash_mentions_evidence_path",
+      "tool_name": "Bash",
+      "command": "cat /fixture/evidence/a.txt",
+      "expected_proven_Read_calls": 0,
+      "expected_coverage_note": "Other tool access is outside this counter."
+    },
+    {
+      "name": "privacy",
+      "private_sentinels": [
+        "/fixture/private-project",
+        "SECRET_SENTINEL_58",
+        "source excerpt sentinel"
+      ],
+      "expected_sentinels_in_public_result": []
+    }
+  ]
+}

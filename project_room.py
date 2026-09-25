@@ -1812,6 +1812,12 @@ def main(argv=None):
     audit.add_argument("--room", required=True)
     audit.add_argument("--handoff", required=True)
     audit.add_argument("--attempt", type=int, required=True)
+    evidence = commands.add_parser("ao-evidence-read-audit", help="read-only Read counts for one owned request; no model or network")
+    evidence.add_argument("--home", default=argparse.SUPPRESS, help="controller home; also accepted before the subcommand")
+    evidence.add_argument("--room", required=True)
+    evidence.add_argument("--request", required=True)
+    evidence.add_argument("--ao-database", required=True)
+    evidence.add_argument("--evidence-root", required=True)
     call = commands.add_parser("call")
     call.add_argument("tool", choices=sorted(TOOL_SCHEMAS))
     call.add_argument("--args", default="{}", help="JSON argument object")
@@ -1834,6 +1840,29 @@ def main(argv=None):
                 raise room.RoomError(str(exc)) from exc
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0 if result["complete"] else 1  # the documented contract shared with transcript_audit.py: 1 means incomplete
+        if args.command == "ao-evidence-read-audit":
+            # Dispatch before Service so a read-only audit cannot provision or repair state.
+            try:
+                import ao_evidence_audit
+            except Exception:
+                print(json.dumps({"error": "ao_evidence_read_audit_failed"}), file=sys.stderr)
+                return 2
+            try:
+                # Keep links visible to the audit's no-follow traversal. The normal controller
+                # resolves its home, but doing that here would erase a linked source ancestor.
+                audit_home = Path(args.home or os.environ.get("PROJECT_ROOM_HOME") or Path.home() / ".project-room").expanduser()
+                if not audit_home.is_absolute():
+                    audit_home = Path.cwd() / audit_home
+                result = ao_evidence_audit.audit(audit_home, args.room, args.request,
+                                                 args.ao_database, args.evidence_root)
+            except ao_evidence_audit.AuditError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                return 2
+            except Exception:
+                print(json.dumps({"error": "ao_evidence_read_audit_failed"}), file=sys.stderr)
+                return 2
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0 if result["coverage"] == "complete" else 1
         service = Service(args.home)
         if args.command == "setup":
             result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider)

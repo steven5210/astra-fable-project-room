@@ -1,2 +1,3 @@
 # Exact CRLF byte oracles must survive checkout/archive without normalization.
 tests/fixtures/changesets/unicode-crlf.*.txt -text whitespace=cr-at-eol
+tests/fixtures/prompt_projection/*.txt -text whitespace=cr-at-eol

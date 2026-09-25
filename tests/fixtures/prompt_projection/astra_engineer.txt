@@ -1,0 +1,5 @@
+[Project Room room-1 request request-1]
+Workflow: Astra-led. Astra implements; a separate reviewer assesses evidence. No routine Fable or delegate calls.
+Exact spec: /synthetic/room/spec.json
+Spec SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Add café.
