@@ -265,6 +265,58 @@ class CrashTests(unittest.TestCase):
                 for command in ('audit','apply','resume'):
                     self.assert_cli_refusal(c,command,expected)
                     self.assertEqual(tree_snapshot(c.base),before)
+    def test_cross_plan_apply_preserves_missing_plan_precommit_evidence(self):
+        c=self.case(); original=c.target_snapshot()
+        self.crash(c.apply,'after_stage_create')
+        self.assertIsNone(c.chain()); self.assertEqual(c.target_snapshot(),original)
+        old_journal=c.state/'journals'/c.sha
+        journal_before=tree_snapshot(old_journal)
+        leftovers={name:value for name,value in tree_snapshot(c.workspace).items()
+                   if name.startswith('.changeset-') and name.endswith('.stage')}
+        self.assertEqual(len(leftovers),1)
+        (c.state/'plans'/(c.sha+'.json')).unlink()
+        other=copy.copy(c); other.envelope=copy.deepcopy(c.envelope)
+        other.envelope['batch_id']='new-plan-after-uncommitted-crash'; other.prepare()
+        self.assertNotEqual(other.sha,c.sha)
+        self.assertEqual(other.apply()['outcome'],'applied_unverified')
+        self.assertEqual(other.contents(),other.after)
+        self.assertEqual(tree_snapshot(old_journal),journal_before)
+        current=tree_snapshot(c.workspace)
+        for name,value in leftovers.items(): self.assertEqual(current[name],value)
+        before=tree_snapshot(c.base)
+        for command in ('audit','resume'):
+            self.assert_cli_refusal(other,command,'plan_missing')
+            self.assertEqual(tree_snapshot(c.base),before)
+    def test_scratch_inventory_reserves_two_records_at_literal_512_limit(self):
+        c=self.case(); c.envelope['batch_id']='one-replacement-budget'
+        c.envelope['targets']=c.envelope['targets'][:1]; c.prepare()
+        self.crash(c.apply,'after_stage_create')
+        scratch=c.state/'journals'/c.sha/'scratch'
+        self.assertEqual(len(list(scratch.iterdir())),1)
+        # Synthesize retained crash-only intents. No claim is made that 510
+        # processes were executed; the admitted on-disk record count is literal.
+        for index in range(510):
+            nonce=format(index,'032x')
+            intent={'version':1,'plan_sha256':c.sha,'attempt_id':'1'*32,
+                    'target_index':0,'name':'.changeset-'+nonce+'.stage','intent_id':nonce}
+            intent['sha256']=digest_object(intent,'sha256')
+            path=scratch/(nonce+'.intent.json')
+            with path.open('x',encoding='utf-8') as stream: stream.write(canonical(intent))
+            path.chmod(0o600)
+        self.assertEqual(len(list(scratch.iterdir())),511)
+        before=tree_snapshot(c.base)
+        with self.assertRaises(ChangesetError) as exc: c.apply()
+        self.assertEqual(exc.exception.code,'state_inventory_limit')
+        self.assertEqual(tree_snapshot(c.base),before)
+        # Removing only the explicitly created final fixture record leaves
+        # room for the actual replacement's intent/owner pair, reaching 512.
+        path.unlink(); retained=tree_snapshot(scratch)
+        self.assertEqual(c.apply()['outcome'],'applied_unverified')
+        self.assertEqual(len(list(scratch.iterdir())),512)
+        current=tree_snapshot(scratch)
+        for name,value in retained.items(): self.assertEqual(current[name],value)
+        expected=dict(c.before); expected['a.txt']=c.after['a.txt']
+        self.assertEqual(c.contents(),expected)
     def test_unsafe_lock_paths_refuse_without_state_or_target_writes(self):
         for kind in ('symlink','hardlink','mode','fifo','directory','foreign_owner'):
             with self.subTest(kind=kind):

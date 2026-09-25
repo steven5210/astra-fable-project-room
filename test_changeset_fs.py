@@ -270,6 +270,37 @@ class FilesystemTests(unittest.TestCase):
         with self.mocked_linux_probe(),patch.object(fs.os,'setxattr',side_effect=OSError(errno.EPERM,'synthetic')),patch.object(fs.os,'unlink',side_effect=OSError(errno.EACCES,'synthetic')):
             self.assert_refusal('unsupported_capability',lambda:fs.require_platform_support(self.root))
         self.assertEqual(len(list(self.base.glob('.visibility-*'))),1)
+    def test_linux_probe_cleanup_sync_failure_preserves_original_refusal(self):
+        foreign=self.base/'.visibility-retained-foreign'
+        foreign.write_bytes(b'synthetic preexisting evidence'); foreign.chmod(0o600)
+        before={p.name:(p.stat().st_ino,p.stat().st_mode,p.read_bytes()) for p in self.base.iterdir()}
+        with self.mocked_linux_probe(),patch.object(fs.os,'setxattr',side_effect=OSError(errno.EPERM,'synthetic')):
+            with patch.object(fs,'sync_dir',side_effect=ChangesetError('unsupported_durability')) as sync:
+                self.assert_refusal('unsupported_capability',lambda:fs.require_platform_support(self.root))
+                sync.assert_called_once_with(self.root.fd)
+        self.assertEqual({p.name:(p.stat().st_ino,p.stat().st_mode,p.read_bytes()) for p in self.base.iterdir()},before)
+        self.assertFalse((self.base/'linux-visibility.json').exists())
+    def test_linux_probe_crash_leftovers_have_bounded_inventory_without_cleanup(self):
+        # These represent files left by termination before exception cleanup.
+        # Linux xattr/durability primitives remain explicitly mocked on Darwin.
+        for index in range(63):
+            path=self.base/('.visibility-'+format(index,'032x'))
+            path.write_bytes(b'synthetic crash-only evidence'); path.chmod(0o600)
+        snapshot=lambda:{p.name:(p.stat().st_ino,p.stat().st_mode,p.read_bytes()) for p in self.base.iterdir()}
+        self.assertEqual(len(list(self.base.iterdir())),64) # includes the source
+        before=snapshot()
+        with self.mocked_linux_probe(),patch.object(fs.os,'setxattr',side_effect=OSError(errno.EPERM,'synthetic')) as setter:
+            self.assert_refusal('unsupported_capability',lambda:fs.require_platform_support(self.root))
+            setter.assert_called_once()
+        self.assertEqual(snapshot(),before)
+        extra=self.base/('.visibility-'+format(63,'032x'))
+        extra.write_bytes(b'synthetic extra crash evidence'); extra.chmod(0o600)
+        before=snapshot(); self.assertEqual(len(before),65)
+        with self.mocked_linux_probe(),patch.object(fs.os,'setxattr') as setter:
+            for _ in range(2):
+                self.assert_refusal('state_inventory_limit',lambda:fs.require_platform_support(self.root))
+                self.assertEqual(snapshot(),before)
+            setter.assert_not_called()
     def test_atomic_record_fault_preserves_temporary_without_commit(self):
         class Interrupted(Exception): pass
         def hook(point,detail):

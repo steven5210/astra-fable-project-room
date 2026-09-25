@@ -1,8 +1,10 @@
 import copy
+import ctypes as C
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -136,6 +138,39 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(journal,'apply_meta',fail_second):
             with self.assertRaises(ChangesetError): c.apply()
         self.assertEqual(c.target_snapshot(),before); self.assertIsNone(c.chain())
+    @unittest.skipUnless(fs.SYSTEM=='Darwin','native Darwin compressed-source workflow')
+    def test_native_compressed_source_refuses_plan_and_apply_before_staging(self):
+        setx=fs._native('fsetxattr',[C.c_int,C.c_char_p,C.c_void_p,C.c_size_t,C.c_uint32,C.c_int],C.c_int)
+        chflags=fs._native('fchflags',[C.c_int,C.c_uint],C.c_int)
+        for phase in ('plan','apply'):
+            with self.subTest(phase=phase):
+                base=Path(self.temp.name)/('compressed-'+phase); base.mkdir()
+                c=Case(base)
+                if phase=='apply': self.prepare(c)
+                fd=os.open(c.workspace/'a.txt',os.O_RDWR|os.O_NOFOLLOW)
+                try:
+                    payload=c.before['a.txt']
+                    compressed=struct.pack('<IIQ',0x636d7066,1,len(payload))+payload
+                    os.ftruncate(fd,0)
+                    self.assertEqual(setx(fd,b'com.apple.decmpfs',C.create_string_buffer(compressed),len(compressed),0,0),0)
+                    self.assertEqual(chflags(fd,0x20),0)
+                    self.assertTrue(os.fstat(fd).st_flags&0x20)
+                    self.assertEqual(fs.read_fd(fd)[0],payload)
+                    before=tree_snapshot(c.workspace)
+                    stores=('sources','drafts','staged','backups','plans','templates','journals')
+                    retained={name:tree_snapshot(c.state/name) for name in stores}
+                    with patch.object(journal,'apply_meta') as stage_metadata:
+                        with self.assertRaises(ChangesetError) as exc:
+                            c.prepare() if phase=='plan' else c.apply()
+                        self.assertEqual(exc.exception.code,'unsupported_macos_flags')
+                        stage_metadata.assert_not_called()
+                    self.assertEqual(tree_snapshot(c.workspace),before)
+                    self.assertEqual({name:tree_snapshot(c.state/name) for name in stores},retained)
+                    self.assertTrue(os.fstat(fd).st_flags&0x20)
+                    self.assertEqual(fs._mac_get(fd,b'com.apple.decmpfs',len(compressed)),compressed)
+                finally:
+                    try: self.assertEqual(chflags(fd,0),0)
+                    finally: os.close(fd)
     def test_pinned_input_receipt_and_root_mode_refusals(self):
         for mutation in ('pin','receipt','root'):
             with self.subTest(mutation=mutation):

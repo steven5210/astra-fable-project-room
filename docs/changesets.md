@@ -63,7 +63,7 @@ Linux support requires proof of access to the trusted xattr namespace on the act
 
 Limits: 32 targets, 10 MiB per source/draft/proposed/check input, 64 MiB aggregate retained plan bytes, 4096 operations, 256 conditions, 64 pinned inputs, JSON depth 64, path depth 32, 128-byte IDs, 4300-digit integers, 64 xattr names and 64 KiB xattrs per file. Persisted plan, journal, template and receipt JSON contain no floats; ordinary draft values are bound by exact byte digests. Plans and audits contain no timestamps.
 
-Discovery admits at most 256 journals. Each journal has at most 256 outcome records and 256 scratch intents, and an audit report is bounded to 10 MiB. Recovery checks remaining record capacity before creating another attempt.
+Discovery admits at most 256 journals. Each journal has a budget of 256 outcome records and 512 scratch records, and an audit report is bounded to 10 MiB. Each staged replacement normally uses an intent and an ownership record; a crash may leave only the intent. Apply and recovery reserve two scratch records per remaining replacement before creating another attempt.
 
 ## Recovery
 
@@ -75,7 +75,7 @@ All cooperating invocations must use the same configured state root. A different
 
 Resume rechecks every target, root, input, backup, retained draft and journal before another replacement. Scratch handling requires recorded ownership, inode, mode, metadata and an exact proposed-byte prefix; unrecorded or nonconforming scratch is preserved and refuses. Restaging preserves the old partial as evidence. Audit includes recorded `precommit_staging` and earlier-attempt leftovers. These `.changeset-*.stage` files may remain inside the candidate after an interrupted apply; do not commit them.
 
-Foreign entries in the journal directory (including a file-browser metadata file) refuse with `unknown_state_entry`; a staging-only journal whose plan is missing refuses with `plan_missing`. Apply, audit and resume all refuse these shapes without deleting or rewriting evidence; no reusable audit digest is issued. Some corrupt or externally modified states therefore have no automatic recovery command. Preserve that evidence for diagnosis rather than changing hashes to force recovery. Completed replay also revalidates current bytes and inputs, including the unchanged receipt at its recorded locator, before returning its old receipt. Files are replaced atomically one at a time; a batch is not a filesystem transaction.
+Foreign entries in the journal directory (including a file-browser metadata file) make apply, audit and resume refuse with `unknown_state_entry`, preserving the evidence. A staging-only journal whose plan is missing makes audit and resume refuse with `plan_missing`; no reusable audit digest is issued. Applying that missing plan also refuses. A different valid plan may still apply before the earlier journal's prepared commit point, preserving its leftovers. That new batch can be applied while audit/resume remain unavailable because the earlier precommit evidence cannot be interpreted. Some corrupt or externally modified states therefore have no automatic recovery command. Preserve that evidence for diagnosis rather than changing hashes to force recovery. Completed replay also revalidates current bytes and inputs, including the unchanged receipt at its recorded locator, before returning its old receipt. Files are replaced atomically one at a time; a batch is not a filesystem transaction.
 
 ## Commands and complete synthetic example
 
