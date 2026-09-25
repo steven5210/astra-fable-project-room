@@ -1,0 +1,49 @@
+{
+  "basis": "Independent literal formatting contract; no production builder import or generated expected output from code under test",
+  "spec_revision": 1,
+  "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "spec_content": "Δ café.\r\n",
+  "gates": [
+    [
+      "python3",
+      "-m",
+      "unittest"
+    ]
+  ],
+  "caller": "Add café.\n",
+  "cases": [
+    {
+      "name": "normal_reviewer",
+      "fixture": "normal_reviewer.txt",
+      "text_sha256": "4aeb67941a9fc0a93df62bbb398c7fdd78229d57d6314bb787698667ab17399d",
+      "total_bytes": 1040,
+      "caller_bytes": 11,
+      "specification_bytes": 194,
+      "workflow_bytes": 834,
+      "separator_bytes": 1,
+      "spec_delivery": "full"
+    },
+    {
+      "name": "astra_engineer",
+      "fixture": "astra_engineer.txt",
+      "text_sha256": "abea45dd1de0b522f59d50a08a6b26eb76c2e031bfde2ced2956561be131d03e",
+      "total_bytes": 281,
+      "caller_bytes": 11,
+      "specification_bytes": 116,
+      "workflow_bytes": 154,
+      "separator_bytes": 0,
+      "spec_delivery": "none"
+    },
+    {
+      "name": "astra_reviewer",
+      "fixture": "astra_reviewer.txt",
+      "text_sha256": "7f9a5976371599219fc756167b0577326d981799ee2a5122cd4f28451556d52c",
+      "total_bytes": 888,
+      "caller_bytes": 11,
+      "specification_bytes": 116,
+      "workflow_bytes": 761,
+      "separator_bytes": 0,
+      "spec_delivery": "none"
+    }
+  ]
+}

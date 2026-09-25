@@ -525,6 +525,19 @@ class RoutingAdoptionTests(AdoptionFixture):
         self.start_attachment(prepared)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'after-handshake', purpose='implementation')
         sent = self.fake.posts[-1][1]['text']
+        current = self.state()
+        request = current['requests']['after-handshake']
+        epoch = ao.read(self.directory() / current['provider_transition']['epoch_record'])
+        provider_text = provider.amendment_text(epoch)
+        # Frozen baseline path: previously delivered workflow/spec, followed by
+        # exactly the provider amendment, routing amendment and caller with two LFs.
+        self.assertEqual(request['carried']['parts'], [])
+        self.assertEqual(sent, provider_text + '\n' + routing.INSTRUCTION + '\nContinue.')
+        self.assertEqual(request['prompt_projection'], {
+            'version': 1, 'text_sha256': ao.digest(sent.encode()), 'total_bytes': len(sent.encode()),
+            'caller_bytes': 9, 'specification_bytes': 0,
+            'workflow_bytes': len(provider_text.encode()) + len(routing.INSTRUCTION.encode()),
+            'separator_bytes': 2, 'spec_delivery': 'none'})
         self.assertIn(routing.INSTRUCTION, sent)
         self.assertNotIn('<specification>', sent)
         self.assertTrue(sent.endswith('Continue.'))
@@ -532,6 +545,9 @@ class RoutingAdoptionTests(AdoptionFixture):
         self.service.ao_room_sync(self.room)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'next', purpose='correction')
         self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')
+        projection = self.state()['requests']['next']['prompt_projection']
+        self.assertEqual((projection['total_bytes'], projection['caller_bytes'],
+                          projection['workflow_bytes'], projection['separator_bytes']), (9, 9, 0, 0))
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_attempts'], 3)
 
 

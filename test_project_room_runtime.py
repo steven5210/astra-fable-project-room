@@ -136,6 +136,9 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         self.assertEqual(status["delegate"]["provider"], "none")
         self.assertIsNone(status["acceptance_review_extension"])
         self.assertEqual(status["acceptance_review_attempts"], 0)
+        self.assertEqual(status["latest_prompt"]["coverage"], "unavailable")
+        self.assertEqual(status["usage"]["native_worker_usage"],
+                         {"coverage": "unavailable", "reason": "native_worker_usage_not_attributed"})
         self.assertEqual(self.tool(server, "ao_room_list")["count"], 1)
         self.assertEqual(self.request(server, "ping"), {})
         self.assertEqual(state.read_bytes(), original)
@@ -161,6 +164,34 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertIn("{plan,apply,audit,resume}", result.stdout)
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+
+    def test_evidence_audit_cli_survives_eviction_without_creating_state(self):
+        retained = runtime.retain(self.source, self.home)
+        directory = Path(retained["path"])
+        required = ("ao_prompt_metrics.py", "ao_evidence_audit.py", "ao_evidence_audit_io.py",
+                    "ao_evidence_audit_native.py")
+        self.assertTrue(all((directory / name).is_file() for name in required))
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        shutil.rmtree(self.source)
+        absent = self.base / "audit-home-must-stay-absent"
+        bootstrap = READ_ONLY_BOOTSTRAP.replace(
+            "runpy.run_path(sys.argv[1], run_name='__main__')",
+            "entry = sys.argv[1]\nsys.path.insert(0, os.path.dirname(entry))\n"
+            "sys.argv = [entry] + sys.argv[3:]\nrunpy.run_path(entry, run_name='__main__')")
+        result = subprocess.run(
+            [sys.executable, "-E", "-s", "-B", "-c", bootstrap,
+             str(directory / "project_room.py"), str(Path.home()), "ao-evidence-read-audit",
+             "--home", str(absent), "--room", "fixture-room", "--request", "fixture-request",
+             "--ao-database", str(self.base / "absent.db"), "--evidence-root", str(self.base / "evidence")],
+            cwd=self.base, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["coverage"], "unavailable")
+        self.assertEqual(report["reasons"], ["request_unbound"])
+        self.assertFalse(absent.exists())
+        self.assertFalse((self.base / "absent.db").exists())
         self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
 
     def test_new_release_preserves_old_connection_and_identifies_both_exact_copies(self):
