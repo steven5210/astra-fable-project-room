@@ -237,7 +237,12 @@ class Service:
                 if not (directory / "state.json").is_file():
                     raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
                 state = read(directory / "state.json")
-                yield directory, state
+                try:
+                    yield directory, state
+                except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+                    from ao_history_reconciliation import invalidate_latest
+                    invalidate_latest(self, directory, state, exc)
+                    raise
 
     def save(self, directory, state):
         atomic(directory / "state.json", state)
@@ -303,6 +308,10 @@ class Service:
             from ao_provider_transition import _CompleteClient
             if not isinstance(client, _CompleteClient):
                 client = _CompleteClient(client)
+        from ao_history_reconciliation import StrictHistoryClient, requires_strict_history
+        if (requires_strict_history(self.root / 'rooms' / state['room_id'], state, binding)
+                and not isinstance(client, StrictHistoryClient)):
+            client = StrictHistoryClient(client)
         raw = client.request("GET", "/sessions/" + binding["session_id"])
         session = raw.get("session", raw)
         if (session.get("id") != binding["session_id"] or session.get("projectId") != state["ao_project_id"]

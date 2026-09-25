@@ -155,6 +155,16 @@ def latest_for_role(state, role):
 
 
 def observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None):
+    try:
+        return _observe(service, directory, state, request, snapshot, allow_unknown_clear, source_verification)
+    except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+        from ao_history_reconciliation import invalidate
+        if request.get('history_reconciliation_sha256'):
+            invalidate(service, directory, state, request['request_id'], exc)
+        raise
+
+
+def _observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None):
     from ao_project_room import atomic, digest, read, sent_message, turn_ids
     from ao_project_room import native_turn_identity
     identity = native_turn_identity(request)
@@ -194,12 +204,18 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
             for p in (native or {}).get(field, [])}) if not (native or {}).get('unknown') else set()
         if extra_turns - proven_imports:
             raise RoomError('Native history contains unverified recovered context; audit its exact source before continuing')
+    from ao_history_reconciliation import reconcile
+    proof_sha256 = reconcile(service, directory, state, request, saved, observed, snapshot, native, allow_unknown_clear)
+    if proof_sha256:
+        observed = {**observed, 'history_truncated': False}
     value = {'version': 1, 'room_id': state['room_id'], 'request_id': request['request_id'],
              'receipt_sha256': request['receipt_sha256'], 'text_sha256': request['text_sha256'],
              'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],
              'ao_terminal': turns[0], 'session_failures': observed['sessionFailures'], 'provider_failures': activities,
              'native': native, 'outcome': classify(observed, native,
                 require_structured=state['workflow'] == 'fable_engineering' or request['role'] == 'reviewer')}
+    if proof_sha256:
+        value['history_reconciliation_sha256'] = proof_sha256
     old = load(directory, request) if request.get('semantic_outcome') else None
     prior_source_verification = (old or {}).get('native_source_verification')
     if source_verification is not None:
@@ -265,6 +281,9 @@ def load(directory, request):
             or record.get('turn_id') != request.get('turn_id')
             or record.get('provider_turn_id') != request.get('provider_turn_id')):
         raise RoomError('Semantic outcome evidence changed or belongs to another result')
+    if record.get('history_reconciliation_sha256'):
+        from ao_history_reconciliation import load_proof, PROOF
+        load_proof(directory, {**request, PROOF: record[PROOF]})
     return record
 
 
@@ -353,6 +372,13 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
     inputs = {'version': 1, 'room_id': state['room_id'], 'blocked_request_id': request_id,
               'outcome_sha256': outcome_sha256, 'resume_request_id': resume_request_id,
               'diagnosis': diagnosis, 'authorization': authorization}
+    reconciled_observation = None
+    if request.get('history_reconciliation_sha256'):
+        snapshot = service.identity(service.client(state), state, request)
+        reconciled_observation = observe(service, directory, state, request, snapshot)
+        if (request['semantic_outcome_sha256'] != outcome_sha256
+                or reconciled_observation['outcome']['kind'] not in RESUMABLE or inconclusive(reconciled_observation)):
+            raise RoomError('History reconciliation evidence changed; explicit outcome audit required')
     prior = release_record(directory, state, request)
     if prior:
         if 'native_failure_settlement' in prior:
@@ -367,8 +393,11 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
     ao_acceptance_extension.guard_outcome_resume(service, state, request, resume_request_id)
     if request_id == resume_request_id or resume_request_id in state['requests']:
         raise RoomError('Continuation requires one unused request identity')
-    snapshot = service.identity(service.client(state), state, request)
-    value = observe(service, directory, state, request, snapshot)
+    if reconciled_observation is None:
+        snapshot = service.identity(service.client(state), state, request)
+        value = observe(service, directory, state, request, snapshot)
+    else:
+        value = reconciled_observation
     if (request['semantic_outcome_sha256'] != outcome_sha256 or value['outcome']['kind'] not in RESUMABLE
             or inconclusive(value)):
         raise RoomError('Outcome evidence changed or does not establish an eligible diagnosed failure')
