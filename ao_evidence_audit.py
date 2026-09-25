@@ -720,6 +720,11 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                                                 for index, entry in enumerate(admitted)):
                 continue
             for candidate in native.launch_candidates(scan, scope):
+                # An earlier candidate in this same scan may revoke the actor's
+                # authority by reusing its ID or an ancestor's ID.
+                if parent_index is not None and any(entry["ambiguous"] and _descends_from(parent_index, index, admitted)
+                                                    for index, entry in enumerate(admitted)):
+                    break
                 if candidate.agent_id is None:
                     child_problems.add(candidate.reason)
                     collector.note(candidate.reason)
