@@ -12,6 +12,7 @@ from unittest.mock import patch
 import ao_project_room as ao
 import ao_prompt_metrics as metrics
 from test_ao_project_room import FakeAO
+from test_ao_prompt_metrics import AstraProjectionFixture
 
 
 def canonical(value):
@@ -219,6 +220,56 @@ class ReceiptIdentityBoundaryTests(unittest.TestCase):
         self.assertEqual((value["integrity"], value["delivery"]), ("receipt_verified", "submitted"))
         self.assertIn("delivery_unobserved", value["reasons"])
 
+    def test_empty_or_malformed_provider_identity_retains_unknown_delivery_receipt(self):
+        for provider_id in (None, "", " ", 0, False, [], {}, 1):
+            with self.subTest(provider_id=provider_id):
+                self.request["provider_turn_id"] = provider_id
+                self.request["state"] = "uncertain"
+                self.receipt["turn"].update(providerTurnId=provider_id, state="failed")
+                self.request["observed_turn"] = copy.deepcopy(self.receipt["turn"])
+                self.receipt["prompt_projection_sha256"] = metrics.receipt_projection_sha256(self.request)
+                self.write_receipt()
+                value = self.latest()
+                self.assertEqual((value["coverage"], value["integrity"], value["delivery"]),
+                                 ("known", "receipt_verified", "submitted"))
+                self.assertEqual(value["reasons"], ["delivery_unobserved"])
+
+    def test_binding_refusal_preserves_known_projection_metrics(self):
+        with patch.object(metrics, "projection_binding", side_effect=ao.RoomError("unavailable binding")):
+            value = self.latest()
+        self.assertEqual((value["coverage"], value["total_bytes"], value["integrity"]),
+                         ("known", 9, "unavailable"))
+        self.assertEqual(value["reasons"], ["delivery_unobserved", "projection_integrity"])
+
+    def test_missing_receipt_is_unavailable_for_every_controller_terminal_state(self):
+        self.assertEqual(set(metrics.TERMINAL_STATES), ao.TERMINAL)
+        self.request.pop("receipt")
+        self.request.pop("receipt_sha256")
+        for terminal in sorted(ao.TERMINAL):
+            with self.subTest(state=terminal):
+                self.request["state"] = terminal
+                value = self.latest()
+                self.assertEqual(value["coverage"], "known")
+                self.assertEqual(value["reasons"], ["delivery_unobserved", "receipt_unavailable"])
+
+    def test_real_lock_preserves_unproven_state_and_journals_on_projection_refusal(self):
+        import ao_history_reconciliation
+        self.request["text_sha256"] = "0" * 64
+        service = ao.Service(self.root / "service-home")
+        directory = service.root / "rooms" / "room-1"
+        service.save(directory, self.state)
+        before = (directory / "state.json").read_bytes()
+        entries = sorted(str(p.relative_to(directory)) for p in directory.rglob("*"))
+        service.client = lambda *args: self.fail("AO client constructed despite corrupt projection")
+        with patch.object(ao_history_reconciliation, "invalidate_latest",
+                          wraps=ao_history_reconciliation.invalidate_latest) as invalidation:
+            with self.assertRaisesRegex(ao.RoomError, "saved prompt projection is invalid"):
+                service.ao_room_send("room-1", "engineer", "Continue.", "new-request")
+        invalidation.assert_called_once()
+        self.assertEqual((directory / "state.json").read_bytes(), before)
+        self.assertEqual(ao.read(directory / "state.json")["requests"], self.state["requests"])
+        self.assertEqual(sorted(str(p.relative_to(directory)) for p in directory.rglob("*")), entries)
+
     def test_inconsistent_saved_text_hash_refuses_before_dispatch_or_receipt_binding(self):
         self.request['text_sha256'] = '0' * 64
         self.assertEqual(self.latest()['reasons'], ['projection_integrity'])
@@ -290,6 +341,27 @@ class ReceiptIdentityBoundaryTests(unittest.TestCase):
         self.assertIsInstance(metrics.strict_json('{"v":' * 64 + '0' + '}' * 64), dict)
         with self.assertRaises(ao.RoomError):
             metrics.strict_json("[" * 65 + "0" + "]" * 65)
+
+
+class FailedNativeIdentitySyncTests(AstraProjectionFixture):
+    def test_real_sync_preserves_blank_identity_failure_without_observed_delivery(self):
+        self.bind()
+        self.service.ao_room_send(self.room, "engineer", "Continue.", "request-1")
+        self.fake.finish("engineer", state="failed")
+        self.fake.snapshots["engineer"]["turns"][-1]["providerTurnId"] = ""
+        state = self.state()
+        state["requests"]["request-1"]["provider_turn_id"] = ""
+        self.service.save(self.directory(), state)
+        result = self.service.ao_room_sync(self.room)
+        saved = self.state()["requests"]["request-1"]
+        self.assertEqual(saved["state"], "uncertain")
+        receipt = ao.read(self.directory() / saved["receipt"])
+        self.assertEqual(receipt["turn"]["providerTurnId"], "")
+        self.assertEqual(receipt["turn"]["state"], "failed")
+        self.assertEqual(result["latest_prompt"]["integrity"], "receipt_verified")
+        self.assertEqual(result["latest_prompt"]["delivery"], "submitted")
+        self.assertIn("delivery_unobserved", result["latest_prompt"]["reasons"])
+        self.assertEqual(len(self.fake.posts), 1)
 
 
 if __name__ == "__main__":

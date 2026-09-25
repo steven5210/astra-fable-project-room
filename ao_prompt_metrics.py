@@ -25,7 +25,8 @@ ROLES = ("engineer", "reviewer")
 KINDS = ("workflow", "specification", "caller", "separator")
 SEPARATORS = ("", "\n")
 DELIVERIES = ("none", "full", "changes")
-TERMINAL_STATES = ("completed", "settled_failure")
+# Kept aligned with ao_project_room.TERMINAL by an independent regression.
+TERMINAL_STATES = ("completed", "failed", "cancelled", "interrupted", "settled_failure")
 PROJECTION_FIELDS = ("version", "text_sha256", "total_bytes", "caller_bytes", "specification_bytes",
                      "workflow_bytes", "separator_bytes", "spec_delivery")
 BYTE_FIELDS = ("total_bytes", "caller_bytes", "specification_bytes", "workflow_bytes", "separator_bytes")
@@ -177,8 +178,7 @@ def projection_binding(request, projection):
             or request.get("text_sha256") != projection["text_sha256"]):
         raise RoomError("Saved request text identity contradicts its prompt projection")
     turn_id, provider_id = request.get("turn_id"), _native_id(request)
-    if (not _nonempty(turn_id)
-            or (request.get("provider_turn_id") is not None and not _nonempty(request["provider_turn_id"]))):
+    if not _nonempty(turn_id):
         raise RoomError("Projection receipt requires an exact saved turn identity")
     # A failed/uncertain native dispatch can lack a provider ID. Bind that absence
     # truthfully while preserving its receipt; it cannot prove observed delivery.
@@ -396,12 +396,18 @@ def _receipt_identity(request, receipt):
             or not isinstance(settings, dict) or settings.get("model") != request["model"]
             or settings.get("reasoningEffort") != request["reasoning_effort"]):
         return False
-    if turn.get("id") != turn_id or turn.get("providerTurnId") != provider_id:
+    receipt_provider_id = turn.get("providerTurnId")
+    receipt_provider_id = receipt_provider_id if _nonempty(receipt_provider_id) else None
+    if turn.get("id") != turn_id or receipt_provider_id != provider_id:
         return False
     observed = request.get("observed_turn")
-    if observed is not None and (not isinstance(observed, dict) or observed.get("id") != turn_id
-            or observed.get("providerTurnId") != provider_id):
-        return False
+    if observed is not None:
+        if not isinstance(observed, dict) or observed.get("id") != turn_id:
+            return False
+        observed_provider_id = observed.get("providerTurnId")
+        observed_provider_id = observed_provider_id if _nonempty(observed_provider_id) else None
+        if observed_provider_id != provider_id:
+            return False
     if request.get("model_reroute"):
         return False
     reroute = receipt.get("modelReroute")
@@ -523,8 +529,12 @@ def _latest_prompt(directory, state):
         reasons.append("receipt_unavailable")
     if receipt is not None:
         if projected:
-            if (not _receipt_identity(request, receipt)
-                    or receipt.get("prompt_projection_sha256") != projection_binding(request, projection)):
+            try:
+                verified = (_receipt_identity(request, receipt)
+                            and receipt.get("prompt_projection_sha256") == projection_binding(request, projection))
+            except RoomError:
+                verified = False
+            if not verified:
                 integrity = "unavailable"
                 reasons.append("projection_integrity")
             else:
