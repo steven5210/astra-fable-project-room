@@ -38,10 +38,11 @@ SOURCE_DIMENSION = frozenset(("source_missing", "source_unsafe", "source_changed
                               "source_malformed", "identity_conflict", "directory_entry_limit",
                               "transcript_bytes_limit", "aggregate_bytes_limit", "record_bytes_limit",
                               "record_count_limit", "record_id_limit", "tool_id_limit", "json_depth_limit",
-                              "binding_bytes_limit"))
+                              "binding_bytes_limit", "child_missing", "child_limit"))
 PATH_DIMENSION = frozenset(("path_relative", "path_invalid", "path_bytes_limit", "tool_format_unsupported"))
 RESULT_DIMENSION = frozenset(("result_unresolved", "result_unclassifiable", "tool_format_unsupported"))
-INTERVAL_DIMENSION = frozenset(("interval_unbound", "interval_ambiguous"))
+INTERVAL_DIMENSION = frozenset(("interval_unbound", "interval_ambiguous", "owner_conflict",
+                                "child_attribution_ambiguous", "child_interval_unbound", "launch_unresolved"))
 HEX64 = re.compile("[0-9a-f]{64}")
 
 
@@ -506,17 +507,19 @@ class Candidate:
 
 
 def human_candidate(record):
-    """A potentially genuine human record or boundary: never a compaction summary or notification."""
+    """A genuine human candidate with a supported compaction marker."""
+    return (looks_human(record)
+            and ("isCompactSummary" not in record or type(record["isCompactSummary"]) is bool))
+
+
+def looks_human(record):
+    """Potential human boundary, including malformed markers that cannot be skipped."""
     origin = record.get("origin")
     if not isinstance(origin, dict) or origin.get("kind") != "human":
         return False
     if record.get("isCompactSummary") is True:
         return False
     return True
-
-
-def looks_human(record):
-    return human_candidate(record)
 
 
 class RecordScanner:
@@ -547,9 +550,9 @@ class RecordScanner:
         self.collector.note(reason)
 
     def _human(self, record, number, timestamp, uuid_value, unique, text):
-        if self.kind != "parent" or not human_candidate(record):
+        if self.kind != "parent" or not looks_human(record):
             return
-        if record.get("isSidechain") is True or record.get("agentId") is not None:
+        if record.get("isSidechain") is True:
             return
         digest_value = None
         if isinstance(text, str):
@@ -557,7 +560,8 @@ class RecordScanner:
                 digest_value = sha256_hex(text.encode("utf-8"))
             except UnicodeEncodeError:
                 digest_value = None
-        self.humans.append(HumanObs(number, timestamp, uuid_value, digest_value, unique))
+        self.humans.append(HumanObs(number, timestamp, uuid_value, digest_value,
+                                    unique and human_candidate(record)))
 
     @staticmethod
     def _human_text(record, content):
@@ -599,7 +603,7 @@ class RecordScanner:
             self.note("source_malformed")
             return
         timestamp = parse_timestamp(value.get("timestamp"))
-        human_like = self.kind == "parent" and kind == "user" and human_candidate(value)
+        human_like = self.kind == "parent" and kind == "user" and looks_human(value)
         message = value.get("message")
         content = message.get("content") if isinstance(message, dict) and message.get("role") == kind else None
         human_text = self._human_text(value, content) if human_like else None
@@ -617,9 +621,6 @@ class RecordScanner:
         elif previous == digest_value:
             self.duplicates.append((number, timestamp))
             self.duplicate_records += 1
-            for human in self.humans:
-                if human.uuid == uuid_value:
-                    human.unique = False
             return
         else:
             self.record_conflict = True
@@ -627,6 +628,10 @@ class RecordScanner:
             for human in self.humans:
                 if human.uuid == uuid_value:
                     human.unique = False
+            self._human(value, number, timestamp, uuid_value, False, human_text)
+            return
+        if "isCompactSummary" in value and type(value["isCompactSummary"]) is not bool:
+            self.note("source_malformed")
             self._human(value, number, timestamp, uuid_value, False, human_text)
             return
         if value.get("sessionId") != self.session_id:
@@ -648,6 +653,7 @@ class RecordScanner:
                 return
             if "agentId" in value:
                 self.note("identity_conflict")
+                self._human(value, number, timestamp, uuid_value, False, human_text)
                 return
         else:
             if sidechain is not True or value.get("agentId") != self.agent_id:
@@ -842,6 +848,9 @@ def launch_candidates(scan, scope):
         if mismatched or len(ids) > 1:
             candidates.append(Candidate(None, None, "child_attribution_ambiguous"))
             continue
+        if any(item.canonical is None or item.classification != "non_error" for item in observations):
+            candidates.append(Candidate(None, None, "launch_unresolved"))
+            continue
         if not ids:
             candidates.append(Candidate(None, None, "launch_unresolved"))
             continue
@@ -852,7 +861,12 @@ def launch_candidates(scan, scope):
                 continue
             completions.setdefault(item.fingerprint, item)
         if len(completions) > 1:
-            candidates.append(Candidate(agent_id, None, "child_attribution_ambiguous"))
+            candidates.append(Candidate(None, None, "child_attribution_ambiguous"))
+            continue
+        if completions and any(item.fingerprint not in completions for item in observations):
+            # A supported completion cannot hide an additional unresolved result.
+            # Only the exact complete observation fingerprint may deduplicate.
+            candidates.append(Candidate(None, None, "child_attribution_ambiguous"))
             continue
         if flagged or not completions:
             candidates.append(Candidate(agent_id, None, "child_interval_unbound"))
@@ -952,6 +966,6 @@ def group_report(scan, interval):
     interval_label = "incomplete" if (reasons & INTERVAL_DIMENSION) else "complete"
     path = "incomplete" if (reasons & PATH_DIMENSION) or flags["quarantined"] or flags["unsupported"] else "complete"
     result = "incomplete" if (reasons & RESULT_DIMENSION) or flags["quarantined"] or flags["unsupported"] else "complete"
-    coverage = "complete" if source == interval_label == path == result == "complete" else "incomplete"
+    coverage = "complete" if not reasons and source == interval_label == path == result == "complete" else "incomplete"
     return {"coverage": coverage, "source_coverage": source, "interval_coverage": interval_label,
             "path_coverage": path, "result_coverage": result, "counts": counts, "reasons": sorted(reasons)}

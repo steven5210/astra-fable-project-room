@@ -429,6 +429,8 @@ def _read_preparation(room_root, state, request):
         if state.get("provider_transition") is None:
             _preparation_failure("provider_epoch" not in request and state.get("routing_adoption") is None
                                  and state.get("preparation") == "preparation.json")
+            if "bindings" in state:
+                _bound_role(request, state["bindings"])
             expected = state.get("preparation_sha256")
             prepared = _preparation_record(room_root, "preparation.json", expected,
                                             _digest(delegate, "preparation_unbound"), state["room_id"])
@@ -616,17 +618,28 @@ def _recheck_listing(config_root, state, limits, collector):
         except audit_io.SourceError as exc:
             if exc.reason != "source_missing":
                 collector.note("source_changed")
+                return True
         else:
             collector.note("source_changed")
-        return
+            return True
+        return False
     try:
         names, identity, overflow = config_root.list_dir(state["parts"], limits["directory"], "source_changed",
                                                          "source_changed")
     except audit_io.SourceError:
         collector.note("source_changed")
-        return
+        return True
     if overflow != state["overflow"] or identity != state["identity"] or names != state["names"]:
         collector.note("source_changed")
+        return True
+    return False
+
+
+def _note_scanners(collector, records, reason):
+    """Shared identity/discovery evidence affects each source whose authority depends on it."""
+    collector.note(reason)
+    for record in records:
+        record["scan"].note(reason)
 
 
 def _descends_from(index, ancestor, admitted):
@@ -703,6 +716,9 @@ def _collect_sources(binding, collector, limits, notes, config_root):
         while head < len(queue) and not stop_children:
             scan, scope, parent_index = queue[head]
             head += 1
+            if parent_index is not None and any(entry["ambiguous"] and _descends_from(parent_index, index, admitted)
+                                                for index, entry in enumerate(admitted)):
+                continue
             for candidate in native.launch_candidates(scan, scope):
                 if candidate.agent_id is None:
                     child_problems.add(candidate.reason)
@@ -750,6 +766,12 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                 entry["scan"] = child_scan
                 entry["result"] = child_result
                 scanned.append({"root": config_root, "parts": child_parts, "result": child_result, "scan": child_scan})
+                if child_scan.contradictory:
+                    entry["ambiguous"] = True
+                    entry["reason"] = "child_attribution_ambiguous"
+                    child_problems.add("child_attribution_ambiguous")
+                    collector.note("child_attribution_ambiguous")
+                    continue
                 queue.append((child_scan, candidate.interval, index))
     for index, entry in enumerate(admitted):
         if not entry["ambiguous"]:
@@ -766,7 +788,8 @@ def _collect_sources(binding, collector, limits, notes, config_root):
         except audit_io.SourceError as exc:
             collector.note(exc.reason)
             record["scan"].note(exc.reason)
-            break
+            # Each remaining source still needs its own bounded second-pass
+            # proof (or refusal) before its group may claim complete coverage.
     owner_changed = True
     try:
         owner, database_identity = _read_owner(binding["database"], binding["request"]["session_id"])
@@ -774,8 +797,7 @@ def _collect_sources(binding, collector, limits, notes, config_root):
     except AuditRefusal:
         owner_changed = True
     if owner_changed:
-        collector.note("owner_conflict")
-        parent_scan.note("owner_conflict")
+        _note_scanners(collector, scanned, "owner_conflict")
         if interval is not None and interval.kind == "terminal":
             interval = None
             parent_scan.note("interval_unbound")
@@ -787,13 +809,19 @@ def _collect_sources(binding, collector, limits, notes, config_root):
             collector.note(exc.reason)
             record["scan"].note(exc.reason)
     for state in required_listings:
-        _recheck_listing(config_root, state, limits, collector)
+        # Project discovery and the configuration root authorize all sources. The
+        # subagents inventory affects child sources, not the parent's own file.
+        affected = scanned if state["parts"] == ("projects",) else scanned[1:]
+        if state["overflow"]:
+            _note_scanners(collector, affected, "directory_entry_limit")
+        if _recheck_listing(config_root, state, limits, collector):
+            _note_scanners(collector, affected, "source_changed")
     try:
         if config_root.find_exact(names, native_id + ".jsonl") != matches:
-            collector.note("source_changed")
+            _note_scanners(collector, scanned, "source_changed")
         config_root.recheck_identity("source_changed")
     except audit_io.SourceError:
-        collector.note("source_changed")
+        _note_scanners(collector, scanned, "source_changed")
     parent_group = native.group_report(parent_scan, interval)
     public_children = []
     child_labels = []
@@ -805,7 +833,8 @@ def _collect_sources(binding, collector, limits, notes, config_root):
         child_labels.append(observation is None or observation["coverage"] != "complete")
     if parent_group["coverage"] == "unavailable":
         child_coverage = "unavailable"
-    elif (child_problems or any(child_labels) or parent_group["source_coverage"] != "complete"
+    elif (child_problems or any(child_labels) or notes & (native.SOURCE_DIMENSION | native.INTERVAL_DIMENSION)
+          or parent_group["source_coverage"] != "complete"
           or parent_group["interval_coverage"] != "complete"):
         child_coverage = "incomplete"
     else:

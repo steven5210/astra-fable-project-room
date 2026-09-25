@@ -141,6 +141,56 @@ class HistoryFixture(AuditFixture):
 
 
 class PreparationIdentityTests(HistoryFixture, unittest.TestCase):
+    def test_initial_request_must_match_present_role_binding(self):
+        fields = ("session_id", "harness", "model", "reasoning_effort", "conversation_id", "branch_id")
+        for field in fields + ("role-owner", "missing-role", "null-bindings", "list-bindings"):
+            with self.subTest(field=field):
+                self.reset()
+                self.build()
+                self.write_transcript([self.human()])
+                binding = {key: self.request[key] for key in fields}
+                self.state["bindings"] = {"engineer": binding,
+                                          "reviewer": {**binding, "session_id": "other-reviewer"}}
+                if field in fields:
+                    binding[field] = "different-bound-value"
+                elif field == "role-owner":
+                    self.request["role"] = "reviewer"
+                elif field == "missing-role":
+                    self.state["bindings"].pop("engineer")
+                elif field == "null-bindings":
+                    self.state["bindings"] = None
+                else:
+                    self.state["bindings"] = []
+                self.write_state()
+                report = self.audit_in_process()
+                self.assertEqual(report["reasons"], ["preparation_unbound"])
+                self.assertEqual(report["sources"], [])
+
+    def test_matching_initial_role_binding_and_absent_legacy_bindings_remain_supported(self):
+        self.build()
+        self.write_transcript([self.human()])
+        self.assertNotIn("bindings", self.state)
+        self.assertEqual(self.audit_in_process()["coverage"], "complete")
+        for role in ("engineer", "reviewer"):
+            self.request["role"] = role
+            self.state["bindings"] = {role: {key: self.request[key] for key in
+                ("session_id", "harness", "model", "reasoning_effort", "conversation_id", "branch_id")}}
+            self.write_state()
+            self.assertEqual(self.audit_in_process()["coverage"], "complete")
+
+    def test_historical_request_does_not_use_current_newer_role_binding(self):
+        for adopted in (False, True):
+            with self.subTest(adopted=adopted):
+                self.reset()
+                self.history(adopt=adopted)
+                self.write_transcript([self.human()])
+                self.state["bindings"]["engineer"].update(session_id="newer-session", model="newer-model",
+                                                           conversation_id="newer-conversation", branch_id="newer-branch")
+                self.write_state()
+                report = self.audit_in_process()
+                self.assertEqual(report["coverage"], "complete")
+                self.assertEqual(report["owner_sha256"], self.expected_owner(self.history_records["source"]))
+
     def test_real_initial_profile_projects_path_and_distinct_ao_native_ids(self):
         self.build()
         self.write_transcript([self.human()])
@@ -544,6 +594,140 @@ class FinalStabilityTests(AuditFixture, unittest.TestCase):
         self.assertEqual(report["coverage"], "incomplete")
         self.assertIn("source_changed", report["reasons"])
         self.assertEqual(len(report["sources"]), 1)
+        self.assertEqual(report["parent"]["source_coverage"], "incomplete")
+        self.assertIn("source_changed", report["parent"]["reasons"])
+        self.assertEqual(report["child_coverage"], "incomplete")
+
+    def test_late_subagents_listing_change_reaches_child_source_labels(self):
+        self.parent_and_child()
+        original = fs._open_component
+        changed = False
+        def add_entry(name, flags, dir_fd):
+            nonlocal changed
+            if name == "agent-a1.jsonl" and not changed:
+                changed = True
+                (self.subagents / "agent-late.jsonl").write_bytes(b"")
+            return original(name, flags, dir_fd)
+        with mock.patch.object(fs, "_open_component", side_effect=add_entry):
+            report = self.audit_in_process()
+        self.assertEqual(report["parent"]["source_coverage"], "complete")
+        self.assertEqual(report["children"][0]["observation"]["source_coverage"], "incomplete")
+        self.assertIn("source_changed", report["children"][0]["observation"]["reasons"])
+        self.assertEqual(report["child_coverage"], "incomplete")
+
+    def test_late_projects_listing_change_reaches_every_source_label(self):
+        self.parent_and_child()
+        original = fs.rehash_source
+        def add_project(opened, *args):
+            name = opened.name
+            result = original(opened, *args)
+            if name == "agent-a1.jsonl":
+                (self.config_root / "projects" / "new-project-entry").mkdir()
+            return result
+        with mock.patch.object(fs, "rehash_source", side_effect=add_project):
+            report = self.audit_in_process()
+        self.assertEqual(report["parent"]["source_coverage"], "incomplete")
+        self.assertEqual(report["children"][0]["observation"]["source_coverage"], "incomplete")
+        self.assertEqual(report["child_coverage"], "incomplete")
+
+    def test_final_root_replacement_reaches_every_source_label(self):
+        self.parent_and_child()
+        original, calls = fs.Root.find_exact, 0
+        def replace_after_discovery(root, *args):
+            nonlocal calls
+            result = original(root, *args)
+            calls += 1
+            if calls == 2:
+                self.config_root.rename(self.config_root.with_name("retained-old-config"))
+                self.config_root.mkdir()
+            return result
+        with mock.patch.object(fs.Root, "find_exact", autospec=True, side_effect=replace_after_discovery):
+            report = self.audit_in_process()
+        self.assertEqual(calls, 2)
+        self.assertEqual(report["parent"]["source_coverage"], "incomplete")
+        self.assertEqual(report["children"][0]["observation"]["source_coverage"], "incomplete")
+        self.assertEqual(report["child_coverage"], "incomplete")
+
+    def test_discovery_overflow_reaches_only_relevant_source_labels(self):
+        for location in ("projects", "subagents"):
+            with self.subTest(location=location):
+                self.reset()
+                self.parent_and_child()
+                original = fs.Root.list_dir
+                def overflow(root, parts, *args):
+                    names, identity, exceeded = original(root, parts, *args)
+                    return names, identity, exceeded or parts[-1] == location
+                with mock.patch.object(fs.Root, "list_dir", autospec=True, side_effect=overflow):
+                    report = self.audit_in_process()
+                self.assertEqual(report["parent"]["source_coverage"],
+                                 "incomplete" if location == "projects" else "complete")
+                self.assertEqual(report["children"][0]["observation"]["source_coverage"], "incomplete")
+                self.assertEqual(report["child_coverage"], "incomplete")
+                self.assertIn("directory_entry_limit", report["reasons"])
+
+    def test_owner_drift_reaches_child_and_parent_attribution_labels(self):
+        for endpoint in ("terminal", "human-boundary"):
+            with self.subTest(endpoint=endpoint):
+                self.reset()
+                self.parent_and_child()
+                if endpoint == "human-boundary":
+                    with self.transcript.open("ab") as writer:
+                        writer.write(json.dumps(self.human(uuid="next-human", timestamp="2026-01-01T00:00:40+00:00",
+                                                           text="Next task.")).encode() + b"\n")
+                original, calls = audit._read_owner, 0
+                def change_owner(*args):
+                    nonlocal calls
+                    owner, identity = original(*args)
+                    calls += 1
+                    if calls == 2:
+                        owner["controller_generation"] = "changed-generation"
+                    return owner, identity
+                with mock.patch.object(audit, "_read_owner", side_effect=change_owner):
+                    report = self.audit_in_process()
+                self.assertNotEqual(report["parent"]["interval_coverage"], "complete")
+                self.assertNotEqual(report["children"][0]["observation"]["interval_coverage"], "complete")
+                self.assertNotEqual(report["child_coverage"], "complete")
+                self.assertIn("owner_conflict", report["reasons"])
+
+    def test_contradictory_child_has_no_descendant_path_authority(self):
+        for conflict in ("agent-id", "sidechain", "reused-agent"):
+            with self.subTest(conflict=conflict):
+                self.reset()
+                self.parent_and_child()
+                wrong = self.child_record("assistant", "wrong-owner", "2026-01-01T00:00:28+00:00", "prose")
+                if conflict == "agent-id":
+                    wrong["agentId"] = "other-agent"
+                elif conflict == "sidechain":
+                    wrong["isSidechain"] = False
+                else:
+                    with self.transcript.open("ab") as writer:
+                        for record in (
+                            self.assistant_tools("reused-launch", "2026-01-01T00:00:31+00:00", [
+                                {"type": "tool_use", "id": "reused-tool", "name": "Agent", "input": {"prompt": "reuse"}}]),
+                            self.user_results("reused-completed", "2026-01-01T00:00:33+00:00", [
+                                {"type": "tool_result", "tool_use_id": "reused-tool", "content": "Finished."}],
+                                toolUseResult=completed_result("a1", "reuse"))):
+                            writer.write(json.dumps(record).encode() + b"\n")
+                self.write_child("a1", [
+                    self.child_record("assistant", "nested-launch", "2026-01-01T00:00:22+00:00", [
+                        {"type": "tool_use", "id": "nested-tool", "name": "Agent", "input": {"prompt": "nested"}}]),
+                    self.child_record("user", "nested-completed", "2026-01-01T00:00:27+00:00", [
+                        {"type": "tool_result", "tool_use_id": "nested-tool", "content": "Finished."}],
+                        toolUseResult=completed_result("a2", "nested")), wrong])
+                self.write_child("a2", [self.child_record("assistant", "grandchild-prose", "2026-01-01T00:00:24+00:00",
+                                                          "prose", agent="a2")])
+                original, opened = fs._open_component, []
+                def observe_open(name, *args):
+                    opened.append(name)
+                    return original(name, *args)
+                with mock.patch.object(fs, "_open_component", side_effect=observe_open):
+                    report = self.audit_in_process()
+                self.assertNotIn("agent-a2.jsonl", opened)
+                self.assertEqual(len(report["children"]), 1)
+                self.assertIsNone(report["children"][0]["observation"])
+                self.assertEqual(len(report["sources"]), 2)
+                self.assertEqual(report["child_coverage"], "incomplete")
+                self.assertIn("child_attribution_ambiguous", report["reasons"])
 
 
 if __name__ == "__main__":
