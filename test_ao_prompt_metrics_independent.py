@@ -19,6 +19,46 @@ def canonical(value):
                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
+class PhysicalReadBoundTests(unittest.TestCase):
+    def test_growth_is_refused_without_reading_beyond_admitted_extent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            path.write_bytes(b"{}")
+            original_fdopen = os.fdopen
+            observations, changed = [], False
+
+            class Stream:
+                def __init__(self, raw):
+                    self.raw = raw
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.raw.close()
+
+                def fileno(self):
+                    return self.raw.fileno()
+
+                def read(self, size=-1):
+                    nonlocal changed
+                    if not changed:
+                        with path.open("ab") as grow:
+                            grow.write(b" " * 126)
+                        changed = True
+                    value = self.raw.read(size)
+                    observations.append((len(value), os.lseek(self.fileno(), 0, os.SEEK_CUR)))
+                    return value
+
+            def opened(fd, *args, **kwargs):
+                return Stream(original_fdopen(fd, *args, **kwargs))
+
+            with patch.object(metrics.os, "fdopen", side_effect=opened):
+                with self.assertRaises(metrics.RoomError):
+                    metrics._read_bounded_json(path, maximum=2)
+            self.assertEqual(observations, [(2, 2)])
+
+
 class ActualDispatchOracleTests(unittest.TestCase):
     def test_actual_post_and_saved_projection_match_pre_instrumentation_literal_packets(self):
         fixtures = Path(__file__).parent / "tests/fixtures/prompt_projection"

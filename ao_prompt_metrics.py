@@ -271,7 +271,7 @@ def _read_bounded_json(path, maximum=None, *, dir_fd=None):
     except OSError as exc:
         raise RoomError("Selected receipt is unavailable") from exc
     try:
-        stream = os.fdopen(fd, "rb")
+        stream = os.fdopen(fd, "rb", buffering=0)
     except OSError as exc:
         os.close(fd)
         raise RoomError("Selected receipt is unavailable") from exc
@@ -279,7 +279,16 @@ def _read_bounded_json(path, maximum=None, *, dir_fd=None):
         before = os.fstat(stream.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_size > maximum:
             raise RoomError("Selected receipt is not an owned bounded regular file")
-        raw = stream.read(maximum + 1)
+        # Bound actual descriptor reads to the admitted extent, including during
+        # concurrent growth. Buffered read-ahead and an extra EOF byte can exceed it.
+        chunks, left = [], before.st_size
+        while left:
+            chunk = stream.read(min(left, 262144))
+            if not chunk:
+                raise RoomError("Selected receipt changed while being read")
+            chunks.append(chunk)
+            left -= len(chunk)
+        raw = b"".join(chunks)
         after = os.fstat(stream.fileno())
         named = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
     if (len(raw) > maximum or len(raw) != before.st_size
