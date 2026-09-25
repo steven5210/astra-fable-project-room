@@ -7,6 +7,7 @@ import unittest
 import ao_delegates
 import ao_project_room as ao
 import ao_provider_transition as transition
+import ao_quality_review
 import ao_workflow
 import deepseek_adapter as ds
 from test_ao_adoption import AdoptionFixture
@@ -341,12 +342,23 @@ class HistoricalCorrectionTests(AdoptionFixture):
         state = self.state()
         state['requests']['correction']['carried']['correction_admission']['prior_report_sha256'] = 'f'*64
         ao.atomic(path, state)
-        posts = copy.deepcopy(self.fake.posts)
+        # The older receipt check still independently binds this metadata.
         with self.assertRaisesRegex(ao.RoomError, 'immutable native receipt'):
+            ao_workflow.delivered(state, state['bindings']['engineer']['session_id'], self.directory())
+        before = {str(p.relative_to(self.directory())): p.read_bytes()
+                  for p in self.directory().rglob('*') if p.is_file()}
+        posts = copy.deepcopy(self.fake.posts)
+        # Send now encounters the bounded saved-delivery proof before assembly.
+        with self.assertRaises(ao_quality_review.EvidenceError) as raised:
             self.correct(key='next-section')
+        self.assertEqual(raised.exception.reason, 'quality_evidence_integrity')
         self.assertEqual(self.fake.posts, posts)
+        self.assertEqual({str(p.relative_to(self.directory())): p.read_bytes()
+                          for p in self.directory().rglob('*') if p.is_file()}, before)
+        self.assertNotIn('next-section', self.state()['requests'])
         path.write_bytes(original)
         self.correct(key='next-section')
+        self.assertEqual(len(self.fake.posts), len(posts) + 1)
         request = self.state()['requests']['next-section']
         self.assertEqual(request['text'], 'Continue.')
         self.assertNotIn('correction_admission', request['carried'])

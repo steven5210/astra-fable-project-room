@@ -308,7 +308,7 @@ class HistoricalCompactionTests(CompactionFixture):
         policy = ao_delegates.validate_provider(self.directory(), self.state())
         workflow = ao_workflow.part_texts(prepared, policy)
         if version == 1:
-            self.assertEqual(workflow, self.fixture['workflow_parts'])
+            frozen.assert_frozen_workflow_parts(self, workflow, self.fixture['workflow_parts'])
         self.set_window(99999)  # Invalid future preferences do not relabel history.
         self.fake.config['env'] = {WINDOW_ENV: '350000', 'DISABLE_AUTO_COMPACT': '1'}
         with self.settings_override('user', {'autoCompactEnabled': False}):

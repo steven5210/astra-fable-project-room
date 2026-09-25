@@ -42,7 +42,8 @@ proof under the established recovery checks. Status projection remains read-only
 
 Proof reads are local, owned and no-follow: 8 MiB per binding JSON file, 64 MiB of
 actual reads per proof, 4,096 requests, 256 amendment pointers and container depth
-64. Existing admission and semantic-hold checks retain their precedence. This new
+64. Existing admission and semantic-hold checks remain required before dispatch.
+Invalid saved delivery evidence may cause the new proof to refuse earlier. This
 proof does not turn their older read paths into the new bounded interface. No
 model, network, transcript scan or new subprocess is needed by the proof.
 
