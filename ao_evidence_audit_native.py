@@ -671,7 +671,8 @@ class RecordScanner:
                     and source_uuid != self.launch_uuid):
                 self.contradictory = True
                 self.note("child_attribution_ambiguous")
-                return
+                # Continue validating blocks for negative uniqueness evidence.
+                # The contradictory source has no counts or descendant authority.
         if not isinstance(message, dict) or message.get("role") != kind:
             self.note("source_malformed")
             self._human(value, number, timestamp, uuid_value, False, human_text)
