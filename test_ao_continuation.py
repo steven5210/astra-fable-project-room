@@ -408,7 +408,7 @@ class DelegateEvidenceTests(DelegateFixture):
         self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
     def test_foreign_unknown_and_wrong_profile_refuse_capture_and_continuation(self):
-        for kind in ('foreign', 'unknown', 'profile', 'model', 'malformed'):
+        for kind in ('foreign', 'unknown', 'profile', 'model'):
             with self.subTest(kind=kind):
                 self.setUp()
                 if kind != 'unknown':

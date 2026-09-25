@@ -244,6 +244,11 @@ class HistoricalCorrectionTests(AdoptionFixture):
         self.complete(ids=self.source_jobs+['malformed'])
         self.assert_refused('malformed delegate job')
 
+    def test_malformed_only_claim_retains_historical_lane_refusal(self):
+        self.ready()
+        self.complete(ids=['native-agent-id'])
+        self.assert_refused('no audited historical provider jobs')
+
     def test_current_only_wrong_profile_does_not_gain_a_recovery_lane(self):
         self.ready()
         job = self.add_job(4)

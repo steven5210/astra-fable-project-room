@@ -186,6 +186,27 @@ Contradictory model-provided identifiers refuse; they are never overwritten.
 Missing judgment fields, wrong types and unsupported verdicts still refuse.
 Existing full reports retain their original interpretation and identities.
 
+A completed report that puts malformed strings (for example native Agent IDs) in
+`routing_log[].delegate_job_ids` still fails engineering capture. That field is
+reserved for the room's provider ledger IDs; record native worker attribution
+separately. The existing engineer `purpose: correction` operation can admit a
+report-only repair when the full report is otherwise valid, the original
+completion receipt and candidate are intact, and the same engineer/spec/handoff
+still apply. It verifies every well-formed provider claim first, regardless of
+where malformed strings occur; unknown or foreign IDs, wrong provider identities,
+damaged results and unresolved jobs remain refusals. A rejected string is not
+thereby verified as a native worker ID.
+
+The successor intent carries controller-authored `report_correction_admission`
+evidence binding the rejected report, original candidate and verified provider
+jobs. The original failure and receipt remain unchanged. The candidate must be
+unchanged at dispatch, result capture and acceptance. Recovery is not available
+for scope changes, semantic holds, missing completion evidence or a provider
+transition; the separate historical-provider correction retains its own rules.
+A corrected report still requires normal strict capture, formal verification and
+independent acceptance. Reissuing the identical request remains idempotent;
+unknown delivery is never retried under another request ID.
+
 When a document is requested, deliver complete bounded units, placing artifact
 content before optional reporting. Preserve all required substantive coverage.
 Neither a partial JSON object nor a claim that a document was authored proves
