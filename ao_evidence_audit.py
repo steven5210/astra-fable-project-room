@@ -708,38 +708,45 @@ def _collect_sources(binding, collector, limits, notes, config_root):
     admitted = []
     child_problems = set()
     by_agent = {}
+    claimed_ids = set()
     subagents_state = None
     if interval is not None:
         queue = [(parent_scan, interval, None)]
         head = 0
-        stop_children = False
-        while head < len(queue) and not stop_children:
+        admission_closed = False
+        while head < len(queue):
             scan, scope, parent_index = queue[head]
             head += 1
-            if parent_index is not None and any(entry["ambiguous"] and _descends_from(parent_index, index, admitted)
-                                                for index, entry in enumerate(admitted)):
-                continue
             for candidate in native.launch_candidates(scan, scope):
-                # An earlier candidate in this same scan may revoke the actor's
-                # authority by reusing its ID or an ancestor's ID.
-                if parent_index is not None and any(entry["ambiguous"] and _descends_from(parent_index, index, admitted)
-                                                    for index, entry in enumerate(admitted)):
-                    break
                 if candidate.agent_id is None:
                     child_problems.add(candidate.reason)
                     collector.note(candidate.reason)
                     continue
-                if candidate.agent_id in by_agent:
-                    index = by_agent[candidate.agent_id]
-                    admitted[index]["ambiguous"] = True
+                # Revoked sources still provide negative uniqueness evidence.
+                # Remember even unadmitted IDs so a later claimant cannot appear unique.
+                if candidate.agent_id in claimed_ids:
+                    if candidate.agent_id in by_agent:
+                        admitted[by_agent[candidate.agent_id]]["ambiguous"] = True
                     child_problems.add("child_attribution_ambiguous")
                     collector.note("child_attribution_ambiguous")
+                    continue
+                # There is at most one candidate per globally bounded tool entry;
+                # this explicit guard also bounds the retained negative-claim set.
+                if len(claimed_ids) >= limits["tool_ids"]:
+                    child_problems.add("tool_id_limit")
+                    collector.note("tool_id_limit")
+                    admission_closed = True
+                    continue
+                claimed_ids.add(candidate.agent_id)
+                if admission_closed or (parent_index is not None and any(
+                        entry["ambiguous"] and _descends_from(parent_index, index, admitted)
+                        for index, entry in enumerate(admitted))):
                     continue
                 if len(admitted) >= limits["children"]:
                     child_problems.add("child_limit")
                     collector.note("child_limit")
-                    stop_children = True
-                    break
+                    admission_closed = True
+                    continue
                 index = len(admitted)
                 by_agent[candidate.agent_id] = index
                 entry = {"actor_sha256": native.actor_digest(binding["owner_sha256"], "child", candidate.agent_id),
@@ -765,8 +772,15 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                     if reason == "source_missing":
                         reason = "child_missing"
                     entry["reason"] = reason
+                    entry["ambiguous"] = True
                     child_problems.add(reason)
                     collector.note(reason)
+                    if reason in {"record_count_limit", "record_id_limit", "tool_id_limit", "aggregate_bytes_limit"}:
+                        admission_closed = True
+                    # A failed extent has no hash or observation, but already-read
+                    # validated claims can disprove uniqueness. Revocation makes
+                    # this queued projection negative-only; it is never re-read.
+                    queue.append((child_scan, candidate.interval, index))
                     continue
                 entry["scan"] = child_scan
                 entry["result"] = child_result
@@ -776,7 +790,8 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                     entry["reason"] = "child_attribution_ambiguous"
                     child_problems.add("child_attribution_ambiguous")
                     collector.note("child_attribution_ambiguous")
-                    continue
+                # Every successfully scanned source contributes validated claims,
+                # even when its own positive descendant authority was revoked.
                 queue.append((child_scan, candidate.interval, index))
     for index, entry in enumerate(admitted):
         if not entry["ambiguous"]:

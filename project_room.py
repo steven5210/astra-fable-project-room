@@ -1842,7 +1842,11 @@ def main(argv=None):
             return 0 if result["complete"] else 1  # the documented contract shared with transcript_audit.py: 1 means incomplete
         if args.command == "ao-evidence-read-audit":
             # Dispatch before Service so a read-only audit cannot provision or repair state.
-            import ao_evidence_audit
+            try:
+                import ao_evidence_audit
+            except Exception:
+                print(json.dumps({"error": "ao_evidence_read_audit_failed"}), file=sys.stderr)
+                return 2
             try:
                 # Keep links visible to the audit's no-follow traversal. The normal controller
                 # resolves its home, but doing that here would erase a linked source ancestor.

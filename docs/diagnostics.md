@@ -100,7 +100,8 @@ The closed JSON report contains opaque owner/source/actor digests, parent and ch
 coverage, supported counts and fixed reasons. It contains no raw paths, session IDs,
 prompt, evidence content, reasoning or arbitrary exception text. Its
 `redundant_read_verdict` is always `not_established`. Exit status is 0 for complete
-coverage, 1 for incomplete/unavailable coverage, and 2 for invalid command arguments.
+coverage, 1 for incomplete/unavailable coverage, and 2 for invalid command arguments
+or a diagnostic error. Errors use fixed codes rather than arbitrary exception text.
 
 ## Resource and stability limits
 
@@ -122,6 +123,10 @@ and checks their complete extent, hash, descriptor/name identity and mutation
 metadata. Required directory inventories and the owner tuple are rechecked. Rejected
 reads still consume the applicable byte budget. Changed, active, torn or ambiguous
 sources prevent complete coverage. Missing evidence is never converted into zero.
+Known child-ID reuse remains a warning after the launching actor loses authority or
+its scan fails. A failed partial scan cannot authorize another file or establish a
+complete-source digest. The audit retains warnings from already-read records when
+a resource limit closes further source admission.
 
 Run collection at a meaningful operator boundary when it answers a concrete question.
 Ordinary status does not run this scan, and neither feature installs a polling loop.

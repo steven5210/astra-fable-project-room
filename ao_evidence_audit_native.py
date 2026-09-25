@@ -821,7 +821,10 @@ def launch_candidates(scan, scope):
             if occurrence.name in AGENT_TOOLS:
                 launch_uuids.add(occurrence.uuid)
     candidates = []
-    ordered = sorted(scan.tool_entries.values(), key=lambda item: item.occurrences[0].number)
+    # A tool-limit refusal can leave the just-created entry without any admitted
+    # occurrence. Partial negative projections must not invent that launch.
+    ordered = sorted((entry for entry in scan.tool_entries.values() if entry.occurrences),
+                     key=lambda item: item.occurrences[0].number)
     for entry in ordered:
         occurrences = [occurrence for occurrence in entry.occurrences if scope.contains(occurrence.number,
                                                                                       occurrence.timestamp)]
