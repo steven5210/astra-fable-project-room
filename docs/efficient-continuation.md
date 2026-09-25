@@ -264,6 +264,47 @@ checks. Send that successor through ordinary `ao_room_send`. Never replay the
 old request. A new user instruction to resume can supply authorization; elapsed
 time, a presumed reset or the original feature request cannot.
 
+### A completed receipt captured with truncated history
+
+An explicit outcome audit can reconcile one narrow historical case: the owned
+request and its AO turn completed, but the immutable receipt was captured with
+`history_truncated: true`. The current strict history read must be complete, all
+owned messages must match the original receipt exactly, and fresh verified native
+evidence must establish a correlated terminal quota error with a unique caller
+anchor and no later human instruction. Partial-message reconstruction, uncertain
+delivery, generic provider failures and successful-final promotion are excluded.
+The ordinary classifier continues refusing the original truncated receipt.
+
+The audit saves a separate content-addressed reconciliation proof. It binds the
+original receipt and caller digests, session/turn/provider/conversation/branch,
+baseline and current turns, owned messages, typed failures and exact verified
+native source. Original receipt bytes, truncation truth, usage uncertainty and
+historical outcomes remain unchanged. The result is still a quota hold; the
+separate authorized `ao_room_outcome_resume` and named successor are required.
+
+Ordinary sync cannot originate or renew this authority. Subsequent observations,
+release calls (including identical repeats) and successor admission revalidate
+the proof. Changed or unknown evidence invalidates it through an immutable
+invalidation chain. Refusals before outcome observation, such as an identity or
+strict-reader failure, also invalidate an established proof. Conservatively, any
+failed locked room operation while that proof is current requires another
+explicit outcome audit, even if the cause was an incorrect operator command.
+If malformed request ordering makes the latest proof unknowable, every proof
+for that role is invalidated conservatively; restoring order still needs a fresh audit.
+Restoring old bytes never restores the prior continuation digest. A fresh audit
+must verify the evidence and create a new proof linked to that invalidation;
+the separate continuation authorization must then bind the new outcome digest.
+Corrupt proof or journal records must be diagnosed and preserved, not edited.
+When exact-byte restoration is needed, retain the damaged file as diagnostic
+evidence and restore only a trusted backup whose bytes match the originally
+recorded digest. Missing or unverified backups remain a blocker; do not invent
+replacement records or remove the invalidation chain. Even after exact restoration,
+run a fresh supported outcome audit and bind any new release to its new digest.
+
+This lane does not establish quota availability, clear a provider safety refusal,
+resume an uncertain failed transport or reset review budgets. An active delegate
+or native owner continues to block recovery. No model is called by reconciliation.
+
 An AO `failed` turn ordinarily remains uncertain. There is one narrow exception:
 a matched native API quota error, exact delivery evidence, an idle retained
 owner and actual continuation authorization can settle it as `settled_failure`.

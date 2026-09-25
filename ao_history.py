@@ -11,7 +11,7 @@ from room import RoomError
 
 
 PAGE_ITEMS = 100
-MAX_PAGES = 50  # Retain the former 10 * 500 entry capacity at the default size.
+MAX_PAGES = 200  # Up to 20,000 entries at the default size; byte/time bounds still apply.
 MAX_REQUESTS = MAX_PAGES + 7  # Bounded room for 100 -> 50 -> ... -> 1 reductions.
 MAX_RESPONSE_BYTES = 8_000_000
 MAX_OBSERVATION_BYTES = 80_000_000

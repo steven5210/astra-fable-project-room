@@ -154,6 +154,188 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(result["messages"]), 5000)
         self.assertEqual(raw.call_count, 50)
 
+    def observe_large_timeline(self, count, strict, shrink_first=False, calls=None):
+        # shrink_first is the integer count N of leading GETs that raise
+        # history.ResponseTooLarge (True == 1, False == 0, kept for existing callers).
+        # calls may be supplied by the caller so the exact GET count remains
+        # observable even when the reader raises before this method returns.
+        entries = [{"id": "timeline-" + str(i), "sequence": i, "summary": "synthetic"}
+                   for i in range(1, count + 1)]
+        entries[0].update(status="failed", summary="oldest failure must survive pagination")
+        entries[1].update(role="user", text="original human anchor")
+        base = self.pages()[0]
+        if calls is None:
+            calls = []
+        client = ao.Client("http://127.0.0.1:1")
+
+        def fetch(method, path, payload=None):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(payload)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            calls.append(query)
+            if shrink_first and len(calls) <= shrink_first:
+                raise history.ResponseTooLarge("synthetic oversized history GET")
+            limit = int(query["limit"][0])
+            before = int(query.get("beforeSequence", [count + 1])[0])
+            # sequence == index + 1, so entries with sequence < before are entries[:before - 1].
+            remaining = entries[:before - 1]
+            selected = remaining[-limit:]
+            return {**base, "turns": [{"id": "original-turn", "state": "completed"}],
+                    "messages": [entry for entry in selected if entry["sequence"] % 2 == 0],
+                    "activities": [entry for entry in selected if entry["sequence"] % 2],
+                    "oldestSequence": selected[0]["sequence"],
+                    "hasMoreBefore": len(remaining) > len(selected)}
+
+        with patch.object(client, "request", side_effect=fetch):
+            result = (_CompleteClient(client) if strict else client).conversation("fixture")
+        return entries, calls, result
+
+    def test_real_page_cap_supports_20000_entry_history(self):
+        self.assertEqual((history.PAGE_ITEMS, history.MAX_PAGES, history.MAX_REQUESTS), (100, 200, 207))
+        for strict in (False, True):
+            with self.subTest(count=20000, strict=strict):
+                entries, calls, result = self.observe_large_timeline(20000, strict)
+                self.assertEqual(len(calls), 200)
+                self.assertEqual(calls[0], {"limit": ["100"]})
+                self.assertTrue(all(call["limit"] == ["100"] for call in calls))
+                self.assertFalse(result["history_truncated"])
+                self.assertFalse(result["hasMoreBefore"])
+                actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                self.assertEqual(actual, entries)
+
+            with self.subTest(count=20001, strict=strict):
+                calls = []
+                if strict:
+                    with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                        self.observe_large_timeline(20001, True, calls=calls)
+                    self.assertEqual(len(calls), 200)
+                else:
+                    entries, calls, result = self.observe_large_timeline(20001, False, calls=calls)
+                    self.assertEqual(len(calls), 200)
+                    self.assertTrue(result["history_truncated"])
+                    self.assertTrue(result["hasMoreBefore"])
+                    actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                    self.assertEqual(len(actual), 20000)
+                    self.assertEqual(min(item["sequence"] for item in actual), 2)
+                    self.assertNotIn(entries[0], result["activities"])
+
+    def test_smaller_pages_still_refuse_when_history_exceeds_the_cap(self):
+        for strict in (False, True):
+            with self.subTest(count=5008, strict=strict):
+                calls = []
+                if strict:
+                    with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                        self.observe_large_timeline(5008, True, shrink_first=2, calls=calls)
+                    self.assertEqual(len(calls), 202)
+                else:
+                    entries, calls, result = self.observe_large_timeline(5008, False, shrink_first=2, calls=calls)
+                    self.assertEqual(len(calls), 202)
+                    self.assertEqual(calls[0]["limit"], ["100"])
+                    self.assertEqual(calls[1]["limit"], ["50"])
+                    self.assertTrue(all(call["limit"] == ["25"] for call in calls[2:]))
+                    self.assertTrue(result["history_truncated"])
+                    self.assertTrue(result["hasMoreBefore"])
+                    actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                    self.assertEqual(len(actual), 5000)
+                    self.assertEqual(min(item["sequence"] for item in actual), 9)
+                    self.assertNotIn(entries[0], result["activities"])
+
+            with self.subTest(count=10001, strict=strict):
+                calls = []
+                if strict:
+                    with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                        self.observe_large_timeline(10001, True, shrink_first=1, calls=calls)
+                    self.assertEqual(len(calls), 201)
+                else:
+                    entries, calls, result = self.observe_large_timeline(10001, False, shrink_first=1, calls=calls)
+                    self.assertEqual(len(calls), 201)
+                    self.assertEqual(calls[0]["limit"], ["100"])
+                    self.assertTrue(all(call["limit"] == ["50"] for call in calls[1:]))
+                    self.assertTrue(result["history_truncated"])
+                    self.assertTrue(result["hasMoreBefore"])
+                    actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                    self.assertEqual(len(actual), 10000)
+                    self.assertEqual(min(item["sequence"] for item in actual), 2)
+                    self.assertNotIn(entries[0], result["activities"])
+
+            with self.subTest(count=10000, strict=strict):
+                entries, calls, result = self.observe_large_timeline(10000, strict, shrink_first=1)
+                self.assertEqual(len(calls), 201)
+                self.assertFalse(result["history_truncated"])
+                self.assertFalse(result["hasMoreBefore"])
+                actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                self.assertEqual(actual, entries)
+
+    def test_six_reductions_use_request_slack_without_extending_the_page_cap(self):
+        self.assertLess(206, history.MAX_REQUESTS)
+        self.assertEqual(history.MAX_REQUESTS, history.MAX_PAGES + 7)
+        for strict in (False, True):
+            with self.subTest(count=200, strict=strict):
+                entries, calls, result = self.observe_large_timeline(200, strict, shrink_first=6)
+                self.assertEqual(len(calls), 206)
+                self.assertEqual([call["limit"] for call in calls[:6]],
+                                 [["100"], ["50"], ["25"], ["12"], ["6"], ["3"]])
+                self.assertTrue(all(call["limit"] == ["1"] for call in calls[6:]))
+                self.assertFalse(result["history_truncated"])
+                self.assertFalse(result["hasMoreBefore"])
+                actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                self.assertEqual(actual, entries)
+
+            with self.subTest(count=201, strict=strict):
+                calls = []
+                if strict:
+                    with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                        self.observe_large_timeline(201, True, shrink_first=6, calls=calls)
+                    self.assertEqual(len(calls), 206)
+                else:
+                    entries, calls, result = self.observe_large_timeline(201, False, shrink_first=6, calls=calls)
+                    self.assertEqual(len(calls), 206)
+                    self.assertTrue(result["history_truncated"])
+                    self.assertTrue(result["hasMoreBefore"])
+                    actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                    self.assertEqual(len(actual), 200)
+                    self.assertEqual(min(item["sequence"] for item in actual), 2)
+                    self.assertNotIn(entries[0], result["activities"])
+
+    def test_long_history_preserves_oldest_failure_and_original_anchor(self):
+        for count in (5008, 10001):
+            for strict in (False, True):
+                with self.subTest(count=count, strict=strict):
+                    expected, calls, result = self.observe_large_timeline(count, strict)
+                    actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(result["turns"], [{"id": "original-turn", "state": "completed"}])
+                    self.assertEqual(len(calls), (count + 99) // 100)
+                    self.assertFalse(result["history_truncated"])
+                    self.assertFalse(result["hasMoreBefore"])
+
+    def test_long_history_remains_complete_after_oversized_page_reduction(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                expected, calls, result = self.observe_large_timeline(5008, strict, shrink_first=True)
+                self.assertEqual(calls[:2], [{"limit": ["100"]}, {"limit": ["50"]}])
+                self.assertEqual(len(calls), 102)
+                actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
+                self.assertEqual(actual, expected)
+                self.assertFalse(result["history_truncated"])
+
+    def test_exact_terminal_page_completes_but_another_page_remains_truncated(self):
+        # Exercise the same completion/bound boundary with a small synthetic cap.
+        with patch.object(history, "MAX_PAGES", 2):
+            for strict in (False, True):
+                with self.subTest(strict=strict):
+                    expected, calls, result = self.observe_large_timeline(200, strict)
+                    self.assertEqual(len(calls), 2)
+                    self.assertFalse(result["history_truncated"])
+                    self.assertEqual(len(result["messages"]) + len(result["activities"]), len(expected))
+            expected, calls, result = self.observe_large_timeline(201, False)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(result["history_truncated"])
+            self.assertTrue(result["hasMoreBefore"])
+            self.assertNotIn(expected[0], result["activities"])
+            with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
+                self.observe_large_timeline(201, True)
+
     def test_page_and_byte_bounds_never_certify_incomplete_history(self):
         for bound, value in (("MAX_PAGES", 1), ("MAX_REQUESTS", 1),
                              ("MAX_OBSERVATION_BYTES", len(history.canonical(self.pages()[0])) + 1)):

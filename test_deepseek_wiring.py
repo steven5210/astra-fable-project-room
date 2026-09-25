@@ -4,6 +4,7 @@ status/doctor surfaces and progress categories. Fake Claude and fake adapters on
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,10 @@ import room
 from test_implementation import FAKE as IMPLEMENTATION_FAKE
 from test_project_room import ProjectFixture, ROOT
 from test_recovery import FAKE as RECOVERY_FAKE, fixed_inspector
+
+
+# Cachebuster policy: public release "0.3.0" plus an optional "+codex.<sanitized token>" suffix.
+_PLUGIN_VERSION_PATTERN = re.compile(r"0\.3\.0(?:\+codex\.[a-z0-9]+(?:-[a-z0-9]+)*)?")
 
 
 def implementation_fake():
@@ -823,7 +828,36 @@ class StatusSurfaceTests(WiringFixture):
         descriptions = {tool["name"]: tool["description"] for tool in listed}
         self.assertIn("provider", descriptions["room_implementation_submit"])
         self.assertIn("delegate_jobs", descriptions["room_status"])
-        self.assertEqual(json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"], "0.3.0")
+        for value, accepted in [
+            ("0.3.0", True),
+            ("0.3.0+codex.20260922054816", True),
+            ("0.3.0+codex.abc", True),
+            ("0.3.0+codex.local-20260519-184516", True),
+            ("0.3.1", False),
+            ("0.3.0-rc1", False),
+            ("0.3.0-rc1+codex.abc", False),
+            ("0.3.0+", False),
+            ("0.3.0+codex", False),
+            ("0.3.0+codex.", False),
+            ("0.3.0+codex.-abc", False),
+            ("0.3.0+codex.abc-", False),
+            ("0.3.0+codex.a--b", False),
+            ("0.3.0+codex.ABC", False),
+            ("0.3.0+codex.a.b", False),
+            ("0.3.0+codex.a_b", False),
+            ("0.3.0+other.abc", False),
+            ("0.3.0+Codex.abc", False),
+            ("0.3.0+codex.abc+1", False),
+            ("0.3.0+codex.abc+codex.def", False),
+            ("v0.3.0+codex.abc", False),
+            ("0.3.0+codex.abc\n", False),
+            (" 0.3.0", False),
+        ]:
+            with self.subTest(value=value):
+                self.assertEqual(_PLUGIN_VERSION_PATTERN.fullmatch(value) is not None, accepted)
+        manifest_version = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
+        self.assertIsNotNone(_PLUGIN_VERSION_PATTERN.fullmatch(manifest_version),
+                              f"unexpected plugin.json version: {manifest_version!r}")
 
 
 if __name__ == "__main__":
