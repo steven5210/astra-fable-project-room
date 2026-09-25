@@ -1,0 +1,24 @@
+{
+  "title": "prefix revised suffix",
+  "whole": "replacement",
+  "flag": true,
+  "added": "café",
+  "rows": [
+    {
+      "id": "a",
+      "n": 1
+    },
+    {
+      "id": "b",
+      "n": 4
+    },
+    {
+      "id": "z",
+      "n": 3
+    }
+  ],
+  "tail": [
+    "first",
+    "second"
+  ]
+}

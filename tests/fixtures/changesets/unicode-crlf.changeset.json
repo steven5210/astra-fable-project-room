@@ -1,0 +1,12 @@
+{
+  "changeset_format": "anchored-text-v1",
+  "document": "notes.md",
+  "request_id": "synthetic-text",
+  "operations": [
+    {
+      "id": "T1",
+      "anchor": "status: old",
+      "replacement": "status: revised"
+    }
+  ]
+}

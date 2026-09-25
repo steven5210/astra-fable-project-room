@@ -1,0 +1,90 @@
+{
+  "changeset_format": "json-ops-v1",
+  "document": "report.json",
+  "request_id": "synthetic-all-ops",
+  "operations": [
+    {
+      "id": "J1",
+      "op": "edit_string",
+      "path": [
+        "title"
+      ],
+      "anchor": "old",
+      "replacement": "revised"
+    },
+    {
+      "id": "J2",
+      "op": "replace_string",
+      "path": [
+        "whole"
+      ],
+      "old_starts_with": "start",
+      "old_ends_with": "end",
+      "new": "replacement"
+    },
+    {
+      "id": "J3",
+      "op": "insert_key_after",
+      "path": [],
+      "after_key": "flag",
+      "key": "added",
+      "value": "café"
+    },
+    {
+      "id": "J4",
+      "op": "insert_items_after",
+      "path": [
+        "rows"
+      ],
+      "after": {
+        "id": "a"
+      },
+      "items": [
+        {
+          "id": "b",
+          "n": 4
+        }
+      ]
+    },
+    {
+      "id": "J5",
+      "op": "set_value",
+      "path": [
+        "rows",
+        {
+          "id": "z"
+        },
+        "n"
+      ],
+      "old": 2,
+      "new": 3
+    },
+    {
+      "id": "J6",
+      "op": "append_items",
+      "path": [
+        "tail"
+      ],
+      "old_length": 0,
+      "items": [
+        "first",
+        "second"
+      ]
+    }
+  ],
+  "self_check": {
+    "claim": "inert synthetic metadata, not a verdict"
+  },
+  "location_dispositions": [
+    {
+      "operation_ids": [
+        "J1",
+        "J2",
+        "J3",
+        "J4",
+        "J5",
+        "J6"
+      ]
+    }
+  ]
+}

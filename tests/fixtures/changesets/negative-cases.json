@@ -1,0 +1,138 @@
+[
+  {
+    "id": "overlapping-anchor",
+    "format": "anchored-text-v1",
+    "source": "aaa",
+    "operation": {
+      "id": "a",
+      "anchor": "aa",
+      "replacement": "b"
+    },
+    "expected": "reject"
+  },
+  {
+    "id": "nested-bool-number",
+    "format": "json-ops-v1",
+    "source": {
+      "v": {
+        "ok": true
+      }
+    },
+    "operation": {
+      "id": "a",
+      "op": "set_value",
+      "path": [
+        "v"
+      ],
+      "old": {
+        "ok": 1
+      },
+      "new": null
+    },
+    "expected": "reject"
+  },
+  {
+    "id": "overflow-json",
+    "source_json": "{\"v\":1e400}",
+    "expected": "reject"
+  },
+  {
+    "id": "duplicate-json-key",
+    "source_json": "{\"v\":1,\"v\":2}",
+    "expected": "reject"
+  },
+  {
+    "id": "duplicate-selector",
+    "format": "json-ops-v1",
+    "source": {
+      "v": [
+        {
+          "id": "a"
+        },
+        {
+          "id": "a"
+        }
+      ]
+    },
+    "operation": {
+      "id": "a",
+      "op": "set_value",
+      "path": [
+        "v",
+        {
+          "id": "a"
+        },
+        "id"
+      ],
+      "old": "a",
+      "new": "b"
+    },
+    "expected": "reject"
+  },
+  {
+    "id": "unknown-field",
+    "format": "json-ops-v1",
+    "source": {
+      "v": 1
+    },
+    "operation": {
+      "id": "a",
+      "op": "set_value",
+      "path": [
+        "v"
+      ],
+      "old": 1,
+      "new": 2,
+      "shell": "DO NOT EXECUTE"
+    },
+    "expected": "reject"
+  },
+  {
+    "id": "inserted-duplicate-id",
+    "format": "json-ops-v1",
+    "source": {
+      "v": [
+        {
+          "id": "a"
+        }
+      ]
+    },
+    "operation": {
+      "id": "a",
+      "op": "insert_items_after",
+      "path": [
+        "v"
+      ],
+      "after": {
+        "id": "a"
+      },
+      "items": [
+        {
+          "id": "a"
+        }
+      ]
+    },
+    "expected": "reject"
+  },
+  {
+    "id": "boolean-index",
+    "format": "json-ops-v1",
+    "source": {
+      "v": [
+        1,
+        2
+      ]
+    },
+    "operation": {
+      "id": "a",
+      "op": "set_value",
+      "path": [
+        "v",
+        true
+      ],
+      "old": 2,
+      "new": 3
+    },
+    "expected": "reject"
+  }
+]
