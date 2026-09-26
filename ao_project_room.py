@@ -617,11 +617,17 @@ class Service:
                 return self.request_summary(previous)
             ao_prompt_metrics.assert_dispatch_projections(state)  # Fail closed before any new dispatch.
             self.quiet(state)
+            if role not in state["bindings"]:
+                raise RoomError("Bind the requested role first")
+            # Read-only proof precedes any observation that can save state. Reuse
+            # it at the sole packet assembly point; failed proof saves no intent.
+            quality = None
+            if ao_workflow.normal(state) and role == "engineer":
+                from ao_quality_review import inspect
+                quality = inspect(directory, state)
             import ao_acceptance_extension
             ao_acceptance_extension.before_send(self, state, role, request_id)
             spec = self.spec(directory, state)
-            if role not in state["bindings"]:
-                raise RoomError("Bind the requested role first")
             binding = state["bindings"][role]
             client = self.client(state)
             snapshot = self.identity(client, state, binding)
@@ -652,7 +658,8 @@ class Service:
                     assembly.add("workflow", f"[Project Room {room_id} request {request_id}]\n")
                 # A retained engineer session receives only what the controller has not delivered yet; the request
                 # identity stays in this record and the durable clientMessageId, never in the message bytes.
-                _, carried = ao_workflow.packet(self, directory, state, role, purpose, message, snapshot=snapshot, gather=assembly)
+                _, carried = ao_workflow.packet(self, directory, state, role, purpose, message, snapshot=snapshot,
+                                               gather=assembly, quality=quality)
             else:
                 if purpose not in (None, "implementation", "correction", "acceptance_review"):
                     raise RoomError("Astra-led rooms do not claim Fable specification consensus")
@@ -998,7 +1005,7 @@ class Service:
                          acceptance_review_extension=ao_acceptance_extension.summary(self, state),
                          acceptance_review_attempts=sum(r.get("role") == "reviewer" for r in ordered),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
-                         engineer_context=ao_workflow.context_summary(state),
+                         engineer_context=ao_workflow.context_summary(state, directory),
                          review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],

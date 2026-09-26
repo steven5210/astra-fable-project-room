@@ -22,6 +22,19 @@ import test_ao_response_normalization as normalization_tests
 FIXTURES = Path(__file__).parent / "testdata/ao-routing-v1"
 BASELINE = "a797bf7a3f327c0bd9ab2001caca154ff48c67ef"
 V1_GUARD_SHA256 = "49078d6b90bfa2602fd007a8eb28362c8afcf6bf13f55ab324191b6d9593dab3"
+QUALITY_PART = "quality_first_review_v1"
+QUALITY_SHA256 = "6d043563ae4c27854dbaad53b9762476efa189c9fb6565dfb5670e24cee47a4e"
+
+
+def assert_frozen_workflow_parts(test, actual, expected):
+    # Keep the actual pre-promotion fixture immutable; only the new versioned
+    # instruction may be added, and its bytes are pinned independently here.
+    test.assertNotIn(QUALITY_PART, expected)
+    test.assertEqual(set(actual), set(expected) | {QUALITY_PART})
+    test.assertEqual({name: actual[name] for name in expected}, expected)
+    instruction = actual[QUALITY_PART].encode()
+    test.assertEqual(len(instruction), 1405)
+    test.assertEqual(ao.digest(instruction), QUALITY_SHA256)
 
 
 class FrozenV1RoutingTests(Fixture):
@@ -88,13 +101,14 @@ class FrozenV1RoutingTests(Fixture):
         policy = ao_delegates.validate_provider(self.directory(), self.state())
         self.assertEqual(policy, self.fixture["policy"])
         actual = ao_workflow.part_texts(self.prepared, policy)
-        self.assertEqual(actual, self.fixture["workflow_parts"])
+        assert_frozen_workflow_parts(self, actual, self.fixture["workflow_parts"])
         self.assertNotIn("Fable is the orchestrator: inspect evidence", actual["routing"])
         self.assertNotIn("The entire final response must be that JSON object", actual["review_contract"])
         self.assertIn("Fable owns implementation, engineering review and eligible delegation", actual["report_contract"])
         self.service.ao_room_bind(self.room, "engineer", "engineer", ao_workflow.FABLE_MODEL, "max")
         self.agree()
         request = copy.deepcopy(self.state()["requests"]["spec_review"])
+        self.assertEqual(request["text"].count(actual[QUALITY_PART]), 1)
         self.assertEqual({name: request["carried"]["part_sha256"][name] for name in actual},
                          {name: ao.digest(value.encode()) for name, value in actual.items()})
         from ao_report_contract import PART, INSTRUCTION

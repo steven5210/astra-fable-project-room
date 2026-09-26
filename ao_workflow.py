@@ -17,7 +17,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
-         "delegation_efficiency_v2", "review_first_routing_v1")
+         "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -346,7 +346,9 @@ def engineering_ready(service, directory, state):
 
 def part_texts(prepared, policy):
     """The pinned one-time workflow parts for this room, keyed by stable part name."""
+    from ao_quality_review import PART as QUALITY_PART, INSTRUCTION as QUALITY_INSTRUCTION
     parts = {
+        QUALITY_PART: QUALITY_INSTRUCTION,
         "review_contract": ("Workflow: Fable engineering with independent Astra acceptance.\nSpecification review turns: Fable owns "
                             "engineering interpretation. Review the exact specification delivered to this session read-only, without "
                             "implementation or delegates; a later revision arrives as its changes only. Finish with one JSON object: "
@@ -431,16 +433,18 @@ def delivered(state, session_id, directory=None):
     return {"spec_record_sha256": spec_record, "parts": sorted(parts), "completed_requests": len(completed)}
 
 
-def context_summary(state):
+def context_summary(state, directory=None):
     """Offline status of what the bound engineer session has been sent; never an agent claim."""
     binding = state.get("bindings", {}).get("engineer")
     if not binding:
         return None
+    from ao_quality_review import summary
+    quality = {"quality_first_review": summary(directory, state)} if directory is not None else {}
     try:
         held = delivered(state, binding["session_id"])
     except RoomError as exc:
-        return {"session_id": binding["session_id"], "error": str(exc)}
-    return {"session_id": binding["session_id"], "spec_record_sha256": held["spec_record_sha256"],
+        return {"session_id": binding["session_id"], "error": str(exc), **quality}
+    return {"session_id": binding["session_id"], "spec_record_sha256": held["spec_record_sha256"], **quality,
             "spec_current": held["spec_record_sha256"] == state.get("spec_record_sha256"),
             "parts": held["parts"], "undelivered_parts": [p for p in PARTS if p not in held["parts"]],
             "meaning": "Derived from the controller's completed observed turns, never from agent claims; later engineer turns carry "
@@ -502,7 +506,7 @@ def _assembly(gather, join):
     return gather
 
 
-def packet(service, directory, state, role, purpose, message, snapshot=None, gather=None):
+def packet(service, directory, state, role, purpose, message, snapshot=None, gather=None, quality=None):
     """One native message. Every controller check stays; only text the session already holds is omitted.
 
     The real assembly runs once through tagged fragments (``gather`` when the caller supplies it),
@@ -595,6 +599,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
     from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
     texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
+    import ao_quality_review
+    quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
     if review_extension is not None:
@@ -604,6 +610,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     if attribution_admission is not None:
         carried["report_correction_admission"] = attribution_admission
     for name in PARTS:
+        if name == ao_quality_review.PART and quality["source"] is not None:
+            continue  # Verified immutable amendment roots also satisfy this new part.
         if name not in held["parts"]:
             assembly.add("workflow", texts[name])
             carried["parts"].append(name)
@@ -635,10 +643,18 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
                 block += "\nAgreed gates: " + json.dumps(spec["gates"])
             assembly.add("specification", block)
     from ao_instruction_amendments import pending
-    amendments = pending(directory, state, binding['session_id'])
+    amendments = pending(directory, state, binding['session_id'], quality=quality)
     if amendments:
-        for amendment, _ in amendments:
-            assembly.add("workflow", amendment)
-        carried['instruction_amendments'] = [sha for _, sha in amendments]
+        carried_amendments = []
+        for amendment, sha in amendments:
+            if amendment == ao_quality_review.INSTRUCTION and quality["source"] is not None:
+                continue  # Absent text is recorded only as root-backed equivalence.
+            if amendment != ao_quality_review.INSTRUCTION or ao_quality_review.PART not in carried["parts"]:
+                assembly.add("workflow", amendment)
+            carried_amendments.append(sha)
+        if carried_amendments:
+            carried['instruction_amendments'] = carried_amendments
+    if quality["equivalence"] is not None:
+        carried[ao_quality_review.EQUIVALENCE] = quality["equivalence"]
     assembly.add("caller", message)
     return assembly.text, carried

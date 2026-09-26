@@ -38,6 +38,8 @@ Fable keeps personal spec review, pushback and useful enhancement suggestions at
 
 Recovery status distinguishes the retained parent conversation from native children: child context resume and messaging are unsupported by the bounded routing guard. The supported fallback is to verify preserved artifacts, then use the operator or a fresh pinned worker under normal dispatch gates. Installing this update does not restart active work or establish live savings.
 
+The shared `quality_first_review_v1` instruction sends source preparation and mechanical verification to delegates and the assigned operator, while Fable retains substantive review and its final verdict at MAX. Exact verified earlier amendments are recognized without resending the same instruction or rewriting history. Saved status exposes its verified delivery source; this establishes delivery, not subscription savings. See [shared quality-first review](docs/efficient-continuation.md#shared-quality-first-review-instruction).
+
 An app update that removes a pinned Claude executable has a separate [audited repair](docs/efficient-continuation.md#a-pinned-claude-executable-disappeared). It retains the native session and original preparation, records the real replacement identity, and leaves continuation and quota holds with the existing operator.
 
 ## Prerequisites
