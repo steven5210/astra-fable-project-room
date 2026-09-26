@@ -14,7 +14,7 @@ PAGE_ITEMS = 100
 MAX_PAGES = 200  # Up to 20,000 entries at the default size; byte/time bounds still apply.
 MAX_REQUESTS = MAX_PAGES + 7  # Bounded room for 100 -> 50 -> ... -> 1 reductions.
 MAX_RESPONSE_BYTES = 8_000_000
-MAX_OBSERVATION_BYTES = 80_000_000
+MAX_OBSERVATION_BYTES = 160_000_000  # Aggregate history only; each response remains capped at 8 MB.
 MAX_OBSERVATION_SECONDS = 150
 COLLECTIONS = ("turns", "messages", "activities")
 IDENTITY_FIELDS = ("sessionId", "conversationId", "activeBranchId", "controller", "settings", "branchMaterialization")
@@ -22,6 +22,23 @@ IDENTITY_FIELDS = ("sessionId", "conversationId", "activeBranchId", "controller"
 
 class ResponseTooLarge(RoomError):
     """The transport stopped at its unchanged response-size boundary."""
+
+
+class HistoryObservationLimit(RoomError):
+    """A bounded read stopped without complete evidence; safe diagnostic counters."""
+
+    def __init__(self, limit_kind, *, pages, requests, observed_bytes):
+        self.limit_kind = limit_kind
+        self.pages = pages
+        self.requests = requests
+        self.observed_bytes = observed_bytes
+        self.limit = {"aggregate_bytes": MAX_OBSERVATION_BYTES,
+                      "elapsed_seconds": MAX_OBSERVATION_SECONDS,
+                      "pages": MAX_PAGES, "requests": MAX_REQUESTS}[limit_kind]
+        super().__init__(
+            "Complete native history is required within the bounded observation window "
+            f"(limit={limit_kind}:{self.limit}; pages={pages}; requests={requests}; "
+            f"observed_bytes={observed_bytes})")
 
 
 def canonical(value):
@@ -46,9 +63,10 @@ The caller constructs the validated session path; this helper only issues GETs.
     pages = requests = observed_bytes = 0
     deadline = time.monotonic() + MAX_OBSERVATION_SECONDS
 
-    def bounded_result():
+    def bounded_result(limit_kind):
         if strict or result is None:
-            raise RoomError("Complete native history is required within the bounded observation window")
+            raise HistoryObservationLimit(limit_kind, pages=pages, requests=requests,
+                                          observed_bytes=observed_bytes)
         return finish(True)
 
     def finish(truncated):
@@ -60,7 +78,7 @@ The caller constructs the validated session path; this helper only issues GETs.
 
     while pages < MAX_PAGES and requests < MAX_REQUESTS:
         if time.monotonic() >= deadline:
-            return bounded_result()
+            return bounded_result("elapsed_seconds")
         query = path + "?limit=" + str(limit)
         if cursor is not None:
             query += "&beforeSequence=" + str(cursor)
@@ -70,15 +88,17 @@ The caller constructs the validated session path; this helper only issues GETs.
         except ResponseTooLarge:
             observed_bytes += MAX_RESPONSE_BYTES + 1
             if observed_bytes >= MAX_OBSERVATION_BYTES:
-                return bounded_result()
+                return bounded_result("aggregate_bytes")
             if limit == 1:
                 raise RoomError("One AO history item exceeds 8 MB; preserve the native result and inspect it without replaying the turn")
             limit = max(1, limit // 2)
             continue  # Same history cursor, smaller read; never a model request.
         pages += 1
         observed_bytes += len(canonical(page))
-        if observed_bytes > MAX_OBSERVATION_BYTES or time.monotonic() >= deadline:
-            return bounded_result()
+        if observed_bytes > MAX_OBSERVATION_BYTES:
+            return bounded_result("aggregate_bytes")
+        if time.monotonic() >= deadline:
+            return bounded_result("elapsed_seconds")
         if (not isinstance(page, dict) or any(not isinstance(page.get(k), list) for k in COLLECTIONS)
                 or type(page.get("hasMoreBefore")) is not bool):
             raise RoomError("AO requires explicit complete native history arrays in the raw AO response")
@@ -110,4 +130,4 @@ The caller constructs the validated session path; this helper only issues GETs.
             raise RoomError("Native history pagination is incomplete or ambiguous")
         seen.add(next_cursor)
         cursor = next_cursor
-    return bounded_result()
+    return bounded_result("pages" if pages >= MAX_PAGES else "requests")
