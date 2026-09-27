@@ -1,5 +1,6 @@
 """Bounded local Claude error evidence. Reads no account settings or credentials."""
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,13 @@ from room import RoomError
 
 
 def timestamp(value):
-    return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    """Parse a native timestamp; malformed rows refuse as RoomError."""
+    if not isinstance(value, str):
+        raise RoomError('Native event timestamp is malformed')
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except ValueError as exc:
+        raise RoomError('Native event timestamp is malformed') from exc
 
 
 def human_text(row):
@@ -27,6 +34,217 @@ def human_text(row):
             or any(not isinstance(x, dict) or x.get('type') != 'text' or not isinstance(x.get('text'), str) for x in content)):
         return None
     return ''.join(x['text'] for x in content)
+
+
+COMPACTION_THRASHING_TEXT = (
+    'Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, '
+    '3 times in a row. A file being read or a tool output is likely too large for the context window. '
+    'Try reading in smaller chunks, or use /clear to start fresh.'
+)
+COMPACTION_THRASHING_TEXT_SHA256 = hashlib.sha256(COMPACTION_THRASHING_TEXT.encode()).hexdigest()
+
+
+def _message_text(message):
+    if not isinstance(message, dict):
+        return None
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    if (isinstance(content, list) and content and all(isinstance(x, dict)
+            and x.get('type') == 'text' and isinstance(x.get('text'), str) for x in content)):
+        return ''.join(x['text'] for x in content)
+    return None
+
+
+def _assistant_substantive(message):
+    '''Only demonstrably empty supported text content is non-substantive.
+
+    Unknown or opaque non-text blocks and malformed text are ambiguous and
+    therefore disqualify this exact lane.
+    '''
+    if not isinstance(message, dict):
+        return True
+    content = message.get('content')
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return True
+    for block in content:
+        if not isinstance(block, dict) or block.get('type') != 'text':
+            return True
+        text = block.get('text')
+        if not isinstance(text, str) or text.strip():
+            return True
+    return False
+
+
+def _non_substantive_continuation(message):
+    """Only an absent, empty or exact-error text body can continue the exact error."""
+    if not isinstance(message, dict):
+        return False
+    content = message.get('content')
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content in ('', COMPACTION_THRASHING_TEXT)
+    if isinstance(content, list):
+        if not content:
+            return True
+        if all(isinstance(block, dict) and block.get('type') == 'text'
+               and isinstance(block.get('text'), str) for block in content):
+            return ''.join(block['text'] for block in content) in ('', COMPACTION_THRASHING_TEXT)
+    return False
+
+
+def _same_error_envelope(row):
+    """Later same-id synthetic records must not contradict the exact typed error."""
+    nested = row.get('apiError') or {}
+    if not isinstance(nested, dict):
+        return False
+    if row.get('apiErrorStatus', nested.get('status')) is not None:
+        return False
+    if row.get('quotaLimits') not in (None, {}, []):
+        return False
+    if any(row.get(key) not in (None, False, '') for key in
+           ('rateLimitType', 'quota', 'quota_limit', 'safety', 'refusal')):
+        return False
+    return row.get('error') in (None, 'invalid_request')
+
+
+def contradictory_stop(value):
+    """A refusal or safety stop is a different terminal outcome than the exact thrashing error."""
+    return isinstance(value, str) and ('refusal' in value or 'safety' in value)
+
+
+def compaction_failure(events, request, session_id, workspace, outcome):
+    '''Return the narrow, positively bound autocompact-thrashing proof or None.'''
+    from ao_project_room import digest
+    if (not isinstance(events, list) or any(not isinstance(row, dict) for row in events)
+            or not isinstance(request, dict) or not isinstance(session_id, str) or not session_id
+            or not isinstance(workspace, str) or not workspace or not isinstance(outcome, dict)
+            or outcome.get('next_human_uuid') is not None):
+        return None
+    anchor_uuid = outcome.get('anchor_uuid')
+    errors = outcome.get('errors')
+    if (not isinstance(anchor_uuid, str) or not anchor_uuid
+            or not isinstance(errors, list) or len(errors) != 1
+            or not isinstance(errors[0], dict) or errors[0].get('error') != 'invalid_request'):
+        return None
+    error_uuid = errors[0].get('uuid')
+    if not isinstance(error_uuid, str) or not error_uuid or error_uuid == anchor_uuid:
+        return None
+    stops = outcome.get('stop_reasons')
+    if not isinstance(stops, list) or any(contradictory_stop(stop) for stop in stops):
+        return None
+    anchor_index = error_index = None
+    for index, row in enumerate(events):
+        if row.get('sessionId') != session_id or row.get('isSidechain'):
+            continue
+        if row.get('agentId') is not None or row.get('agent_id') is not None:
+            if row.get('uuid') in (anchor_uuid, error_uuid):
+                return None
+            continue
+        if row.get('uuid') == anchor_uuid:
+            if anchor_index is not None:
+                return None
+            anchor_index = index
+        if row.get('uuid') == error_uuid:
+            if error_index is not None:
+                return None
+            error_index = index
+    if anchor_index is None or error_index is None or anchor_index >= error_index:
+        return None
+    anchor, error_row = events[anchor_index], events[error_index]
+    if human_text(anchor) is None or anchor.get('cwd') != workspace or error_row.get('cwd') != workspace:
+        return None
+    anchor_message = anchor.get('message')
+    if not isinstance(anchor_message, dict) or anchor_message.get('role') != 'user':
+        return None
+    if error_row.get('type') != 'assistant' or error_row.get('isApiErrorMessage') is not True:
+        return None
+    message = error_row.get('message')
+    if not isinstance(message, dict) or message.get('role') != 'assistant':
+        return None
+    if message.get('model') != '<synthetic>' or message.get('stop_reason') != 'stop_sequence':
+        return None
+    if _message_text(message) != COMPACTION_THRASHING_TEXT:
+        return None
+    nested = error_row.get('apiError') or {}
+    if not isinstance(nested, dict):
+        return None
+    if error_row.get('apiErrorStatus', nested.get('status')) is not None:
+        return None
+    if error_row.get('quotaLimits') not in (None, {}, []):
+        return None
+    if any(error_row.get(key) not in (None, False, '') for key in
+           ('rateLimitType', 'quota', 'quota_limit', 'safety', 'refusal')):
+        return None
+    for projection in errors + (outcome.get('settled_errors') or []):
+        if (not isinstance(projection, dict) or projection.get('error') != 'invalid_request'
+                or projection.get('http_status') is not None):
+            return None
+    start = timestamp(anchor['timestamp'])
+    for index, row in enumerate(events):
+        if row.get('sessionId') != session_id or row.get('isSidechain'):
+            continue
+        try:
+            row_time = timestamp(row.get('timestamp'))
+        except (RoomError, KeyError, TypeError, ValueError, AttributeError):
+            if human_text(row) is not None or row.get('type') == 'assistant':
+                return None
+            continue
+        if (human_text(row) is not None and row.get('uuid') != anchor_uuid
+                and (row_time >= start or index > anchor_index)):
+            # A source-order-later human record is a new instruction even when
+            # its timestamp is rewound or inconsistent; do not sort it away.
+            return None
+    error_start = timestamp(error_row['timestamp'])
+    error_message_id = message.get('id') if isinstance(message.get('id'), str) and message['id'] else None
+    for index, row in enumerate(events):
+        if row.get('sessionId') != session_id or row.get('uuid') == error_uuid:
+            continue
+        if row.get('type') != 'assistant' or row.get('uuid') == anchor_uuid:
+            continue
+        later = row.get('message')
+        if not isinstance(later, dict):
+            return None
+        try:
+            row_time = timestamp(row.get('timestamp'))
+        except (RoomError, KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if not (index > error_index or (index > anchor_index and row_time >= error_start)):
+            continue
+        if contradictory_stop(later.get('stop_reason')):
+            return None
+        same_error = (error_message_id is not None and later.get('id') == error_message_id
+                      and later.get('role') == 'assistant'
+                      and later.get('model') == '<synthetic>'
+                      and later.get('stop_reason') in (None, 'stop_sequence')
+                      and _same_error_envelope(row))
+        if same_error:
+            if not _non_substantive_continuation(later):
+                return None
+            continue
+        if row.get('isApiErrorMessage') is True or later.get('model') == '<synthetic>':
+            return None
+        if _assistant_substantive(later):
+            return None
+    return {
+        'version': 1,
+        'kind': 'autocompact_thrashing',
+        'error': 'invalid_request',
+        'error_role': 'assistant',
+        'error_model': '<synthetic>',
+        'error_stop_reason': 'stop_sequence',
+        'error_text_sha256': COMPACTION_THRASHING_TEXT_SHA256,
+        'error_message_id': error_message_id,
+        'assistant_uuid': error_uuid,
+        'anchor_uuid': anchor_uuid,
+        'next_human_uuid': None,
+        'later_substantive': False,
+        'http_status_absent': True,
+        'workspace_sha256': digest(workspace.encode()),
+    }
 
 
 def events_outcome(events, request, session_id, workspace=None):
@@ -293,7 +511,8 @@ def inspect(directory, state, request, source, snapshot):
     if (not path.is_absolute() or path.name != source['native_session_id'] + '.jsonl'
             or any(p.is_symlink() for p in (path, *path.parents))):
         raise RoomError('Use the exact owned native transcript without symlinks')
-    with path.open('rb') as stream:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as stream:
         before = os.fstat(stream.fileno())
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022
                 or before.st_size > 64_000_000):
@@ -306,6 +525,10 @@ def inspect(directory, state, request, source, snapshot):
     events = [json.loads(line) for line in raw.splitlines() if line.strip()]
     result = events_outcome(events, request, source['native_session_id'],
                             workspace=workspace if role == 'reviewer' else None)
+    if role == 'engineer':
+        proof = compaction_failure(events, request, source['native_session_id'], workspace, result)
+        if proof is not None:
+            result = {**result, 'compaction_failure': proof}
     result = {**result, 'source': source, 'source_sha256': digest(raw),
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
     if (role == 'engineer' and state.get('workflow') == 'fable_engineering'

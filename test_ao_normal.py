@@ -600,7 +600,7 @@ class RoutingTests(Fixture):
         for event in denied:
             self.assertIsNotNone(self.decide(event), event)
         self.assertIsNone(self.decide({'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, 'agent_type': 'pr-opus', 'agent_id': 'child'}))
-        self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}}))
+        self.assertIn('Read admission:', self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}}))  # missing native identity cannot grant root Read clearance
         self.assertIsNone(self.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'x'}, 'agent_type': 'pr-sonnet', 'agent_id': 'child'}))
         self.assertIsNone(self.decide({'tool_name': 'TaskOutput', 'tool_input': {'task_id': 'x'}}))
         for root_tool in ('mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask', 'mcp__deepseek__deepseek_result'):
@@ -649,8 +649,9 @@ class RoutingTests(Fixture):
         for identity in ({'agent_type': 'pr-opus'}, {'agent_type': 'pr-opus', 'agent_id': ''},
                          {'agent_type': 'pr-opus', 'agent_id': ' '}):
             self.assertIsNotNone(self.decide({'tool_name': 'Skill', 'tool_input': {'skill': 'claude-in-chrome'}, **identity}))
-        for tool in ('Read', 'Grep', 'Glob', 'ToolSearch', 'TaskCreate', 'TaskUpdate', 'TaskOutput'):
+        for tool in ('Grep', 'Glob', 'ToolSearch', 'TaskCreate', 'TaskUpdate', 'TaskOutput'):
             self.assertIsNone(self.decide({'tool_name': tool, 'tool_input': {}}))
+        self.assertIn('Read admission:', self.decide({'tool_name': 'Read', 'tool_input': {}}))  # bounded valid root Reads are exercised in test_ao_read_admission
         for tool in ('mcp__project-room__ao_room_status', 'mcp__deepseek__change_profile', 'mcp__qwen-local__qwen_submit'):
             self.assertIsNotNone(self.decide({'tool_name': tool, 'tool_input': {}}))
         self.bind()

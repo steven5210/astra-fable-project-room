@@ -1,5 +1,6 @@
 """Durable semantic holds, separate from AO transport and immutable receipts."""
 import json
+import re
 
 from room import RoomError
 
@@ -73,6 +74,10 @@ def classify(receipt, native=None, require_structured=True):
     if native and not native.get('unknown'):
         errors += native['errors']
         stops += native['stop_reasons']
+    from ao_native_outcome import contradictory_stop
+    if any(contradictory_stop(stop) for stop in stops):
+        return {'kind': 'unknown', 'hold': True,
+                'reason': 'A refusal or safety terminal stop contradicts provider-failure recovery; diagnose the refusal separately'}
     quota = any((isinstance(kind := (e.get('type') or e.get('kind') or e.get('error')), str) and kind in QUOTA_KINDS)
                 or e.get('httpStatus', e.get('http_status')) == 429 for e in errors)
     if errors:
@@ -125,6 +130,123 @@ def inconclusive(record):
                 or (record.get('observation_outcome') or {}).get('kind') == 'unknown')
 
 
+def _disqualifying_token(value):
+    # A bare typed ``limit`` is ambiguous here: the exact upstream vocabulary
+    # is not established, so it conservatively disqualifies only the compaction
+    # lane. Generic classification and the exact native quota contract remain
+    # unchanged; this is not a quota assertion.
+    return (isinstance(value, str)
+            and (value in QUOTA_KINDS or value == 'limit' or 'quota' in value or 'rate_limit' in value
+                 or 'refusal' in value or 'safety' in value))
+
+
+def _contradictory_failure(value):
+    """Check every typed field; a generic type must not shadow a specific category."""
+    if not isinstance(value, dict):
+        return True
+    if value.get('httpStatus', value.get('http_status')) == 429:
+        return True
+    fields = []
+    for key in ('type', 'kind', 'error', 'category', 'reason'):
+        item = value.get(key)
+        if isinstance(item, str):
+            fields.append(item)
+        elif isinstance(item, dict):
+            fields.extend(item.get(nested) for nested in ('type', 'kind', 'error', 'category', 'reason')
+                          if isinstance(item.get(nested), str))
+    return any(_disqualifying_token(field) for field in fields)
+
+
+def native_compaction_failure(record):
+    '''Only the exact public autocompact-thrashing envelope, positively bound.'''
+    from ao_native_outcome import COMPACTION_THRASHING_TEXT_SHA256, contradictory_stop
+    native = record.get('native') or {}
+    if record.get('outcome', {}).get('kind') != 'provider_error' or inconclusive(record):
+        return False
+    if native.get('unknown') or native.get('next_human_uuid') is not None:
+        return False
+    native_stops = native.get('stop_reasons')
+    if not isinstance(native_stops, list) or any(contradictory_stop(stop) for stop in native_stops):
+        return False
+    proof = native.get('compaction_failure')
+    keys = {'version', 'kind', 'error', 'error_role', 'error_model', 'error_stop_reason',
+            'error_text_sha256', 'error_message_id', 'assistant_uuid', 'anchor_uuid',
+            'next_human_uuid', 'later_substantive', 'http_status_absent', 'workspace_sha256'}
+    if not isinstance(proof, dict) or set(proof) != keys:
+        return False
+    if (proof.get('version') != 1 or proof.get('kind') != 'autocompact_thrashing'
+            or proof.get('error') != 'invalid_request' or proof.get('error_role') != 'assistant'
+            or proof.get('error_model') != '<synthetic>' or proof.get('error_stop_reason') != 'stop_sequence'
+            or proof.get('error_text_sha256') != COMPACTION_THRASHING_TEXT_SHA256
+            or proof.get('next_human_uuid') is not None or proof.get('later_substantive') is not False
+            or proof.get('http_status_absent') is not True
+            or proof.get('anchor_uuid') != native.get('anchor_uuid')
+            or not isinstance(proof.get('anchor_uuid'), str) or not proof['anchor_uuid']
+            or not isinstance(proof.get('assistant_uuid'), str) or not proof['assistant_uuid']
+            or proof['assistant_uuid'] == proof['anchor_uuid']
+            or not (proof.get('error_message_id') is None
+                    or (isinstance(proof.get('error_message_id'), str) and proof['error_message_id']))
+            or not isinstance(proof.get('workspace_sha256'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', proof['workspace_sha256']) is None):
+        return False
+    errors = native.get('errors')
+    if not isinstance(errors, list) or len(errors) != 1 or not isinstance(errors[0], dict):
+        return False
+    error = errors[0]
+    if (error.get('uuid') != proof['assistant_uuid'] or error.get('error') != 'invalid_request'
+            or error.get('http_status') is not None):
+        return False
+    settled = native.get('settled_errors') or []
+    if not isinstance(settled, list):
+        return False
+    for projection in errors + settled:
+        if (not isinstance(projection, dict) or projection.get('error') != 'invalid_request'
+                or projection.get('http_status') is not None):
+            return False
+    terminal = record.get('ao_terminal')
+    turn_id = record.get('turn_id')
+    provider_turn_id = record.get('provider_turn_id')
+    if isinstance(terminal, dict):
+        turn_id = terminal.get('id', turn_id)
+        provider_turn_id = terminal.get('providerTurnId', provider_turn_id)
+        for key in ('error', 'failure'):
+            value = terminal.get(key)
+            if isinstance(value, str) and _disqualifying_token(value):
+                return False
+            if isinstance(value, dict) and _contradictory_failure(value):
+                return False
+        for key in ('stop_reason', 'stopReason'):
+            if contradictory_stop(terminal.get(key)):
+                return False
+    failures = record.get('session_failures', [])
+    activities = record.get('provider_failures', [])
+    if not isinstance(failures, list) or not isinstance(activities, list):
+        return False
+    for failure in failures:
+        if not isinstance(failure, dict):
+            return False
+        if failure.get('turnId') is None and failure.get('providerTurnId') is None:
+            return False
+        if (failure.get('turnId') == turn_id
+                or (provider_turn_id and failure.get('providerTurnId') == provider_turn_id)):
+            if _contradictory_failure(failure):
+                return False
+    for activity in activities:
+        if not isinstance(activity, dict) or _contradictory_failure(activity):
+            return False
+    return True
+
+
+def native_failure_kind(record):
+    if inconclusive(record):
+        return None
+    if native_quota_failure(record):
+        return 'quota_limit'
+    if native_compaction_failure(record):
+        return 'compaction_thrashing'
+    return None
+
+
 def validate_settlement(directory, request):
     from ao_project_room import digest, read
     release = release_record(directory, {'room_id': directory.name}, request)
@@ -133,11 +255,32 @@ def validate_settlement(directory, request):
     proof = release.get('native_failure_settlement') or {}
     evidence_path = 'outcomes/' + request['request_id'] + '/' + release.get('outcome_sha256', '') + '.json'
     record = read(directory / evidence_path)
+    base = {'prior_state': 'uncertain', 'ao_state': 'failed', 'receipt_sha256': request['receipt_sha256']}
+    native = record.get('native') or {}
+    source = native.get('source')
+    source_ok = (isinstance(source, dict)
+                 and set(source) == {'database', 'transcript', 'session_id', 'native_session_id'}
+                 and all(isinstance(value, str) and value for value in source.values())
+                 and source.get('session_id') == request.get('session_id')
+                 and isinstance(native.get('source_sha256'), str)
+                 and re.fullmatch(r'[0-9a-f]{64}', native['source_sha256']) is not None)
+    quota = isinstance(proof, dict) and proof == base and native_quota_failure(record)
+    compaction = (
+        request.get('role') == 'engineer'
+        and isinstance(proof, dict)
+        and set(proof) == set(base) | {'kind', 'required_guard_sha256'}
+        and proof.get('kind') == 'compaction_thrashing'
+        and isinstance(proof.get('required_guard_sha256'), str)
+        and re.fullmatch(r'[0-9a-f]{64}', proof['required_guard_sha256']) is not None
+        and all(proof.get(key) == value for key, value in base.items())
+        and source_ok and native_compaction_failure(record)
+    )
     if (digest(release) != request.get('outcome_resume_sha256')
             or release.get('room_id') != directory.name or release.get('blocked_request_id') != request['request_id']
-            or digest(record) != release.get('outcome_sha256') or not native_quota_failure(record)
-            or record['receipt_sha256'] != request['receipt_sha256']
-            or proof != {'prior_state': 'uncertain', 'ao_state': 'failed', 'receipt_sha256': request['receipt_sha256']}
+            or digest(record) != release.get('outcome_sha256') or not (quota or compaction)
+            or record.get('receipt_sha256') != request['receipt_sha256']
+            or record.get('turn_id') != request.get('turn_id')
+            or record.get('provider_turn_id') != request.get('provider_turn_id')
             or (request.get('observed_turn') or {}).get('state') != 'failed'):
         raise RoomError('Settled native failure proof changed')
 
@@ -310,6 +453,121 @@ def release_record(directory, state, request):
     return value
 
 
+def _reviewed_guard_sha256():
+    from ao_project_room import digest
+    from pathlib import Path
+    try:
+        from ao_routing_guard import READ_ADMISSION_VERSION
+    except ImportError as exc:
+        raise RoomError('The reviewed read-admission guard is not installed; compaction failure cannot be settled') from exc
+    if READ_ADMISSION_VERSION != 1:
+        raise RoomError('The installed read-admission guard is not review version 1; compaction failure cannot be settled')
+    path = Path(__file__).with_name('ao_routing_guard.py')
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RoomError('The reviewed read-admission guard source is unavailable; compaction failure cannot be settled') from exc
+    return digest(raw)
+
+
+def _require_compaction_mitigation(service, directory, state, request, release, diagnosed=False):
+    proof = release.get('native_failure_settlement') or {}
+    if proof.get('kind') != 'compaction_thrashing':
+        if diagnosed:
+            raise RoomError('Autocompact-thrashing evidence requires an exact native compaction settlement; this continuation carries no mitigation')
+        return
+    required = proof.get('required_guard_sha256')
+    if not isinstance(required, str) or re.fullmatch(r'[0-9a-f]{64}', required) is None:
+        raise RoomError('Compaction-thrashing continuation lacks its exact reviewed guard identity')
+    try:
+        from ao_delegates import validate_preparation
+        from ao_routing import validate_local
+        from ao_routing_refresh import effective
+        prepared = validate_preparation(directory, state, request['session_id'])
+        validate_local(prepared, state, directory)
+        routing = effective(directory, state, prepared) if state.get('routing_refresh') else prepared.get('routing')
+    except (RoomError, OSError, ValueError, KeyError, TypeError, ImportError) as exc:
+        raise RoomError('Compaction-thrashing continuation requires the reviewed read-admission routing guard; perform the supported stopped-controller refresh before sending') from exc
+    if not isinstance(routing, dict) or routing.get('guard_sha256') != required:
+        raise RoomError('Compaction-thrashing continuation requires the reviewed read-admission routing guard; the effective guard does not match the settled mitigation')
+
+
+def _fresh_failed_turn_evidence(directory, request, snapshot):
+    """Read-only reconstruction of the exact current AO evidence a fresh audit uses.
+
+    A changed current receipt, provider turn, activity or session-failure record
+    must refuse an unused compaction refresh before it can carry a stale proof
+    forward. This never writes an outcome, saves state or dispatches a model.
+    """
+    from ao_project_room import sent_message
+    saved = receipt(directory, request)
+    turns = [t for t in snapshot.get('turns', []) if t.get('id') == request.get('turn_id')]
+    messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == request.get('turn_id')]
+    baseline = request.get('baseline') or {}
+    if (snapshot.get('history_truncated') or not sent_message(request, snapshot) or len(turns) != 1
+            or not isinstance(turns[0], dict) or messages != saved.get('messages')
+            or turns[0].get('state') != 'failed'
+            or turns[0].get('providerTurnId') != request.get('provider_turn_id')
+            or snapshot.get('conversationId') != baseline.get('conversation_id')
+            or snapshot.get('activeBranchId') != baseline.get('branch_id')):
+        raise RoomError('Unused compaction continuation AO evidence changed; re-audit before continuing')
+    return {**saved, 'turn': turns[0], 'sessionFailures': snapshot.get('sessionFailures', []),
+            'provider_failures': activity_failures(snapshot, request['turn_id'])}
+
+
+def verify_unused_compaction_source(directory, state, request, snapshot):
+    """Read-only fresh verification of an unused compaction continuation source.
+
+    A settlement that already has a legitimate successor keeps its immutable
+    historical validation. Only the currently unused successor must still
+    reproduce the exact saved native proof and source digest at a refresh
+    boundary. This function never writes or mutates state; stale evidence
+    refuses before any refresh intent or runtime replacement.
+    """
+    from ao_native_outcome import inspect
+    from ao_project_room import digest, read
+    release = release_record(directory, state, request)
+    proof = (release or {}).get('native_failure_settlement') or {}
+    if proof.get('kind') != 'compaction_thrashing':
+        return
+    if release.get('resume_request_id') in state.get('requests', {}):
+        return
+    path = request.get('semantic_outcome')
+    expected = 'outcomes/' + request['request_id'] + '/' + request.get('semantic_outcome_sha256', '') + '.json'
+    if not path or path != expected:
+        raise RoomError('Unused compaction continuation has no exact owned outcome record')
+    record = read(directory / path)
+    if (digest(record) != request.get('semantic_outcome_sha256')
+            or record.get('request_id') != request['request_id']
+            or record.get('receipt_sha256') != request.get('receipt_sha256')
+            or record.get('turn_id') != request.get('turn_id')
+            or record.get('provider_turn_id') != request.get('provider_turn_id')):
+        raise RoomError('Unused compaction continuation outcome evidence changed; re-audit before continuing')
+    native = record.get('native') or {}
+    source = native.get('source')
+    if (not isinstance(source, dict) or native.get('unknown')
+            or not isinstance(native.get('source_sha256'), str)
+            or not isinstance(native.get('compaction_failure'), dict)):
+        raise RoomError('Unused compaction continuation lacks its exact native source evidence')
+    try:
+        current = inspect(directory, state, request, source, snapshot)
+    except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+        raise RoomError('Unused compaction continuation source cannot be verified; re-audit before continuing') from exc
+    if (current.get('unknown') or current.get('next_human_uuid') is not None
+            or current.get('source_sha256') != native['source_sha256']
+            or current.get('compaction_failure') != native['compaction_failure']):
+        raise RoomError('Unused compaction continuation source changed; re-audit before continuing')
+    observed = _fresh_failed_turn_evidence(directory, request, snapshot)
+    fresh = {**record, 'ao_terminal': observed['turn'], 'session_failures': observed['sessionFailures'],
+             'provider_failures': observed['provider_failures'], 'native': current,
+             'outcome': classify(observed, current, require_structured=(
+                 state.get('workflow') == 'fable_engineering' or request.get('role') == 'reviewer'))}
+    if (release.get('outcome_sha256') != request.get('semantic_outcome_sha256')
+            or inconclusive(fresh) or native_failure_kind(fresh) != 'compaction_thrashing'
+            or digest(fresh) != release.get('outcome_sha256')):
+        raise RoomError('Unused compaction continuation AO evidence changed; re-audit before continuing')
+
+
 def gate(service, directory, state, role, new_request_id, snapshot):
     request = latest_for_role(state, role)
     if not request:
@@ -320,6 +578,10 @@ def gate(service, directory, state, role, new_request_id, snapshot):
     release = release_record(directory, state, request)
     if (release and release['resume_request_id'] == new_request_id
             and release['outcome_sha256'] == request['semantic_outcome_sha256'] and not inconclusive(value)):
+        diagnosed = native_failure_kind(value) == 'compaction_thrashing'
+        if diagnosed and request.get('state') == 'completed':
+            raise RoomError('AO-completed autocompact-thrashing evidence is not eligible for recovery; only an exact failed AO transport turn can settle this native failure')
+        _require_compaction_mitigation(service, directory, state, request, release, diagnosed)
         return
     raise RoomError('Native semantic hold: ' + value['outcome']['kind'] + '. Inspect ao_room_outcome_audit; no automatic retry or replay.')
 
@@ -353,11 +615,17 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
     snapshot = service.identity(service.client(state), state, request)
     value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True,
                     source_verification=source_verification)
+    diagnosed = native_failure_kind(value)
+    completed_compaction = request['state'] == 'completed' and diagnosed == 'compaction_thrashing'
+    settlement = diagnosed if request['state'] != 'completed' else None
+    if settlement == 'compaction_thrashing' and request.get('role') != 'engineer':
+        settlement = None
     return {'request_id': request['request_id'], 'outcome': value['outcome'],
             'outcome_sha256': request['semantic_outcome_sha256'], 'native': value['native'],
             'observation_outcome': value.get('observation_outcome'),
-            'resume_eligible': (value['outcome']['kind'] in RESUMABLE and not inconclusive(value) if request['state'] == 'completed'
-                                else native_quota_failure(value)),
+            'resume_eligible': (False if completed_compaction else
+                                (value['outcome']['kind'] in RESUMABLE and not inconclusive(value)
+                                 if request['state'] == 'completed' else settlement is not None)),
             'model_dispatch': False, 'quota_reset_established': False}
 
 
@@ -369,6 +637,10 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
     if not request or latest_for_role(state, request['role']) != request:
         raise RoomError('Only the latest owned result can authorize an outcome continuation')
     audit_quiet(service, directory, state, request)
+    if request['state'] == 'completed':
+        current = load(directory, request)
+        if current and native_failure_kind(current) == 'compaction_thrashing':
+            raise RoomError('AO-completed autocompact-thrashing evidence is not eligible for the completed recovery lane; only an exact failed AO transport turn can settle this native failure')
     inputs = {'version': 1, 'room_id': state['room_id'], 'blocked_request_id': request_id,
               'outcome_sha256': outcome_sha256, 'resume_request_id': resume_request_id,
               'diagnosis': diagnosis, 'authorization': authorization}
@@ -385,6 +657,13 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
             inputs['native_failure_settlement'] = prior['native_failure_settlement']
             validate_settlement(directory, request)
         if {k: v for k, v in prior.items() if k != 'previous_resume_sha256'} == inputs:
+            if (inputs.get('native_failure_settlement', {}).get('kind') == 'compaction_thrashing'
+                    and resume_request_id not in state['requests']):
+                snapshot = service.identity(service.client(state), state, request)
+                value = observe(service, directory, state, request, snapshot)
+                if (request.get('semantic_outcome_sha256') != outcome_sha256
+                        or native_failure_kind(value) != 'compaction_thrashing' or inconclusive(value)):
+                    raise RoomError('Compaction-thrashing continuation evidence changed; a fresh audit is required')
             return {**prior, 'model_dispatch': False}
         if prior['resume_request_id'] != resume_request_id:
             raise RoomError('This outcome already has a different immutable continuation')
@@ -402,10 +681,16 @@ def resume(service, directory, state, request_id, outcome_sha256, resume_request
             or inconclusive(value)):
         raise RoomError('Outcome evidence changed or does not establish an eligible diagnosed failure')
     if request['state'] != 'completed':
-        if request['state'] not in ('uncertain', 'settled_failure') or not native_quota_failure(value):
-            raise RoomError('Only an exactly correlated native quota failure can settle an uncertain AO failed turn')
+        settlement_kind = native_failure_kind(value)
+        if (request['state'] not in ('uncertain', 'settled_failure')
+                or settlement_kind not in ('quota_limit', 'compaction_thrashing')
+                or (settlement_kind == 'compaction_thrashing' and request.get('role') != 'engineer')):
+            raise RoomError('Only an exactly correlated native quota or autocompact-thrashing failure can settle an uncertain AO failed turn')
         inputs['native_failure_settlement'] = {'prior_state': 'uncertain', 'ao_state': 'failed',
                                                'receipt_sha256': request['receipt_sha256']}
+        if settlement_kind == 'compaction_thrashing':
+            inputs['native_failure_settlement'].update(kind='compaction_thrashing',
+                                                       required_guard_sha256=_reviewed_guard_sha256())
     path = 'outcome-resumes/' + request_id + '/' + digest(inputs) + '.json'
     if (directory / path).exists() and read(directory / path) != inputs:
         raise RoomError('A different continuation intent already exists')
