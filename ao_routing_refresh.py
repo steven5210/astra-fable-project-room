@@ -268,7 +268,7 @@ def _retained_manifest(directory, state):
 def _inspect(service, directory, state, inputs, prepared, routing):
     from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity, _native, _ledger_rows, _ledger_check
     from ao_review_extension import guard_pending_receipts, guard_routing_refresh
-    from ao_outcomes import validate_settlement
+    from ao_outcomes import validate_settlement, verify_unused_compaction_source
     guard_pending_receipts(directory, state)
     engineer = state['bindings'].get('engineer') or {}
     if (not ao_workflow.normal(state) or engineer.get('harness') != 'claude-code'
@@ -289,7 +289,10 @@ def _inspect(service, directory, state, inputs, prepared, routing):
     snapshot = _ReadOnlyIdentity(service).identity(_CompleteClient(service.client(state)), state, engineer)
     if snapshot.get('controller') != 'stopped':
         raise RoomError('Stop the idle native engineer through AO before routing refresh')
-    native = _native(state, engineer, snapshot, directory)
+    for request in state['requests'].values():
+        if request.get('state') == 'settled_failure':
+            verify_unused_compaction_source(directory, state, request, snapshot)
+    native = _native(state, engineer, snapshot, directory, allow_settled_failures=True)
     owner = read_owner(inputs['database_path'], engineer['session_id'])
     if (owner['provider_conversation_id'] != inputs['native_session_id'] or owner['project_id'] != state['ao_project_id']
             or owner['workspace_path'] != prepared['worktree'] or owner['ao_conversation_id'] != engineer['conversation_id']

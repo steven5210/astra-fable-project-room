@@ -33,6 +33,14 @@ class OutcomeClassificationTests(unittest.TestCase):
             self.assertEqual(outcomes.classify(self.receipt(text))['kind'], 'unknown')
         self.assertFalse(outcomes.classify(self.receipt('Done', stopReason='end_turn'))['hold'])
 
+    def test_refusal_or_safety_stop_disqualifies_recovery_at_the_classifier(self):
+        for turn in ({'stopReason': 'refusal'}, {'stop_reason': 'refusal'}, {'stopReason': 'safety'}):
+            with self.subTest(turn=turn):
+                result = outcomes.classify(self.receipt('{}', error={'type': 'invalid_request'}, **turn))
+                self.assertEqual((result['kind'], result['hold']), ('unknown', True))
+        result = outcomes.classify(self.receipt('{}'), {'errors': [], 'stop_reasons': ['refusal']})
+        self.assertEqual((result['kind'], result['hold']), ('unknown', True))
+
     def test_stale_failure_does_not_poison_later_turn(self):
         value = self.receipt()
         value['sessionFailures'] = [{'turnId': 'old', 'kind': 'quota_exhausted'}]
@@ -298,6 +306,32 @@ class NativeFileTests(unittest.TestCase):
                 with self.assertRaises(ao.RoomError): native.inspect(root, {}, request, {**source, 'transcript':str(other)}, snapshot)
                 with self.assertRaisesRegex(ao.RoomError, 'identity'): native.inspect(root, {}, request, source, {**snapshot, 'activeBranchId':'other'})
 
+    def test_malformed_timestamp_is_a_contained_refusal(self):
+        fixture = NativeCorrelationTests()
+        fixture.setUp()
+        row = {**fixture.error, 'uuid': 'malformed-time', 'timestamp': 123}
+        with self.assertRaisesRegex(ao.RoomError, 'timestamp'):
+            native.events_outcome([fixture.anchor, row], fixture.request, 'native')
+
+    def test_nonregular_transcript_is_refused_before_blocking(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        import ao_delegates
+        fixture = NativeCorrelationTests()
+        fixture.setUp()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path = root / 'native.jsonl'
+            os.mkfifo(path, 0o600)
+            source = {'transcript': str(path), 'native_session_id': 'native'}
+            owner = {'workspace_path': str(root), 'ao_conversation_id': 'conversation', 'active_branch_id': 'branch'}
+            snapshot = {'conversationId': 'conversation', 'activeBranchId': 'branch'}
+            request = {**fixture.request, 'session_id': 'engineer'}
+            with patch.object(native, 'validate_source', return_value=owner), patch.object(ao_delegates, 'validate_preparation', return_value={'worktree': str(root)}):
+                with self.assertRaisesRegex(ao.RoomError, 'ownership or size'):
+                    native.inspect(root, {}, request, source, snapshot)
+
 
 class CompactionImportTests(unittest.TestCase):
     def setUp(self):
@@ -324,3 +358,56 @@ class CompactionImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ao.RoomError, 'Conflicting duplicate'):
             native.compaction_imports([self.row, changed], 'native', self.snapshot)
         self.assertEqual(len(native.compaction_imports([self.row, self.row], 'native', self.snapshot)), 1)
+
+
+class SettlementProofValueTests(unittest.TestCase):
+    def settlement(self, proof):
+        import tempfile
+        from pathlib import Path
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name).resolve()
+        request_id = 'implementation'
+        receipt_sha256 = 'b' * 64
+        record = {
+            'version': 1, 'room_id': directory.name, 'request_id': request_id,
+            'receipt_sha256': receipt_sha256, 'text_sha256': 'c' * 64,
+            'turn_id': 'turn', 'provider_turn_id': 'provider',
+            'outcome': {'kind': 'quota_limit', 'hold': True, 'reason': 'synthetic'},
+            'session_failures': [], 'provider_failures': [],
+            'native': {'anchor_uuid': 'anchor', 'next_human_uuid': None,
+                       'errors': [{'uuid': 'quota-error', 'error': 'rate_limit', 'http_status': 429}],
+                       'stop_reasons': []},
+        }
+        outcome_sha = ao.digest(record)
+        release = {'version': 1, 'room_id': directory.name, 'blocked_request_id': request_id,
+                   'outcome_sha256': outcome_sha, 'resume_request_id': 'resume',
+                   'diagnosis': 'synthetic diagnosis', 'authorization': 'synthetic authorization',
+                   'native_failure_settlement': proof}
+        release_sha = ao.digest(release)
+        request = {'request_id': request_id, 'receipt_sha256': receipt_sha256,
+                   'turn_id': 'turn', 'provider_turn_id': 'provider',
+                   'observed_turn': {'state': 'failed'},
+                   'outcome_resume': 'outcome-resumes/' + request_id + '/' + release_sha + '.json',
+                   'outcome_resume_sha256': release_sha}
+        (directory / 'outcome-resumes' / request_id).mkdir(parents=True, exist_ok=True)
+        (directory / 'outcomes' / request_id).mkdir(parents=True, exist_ok=True)
+        ao.atomic(directory / 'outcome-resumes' / request_id / (release_sha + '.json'), release)
+        ao.atomic(directory / 'outcomes' / request_id / (outcome_sha + '.json'), record)
+        return directory, request
+
+    def test_quota_settlement_requires_exact_original_proof_values(self):
+        base = {'prior_state': 'uncertain', 'ao_state': 'failed', 'receipt_sha256': 'b' * 64}
+        directory, request = self.settlement(base)
+        outcomes.validate_settlement(directory, request)
+        for changed in ({**base, 'prior_state': 'active'},
+                        {**base, 'ao_state': 'completed'},
+                        {**base, 'receipt_sha256': 'wrong'}):
+            with self.subTest(changed=changed):
+                directory, request = self.settlement(changed)
+                with self.assertRaisesRegex(ao.RoomError, 'proof changed'):
+                    outcomes.validate_settlement(directory, request)
+
+
+if __name__ == '__main__':
+    unittest.main()

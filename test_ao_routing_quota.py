@@ -226,12 +226,18 @@ class NativeQuotaGuardTests(unittest.TestCase):
         self.assertIsNotNone(guard.decide(self.event()))  # Error's resetsAt=1 is deliberately long elapsed.
 
     def test_reads_results_cancellation_and_worker_execution_do_not_read_quota_transcript(self):
-        tools = ("Read", "Glob", "Grep", "ToolSearch", "TaskOutput", "AskUserQuestion",
+        tools = ("Glob", "Grep", "ToolSearch", "TaskOutput", "AskUserQuestion",
                  "mcp__deepseek__deepseek_health", "mcp__deepseek__deepseek_status",
                  "mcp__deepseek__deepseek_result", "mcp__deepseek__deepseek_cancel")
         with mock.patch.object(guard, "_transcript_tail", side_effect=AssertionError("unexpected evidence read")):
             for tool in tools:
                 self.assertIsNone(guard.decide(self.event(tool, transcript_path="unsafe")))
+            # Root Read now has its own admission path and still never consults native
+            # quota evidence. An unsupported Read shape is refused before any transcript
+            # inspection, so this quota-transcript mock must not be reached at all.
+            read = guard.decide(self.event("Read", transcript_path="unsafe"))
+            self.assertIn("Read admission", read)
+            self.assertNotIn("quota", read)
             self.assertIsNone(guard.decide(self.event("Bash", transcript_path="unsafe",
                 agent_type="pr-sonnet", agent_id="native-child")))
             self.assertIn("one layer", guard.decide(self.event(agent_type="pr-opus", agent_id="native-child")))

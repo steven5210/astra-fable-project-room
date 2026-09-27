@@ -179,6 +179,30 @@ class _Reader:
         return value
 
 
+def _settlement_valid(record, release, request):
+    from ao_outcomes import native_compaction_failure, native_quota_failure
+    base = {'prior_state': 'uncertain', 'ao_state': 'failed', 'receipt_sha256': request['receipt_sha256']}
+    proof = release.get('native_failure_settlement')
+    if proof == base:
+        return native_quota_failure(record)
+    if (request.get('role') != 'engineer' or not isinstance(proof, dict)
+            or set(proof) != set(base) | {'kind', 'required_guard_sha256'}
+            or proof.get('kind') != 'compaction_thrashing'
+            or not isinstance(proof.get('required_guard_sha256'), str)
+            or _HEX.fullmatch(proof['required_guard_sha256']) is None
+            or any(proof.get(key) != value for key, value in base.items())):
+        return False
+    native = record.get('native') or {}
+    source = native.get('source')
+    if (not isinstance(source, dict) or set(source) != {'database', 'transcript', 'session_id', 'native_session_id'}
+            or any(not isinstance(value, str) or not value for value in source.values())
+            or source.get('session_id') != request.get('session_id')
+            or not isinstance(native.get('source_sha256'), str)
+            or _HEX.fullmatch(native['source_sha256']) is None):
+        return False
+    return native_compaction_failure(record)
+
+
 def _settlement(reader, request):
     """The existing settlement contract, read through the bounded owned reader."""
     from ao_outcomes import native_quota_failure
@@ -198,9 +222,8 @@ def _settlement(reader, request):
              and type(record.get("version")) is int and record["version"] == VERSION
              and record.get("room_id") == reader.root.name and record.get("request_id") == name
              and all(record.get(k) == request.get(k) for k in ("text_sha256", "turn_id", "provider_turn_id"))
-             and native_quota_failure(record) and record.get("receipt_sha256") == request["receipt_sha256"]
-             and release.get("native_failure_settlement") == {
-                 "prior_state": "uncertain", "ao_state": "failed", "receipt_sha256": request["receipt_sha256"]}
+             and _settlement_valid(record, release, request)
+             and record.get("receipt_sha256") == request["receipt_sha256"]
              and (request.get("observed_turn") or {}).get("state") == "failed")
 
 

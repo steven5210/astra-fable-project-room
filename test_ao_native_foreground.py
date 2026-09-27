@@ -77,8 +77,14 @@ class ForegroundTests(unittest.TestCase):
         with patch.dict(os.environ):
             os.environ.pop(FLAG, None)
             for tool in ('mcp__deepseek__deepseek_submit', 'mcp__deepseek__deepseek_ask',
-                         'mcp__deepseek__deepseek_result', 'mcp__deepseek__deepseek_status', 'Read', 'TaskOutput'):
+                         'mcp__deepseek__deepseek_result', 'mcp__deepseek__deepseek_status', 'TaskOutput'):
                 self.assertIsNone(guard.decide({'tool_name': tool, 'tool_input': {}}))
+            # Read has its own native-evidence admission tests. Isolate the
+            # foreground flag here: it must not precede a successful Read policy.
+            event = {'tool_name': 'Read', 'tool_input': {}}
+            with patch.object(guard, '_read_denial', return_value=None) as admission:
+                self.assertIsNone(guard.decide(event))
+                admission.assert_called_once_with(event, {})
             self.assertIsNone(guard.decide({'tool_name': 'Bash', 'tool_input': {},
                                            'agent_type': 'pr-sonnet', 'agent_id': 'synthetic-child'}))
             self.assertIn('Fable orchestrates', guard.decide({'tool_name': 'Bash', 'tool_input': {}}))

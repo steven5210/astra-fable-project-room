@@ -391,13 +391,22 @@ This lane does not establish quota availability, clear a provider safety refusal
 resume an uncertain failed transport or reset review budgets. An active delegate
 or native owner continues to block recovery. No model is called by reconciliation.
 
-An AO `failed` turn ordinarily remains uncertain. There is one narrow exception:
-a matched native API quota error, exact delivery evidence, an idle retained
-owner and actual continuation authorization can settle it as `settled_failure`.
+An AO `failed` turn ordinarily remains uncertain. There are two narrow settlement
+exceptions, each requiring its own exact positive evidence. The first is a
+matched native API quota error with exact delivery evidence, an idle retained
+owner and actual continuation authorization. The second is the separately
+documented exact autocompact-thrashing compaction diagnosis, which is not quota
+and is not a generic provider-error recovery: it requires the exact native
+public-error proof and a fresh positive diagnosis, and contradictory quota,
+safety or refusal evidence disqualifies it. The read-admission mitigation for
+that compaction lane binds only the exact settled diagnosis; it does not let a
+contradictory or ambiguous record bypass the fresh positive proof. See
+[compaction-failure recovery](compaction-failure-recovery.md).
 The original failed receipt, partial work, native identity and consumed attempts
-remain intact. That state is not successful engineering or acceptance. Unknown
-delivery, arbitrary crashes, unresolved paid delegates and generic transport
-failures cannot use this exception. Review budgets are never renewed here.
+remain intact in either case. Neither state is successful engineering or
+acceptance. Unknown delivery, arbitrary crashes, unresolved paid delegates and
+generic transport failures cannot use these exceptions. Review budgets are never
+renewed here.
 
 ## Affected AO bridge workaround
 

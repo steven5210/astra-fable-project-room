@@ -93,7 +93,11 @@ An operator can configure an existing retained session at an idle boundary:
 
 A pending, interrupted or uncertain request is outside this procedure: preserve
 the evidence and diagnose it through status/sync. This configuration change adds
-no audited replay or automatic crash-recovery operation.
+no audited replay or automatic crash-recovery operation. A failed
+autocompact-thrashing turn has its own separate, positively diagnosed recovery
+lane and its own read-admission guard binding; it is not this configuration
+procedure and it never retries automatically. See
+[compaction-failure recovery](compaction-failure-recovery.md).
 
 ## Verify without replaying work
 

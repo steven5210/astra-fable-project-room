@@ -287,7 +287,7 @@ def _history_digest(turns, messages):
     return ao.digest({"turns": sorted(turns, key=lambda t: t["id"]), "messages": sorted(messages, key=lambda m: m["id"])})
 
 
-def _native(state, binding, snapshot, directory=None):
+def _native(state, binding, snapshot, directory=None, allow_settled_failures=False):
     if snapshot.get("history_truncated") is not False:
         raise RoomError("Provider transition requires complete native history; truncated or unknown history refuses")
     if snapshot.get("controller") not in ("ready", STOPPED):
@@ -301,12 +301,27 @@ def _native(state, binding, snapshot, directory=None):
     if not isinstance(turns, list) or not isinstance(messages, list):
         raise RoomError("Provider transition requires explicit native turn and message arrays")
     from ao_outcomes import known_context_turns
-    imports = known_context_turns(directory, state, snapshot) if state.get('provider_transition') and directory else set()
+    # An ordinary refresh snapshot with no recovered context keeps the historical
+    # no-op behavior; only the committed transition or an actual recovered turn
+    # requires the proof that may load a saved outcome record.
+    if directory is not None and (state.get('provider_transition')
+                                  or (allow_settled_failures and any(isinstance(turn, dict) and turn.get('state') == 'recovered'
+                                                                     for turn in turns))):
+        imports = known_context_turns(directory, state, snapshot)
+    else:
+        imports = set()
     settled = {}
     if state.get('provider_transition') and directory is not None:
         from ao_outcomes import validate_settlement
         for request in state['requests'].values():
             if (request.get('state') == 'settled_failure' and request.get('provider_epoch') == EPOCH
+                    and request.get('session_id') == binding['session_id']):
+                validate_settlement(directory, request)
+                settled[request['turn_id']] = request
+    if allow_settled_failures and directory is not None:
+        from ao_outcomes import validate_settlement
+        for request in state['requests'].values():
+            if (request.get('state') == 'settled_failure'
                     and request.get('session_id') == binding['session_id']):
                 validate_settlement(directory, request)
                 settled[request['turn_id']] = request
