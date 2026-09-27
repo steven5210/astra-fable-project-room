@@ -70,11 +70,39 @@ conflicting duplicates refuse.
 
 * Unrelated native records (for example queue-operation rows without a `uuid`,
 system rows, summaries) are ignored; they are not treated as missing identity.
-* If the current call is absent, or the bounded window ends with a record that is
-still being flushed, the read is refused with a truthful retry reason - even when
-an earlier complete record already matched the call, because a later partial
-record can still change caller authority. The hook contract does not guarantee
-that the call was flushed, and the final native log is not live-flush validation.
+* If the current call is absent from a complete, verified transcript revision, the
+guard waits briefly in the same hook invocation for a late native flush: at most
+`READ_CORRELATION_ATTEMPTS` (8) checks over at most
+`READ_CORRELATION_WAIT_SECONDS` (2.0) wall-clock seconds, sleeping at most
+`READ_CORRELATION_SLEEP_SECONDS` (0.2) seconds between attempts. Only that exact
+transient outcome is retried; a partial tail, a conflicting duplicate, staleness,
+a replacement, a rewind and every state or ownership refusal are final.
+* The wait remembers the latest verified absent revision, not only the first: its
+device, inode, size and a bounded sha256 anchor over the bytes ending at that size
+(at most `READ_CONTINUITY_ANCHOR_BYTES` = 65536 bytes). A resumed attempt is
+accepted only when the same device and inode still carry at least that many bytes
+and that bounded previous-content evidence still matches on every attempt,
+including the successful attempt. A grow-then-rewind below the latest verified
+size, or a same-inode rewrite that changes the bounded anchor window, is refused
+before any ledger is created. This is bounded evidence over the latest verified
+revision, not whole-history integrity and not an append-only proof.
+* The wall-clock deadline is checked before each resumed attempt and before a
+positive identity is accepted after a wait. A filesystem or kernel stall cannot be
+forcibly preempted by Python's monotonic check alone; the guard observes the
+deadline after the fact and refuses instead of claiming the hook returned within
+it.
+* If the bounded wait expires, the guard refuses with a truthful reason that does
+not claim the record never existed and does not promise that every later repeat
+fails. The record may simply not have been flushed yet, or it may lie before the
+bounded 2 MiB inspected window (for example after a large earlier tool result).
+No identity and no budget are granted without that correlation, and no evidence is
+cleared or repaired. Do not re-issue the same call in a loop; stop and report the
+refusal together with the private admission state for operator review, and
+continue only in a later native assistant message when work continues.
+* Even when an earlier complete record already matched the call, a later partial
+record can still change caller authority, so an incomplete tail refuses. The hook
+contract does not guarantee that the call was flushed, and the final native log is
+not live-flush validation.
 * Correlation is revalidated under the reservation lock: a transcript that
 advanced to a later caller or assistant message, became incomplete, changed
 content or changed inode between the inspection and the reservation is refused
@@ -95,6 +123,31 @@ to recover it.
 * A rewritten, truncated or replaced transcript cannot open fresh clearance: the
 session continuity record binds the transcript device/inode, the last verified
 size and a fixed 64 KiB anchor digest ending at that size.
+
+## External SDK caller compatibility
+
+Quota inspection and stale-Read checks recognize the original plain-text root
+user record with an explicit human origin. They also recognize the observed
+external SDK CLI record without an origin field when all its identifying fields
+are present: promptSource and turnOrigin are sdk, userType is external,
+entrypoint is sdk-cli, and promptId is a valid UUID. Missing origin alone does
+not establish caller identity. Explicit-null, malformed or contradictory caller
+identity is refused; task notifications, compact summaries, internal messages,
+tool results, meta records and nested workers never establish a fresh caller.
+Known harness envelope prefixes are excluded. Unrecognized shapes are not
+authorization to infer a different caller dialect.
+
+When the quota hook supplies prompt_id, it must be a non-null UUID string and
+match the certified caller's promptId when that field exists. The legacy human
+record without promptId retains its historical, weaker caller evidence; a hook
+that omits prompt_id cannot establish that additional binding. Read admission
+continues to bind the exact assistant message and tool call, not prompt_id.
+A later certified SDK caller makes an older Read stale.
+
+These predicates cover the observed shapes, not every future CLI or SDK format.
+The standalone CLI and AO's retained SDK transport must each be verified against
+actual metadata after an upgrade. A model response or a successful CLI version
+check alone does not validate hook compatibility.
 
 ## Ranges and denials
 
@@ -216,6 +269,18 @@ that runs immediately before the tool: the target file (and the native
 transcript) can still change after the final check and before the read executes.
 That final after-admission race cannot be closed from a deny-only hook; it is
 documented, not denied.
+* The readiness wait is bounded foreground work inside one hook: it re-inspects the
+transcript and validates a bounded previous-content anchor over the latest
+verified absent revision. That anchor covers at most the 64 KiB ending at the
+latest verified size; a same-inode rewrite that preserves that window while
+changing older bytes is not detectable by the wait alone, and the durable
+continuity record and tool-identity bindings remain the later backstop. The wait
+does not establish whole-history integrity or append-only behavior.
+* The wall-clock wait deadline is enforced by `time.monotonic` checks before each
+resumed attempt and before accepting a positive identity after a wait. Python
+cannot preempt a filesystem or kernel stall, so a hook descheduled beyond the
+deadline observes and refuses after the fact rather than guaranteeing a hard
+return-time bound.
 * Whether a running native process actually loaded this copied guard, and whether
 the environment supplies the hook fields this admission requires, cannot be
 proven from the file itself. Live native hook availability stays unverified until
@@ -281,7 +346,10 @@ interrupted first reservation stopped instead of completed, changed-file reuse,
 failed and unsupported directory durability (first attempt and idempotent
 retry), interrupted first-time namespace creation, subprocess concurrency for
 both repeated and distinct calls, restart durability, copied-alone hook execution
-without granting or echoing content, and worker/other-tool routing unchanged.
+without granting or echoing content, worker/other-tool routing unchanged, bounded
+readiness wait cases (late append, latest-absent-revision rewind, same-inode
+previous-content rewrite, and wall-clock deadline enforcement), and explicit
+null/empty/malformed hook prompt_id refusal distinct from an omitted prompt_id.
 Live native hook compatibility remains unverified until a supported native turn
 exercises it. On the first supported live turn, before relying on admission:
 

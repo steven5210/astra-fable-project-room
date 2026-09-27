@@ -82,6 +82,12 @@ READ_SESSION_MAX_BYTES = 1_048_576
 READ_STATE_MAX_BINDINGS = 2048
 READ_CONTINUITY_ANCHOR_BYTES = 65_536
 READ_BINDING_VALUE = re.compile(r"[0-9a-f]{64}:[0-9a-f]{64}")
+# Bounded foreground readiness for the observed native flush race. The wait happens
+# inside one hook invocation only: no background polling, no provider or usage probe,
+# no second model call, and nothing is written before a positive identity.
+READ_CORRELATION_ATTEMPTS = 8
+READ_CORRELATION_WAIT_SECONDS = 2.0
+READ_CORRELATION_SLEEP_SECONDS = 0.2
 # Read is selected by target file, so known auto-detected container forms are
 # refused by suffix and by leading bytes instead of being charged as text.
 READ_CONTAINER_SUFFIXES = (".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif",
@@ -92,6 +98,17 @@ READ_CONTAINER_MAGIC = ((b"%PDF-", "PDF document"), (b"\x89PNG\r\n\x1a\n", "PNG 
                         (b"GIF89a", "GIF image"), (b"II*\x00", "TIFF image"),
                         (b"MM\x00*", "TIFF image"), (b"PK\x03\x04", "ZIP or office container"),
                         (b"\x1f\x8b", "gzip archive"))
+# Positively identified external SDK caller dialect (Claude Code 2.1.282). A missing
+# origin alone is never human evidence: the dialect is certified only by its complete
+# identity, and the older origin.kind=human shape stays deliberately supported. See
+# docs/read-admission.md for the limits that remain in both dialects.
+SDK_CALLER_PROMPT_SOURCE = "sdk"
+SDK_CALLER_TURN_ORIGIN = "sdk"
+SDK_CALLER_USER_TYPE = "external"
+SDK_CALLER_ENTRYPOINT = "sdk-cli"
+SDK_CALLER_IDENTITY_KEYS = ("turnOrigin", "promptId")
+SDK_CALLER_ENVELOPE_PREFIXES = ("<task-notification", "<system-reminder", "<local-command",
+                                "<command-name", "<command-message")
 QUOTA_HOOK_FIELDS = ("session_id", "transcript_path", "cwd")
 NEW_WORK_TOOLS = frozenset({"Agent", "mcp__deepseek__deepseek_submit", "mcp__deepseek__deepseek_ask"})
 # Native model-specific windows (for example seven_day_opus) are deliberately
@@ -157,8 +174,10 @@ def _open_owned_transcript_leaf(path):
 def _transcript_window(path, limit):
     """Read an owned regular file without following any path component symlink.
 
-    Returns the bounded tail together with the file's device, inode and size so a
-    caller can bind a decision to the exact transcript revision it inspected.
+    Returns the bounded tail together with the file's device, inode, size and a
+    bounded anchor digest over the bytes ending at that size, so a caller can bind a
+    decision to the exact transcript revision it inspected. The anchor is a fixed
+    bounded window, not an append-only proof for the whole history.
     """
     leaf, before = _open_owned_transcript_leaf(path)
     try:
@@ -169,20 +188,23 @@ def _transcript_window(path, limit):
         after = os.fstat(leaf)
         if len(raw) != before.st_size - offset or _file_identity(before) != _file_identity(after):
             raise ValueError("native quota transcript changed during inspection")
+        anchor_length = min(len(raw), READ_CONTINUITY_ANCHOR_BYTES)
+        anchor = (hashlib.sha256(raw[-anchor_length:]).hexdigest() if anchor_length
+                  else hashlib.sha256(b"").hexdigest())
         if start:
             preceding, raw = raw[:1], raw[1:]
             if preceding != b"\n":
                 _, separator, raw = raw.partition(b"\n")
                 if not separator:
                     raw = b""
-        return raw, before.st_dev, before.st_ino, before.st_size
+        return raw, before.st_dev, before.st_ino, before.st_size, anchor
     finally:
         os.close(leaf)
 
 
 def _transcript_tail(path):
     """Native quota evidence tail over the same bounded owned-file inspection."""
-    raw, _, _, _ = _transcript_window(path, MAX_TRANSCRIPT_BYTES)
+    raw, _, _, _, _ = _transcript_window(path, MAX_TRANSCRIPT_BYTES)
     return raw
 
 
@@ -232,6 +254,150 @@ def _human_caller(row):
             and message.get("role") == "user" and _text_content(message) is not None)
 
 
+class _CallerIdentityError(ValueError):
+    """A caller-shaped record claims an identity that cannot be certified.
+
+    Such a record is refused instead of being skipped: skipping it could resolve the
+    current turn to an older caller and falsely clear a stale or stopped turn.
+    """
+
+
+def _prompt_uuid(value):
+    """Canonical UUID form of one promptId, or _CallerIdentityError when unusable."""
+    if not isinstance(value, str) or not value:
+        raise _CallerIdentityError(
+            "a caller record presents external SDK caller identity keys but carries no usable "
+            "promptId UUID; caller identity is refused rather than inferred from an older record")
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise _CallerIdentityError(
+            "a caller record presents external SDK caller identity keys but its promptId is not a "
+            "UUID; caller identity is refused rather than inferred from an older record")
+
+
+def _hook_prompt_id(event):
+    """The hook's canonical prompt_id, or None when the event omits the field.
+
+    A missing optional prompt_id stays supported for older hook events: it is the
+    documented case where no caller prompt binding can be enforced. A prompt_id that
+    is present but null, empty, non-text or not a UUID is refused distinctly, because
+    the hook presents a field that cannot be certified; no caller is inferred from an
+    older record and an explicit null is never treated as an omitted field.
+    """
+    if "prompt_id" not in event:
+        return None
+    value = event["prompt_id"]
+    if value is None:
+        raise ValueError("native hook prompt_id is present but null, so no current caller can be bound")
+    if not isinstance(value, str):
+        raise ValueError("native hook prompt_id is present but not text, so no current caller can be bound")
+    if not value:
+        raise ValueError("native hook prompt_id is present but empty, so no current caller can be bound")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValueError("native hook prompt_id is not a UUID, so no current caller can be bound")
+
+
+def _caller_envelope(text):
+    """True for harness-generated envelopes that are never a fresh human caller."""
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in SDK_CALLER_ENVELOPE_PREFIXES)
+
+
+def _prompt_mismatch_error():
+    return ("the root caller record's promptId does not match the prompt_id of the current hook "
+            "event, so the current caller cannot be bound and no older record may clear this turn")
+
+
+def _certify_sdk_caller(row, prompt_id):
+    """Certify the complete external SDK caller dialect; refuse anything incomplete."""
+    missing = [name for name, expected in (("promptSource", SDK_CALLER_PROMPT_SOURCE),
+                                           ("userType", SDK_CALLER_USER_TYPE),
+                                           ("entrypoint", SDK_CALLER_ENTRYPOINT))
+               if row.get(name) != expected]
+    if missing:
+        raise _CallerIdentityError(
+            "a root user record presents external SDK caller identity keys but not the complete "
+            "dialect (" + ", ".join(missing) + " missing or different); caller identity is refused "
+            "rather than inferred from an older record")
+    canonical = _prompt_uuid(row.get("promptId"))
+    if prompt_id is not None and canonical != prompt_id:
+        raise _CallerIdentityError(_prompt_mismatch_error())
+    return canonical
+
+
+def _caller_kind(row, prompt_id=None):
+    """Classify one root-session record as 'human', 'sdk' or None when it is not a caller.
+
+    'human' is the older origin.kind=human dialect and stays deliberately supported.
+    'sdk' is the positively identified external SDK caller dialect observed on Claude
+    Code 2.1.282: plain text content, no origin field, promptSource=sdk,
+    turnOrigin=sdk, userType=external, entrypoint=sdk-cli and a promptId UUID.
+    ``prompt_id`` is the hook's own prompt_id when it supplied one; it is then
+    enforced against the record's promptId.
+
+    A missing origin is never human evidence. Records that are positively not fresh
+    callers (compaction summaries, meta or visible-only records, tool results, nested
+    workers and harness envelopes) are never callers, and an explicit nonhuman origin
+    is never overridden. A plain-text user record that presents the new dialect's
+    identity keys but cannot be certified raises _CallerIdentityError instead of being
+    skipped, so a scan can never fall through to an older caller.
+    """
+    if row.get("type") != "user":
+        return None
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    origin = row.get("origin")
+    if origin is not None and not isinstance(origin, dict):
+        raise _CallerIdentityError(
+            "a root user record carries a malformed origin field; caller identity is refused "
+            "rather than inferred from an older record")
+    text = _text_content(message)
+    if (text is None or row.get("isCompactSummary") or row.get("isMeta")
+            or row.get("isVisibleInTranscriptOnly") or "toolUseResult" in row
+            or row.get("isSidechain") not in (None, False) or row.get("agentId") is not None
+            or row.get("agent_id") is not None or _caller_envelope(text)):
+        # A tool result, summary, meta or visible-only record, nested worker record or
+        # harness envelope is positively not a fresh caller; caller-looking fields on
+        # such a record never override that.
+        return None
+    if isinstance(origin, dict) and origin.get("kind") != "human":
+        if any(row.get(name) is not None for name in SDK_CALLER_IDENTITY_KEYS):
+            raise _CallerIdentityError(
+                "a root user record combines an explicit nonhuman origin with external SDK caller "
+                "identity keys; the identity is contradictory and is refused rather than inferred "
+                "from an older record")
+        # An explicit nonhuman origin is never overridden.
+        return None
+    if "origin" in row and origin is None:
+        raise _CallerIdentityError(
+            "a root user record carries an explicit null origin field; the supported caller dialects "
+            "use either origin.kind=human or no origin field, so this unobserved shape is refused "
+            "rather than inferred from an older record")
+    turn_origin = row.get("turnOrigin")
+    if _human_caller(row):
+        if turn_origin not in (None, SDK_CALLER_TURN_ORIGIN):
+            raise _CallerIdentityError(
+                "a caller record combines an origin.kind=human identity with a different turnOrigin; "
+                "the identity is contradictory and is refused rather than inferred from an older "
+                "record")
+        if prompt_id is not None and row.get("promptId") is not None:
+            if _prompt_uuid(row.get("promptId")) != prompt_id:
+                raise _CallerIdentityError(_prompt_mismatch_error())
+        return "human"
+    if not any(row.get(name) is not None for name in SDK_CALLER_IDENTITY_KEYS):
+        return None
+    if turn_origin != SDK_CALLER_TURN_ORIGIN:
+        raise _CallerIdentityError(
+            "a root user record presents caller identity keys without the external SDK caller "
+            "turnOrigin; the identity is refused rather than inferred from an older record")
+    _certify_sdk_caller(row, prompt_id)
+    return "sdk"
+
+
 def _account_quota_error(row):
     """Account evidence in a typed API failure; cwd/model identity is checked separately."""
     message = row.get("message")
@@ -265,6 +431,7 @@ def inspect_quota(event):
     if _absolute_parts(path)[-1] != session_id + ".jsonl":
         raise ValueError("native quota transcript does not match the exact root session")
     _absolute_parts(cwd)
+    prompt_id = _hook_prompt_id(event)
     raw = _transcript_tail(path)
     if not raw.endswith(b"\n"):
         raise ValueError("native quota transcript has no complete current caller window")
@@ -279,7 +446,13 @@ def inspect_quota(event):
             raise ValueError("native quota transcript record is malformed")
         if not _root_session_record(row, session_id):
             continue
-        if row.get("cwd") == cwd and _human_caller(row):
+        try:
+            caller = _caller_kind(row, prompt_id)
+        except _CallerIdentityError as exc:
+            # A caller-shaped record that cannot be certified refuses the turn; it is
+            # never skipped in favour of an older caller record.
+            raise ValueError(str(exc))
+        if caller is not None and row.get("cwd") == cwd:
             if not isinstance(row.get("uuid"), str) or not row["uuid"]:
                 raise ValueError("native quota caller lacks its identity")
             return {"status": "quota_in_current_turn" if errors else "clear_current_turn",
@@ -306,6 +479,26 @@ def _quota_denial(event):
 
 class _ReadRefused(Exception):
     """A deliberate read-admission refusal that carries a model-visible reason."""
+
+
+class _ReadCallAbsent(_ReadRefused):
+    """The one transient Read outcome: the requesting record is not yet present.
+
+    It carries the verified transcript revision in which the record was absent,
+    including a bounded anchor digest over the bytes ending at that revision size when
+    the guard observed it. The bounded readiness wait uses that evidence to refuse a
+    replacement or a same-inode rewrite instead of treating either as a late append;
+    a synthetic or mocked absent without an anchor carries None and cannot establish
+    that content evidence. A partial tail, a conflict, staleness, a replacement, a
+    rewind and every state or ownership refusal are final and are never retried.
+    """
+
+    def __init__(self, reason, device, inode, size, anchor_sha256=None):
+        super().__init__(reason)
+        self.transcript_device = device
+        self.transcript_inode = inode
+        self.transcript_size = size
+        self.transcript_anchor_sha256 = anchor_sha256
 
 
 def _read_path_parts(value, what):
@@ -393,8 +586,20 @@ def _lock_state(directory):
     if fcntl is None:
         raise _ReadRefused("this platform cannot provide the private admission lock, so no durable "
                            "reservation can be recorded")
-    fd = os.open(READ_LOCK_NAME, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                 0o600, dir_fd=directory)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(READ_LOCK_NAME, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+    except FileExistsError:
+        # A single O_CREAT|O_NOFOLLOW open can report ENOENT on macOS while another process
+        # creates the same name, so creation is atomic and the loser of that race opens the
+        # already-existing lock without O_CREAT (and therefore without the racy lookup).
+        try:
+            fd = os.open(READ_LOCK_NAME, flags, dir_fd=directory)
+        except FileNotFoundError:
+            # The name existed a moment ago and this guard never removes it: refuse explicitly
+            # rather than retrying over an absent or replaced lock.
+            raise _ReadRefused("the private read-admission lock disappeared while it was being "
+                               "acquired, so no durable reservation can be recorded")
     try:
         metadata = os.fstat(fd)
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
@@ -495,15 +700,49 @@ def _scan_reason(ahead):
 
 
 def _absent_reason():
+    """Inner text for the one transient outcome; the bounded wait replaces it.
+
+    It is never shown by itself: the readiness wrapper either admits the call after a
+    late append or raises the accurate expiry reason below.
+    """
+    return ("the requesting root-session assistant record was absent from the verified native "
+            "transcript revision at this bounded check")
+
+
+def _readiness_expired_reason(checks, seconds):
     return ("the current Read call could not be positively correlated to a root-session assistant "
-            "record inside the bounded native transcript window. The hook contract does not "
-            "guarantee that the current assistant message is already flushed, and a requesting row "
-            "that predates the bounded window (for example after a large earlier tool result) "
-            "cannot be recovered from that window either. Retry this same bounded read; if it stays "
-            "absent, continue remaining work in a later native assistant message in the same native "
-            "session, which has its own legitimate per-message budget, and report the call. No "
-            "identity or budget is granted without that correlation; do not clear state or bypass "
-            "admission")
+            "record in " + str(checks) + " bounded checks over at most " + str(seconds) + " seconds "
+            "inside this single hook invocation. The hook contract does not guarantee that the "
+            "requesting assistant record is already flushed when the hook runs, so the guard waits "
+            "briefly for a late append; the record did not appear in this bounded window and wait. "
+            "Either the record was not yet written in this native session transcript, or it lies "
+            "before the bounded 2 MiB inspected window (for example after a large earlier tool "
+            "result). No identity and no budget are granted without that correlation, and no evidence "
+            "is cleared or repaired. A later attempt may still fail for the same reason or may see a "
+            "flushed record, so do not re-issue this call in a loop; stop and report this refusal "
+            "together with the private admission state for operator review. Continue only in a later "
+            "native assistant message when work continues")
+
+
+def _waited_revision_reason(detail):
+    return ("the native transcript " + detail + " while the guard was waiting for the requesting "
+            "assistant record inside this hook, so this Read call is refused rather than correlated "
+            "from a changed transcript revision. Treat this as a diagnosed state stop: report the "
+            "native transcript and the private admission state for operator review, and keep the "
+            "current native session and its evidence in place instead of replacing or clearing it")
+
+
+def _require_waited_anchor(transcript_path, latest):
+    """Confirm the bounded previous-content evidence for the latest absent revision."""
+    try:
+        current = _transcript_anchor_digest(transcript_path, latest[0], latest[1], latest[2],
+                                            READ_CONTINUITY_ANCHOR_BYTES)
+    except ValueError:
+        raise _ReadRefused(_waited_revision_reason(
+            "changed before its bounded previous-content evidence could be verified"))
+    if current != latest[3]:
+        raise _ReadRefused(_waited_revision_reason(
+            "no longer matches its bounded previous-content evidence"))
 
 
 def _partial_tail_reason():
@@ -515,8 +754,9 @@ def _partial_tail_reason():
 
 def _changed_reason():
     return ("the native transcript changed between the guard's inspection and the reservation "
-            "transaction, so this Read call cannot inherit the inspected clearance. Retry this "
-            "same bounded read against the current native transcript")
+            "transaction, so this Read call cannot inherit the inspected clearance. Re-issuing the "
+            "same read against an advanced transcript is refused as stale, so continue in the latest "
+            "native assistant message rather than repeating this call in a loop")
 
 
 def _rewind_reason():
@@ -992,14 +1232,24 @@ def _measure_read(path, offset, limit):
 
 
 def _root_human_row(row, session_id, cwd):
-    return (row.get("sessionId") == session_id and row.get("cwd") == cwd
-            and row.get("isSidechain") in (None, False) and row.get("agentId") is None
-            and row.get("agent_id") is None and _human_caller(row))
+    """A certified root-session caller of either supported dialect, or None.
+
+    Both the older origin.kind=human dialect and the positively identified external
+    SDK caller dialect count here, so a later external SDK caller makes an older Read
+    stale exactly like a later origin.kind=human caller. Raises _CallerIdentityError
+    for a caller-shaped record whose identity is contradictory; the Read path refuses
+    that instead of skipping past it.
+    """
+    if (row.get("sessionId") != session_id or row.get("cwd") != cwd
+            or row.get("isSidechain") not in (None, False) or row.get("agentId") is not None
+            or row.get("agent_id") is not None):
+        return None
+    return _caller_kind(row)
 
 
 def _read_message_identity(transcript_path, session_id, cwd, tool_use_id, params):
     """Return (message_id, transcript_device, transcript_inode) for this exact call."""
-    raw, device, inode, size = _transcript_window(transcript_path, READ_TRANSCRIPT_WINDOW_BYTES)
+    raw, device, inode, size, anchor = _transcript_window(transcript_path, READ_TRANSCRIPT_WINDOW_BYTES)
     lines = raw.split(b"\n")
     if lines and lines[-1] != b"":
         # A later partial record may change caller authority or reveal a newer
@@ -1029,8 +1279,16 @@ def _read_message_identity(transcript_path, session_id, cwd, tool_use_id, params
                 and row.get("isSidechain") in (None, False)
                 and row.get("agentId") is None and row.get("agent_id") is None
                 and row.get("cwd") == cwd):
-            if matched and _root_human_row(row, session_id, cwd):
-                stale = True
+            if matched:
+                try:
+                    later_caller = _root_human_row(row, session_id, cwd)
+                except _CallerIdentityError as exc:
+                    # A later caller-shaped record whose identity is contradictory is
+                    # refused here rather than skipped, because skipping it could admit
+                    # a read from an older turn.
+                    raise _ReadRefused(str(exc))
+                if later_caller is not None:
+                    stale = True
             continue
         identity = row.get("uuid")
         if isinstance(identity, str) and identity:
@@ -1078,10 +1336,78 @@ def _read_message_identity(transcript_path, session_id, cwd, tool_use_id, params
         if matched and row_message_id != message_id:
             stale = True
     if not matched:
-        raise _ReadRefused(_absent_reason())
+        raise _ReadCallAbsent(_absent_reason(), device, inode, size, anchor)
     if stale:
         raise _ReadRefused(_stale_reason())
     return message_id, device, inode, size
+
+
+def _read_message_identity_with_readiness(transcript_path, session_id, cwd, tool_use_id, params):
+    """Bounded foreground wait for a late native flush, then fail closed.
+
+    Only the specific transient outcome - the requesting root assistant record is not
+    present in a complete, verified transcript revision - is retried. Every other
+    outcome (a partial tail, a conflicting duplicate, staleness, a replacement, a
+    rewind, malformed or missing state, an ownership failure) is final and is returned
+    immediately without waiting. Every attempt re-inspects the owned transcript from
+    scratch, so ownership, the exact tool id/name/arguments, the transcript identity,
+    its size and the completeness of its tail are all revalidated on the revision that
+    is finally accepted; the reservation transaction then revalidates everything again
+    under the lock. Nothing is written before a positive identity.
+
+    The wait remembers the latest verified absent revision, not only the first: its
+    device, inode, size and the bounded anchor digest of the bytes ending at that size
+    are carried forward. A later attempt is accepted only when the same device and
+    inode still carry at least that many bytes and the bounded previous-content
+    evidence still matches, so a grow-then-rewind or a same-inode rewrite that only
+    increases the apparent size is refused before any ledger is created. This is
+    bounded evidence over the latest verified revision, not whole-history integrity.
+    """
+    deadline = time.monotonic() + READ_CORRELATION_WAIT_SECONDS
+    latest = None
+    checks = 0
+    while True:
+        # Re-check the wall-clock wait deadline before a resumed attempt, so a sleep
+        # or slow filesystem observation that returns after the deadline cannot be
+        # admitted by the next positive read. The check is necessarily after the
+        # fact: Python's monotonic clock cannot preempt a kernel or filesystem stall.
+        if checks and time.monotonic() >= deadline:
+            raise _ReadRefused(_readiness_expired_reason(checks, READ_CORRELATION_WAIT_SECONDS))
+        checks += 1
+        try:
+            identity = _read_message_identity(transcript_path, session_id, cwd, tool_use_id, params)
+        except _ReadCallAbsent as exc:
+            revision = (exc.transcript_device, exc.transcript_inode, exc.transcript_size)
+            anchor = exc.transcript_anchor_sha256
+            if latest is None:
+                latest = (revision[0], revision[1], revision[2], anchor)
+            else:
+                if revision[:2] != latest[:2]:
+                    raise _ReadRefused(_waited_revision_reason(
+                        "was replaced: its device or inode identity changed"))
+                if revision[2] < latest[2]:
+                    raise _ReadRefused(_waited_revision_reason(
+                        "was truncated or rewritten below the revision already inspected"))
+                if latest[3] is not None:
+                    _require_waited_anchor(transcript_path, latest)
+                latest = (revision[0], revision[1], revision[2], anchor)
+            if checks >= READ_CORRELATION_ATTEMPTS or time.monotonic() >= deadline:
+                raise _ReadRefused(_readiness_expired_reason(checks, READ_CORRELATION_WAIT_SECONDS))
+            time.sleep(max(0.0, min(READ_CORRELATION_SLEEP_SECONDS, deadline - time.monotonic())))
+        else:
+            if latest is not None:
+                if identity[1:3] != latest[:2]:
+                    raise _ReadRefused(_waited_revision_reason(
+                        "was replaced: its device or inode identity changed"))
+                if identity[3] < latest[2]:
+                    raise _ReadRefused(_waited_revision_reason(
+                        "was truncated or rewritten below the revision already inspected"))
+                if latest[3] is not None:
+                    _require_waited_anchor(transcript_path, latest)
+                if time.monotonic() >= deadline:
+                    raise _ReadRefused(_readiness_expired_reason(
+                        checks, READ_CORRELATION_WAIT_SECONDS))
+            return identity
 
 
 def _reserve_read(transcript_path, session_id, cwd, tool_use_id, params, message_id, transcript_device,
@@ -1102,7 +1428,15 @@ def _reserve_read(transcript_path, session_id, cwd, tool_use_id, params, message
     try:
         lock_fd = _lock_state(session_fd)
         try:
-            rechecked = _read_message_identity(transcript_path, session_id, cwd, tool_use_id, params)
+            try:
+                rechecked = _read_message_identity(transcript_path, session_id, cwd, tool_use_id,
+                                                   params)
+            except _ReadCallAbsent:
+                # The positive correlation was established outside the lock moments
+                # earlier; its disappearance here means the transcript changed under the
+                # reservation transaction. The readiness wait is deliberately not used
+                # under the lock.
+                raise _ReadRefused(_changed_reason())
             if rechecked[:3] != (message_id, transcript_device, transcript_inode):
                 raise _ReadRefused(_changed_reason())
             rechecked_size = rechecked[3]
@@ -1298,8 +1632,8 @@ def _read_denial(event, params):
         if len(tool_use_id) > 256 or any(ord(character) < 33 for character in tool_use_id):
             raise _ReadRefused("the native tool_use_id is malformed or overlong")
         path = _read_target_path(file_path, cwd)
-        message_id, device, inode, _ = _read_message_identity(transcript_path, session_id, cwd,
-                                                              tool_use_id, params)
+        message_id, device, inode, _ = _read_message_identity_with_readiness(
+            transcript_path, session_id, cwd, tool_use_id, params)
         estimate = _measure_read(path, offset, limit)
         return _reserve_read(transcript_path, session_id, cwd, tool_use_id, params, message_id, device,
                              inode, estimate)
