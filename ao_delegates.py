@@ -329,13 +329,14 @@ def verify_delegation(home, directory, state, report):
     a digest-verified completed answer, a user-resolved failure (never a result) or a non-result. Anything else
     refuses. Runs at engineering capture and readiness, never inside the pure report parser."""
     ids = report_job_ids(report)
-    if state["delegate"]["provider"] != "deepseek":
-        if ids:
-            raise RoomError("Engineering report names delegate jobs, but this room has no delegate provider")
-        return []
     if not ids:
         return []
     import deepseek_adapter
+    if state["delegate"]["provider"] != "deepseek":
+        rejected = [job_id for job_id in ids if not deepseek_adapter.JOB_ID.fullmatch(job_id)]
+        if len(rejected) == len(ids):
+            raise MalformedDelegateAttributionError(rejected, [])
+        raise RoomError("Engineering report names delegate jobs, but this room has no delegate provider")
     home = Path(home)
     if not (home / "deepseek" / "ledger.sqlite3").exists():
         raise RoomError("Delegate ledger is missing after recorded delegation; the reported delegate jobs cannot be verified "

@@ -246,6 +246,10 @@ def validate_report_correction(home, directory, state, request):
     seen = set()
     while True:
         identity = request.get("request_id")
+        if not isinstance(identity, str) or not identity.strip():
+            raise RoomError("Invalid report-only correction evidence")
+        if state["requests"].get(identity) is not request:
+            raise RoomError("Invalid report-only correction evidence")
         if identity in seen:
             raise RoomError("Cyclic report-only correction evidence")
         seen.add(identity)
