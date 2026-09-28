@@ -128,7 +128,8 @@ transcript, source recheck and interval proofs as the Read audit, but has no evi
 root and does not classify `Read` calls. It runs before mutable Service construction;
 it does not create a home or lock, repair state, sync a session, start a model or
 monitor, use the network, or write the AO or delegate database. The DeepSeek ledger,
-when applicable, is opened with SQLite `mode=ro`.
+when applicable, is opened with SQLite `mode=ro`; symlinked and non-regular ledger
+paths are refused as unsafe.
 
 The version-1 closed report separates parent `primary` counters, proven native child
 `workers`, and `api_delegates`. Native assistant responses are grouped by bounded
@@ -137,8 +138,12 @@ conflicting or cross-actor IDs are excluded. Child usage is counted only inside 
 same proven synchronous intervals as the Read audit; missing, background or
 ambiguous children leave worker totals null. Parent tool-result usage summaries are
 never included as worker counters. A proved request with no children has known-zero
-worker counters. Configured model identity comes from the saved request or prepared
-agent routing and remains distinct from attested transcript models.
+worker counters. `workers_by_attested_model` sums each child response under that
+response's attested model, including children that use multiple models. A public
+`configured_agent` is emitted only when the transcript's `subagent_type` is a key
+in prepared agent routing; other transcript strings are not echoed. Configured model
+identity comes from the saved request or prepared agent routing and remains distinct
+from attested transcript models.
 
 Input/output counters require valid nonnegative token counts. Cache split counters
 remain null if any counted response has an unknown split; `cache_coverage` reports
@@ -158,6 +163,9 @@ bounded time correlation for API delegates. Exit status is 0 for complete covera
 1 for incomplete/unavailable coverage, and 2 for invalid arguments or a diagnostic
 error with a fixed JSON code. Ordinary `ao_room_status` remains unchanged; native
 worker usage there is still explicitly unavailable rather than inferred.
+Binding refusals have unavailable native-total coverage, no parent attribution and
+`api_delegates.reason: not_evaluated`; only the refusal reason is reported. Delegate
+ledger absence, unreadability and unsafe file types remain distinct outcomes.
 
 ## Resource and stability limits
 

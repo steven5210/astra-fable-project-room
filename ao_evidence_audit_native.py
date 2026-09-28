@@ -746,6 +746,9 @@ class RecordScanner:
         if not bounded_text(message_id) or not bounded_text(model):
             self.usage_reasons.add((number, timestamp, "usage_unattributable"))
             return
+        if model != "<synthetic>" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}", model) is None:
+            self.usage_reasons.add((number, timestamp, "usage_unattributable"))
+            return
         if model == "<synthetic>":
             self.usage_observations.append((number, timestamp, message_id, model, None))
             return

@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 
 import ao_evidence_audit as evidence
 import ao_evidence_audit_native as native
@@ -42,7 +44,7 @@ def _actor_unavailable(configured_model, reasons):
 def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     reasons = set(reasons)
     if interval is None or scan is None:
-        return _actor_unavailable(configured_model, reasons)
+        return _actor_unavailable(configured_model, reasons), None
     reasons.update(scan.notes & (native.SOURCE_DIMENSION | native.INTERVAL_DIMENSION))
     observations = [item for item in scan.usage_observations if interval.contains(item[0], item[1])]
     reasons.update(reason for number, timestamp, reason in scan.usage_reasons
@@ -57,6 +59,7 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     repeated = 0
     synthetic = 0
     attested_models = set()
+    counters_by_model = {}
     for message_id, entries in groups.items():
         if message_id in excluded_ids:
             reasons.add("usage_conflict")
@@ -85,6 +88,7 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
                     "cache_creation_input_tokens": entries[0][4][2],
                     "cache_read_input_tokens": entries[0][4][3]}
         counters = _add_counters(counters, response)
+        counters_by_model[model] = _add_counters(counters_by_model.get(model, _empty_counters(0)), response)
         if response["cache_creation_input_tokens"] is None or response["cache_read_input_tokens"] is None:
             reasons.add("cache_split_unavailable")
     if configured_model is None:
@@ -92,10 +96,10 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     token_reasons = reasons - NON_INCOMPLETE_REASONS
     coverage = "complete" if not token_reasons else "incomplete"
     cache_coverage = "incomplete" if "cache_split_unavailable" in reasons else "complete"
-    return {"coverage": coverage, "cache_coverage": cache_coverage, "configured_model": configured_model,
-            "attested_models": sorted(attested_models), "responses": responses,
-            "repeated_response_records": repeated, "synthetic_responses": synthetic,
-            "counters": counters, "reasons": sorted(reasons)}
+    return ({"coverage": coverage, "cache_coverage": cache_coverage, "configured_model": configured_model,
+             "attested_models": sorted(attested_models), "responses": responses,
+             "repeated_response_records": repeated, "synthetic_responses": synthetic,
+             "counters": counters, "reasons": sorted(reasons)}, counters_by_model)
 
 
 def _job_usage(value):
@@ -117,8 +121,14 @@ def _api_delegates(home, state, request, receipt, room):
     if not isinstance(delegate, dict) or delegate.get("provider") != "deepseek":
         return {"coverage": "not_applicable"}
     path = Path(home) / "deepseek" / "ledger.sqlite3"
-    if not path.exists():
+    try:
+        ledger_stat = os.lstat(path)
+    except FileNotFoundError:
         return {"coverage": "unavailable", "reason": "delegate_ledger_absent"}
+    except (OSError, ValueError):
+        return {"coverage": "unavailable", "reason": "delegate_ledger_unreadable"}
+    if not stat.S_ISREG(ledger_stat.st_mode):
+        return {"coverage": "unavailable", "reason": "delegate_ledger_unsafe"}
     jobs = []
     reasons = set()
     try:
@@ -177,18 +187,28 @@ def _configured_model(prepared, configured_agent):
     return value if native.bounded_text(value) else None
 
 
+def _configured_agent(prepared, subagent_type):
+    routing = prepared.get("routing")
+    agents = routing.get("agents") if isinstance(routing, dict) else None
+    if isinstance(subagent_type, str) and isinstance(agents, dict) and subagent_type in agents:
+        return subagent_type
+    return None
+
+
 def _actor_inputs(gathered, request, prepared):
     actors = []
     parent_scan = gathered["parent_scan"]
     actors.append({"actor_sha256": gathered["parent_actor"],
                    "scan": parent_scan, "interval": gathered["interval"],
-                   "configured_model": request.get("model"), "entry": None, "usage": None})
+                   "configured_model": request.get("model"), "configured_agent": None,
+                   "entry": None, "usage": None, "counters_by_model": None})
     for entry in gathered["admitted"]:
-        configured_agent = entry.get("configured_agent")
+        configured_agent = _configured_agent(prepared, entry.get("configured_agent"))
         actors.append({"actor_sha256": entry["actor_sha256"], "scan": entry["scan"],
                        "interval": entry["interval"] if not entry["ambiguous"] else None,
                        "configured_model": _configured_model(prepared, configured_agent),
-                       "entry": entry, "usage": None})
+                       "configured_agent": configured_agent, "entry": entry,
+                       "usage": None, "counters_by_model": None})
     return actors
 
 
@@ -211,7 +231,8 @@ def _group_actors(actors):
         if scan is not None and interval is not None and conflicts:
             actor_conflicts = {item[2] for item in scan.usage_observations
                                if item[2] in conflicts and interval.contains(item[0], item[1])}
-        actor["usage"] = _actor(scan, interval, actor["configured_model"], reasons, actor_conflicts)
+        actor["usage"], actor["counters_by_model"] = _actor(
+            scan, interval, actor["configured_model"], reasons, actor_conflicts)
     return actors
 
 
@@ -226,7 +247,7 @@ def _child_coverage(actors, gathered):
     return "complete"
 
 
-def _native_totals(parent, children, child_coverage, reasons):
+def _native_totals(parent, children, child_coverage, child_counters_by_model):
     primary = parent["counters"] if parent["coverage"] == "complete" else None
     if not children and child_coverage == "complete":
         workers = _empty_counters(0)
@@ -236,15 +257,11 @@ def _native_totals(parent, children, child_coverage, reasons):
     else:
         workers = None
     by_model = None
-    if all(child["usage"] is not None and len(child["usage"]["attested_models"]) == 1 for child in children):
-        if workers is not None:
-            by_model = {}
-            for child in children:
-                model = child["usage"]["attested_models"][0]
-                by_model[model] = _add_counters(by_model.get(model, _empty_counters(0)),
-                                                child["usage"]["counters"])
-    elif children:
-        reasons.add("worker_model_mixed")
+    if workers is not None:
+        by_model = {}
+        for counters_by_model in child_counters_by_model:
+            for model, counters in counters_by_model.items():
+                by_model[model] = _add_counters(by_model.get(model, _empty_counters(0)), counters)
     combined = _add_counters(primary, workers) if primary is not None and workers is not None else None
     return {"coverage": "complete" if combined is not None else "incomplete", "primary": primary,
             "workers": workers, "workers_by_attested_model": by_model, "combined": combined}
@@ -281,10 +298,11 @@ def _work_unit(request):
 def _report(binding, gathered, parent, child_actors, child_coverage, api_delegates, reasons):
     reasons = set(reasons)
     children = [{"actor_sha256": actor["actor_sha256"],
-                 "configured_agent": actor["entry"].get("configured_agent"),
+                 "configured_agent": actor["configured_agent"],
                  "usage": actor["usage"] if actor["usage"]["coverage"] != "unavailable" else None}
                 for actor in sorted(child_actors, key=lambda item: item["actor_sha256"])]
-    totals = _native_totals(parent, children, child_coverage, reasons)
+    totals = _native_totals(parent, children, child_coverage,
+                            [actor["counters_by_model"] for actor in child_actors])
     relation = _relation(binding["request"], parent, totals["workers"])
     reasons.update(parent["reasons"])
     for actor in child_actors:
@@ -313,12 +331,12 @@ def _unavailable(reason, request_sha256=None, owner_sha256=None):
             "request_sha256": request_sha256, "owner_sha256": owner_sha256,
             "work_unit": {"role": None, "purpose": None, "state": None, "provider_epoch": None},
             "sources": [], "parent": None, "children": [], "child_coverage": "unavailable",
-            "native_totals": {"coverage": "incomplete", "primary": None, "workers": None,
+            "native_totals": {"coverage": "unavailable", "primary": None, "workers": None,
                               "workers_by_attested_model": None, "combined": None},
             "parent_rollup": {"basis": "actor_partitioned_records", "parent_counts_include_children": False,
                               "reported_child_summaries_used": False},
             "ao_primary_counter_relation": "unavailable",
-            "api_delegates": {"coverage": "unavailable", "reason": reason}, "reasons": [reason],
+            "api_delegates": {"coverage": "unavailable", "reason": "not_evaluated"}, "reasons": [reason],
             "limitations": list(LIMITATIONS)}
 
 
@@ -338,8 +356,7 @@ def audit(home, room, request_id, database):
             raise evidence.AuditRefusal("request_integrity", binding["request_sha256"],
                                         binding["owner_sha256"]) from None
         if gathered["parent_unavailable"]:
-            parent = _actor(None, None, binding["request"]["model"],
-                            gathered["notes"])
+            parent, _ = _actor(None, None, binding["request"]["model"], gathered["notes"])
             actors = []
             child_coverage = "unavailable"
         else:
