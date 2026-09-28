@@ -252,18 +252,21 @@ def classify_read(input_value, evidence_root):
 
 
 def launch_input(value):
-    """(prompt, flagged) for a supported Agent/Task input; prompt None when the launch cannot qualify."""
+    """(prompt, flagged, subagent_type) for a supported Agent/Task input."""
     if not isinstance(value, dict):
-        return None, False
+        return None, False, None
     prompt = value.get("prompt")
     if not isinstance(prompt, str) or not prompt:
-        return None, False
+        prompt = None
+    subagent_type = value.get("subagent_type")
+    if not bounded_text(subagent_type):
+        subagent_type = None
     flagged = False
     if "run_in_background" in value and value["run_in_background"] is not False:
         flagged = True
     if any(key in value for key in LAUNCH_DENIED_KEYS):
         flagged = True
-    return prompt, flagged
+    return prompt, flagged, subagent_type
 
 
 def supported_image(block):
@@ -499,14 +502,15 @@ class ChildInterval:
 
 
 class Candidate:
-    __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids")
+    __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids", "subagent_type")
 
-    def __init__(self, agent_id, interval, reason, launch_uuid=None, parent_launch_uuids=()):
+    def __init__(self, agent_id, interval, reason, launch_uuid=None, parent_launch_uuids=(), subagent_type=None):
         self.agent_id = agent_id
         self.interval = interval
         self.reason = reason
         self.launch_uuid = launch_uuid
         self.parent_launch_uuids = parent_launch_uuids
+        self.subagent_type = subagent_type
 
 
 def human_candidate(record):
@@ -550,6 +554,9 @@ class RecordScanner:
         self.tool_entries = {}
         self.results = {}
         self.humans = []
+        self.usage_observations = []
+        self.usage_reasons = set()
+        self.compaction_markers = set()
 
     def note(self, reason):
         self.notes.add(reason)
@@ -603,12 +610,15 @@ class RecordScanner:
             self.note("source_malformed")
             return
         kind = value.get("type")
+        timestamp = parse_timestamp(value.get("timestamp"))
+        if ((kind == "system" and value.get("subtype") == "compact_boundary")
+                or (kind == "user" and value.get("isCompactSummary") is True)):
+            self.compaction_markers.add((number, timestamp))
         if kind in ADMIN_TYPES:
             return
         if kind not in MESSAGE_TYPES:
             self.note("source_malformed")
             return
-        timestamp = parse_timestamp(value.get("timestamp"))
         human_like = self.kind == "parent" and kind == "user" and looks_human(value)
         message = value.get("message")
         content = message.get("content") if isinstance(message, dict) and message.get("role") == kind else None
@@ -682,7 +692,7 @@ class RecordScanner:
             self._human(value, number, None, uuid_value, unique, human_text)
             return
         if kind == "assistant":
-            self._assistant(content, uuid_value, timestamp, number)
+            self._assistant(content, uuid_value, timestamp, number, message)
         else:
             self._user(value, content, uuid_value, timestamp, number, unique)
 
@@ -692,8 +702,9 @@ class RecordScanner:
         if tool_id not in self.tool_entries and tool_id not in self.results:
             self.collector.count_tool_id()
 
-    def _assistant(self, content, uuid_value, timestamp, number):
+    def _assistant(self, content, uuid_value, timestamp, number, message):
         if isinstance(content, str):
+            self._usage(message, number, timestamp)
             return
         if not isinstance(content, list):
             self.note("source_malformed")
@@ -721,12 +732,43 @@ class RecordScanner:
                 self.tool_entries[tool_id] = entry
             classified = None
             unsupported = False
-            if name == READ_TOOL:
+            if name == READ_TOOL and self.evidence_root is not None:
                 classified = classify_read(input_value, self.evidence_root)
                 unsupported = classified is None
             launch = launch_input(input_value) if name in AGENT_TOOLS else None
             entry.occurrences.append(ToolOccurrence(number, timestamp, uuid_value, name, canonical, classified,
                                                     unsupported, launch))
+        self._usage(message, number, timestamp)
+
+    def _usage(self, message, number, timestamp):
+        message_id = message.get("id")
+        model = message.get("model")
+        if not bounded_text(message_id) or not bounded_text(model):
+            self.usage_reasons.add((number, timestamp, "usage_unattributable"))
+            return
+        if model == "<synthetic>":
+            self.usage_observations.append((number, timestamp, message_id, model, None))
+            return
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            self.usage_reasons.add((number, timestamp, "usage_unattributable"))
+            self.usage_observations.append((number, timestamp, message_id, model, None))
+            return
+        for key in ("input_tokens", "output_tokens"):
+            if type(usage.get(key)) is not int or usage[key] < 0:
+                self.usage_reasons.add((number, timestamp, "usage_unattributable"))
+                self.usage_observations.append((number, timestamp, message_id, model, None))
+                return
+        cache = []
+        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            value = usage.get(key)
+            if value is not None and (type(value) is not int or value < 0):
+                self.usage_reasons.add((number, timestamp, "usage_unattributable"))
+                self.usage_observations.append((number, timestamp, message_id, model, None))
+                return
+            cache.append(value)
+        self.usage_observations.append((number, timestamp, message_id, model,
+                                        (usage["input_tokens"], usage["output_tokens"], *cache)))
 
     def _user(self, record, content, uuid_value, timestamp, number, unique):
         if isinstance(content, str):
@@ -859,7 +901,7 @@ def launch_candidates(scan, scope):
             candidates.append(Candidate(None, None, "child_attribution_ambiguous"))
             continue
         first = occurrences[0]
-        prompt, flagged = first.launch if first.launch is not None else (None, False)
+        prompt, flagged, subagent_type = first.launch if first.launch is not None else (None, False, None)
         if not isinstance(prompt, str) or not prompt:
             candidates.append(Candidate(None, None, "launch_unresolved"))
             continue
@@ -893,14 +935,14 @@ def launch_candidates(scan, scope):
             candidates.append(Candidate(None, None, "child_attribution_ambiguous"))
             continue
         if flagged or not completions:
-            candidates.append(Candidate(agent_id, None, "child_interval_unbound"))
+            candidates.append(Candidate(agent_id, None, "child_interval_unbound", subagent_type=subagent_type))
             continue
         completion = next(iter(completions.values()))
         if not scope.covers_child(first.number, first.timestamp, completion.number, completion.timestamp):
-            candidates.append(Candidate(agent_id, None, "child_interval_unbound"))
+            candidates.append(Candidate(agent_id, None, "child_interval_unbound", subagent_type=subagent_type))
             continue
         candidates.append(Candidate(agent_id, scope.child(first.timestamp, completion.timestamp), None,
-                                    first.uuid, launch_uuids))
+                                    first.uuid, launch_uuids, subagent_type))
     return candidates
 
 

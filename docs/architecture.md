@@ -5,7 +5,9 @@ projects saved status with a separately verified selected receipt. It keeps prom
 bytes distinct from delivery, native usage and quota. The explicit
 `ao_evidence_audit*` modules read one saved request's bound Claude evidence through
 bounded ownership and source checks before emitting only the closed diagnostic
-schema. They do not participate in dispatch or acceptance. See
+schema; `ao_usage_audit.py` reuses those bounded bindings and intervals to report
+explicit native parent, worker and API delegate usage without participating in
+dispatch or acceptance. See
 [AO diagnostics](diagnostics.md) for the schemas, limits and read-only boundary.
 
 The package separates the agent workflow from durable execution:

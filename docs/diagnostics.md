@@ -110,6 +110,55 @@ prompt, evidence content, reasoning or arbitrary exception text. Its
 coverage, 1 for incomplete/unavailable coverage, and 2 for invalid command arguments
 or a diagnostic error. Errors use fixed codes rather than arbitrary exception text.
 
+## Explicit native usage audit
+
+To inspect usage for one existing owned Claude request, run the separate read-only
+command:
+
+```sh
+python3 project_room.py ao-native-usage-audit \
+  --home /absolute/controller-home \
+  --room ROOM_ID \
+  --request REQUEST_ID \
+  --ao-database /absolute/ao.sqlite
+```
+
+It uses the same saved-request, receipt, preparation, exact AO owner, bounded
+transcript, source recheck and interval proofs as the Read audit, but has no evidence
+root and does not classify `Read` calls. It runs before mutable Service construction;
+it does not create a home or lock, repair state, sync a session, start a model or
+monitor, use the network, or write the AO or delegate database. The DeepSeek ledger,
+when applicable, is opened with SQLite `mode=ro`.
+
+The version-1 closed report separates parent `primary` counters, proven native child
+`workers`, and `api_delegates`. Native assistant responses are grouped by bounded
+message ID: repeated snapshots count once, output uses the maximum snapshot, and
+conflicting or cross-actor IDs are excluded. Child usage is counted only inside the
+same proven synchronous intervals as the Read audit; missing, background or
+ambiguous children leave worker totals null. Parent tool-result usage summaries are
+never included as worker counters. A proved request with no children has known-zero
+worker counters. Configured model identity comes from the saved request or prepared
+agent routing and remains distinct from attested transcript models.
+
+Input/output counters require valid nonnegative token counts. Cache split counters
+remain null if any counted response has an unknown split; `cache_coverage` reports
+that uncertainty separately and it does not alone make token coverage incomplete.
+Unattributable responses and compaction markers inside an interval make the
+affected coverage incomplete. `native_totals.combined` is present only when both
+primary and worker subtotals are complete. The AO primary-counter relation is an
+observation, not an accounting assertion. DeepSeek jobs are selected only by their
+parsed timestamps within the request/receipt window, expose allowlisted usage
+vocabulary, and never contribute to native totals.
+
+The report contains opaque source/actor digests but no raw request, owner, session,
+message, path or transcript identifiers. Its fixed limitations make clear that the
+audit is not billing or quota, is scoped to one request rather than a workflow total,
+does not attest configured models, cannot count unlogged compaction calls, and uses
+bounded time correlation for API delegates. Exit status is 0 for complete coverage,
+1 for incomplete/unavailable coverage, and 2 for invalid arguments or a diagnostic
+error with a fixed JSON code. Ordinary `ao_room_status` remains unchanged; native
+worker usage there is still explicitly unavailable rather than inferred.
+
 ## Resource and stability limits
 
 | Limit | Version 1 ceiling |
