@@ -16,7 +16,8 @@ AuditError = evidence.AuditError
 LIMITATIONS = ("not_billing_or_quota", "single_request_not_workflow_total", "configured_identity_not_attested",
                "compaction_calls_not_logged", "bounded_time_correlation", "delegate_selection_by_time_window")
 COUNTER_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown"))
+NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown",
+                                    "context_attachment_file", "context_attachment_unclassified"))
 NON_INCOMPLETE_DELEGATE_REASONS = frozenset(("delegate_usage_non_final_chunk",))
 MAX_DELEGATE_ROWS = 10000
 MAX_USAGE_JSON_CHARS = 65536

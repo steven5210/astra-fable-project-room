@@ -16,7 +16,16 @@ import re
 import ao_evidence_audit_io as audit_io
 
 
-ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot", "queue-operation"))
+ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot", "queue-operation",
+                         "ai-title", "atis-latch", "last-prompt", "mode"))
+ATTACHMENT_TYPE = "attachment"
+CONTEXT_ATTACHMENT_TYPES = frozenset((
+    "total_tokens_reminder", "prompt_snapshot", "batching_reminder_sent", "deferred_tools_delta",
+    "session_context", "date", "environment", "model", "remote_session_change", "mcp_instructions_delta",
+    "instructions", "auto_mode", "deferred_tools_record", "agent_listing_delta", "silent_turn_reminder",
+    "task_status", "skill_listing",
+))
+FILE_ATTACHMENT_TYPES = frozenset(("file", "edited_text_file", "compact_file_reference", "read_truncation_notice"))
 MESSAGE_TYPES = frozenset(("user", "assistant"))
 AGENT_TOOLS = frozenset(("Agent", "Task"))
 READ_TOOL = "Read"
@@ -665,6 +674,14 @@ class RecordScanner:
                 or (kind == "user" and value.get("isCompactSummary") is True)):
             self.compaction_markers.add((number, timestamp))
         if kind in ADMIN_TYPES:
+            return
+        if kind == ATTACHMENT_TYPE:
+            attachment = value.get("attachment")
+            subtype = attachment.get("type") if isinstance(attachment, dict) else None
+            if subtype in FILE_ATTACHMENT_TYPES:
+                self.note("context_attachment_file")
+            elif subtype not in CONTEXT_ATTACHMENT_TYPES:
+                self.note("context_attachment_unclassified")
             return
         if kind not in MESSAGE_TYPES:
             self.note("source_malformed")

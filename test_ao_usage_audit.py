@@ -107,6 +107,68 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
                          {"basis": "actor_partitioned_records", "parent_counts_include_children": False,
                           "reported_child_summaries_used": False})
 
+    def test_parent_usage_ignores_metadata_and_attachment_records(self):
+        usage = {"input_tokens": 7, "output_tokens": 9,
+                 "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+        metadata = [
+            {"type": "ai-title", "aiTitle": "A title", "sessionId": "native-session"},
+            {"type": "atis-latch", "atis": "latched", "sessionId": "native-session"},
+            {"type": "last-prompt", "lastPrompt": "Continue.", "leafUuid": "leaf-1",
+             "sessionId": "native-session"},
+            {"type": "mode", "mode": "default", "sessionId": "native-session"},
+        ]
+        records = [
+            self.human(),
+            metadata[0],
+            self.attachment_record("date", "attachment-date"),
+            metadata[1],
+            self.attachment_record("file", "attachment-file"),
+            metadata[2],
+            self.attachment_record("session_context", "attachment-session"),
+            metadata[3],
+            self.assistant("response-1", "2026-01-01T00:00:20+00:00", "message-1", usage),
+        ]
+        report = self.report(records)
+        parent = report["parent"]
+        self.assertEqual(parent["coverage"], "complete")
+        self.assertEqual(parent["responses"], 1)
+        self.assertEqual(parent["counters"], self.counts(7, 9, 1, 2))
+        for reason in ("source_malformed", "context_attachment_file", "context_attachment_unclassified"):
+            self.assertNotIn(reason, parent["reasons"])
+
+    def test_unknown_and_non_dict_attachments_do_not_degrade_usage_coverage(self):
+        usage = {"input_tokens": 3, "output_tokens": 4,
+                 "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+        non_dict_attachment = self.attachment_record("future_kind", "attachment-non-dict")
+        non_dict_attachment["attachment"] = "not-an-object"
+        report = self.report([
+            self.human(),
+            self.attachment_record("future_kind", "attachment-unknown"),
+            non_dict_attachment,
+            self.assistant("response-1", "2026-01-01T00:00:20+00:00", "message-1", usage),
+        ])
+        self.assertEqual(report["coverage"], "complete")
+        self.assertEqual(report["parent"]["coverage"], "complete")
+        self.assertEqual(report["parent"]["counters"], self.counts(3, 4, 1, 2))
+
+    def test_child_attachments_do_not_degrade_child_usage_coverage(self):
+        launch, completed = self.launch_records()
+        child_usage = {"input_tokens": 5, "output_tokens": 6,
+                       "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+        self.write_transcript([self.human(), launch, completed])
+        self.write_child("a1", [
+            self.attachment_record("file", "child-attachment", agent_id="a1"),
+            self.child_assistant("child-response", "2026-01-01T00:00:20+00:00",
+                                 "child-message", child_usage),
+        ])
+        self.build_without_delegate()
+        self.build_child_routing()
+        report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        child = report["children"][0]["usage"]
+        self.assertEqual(report["child_coverage"], "complete")
+        self.assertEqual(child["coverage"], "complete")
+        self.assertEqual(child["counters"], self.counts(5, 6, 1, 2))
+
     def test_repeated_streaming_snapshots_count_once_and_use_max_output(self):
         usage = {"input_tokens": 4, "output_tokens": 7,
                  "cache_creation_input_tokens": 2, "cache_read_input_tokens": 1}
