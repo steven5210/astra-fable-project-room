@@ -453,8 +453,34 @@ class AuditTests(AuditFixture, unittest.TestCase):
         self.assertIn("context_attachment_file", parent["reasons"])
         self.assertEqual(parent["source_coverage"], "complete")
 
+    def test_out_of_interval_file_attachment_does_not_degrade_parent_coverage(self):
+        self.write_transcript([self.human()])
+        self.build()
+        baseline_coverage = self.report()["parent"]["coverage"]
+        self.assertEqual(baseline_coverage, "complete")
+
+        self.reset()
+        attachment = self.attachment_record("file", "attachment-before-human")
+        attachment["timestamp"] = "2026-01-01T00:00:05+00:00"
+        self.write_transcript([attachment, self.human()])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], baseline_coverage)
+        self.assertNotIn("context_attachment_file", parent["reasons"])
+
     def test_unknown_attachment_makes_group_incomplete(self):
         self.write_transcript([self.human(), self.attachment_record("future_kind", "attachment-unknown")])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], "incomplete")
+        self.assertIn("context_attachment_unclassified", parent["reasons"])
+
+    def test_non_string_attachment_subtypes_are_unclassified(self):
+        list_subtype = self.attachment_record("unused", "attachment-list-subtype")
+        list_subtype["attachment"]["type"] = ["x"]
+        dict_subtype = self.attachment_record("unused", "attachment-dict-subtype")
+        dict_subtype["attachment"]["type"] = {"a": 1}
+        self.write_transcript([self.human(), list_subtype, dict_subtype])
         self.build()
         parent = self.report()["parent"]
         self.assertEqual(parent["coverage"], "incomplete")

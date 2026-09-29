@@ -151,6 +151,23 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(report["parent"]["coverage"], "complete")
         self.assertEqual(report["parent"]["counters"], self.counts(3, 4, 1, 2))
 
+    def test_non_string_attachment_subtypes_do_not_degrade_usage_coverage(self):
+        usage = {"input_tokens": 3, "output_tokens": 4,
+                 "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+        list_subtype = self.attachment_record("unused", "attachment-list-subtype")
+        list_subtype["attachment"]["type"] = ["x"]
+        dict_subtype = self.attachment_record("unused", "attachment-dict-subtype")
+        dict_subtype["attachment"]["type"] = {"a": 1}
+        report = self.report([
+            self.human(),
+            list_subtype,
+            dict_subtype,
+            self.assistant("response-1", "2026-01-01T00:00:20+00:00", "message-1", usage),
+        ])
+        self.assertEqual(report["coverage"], "complete")
+        self.assertEqual(report["parent"]["coverage"], "complete")
+        self.assertEqual(report["parent"]["counters"], self.counts(3, 4, 1, 2))
+
     def test_child_attachments_do_not_degrade_child_usage_coverage(self):
         launch, completed = self.launch_records()
         child_usage = {"input_tokens": 5, "output_tokens": 6,

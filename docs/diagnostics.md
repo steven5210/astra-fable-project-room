@@ -109,9 +109,9 @@ prompt, evidence content, reasoning or arbitrary exception text. Its
 `redundant_read_verdict` is always `not_established`. Exit status is 0 for complete
 coverage, 1 for incomplete/unavailable coverage, and 2 for invalid command arguments
 or a diagnostic error. Errors use fixed codes rather than arbitrary exception text.
-File attachments add `context_attachment_file`; unknown or non-object subtypes add
-`context_attachment_unclassified`. These notes do not affect source or usage-token
-coverage, but make the evidence group incomplete.
+Attachments inside the actor's request interval add `context_attachment_file` for files
+or `context_attachment_unclassified` for unknown or non-object subtypes. These notes do
+not affect source or usage-token coverage, but make the evidence group incomplete.
 
 ## Explicit native usage audit
 

@@ -16,8 +16,7 @@ AuditError = evidence.AuditError
 LIMITATIONS = ("not_billing_or_quota", "single_request_not_workflow_total", "configured_identity_not_attested",
                "compaction_calls_not_logged", "bounded_time_correlation", "delegate_selection_by_time_window")
 COUNTER_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown",
-                                    "context_attachment_file", "context_attachment_unclassified"))
+NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown"))
 NON_INCOMPLETE_DELEGATE_REASONS = frozenset(("delegate_usage_non_final_chunk",))
 MAX_DELEGATE_ROWS = 10000
 MAX_USAGE_JSON_CHARS = 65536
@@ -39,14 +38,6 @@ def _sum_counters(values):
     return result
 
 
-def _marker_in_interval(interval, number, timestamp):
-    if timestamp is not None:
-        return interval.contains(number, timestamp)
-    # Record numbers are actor-local: only a parent Interval can place a marker by number. A child
-    # interval is bounded by timestamps alone, so a marker without one cannot be excluded (fail closed).
-    return interval.contains_number(number) if isinstance(interval, native.Interval) else True
-
-
 def _actor_unavailable(configured_model, reasons):
     return {"coverage": "unavailable", "cache_coverage": "unavailable", "configured_model": configured_model,
             "attested_models": [], "responses": None, "repeated_response_records": None,
@@ -61,7 +52,8 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     observations = [item for item in scan.usage_observations if interval.contains(item[0], item[1])]
     reasons.update(reason for number, timestamp, reason in scan.usage_reasons
                    if interval.contains(number, timestamp))
-    if any(_marker_in_interval(interval, number, timestamp) for number, timestamp in scan.compaction_markers):
+    if any(native.marker_in_interval(interval, number, timestamp)
+           for number, timestamp in scan.compaction_markers):
         reasons.add("compaction_in_interval")
     groups = {}
     for observation in observations:
