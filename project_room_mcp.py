@@ -80,10 +80,7 @@ LEGACY_TOOLS_HIDDEN_ERROR = (
 
 
 def _legacy_tools_visible(service):
-    try:
-        return service.legacy_tools_visible()
-    except AttributeError:
-        return True
+    return service.legacy_tools_visible() if isinstance(service, project_room.Service) else True
 
 
 def error_response(identifier, code, message):
