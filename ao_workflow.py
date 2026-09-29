@@ -741,8 +741,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
         # Current effective committed root/worker boundaries only, each disclosed once. Fragments go
         # through this same assembly exactly once, so the stored projection equals the sent text.
         import ao_model_boundaries
-        for pending in ao_model_boundaries.pending_notices(directory, state, purpose, held.get("notices") or ()):
-            assembly.add("workflow", pending["fragment"])
-            carried.setdefault("boundary_notices", []).append(ao_model_boundaries.carried_notice(pending))
+        for notice in ao_model_boundaries.pending_notices(directory, state, purpose, held.get("notices") or ()):
+            assembly.add("workflow", notice["fragment"])
+            carried.setdefault("boundary_notices", []).append(ao_model_boundaries.carried_notice(notice))
     assembly.add("caller", message)
     return assembly.text, carried

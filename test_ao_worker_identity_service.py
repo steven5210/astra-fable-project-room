@@ -471,7 +471,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
         decoy.write_text(json.dumps(self.child_row("agent-w3-0", "child-decoy",
                                                    self.iso_at(self.stamp_seconds(0.004)),
                                                    "claude-opus-5-1")) + "\n")
-        result = self.audit_native(moved)
+        self.audit_native(moved)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("child_missing", evidence["reasons"])
@@ -482,7 +482,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
         duplicate = Path(self.transcript).parent.parent / "other-project" / self.NATIVE / "subagents"
         duplicate.mkdir(parents=True)
         shutil.copy2(self.child_file("agent-w3-0"), duplicate / "agent-w3-0.jsonl")
-        result = self.audit_native(moved)
+        self.audit_native(moved)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("identity_conflict", evidence["reasons"])
@@ -493,7 +493,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
         duplicate.parent.mkdir(parents=True)
         shutil.copy2(self.transcript, duplicate)
         moved = self.relocate_source("moved-duplicate-parent")
-        result = self.audit_native(moved)
+        self.audit_native(moved)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("identity_conflict", evidence["reasons"])
@@ -504,7 +504,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
         original = Path(self.transcript).parent / self.NATIVE
         shutil.rmtree(original)
         original.symlink_to(moved.parent / self.NATIVE, target_is_directory=True)
-        result = self.audit_native(moved)
+        self.audit_native(moved)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("source_unsafe", evidence["reasons"])
@@ -531,7 +531,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
                 self.transcript.write_text(self.transcript.read_text() + "\n")
             return value
         with mock.patch.object(ao_worker_identity.audit_io, "rehash_source", side_effect=drift):
-            result = self.audit_native(self.transcript)
+            self.audit_native(self.transcript)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("source_changed", evidence["reasons"])
@@ -546,7 +546,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
                 path.write_text(path.read_text() + "\n")
             return value
         with mock.patch.object(ao_worker_identity.audit_io, "rehash_source", side_effect=drift):
-            result = self.audit_native(self.transcript)
+            self.audit_native(self.transcript)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("source_changed", evidence["reasons"])
@@ -621,7 +621,7 @@ class WorkerIdentityRelocationTests(ServiceWorkerFixture):
                 second.mkdir(parents=True, exist_ok=True)
             return value
         with mock.patch.object(ao_worker_identity.audit_io, "rehash_source", side_effect=add_lineage):
-            result = self.audit_native(self.transcript)
+            self.audit_native(self.transcript)
         evidence = self.worker_evidence(self.state()["requests"]["implementation"])
         self.assertFalse(evidence["qualified"])
         self.assertIn("source_changed", evidence["reasons"])

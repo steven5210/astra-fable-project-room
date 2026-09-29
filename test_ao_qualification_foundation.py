@@ -23,7 +23,7 @@ class RetainedEvidenceTests(QualificationFixture):
     """Defect 1: the room keeps the complete selected capture, not a reference to private files."""
 
     def test_retention_survives_the_private_originals_and_verifies_retained_bytes(self):
-        artifact = self.qualified_room('retained-survives')
+        self.qualified_room('retained-survives')
         directory, state = self.directory(), self.state()
         snapshot = state[em.SELECTION_KEY]['family_qualification']
         entry = snapshot['evidence'][0]

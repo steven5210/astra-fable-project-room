@@ -36,6 +36,10 @@ class ProviderNoneReportCorrectionTests(Fixture):
                                          purpose="correction")
 
     def complete_correction(self, ids):
+        # The real shared producer binds this exact saved request's caller/model/owner/session and
+        # timestamps, so the correction completion has its own native rows before the sync; the test
+        # sends the correction directly instead of through Fixture.send, which notes them itself.
+        self.note_native_turn("correction")
         self.fake.finish("engineer", json.dumps(self.report(
             routing_log=[{"delegate_job_ids": ids}])))
         self.service.ao_room_sync(self.room)

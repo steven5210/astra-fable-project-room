@@ -23,7 +23,6 @@ import ao_project_room as ao
 import ao_prompt_metrics
 import ao_routing
 import ao_workflow
-from room import RoomError
 from test_ao_normal import Fixture
 
 
@@ -246,7 +245,7 @@ class FrozenExpectationTests(Fixture):
 
     def test_raised_root_floor_refuses_before_intent_and_post(self):
         self.ready_implementation()
-        directory, state = self.directory(), self.state()
+        directory = self.directory()
         before = (directory / "state.json").read_bytes()
         posts = self.message_posts()
         with mock.patch.dict(em.BUNDLED_FAMILIES["fable"], {"minimum_claude_code_version": "2.1.999"}):
@@ -292,7 +291,7 @@ class FrozenExpectationTests(Fixture):
 
     def test_readiness_refusal_keeps_the_existing_diagnostic_invalidation_path(self):
         self.ready_implementation()
-        directory, state = self.directory(), self.state()
+        state = self.state()
         requests = set(state["requests"])
         posts = self.message_posts()
         with mock.patch.dict(em.BUNDLED_FAMILIES["fable"], {"minimum_claude_code_version": "2.1.999"}):

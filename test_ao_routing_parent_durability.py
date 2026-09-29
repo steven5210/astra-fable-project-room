@@ -13,7 +13,6 @@ import ao_project_room as ao
 import ao_routing
 import ao_routing_refresh as refresh
 import test_ao_adoption as adoption_fixtures
-import test_ao_review_extension as extension_fixtures
 
 
 class LauncherParentDurabilityTests(unittest.TestCase):
