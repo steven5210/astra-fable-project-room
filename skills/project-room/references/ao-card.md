@@ -30,7 +30,7 @@ outcome; only `up_to_date` counts as current. Then `ao_room_list` (plus legacy
 Resume the recorded backend and state before anything new.
 **Stop:** outcome other than `up_to_date` → [stable-release check](ao.md#stable-release-check).
 Missing setup, URL or config → [setup and resume](ao.md#setup-and-resume).
-Provider limit, truncated output or a paused room → [efficient continuation](../../../docs/efficient-continuation.md).
+Provider limit, truncated output or a paused room → [efficient continuation](../../../docs/guides/efficient-continuation.md).
 
 ## 1. Open, prepare, bind
 
@@ -57,7 +57,7 @@ the first engineer response. Then `ao_room_send` role `engineer`, purpose
 Dispose of each finding with evidence; a behavior change needs a newer revision.
 There are 3 spec-review attempts across revisions, with no automatic renewal.
 **Stop:** attempts exhausted → bring the product tradeoff to the user; an
-extension needs [one-charter review extension](../../../docs/one-charter-review-extension.md).
+extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md).
 Prose around the final JSON → [formatting recovery](ao.md#completed-response-formatting-recovery).
 
 ## 3. Handoff and implementation
@@ -72,7 +72,7 @@ inspect `review_followups`, `enhancement_proposals` and `operator_requests`.
 Pending operator requests block acceptance: do only the authorized execution,
 return the evidence, then get Fable's next judgment.
 **Stop:** `scope_change` → a revised, agreed spec first. Enhancement proposals →
-[enhancement issue handoff](../../../docs/workflow.md#enhancement-issue-handoff).
+[enhancement issue handoff](../../../docs/guides/workflow.md#enhancement-issue-handoff).
 Delegate ledger or routing refusal → [usage, context and delegates](ao.md#usage-context-and-delegates).
 
 ## 4. Correction
@@ -99,7 +99,7 @@ request; sync to terminal. Read Fable's routing report against the actual ledger
 facts. On `rejected`, investigate, correct, reverify and send a new review.
 `ao_room_accept` with that review's `request_id`. There are 3
 acceptance-review requests per room.
-**Stop:** allowance exhausted → [acceptance-review continuation](../../../docs/acceptance-review-continuation.md),
+**Stop:** allowance exhausted → [acceptance-review continuation](../../../docs/guides/acceptance-review-continuation.md),
 which needs the user's actual authorization. An unused reviewer fails to resume →
 [reviewer recovery](ao.md#recovery-of-a-reviewer-that-has-never-been-used).
 
@@ -113,10 +113,10 @@ acceptance, and remaining blockers.
 ## Situations outside the card
 
 - Engineer model change → [engineering model selection and transition](ao.md#engineering-model-selection-and-transition).
-- Provider amendment → [provider transition](../../../docs/provider-transition.md).
+- Provider amendment → [provider transition](../../../docs/operations/provider-transition.md).
 - `astra_led` exception or pilot rooms → [explicit Astra exception](ao.md#explicit-astra-exception-and-historical-pilot-rooms).
 - Uncertain, failed or recovered turns → the second paragraph of
   [explicit Astra exception](ao.md#explicit-astra-exception-and-historical-pilot-rooms).
   Diagnose them without resending.
 - Quota stop, semantic hold, or an instruction staged while paused →
-  [efficient continuation](../../../docs/efficient-continuation.md).
+  [efficient continuation](../../../docs/guides/efficient-continuation.md).

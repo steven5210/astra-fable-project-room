@@ -125,7 +125,7 @@ def handle(message, service):
         readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list", "ao_room_engineer_model_audit"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
-                                             "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify", "ao_room_engineer_model_audit", "ao_room_engineer_model_transition", "ao_room_engineer_model_transition_abandon")}}
+                                             "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify", "ao_room_engineer_model_audit", "ao_room_engineer_model_transition", "ao_room_engineer_model_transition_abandon", "ao_release_check")}}
                             for name, (description, schema) in project_room.TOOL_SCHEMAS.items()
                             if legacy_visible or name.startswith("ao_")]}
     elif method == "tools/call":

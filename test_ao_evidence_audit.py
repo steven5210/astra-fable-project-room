@@ -132,6 +132,16 @@ class AuditFixture:
         value.update(extra)
         return value
 
+    def attachment_record(self, subtype, uuid, agent_id=None):
+        value = {"parentUuid": "parent-record", "isSidechain": agent_id is not None,
+                 "attachment": {"type": subtype}, "type": "attachment", "uuid": uuid,
+                 "timestamp": "2026-01-01T00:00:15+00:00", "userType": "external",
+                 "entrypoint": "cli", "cwd": str(self.workspace), "sessionId": NATIVE_UUID,
+                 "version": "2.1.282", "gitBranch": "main", "rendered": []}
+        if agent_id is not None:
+            value["agentId"] = agent_id
+        return value
+
     def target(self, name="a.txt"):
         return str(self.evidence / name)
 
@@ -411,6 +421,70 @@ class AuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(self.report()["coverage"], "complete")
         self.assertEqual(self.snapshot(self.home), before)
         self.assertFalse((self.home / "ao" / ".lock").exists())
+
+    def test_metadata_and_benign_attachments_preserve_parent_coverage(self):
+        self.write_transcript([self.human()])
+        self.build()
+        baseline_coverage = self.report()["parent"]["coverage"]
+        self.assertEqual(baseline_coverage, "complete")
+
+        self.reset()
+        records = [
+            self.human(),
+            {"type": "ai-title", "aiTitle": "A title", "sessionId": NATIVE_UUID},
+            self.attachment_record("session_context", "attachment-session"),
+            {"type": "atis-latch", "atis": "latched", "sessionId": NATIVE_UUID},
+            {"type": "last-prompt", "lastPrompt": "Continue.", "leafUuid": "leaf-1",
+             "sessionId": NATIVE_UUID},
+            self.attachment_record("date", "attachment-date"),
+            {"type": "mode", "mode": "default", "sessionId": NATIVE_UUID},
+        ]
+        self.write_transcript(records)
+        self.build()
+        parent = self.report()["parent"]
+        self.assertNotIn("source_malformed", parent["reasons"])
+        self.assertEqual(parent["coverage"], baseline_coverage)
+
+    def test_file_attachment_makes_group_incomplete_without_source_gap(self):
+        self.write_transcript([self.human(), self.attachment_record("file", "attachment-file")])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], "incomplete")
+        self.assertIn("context_attachment_file", parent["reasons"])
+        self.assertEqual(parent["source_coverage"], "complete")
+
+    def test_out_of_interval_file_attachment_does_not_degrade_parent_coverage(self):
+        self.write_transcript([self.human()])
+        self.build()
+        baseline_coverage = self.report()["parent"]["coverage"]
+        self.assertEqual(baseline_coverage, "complete")
+
+        self.reset()
+        attachment = self.attachment_record("file", "attachment-before-human")
+        attachment["timestamp"] = "2026-01-01T00:00:05+00:00"
+        self.write_transcript([attachment, self.human()])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], baseline_coverage)
+        self.assertNotIn("context_attachment_file", parent["reasons"])
+
+    def test_unknown_attachment_makes_group_incomplete(self):
+        self.write_transcript([self.human(), self.attachment_record("future_kind", "attachment-unknown")])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], "incomplete")
+        self.assertIn("context_attachment_unclassified", parent["reasons"])
+
+    def test_non_string_attachment_subtypes_are_unclassified(self):
+        list_subtype = self.attachment_record("unused", "attachment-list-subtype")
+        list_subtype["attachment"]["type"] = ["x"]
+        dict_subtype = self.attachment_record("unused", "attachment-dict-subtype")
+        dict_subtype["attachment"]["type"] = {"a": 1}
+        self.write_transcript([self.human(), list_subtype, dict_subtype])
+        self.build()
+        parent = self.report()["parent"]
+        self.assertEqual(parent["coverage"], "incomplete")
+        self.assertIn("context_attachment_unclassified", parent["reasons"])
 
     def test_cli_accepts_global_home_and_refuses_unsafe_arguments(self):
         self.write_transcript([self.human()])

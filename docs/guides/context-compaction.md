@@ -97,7 +97,7 @@ no audited replay or automatic crash-recovery operation. A failed
 autocompact-thrashing turn has its own separate, positively diagnosed recovery
 lane and its own read-admission guard binding; it is not this configuration
 procedure and it never retries automatically. See
-[compaction-failure recovery](compaction-failure-recovery.md).
+[compaction-failure recovery](../operations/compaction-failure-recovery.md).
 
 ## Verify without replaying work
 

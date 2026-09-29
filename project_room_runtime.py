@@ -24,7 +24,7 @@ RUNTIME_FILES = (
     "ao_executable_binding.py", "ao_history.py", "ao_history_reconciliation.py", "ao_instruction_amendments.py", "ao_mcp_attachment.py",
     "ao_model_boundaries.py", "ao_model_qualification.py",
     "ao_native_identity.py", "ao_native_outcome.py", "ao_outcomes.py", "ao_prompt_metrics.py", "ao_project_room.py",
-    "ao_provider_transition.py", "ao_quality_review.py", "ao_report_contract.py", "ao_response_normalization.py",
+    "ao_provider_transition.py", "ao_quality_review.py", "ao_release_check.py", "ao_report_contract.py", "ao_response_normalization.py",
     "ao_review_extension.py", "ao_review_followups.py", "ao_reviewer_recovery.py", "ao_routing.py", "ao_routing_adoption.py", "ao_routing_guard.py",
     "ao_routing_refresh.py",
     "ao_usage_audit.py", "ao_worker_identity.py", "ao_workflow.py", "changeset_core.py", "changeset_faults.py", "changeset_fs.py",

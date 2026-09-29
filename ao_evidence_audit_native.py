@@ -16,7 +16,16 @@ import re
 import ao_evidence_audit_io as audit_io
 
 
-ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot", "queue-operation"))
+ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot", "queue-operation",
+                         "ai-title", "atis-latch", "last-prompt", "mode"))
+ATTACHMENT_TYPE = "attachment"
+CONTEXT_ATTACHMENT_TYPES = frozenset((
+    "total_tokens_reminder", "prompt_snapshot", "batching_reminder_sent", "deferred_tools_delta",
+    "session_context", "date", "environment", "model", "remote_session_change", "mcp_instructions_delta",
+    "instructions", "auto_mode", "deferred_tools_record", "agent_listing_delta", "silent_turn_reminder",
+    "task_status", "skill_listing",
+))
+FILE_ATTACHMENT_TYPES = frozenset(("file", "edited_text_file", "compact_file_reference", "read_truncation_notice"))
 MESSAGE_TYPES = frozenset(("user", "assistant"))
 AGENT_TOOLS = frozenset(("Agent", "Task"))
 READ_TOOL = "Read"
@@ -542,6 +551,14 @@ class ChildInterval:
         return ChildInterval(start, end, self.ancestors + (self,))
 
 
+def marker_in_interval(interval, number, timestamp):
+    if timestamp is not None:
+        return interval.contains(number, timestamp)
+    # Record numbers are actor-local: only a parent Interval can place a marker by number. A child
+    # interval is bounded by timestamps alone, so a marker without one cannot be excluded (fail closed).
+    return interval.contains_number(number) if isinstance(interval, Interval) else True
+
+
 class Candidate:
     __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids", "subagent_type",
                  "tool_id", "name", "identity", "launch_number", "launch_timestamp")
@@ -607,6 +624,7 @@ class RecordScanner:
         self.usage_observations = []
         self.usage_reasons = set()
         self.compaction_markers = set()
+        self.attachment_markers = set()
 
     def note(self, reason):
         self.notes.add(reason)
@@ -665,6 +683,16 @@ class RecordScanner:
                 or (kind == "user" and value.get("isCompactSummary") is True)):
             self.compaction_markers.add((number, timestamp))
         if kind in ADMIN_TYPES:
+            return
+        if kind == ATTACHMENT_TYPE:
+            attachment = value.get("attachment")
+            subtype = attachment.get("type") if isinstance(attachment, dict) else None
+            if not isinstance(subtype, str):
+                subtype = None
+            if subtype in FILE_ATTACHMENT_TYPES:
+                self.attachment_markers.add((number, timestamp, "context_attachment_file"))
+            elif subtype not in CONTEXT_ATTACHMENT_TYPES:
+                self.attachment_markers.add((number, timestamp, "context_attachment_unclassified"))
             return
         if kind not in MESSAGE_TYPES:
             self.note("source_malformed")
@@ -1099,7 +1127,9 @@ def count_group(scan, interval):
     """
     flags = {"quarantined": False, "unsupported": False}
     if interval is None:
-        return None, set(scan.notes), flags
+        reasons = set(scan.notes)
+        reasons.update(reason for _, _, reason in scan.attachment_markers)
+        return None, reasons, flags
     counts = dict.fromkeys(COUNT_KEYS, 0)
     counts["duplicate_records"] = sum(1 for number, timestamp in scan.duplicates
                                       if interval.contains(number, timestamp))
@@ -1164,7 +1194,10 @@ def count_group(scan, interval):
             scan.note("result_unresolved" if outcome == "unresolved" else "result_unclassifiable")
     counts["distinct_slices"] = len(slices)
     counts["repeated_identical_inputs"] = sum(size - 1 for size in inputs.values() if size > 1)
-    return counts, set(scan.notes), flags
+    reasons = set(scan.notes)
+    reasons.update(reason for number, timestamp, reason in scan.attachment_markers
+                   if marker_in_interval(interval, number, timestamp))
+    return counts, reasons, flags
 
 
 def group_report(scan, interval):

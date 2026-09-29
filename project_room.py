@@ -1736,7 +1736,7 @@ class Service:
         extra = set(arguments) - set(schema["properties"])
         if missing or extra:
             raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
-        if name.startswith("ao_room_"):
+        if name.startswith("ao_room_") or name == "ao_release_check":
             import ao_project_room
             return getattr(ao_project_room.Service(self.home), name)(**arguments)
         return getattr(self, name)(**arguments)

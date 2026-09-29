@@ -38,27 +38,24 @@ Report each fact separately and keep the underlying receipts private.
 
 ## Stable-release check
 
-For diagnosed provider limits, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
+For diagnosed provider limits, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/guides/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
 
-At the start of each new or resumed AO work session, compare the installed and
-running AO release with the official [latest stable release](https://github.com/Untrivial-ai/agent-orchestrator/releases/latest).
-The machine-readable feed is `https://api.github.com/repos/Untrivial-ai/agent-orchestrator/releases/latest`;
-exclude drafts and prereleases. Do not treat the initial validation version above
-as a permanent pin, or a development branch as a stable update.
+At the start of each new or resumed AO work session, call `ao_release_check` once
+before the first new model dispatch. It compares the running macOS bundled daemon
+with the official latest stable release, stores private evidence in
+`PROJECT_ROOM_HOME/ao/version-check.json`, and returns `up_to_date`,
+`update_available`, `mismatch` or `unknown`. `up_to_date` verifies the running
+bundle matches the latest stable release. For `update_available`, review the
+release and arrange an update between jobs as below. For `mismatch`, restart AO
+between jobs and recheck. For `unknown`, warn with the reported reasons, never
+treat it as up to date, and do not block status, sync or recovery.
 
-Identify the actual daemon through its configured endpoint's `GET /healthz`
-`executablePath`, and inspect that executable's version and installation provenance.
-Some official bundled daemons report `dev`; on macOS, corroborate the containing
-signed app's `CFBundleShortVersionString` with the saved verified release receipt.
-A config string alone does not prove the running version. If AO is stopped, report
-the installed version separately and check the running daemon after startup.
-
-Save the UTC check time, installed/running/latest versions, their evidence, release
-URL and outcome in private `PROJECT_ROOM_HOME/ao/version-check.json`. Fetch failure,
-rate limiting or ambiguous local identity means **unknown**, never "up to date";
-retain the last successful check separately. Warn about a new release, a version
-mismatch or a check failure. Do not prevent read-only status, reconciliation or
-recovery, and do not interrupt active workers to complete this check.
+For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
+from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's
+version and installation provenance; a configured version string alone does not
+prove which binary is running. Compare it with the official latest stable release,
+excluding drafts and prereleases, and report the result to the user as unknown
+until proven. Leave `version-check.json` to the tool.
 
 When a newer stable release is available, review its changes and arrange an update
 between jobs. Preserve the existing runtime/state and a consistent backup before
@@ -92,7 +89,7 @@ Optional `auto_compact_window` in that same private AO config selects an integer
 from 100,000 to 1,000,000 for future preparations only. The preparation records
 the chosen window and pins it in ignored local Claude settings before launch.
 Conflicting disable or override settings refuse preparation or dispatch. Older
-preparations retain their exact snapshots. Follow [context compaction](../../../docs/context-compaction.md)
+preparations retain their exact snapshots. Follow [context compaction](../../../docs/guides/context-compaction.md)
 for the safe existing-session procedure and live validation; do not rewrite room
 evidence, repeat retained instructions, or lower Fable MAX to reduce context.
 
@@ -186,14 +183,14 @@ Codex task discovers updated MCP tools after plugin installation.
    and Astra's recommendation. Under existing filing authority, Astra files or links
    each worthwhile proposal in the feature project's tracker, applies its enhancement,
    relevant area and accurate status labels, and verifies the issue URL and labels.
-   Follow the [enhancement issue handoff](../../../docs/workflow.md#enhancement-issue-handoff)
+   Follow the [enhancement issue handoff](../../../docs/guides/workflow.md#enhancement-issue-handoff)
    for duplicate/current-implementation checks, pickup criteria and a linked operator
    record of the proposal, labels and user's decision. Do not invent proposals or infer
    "none" from missing legacy fields. Read full receipts before acting on bounded
    previews. Pending `operator_requests` block acceptance even with completed/true:
    perform only authorized execution, return new evidence, and obtain the subsequent
    Fable judgment. A request or optional proposal adds no scope authority. See the
-   [report contract](../../../docs/efficient-continuation.md#personal-review-operator-handoffs-and-enhancements).
+   [report contract](../../../docs/guides/efficient-continuation.md#personal-review-operator-handoffs-and-enhancements).
 7. For a confirmed completed turn, a new `correction` request may repair the
    implementation or missing/malformed report in the same session. The correction
    message is exactly the caller's new instruction, `Continue.` when there is
@@ -211,7 +208,7 @@ Codex task discovers updated MCP tools after plugin installation.
    only a new correction, with its proof recorded in controller metadata and no
    extra context sent to Fable. Active, uncertain, foreign, missing, changed or
    unaudited provider evidence still refuses. See the
-   [historical-report correction boundary](../../../docs/provider-transition.md#historical-report-correction).
+   [historical-report correction boundary](../../../docs/operations/provider-transition.md#historical-report-correction).
 8. Run the gates and independent acceptance below using reviewer purpose
    `acceptance_review`. Inspect actual delegate ledger facts when assessing
    Fable's routing report. Native subagent audit coverage remains a separate item.
@@ -260,7 +257,7 @@ prospective native outcome source with `ao_room_engineer_source_register`
 (engineer-only, a mutation, authenticated owner database and exact transcript,
 never a caller-supplied workspace); a conflicting registered source is never
 replaced. See
-[configured engineering model selection and transition](../../../docs/engineering-model-transition.md)
+[configured engineering model selection and transition](../../../docs/guides/engineering-model-transition.md)
 for the qualification artifact, eligibility, the write-ahead/reconciliation
 contract, abandonment, the conditional PATCH and the full operator sequence.
 
@@ -381,7 +378,7 @@ New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable re
 
 An explicitly authorized normal AO room pinned to DeepInfra V4.1 Flash can make
 one retained provider amendment to official `deepseek-flash`, then adopt v2 before
-its first new-provider request. Follow the [audited adoption procedure](../../../docs/provider-transition.md).
+its first new-provider request. Follow the [audited adoption procedure](../../../docs/operations/provider-transition.md).
 Use its public audit/transition/stage/activate operations; preserve original
 snapshots, full history, consumed attempts and the same native session. A setup
 default change, pre-exec launch receipt or manual saved-state edit cannot establish
@@ -534,7 +531,7 @@ accepts only an actual completed independent reviewer response with matching
 identities, intact logs and unchanged candidate bytes. The ordinary allowance is
 three acceptance-review requests per room across revisions. Further necessary
 reviews require actual user authorization and a fresh
-[single-use acceptance-review audit and grant](../../../docs/acceptance-review-continuation.md)
+[single-use acceptance-review audit and grant](../../../docs/guides/acceptance-review-continuation.md)
 for each exact named request/message. Settle recovery and engineering first,
 verify the candidate, audit both retained owners and all prior evidence, then
 extend and send the one named review. Broad applicable authorization may support
