@@ -1,8 +1,6 @@
 """Executable replacement preserves preparation/history; no real CLI or AO calls."""
 import copy
-import json
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import ao_delegates

@@ -3,10 +3,8 @@ with a starting worker, legacy launches retry transient contention, and at most 
 
 import fcntl
 import os
-from pathlib import Path
 import signal
 import subprocess
-import sys
 import threading
 import time
 import unittest

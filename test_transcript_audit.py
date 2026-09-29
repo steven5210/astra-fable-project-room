@@ -9,7 +9,6 @@ import unittest
 from unittest import mock
 
 import recovery
-import session_paths
 import transcript_audit
 from test_deepseek_wiring import WiringFixture, implementation_fake
 from test_project_room import ROOT

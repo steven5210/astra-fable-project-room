@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 import changeset_fs as fs
 import changeset_faults as faults
-from changeset_core import ChangesetError,MAX_XATTRS,MAX_XATTR_BYTES,canonical,sha256
+from changeset_core import ChangesetError,MAX_XATTR_BYTES,canonical,sha256
 
 class FilesystemTests(unittest.TestCase):
     def setUp(self):

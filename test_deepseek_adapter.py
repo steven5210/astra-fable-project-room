@@ -1,13 +1,11 @@
 """DeepSeek adapter contract and lifecycle tests: fake loopback HTTP/SSE and synthetic keys only, no network."""
 
-import contextlib
 import fcntl
 import http.client
 import http.server
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import stat

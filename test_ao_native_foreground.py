@@ -15,7 +15,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-import ao_delegates
 import ao_project_room as ao
 import ao_routing
 import ao_routing_adoption as adoption

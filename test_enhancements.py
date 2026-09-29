@@ -1,7 +1,6 @@
 """Durable optional proposals and user-decision provenance; no external calls."""
 
 import json
-from pathlib import Path
 import subprocess
 import sys
 import unittest

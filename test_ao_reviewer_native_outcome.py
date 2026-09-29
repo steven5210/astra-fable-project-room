@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 import ao_native_outcome as native
-import ao_outcomes
 import ao_project_room as ao
 import ao_review_extension
 import ao_workflow

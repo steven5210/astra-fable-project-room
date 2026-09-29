@@ -1,4 +1,3 @@
-import copy
 import ctypes as C
 import json
 import os
@@ -117,7 +116,7 @@ class WorkflowTests(unittest.TestCase):
         base=Path(self.temp.name)/'inline'; base.mkdir(); other=Case(base,inline=True); self.prepare(other)
         self.assertEqual(other.apply()['outcome'],'applied_unverified'); self.assertEqual(other.contents(),other.after)
     def test_late_foreign_inode_mode_and_staged_corruption_refuse(self):
-        c=self.prepare()
+        self.prepare()
         for mutation in ('foreign','mode','staged'):
             with self.subTest(mutation=mutation):
                 base=Path(self.temp.name)/mutation; base.mkdir(); other=Case(base); self.prepare(other)

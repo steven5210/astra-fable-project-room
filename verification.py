@@ -128,7 +128,6 @@ def _scope_problem(candidate, worktree):
     entries = candidate.get("entries") if isinstance(candidate, dict) else None
     if not isinstance(entries, list) or len(entries) > COPY_ENTRY_LIMIT:
         return "candidate_unsupported_entry"
-    total = 0
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             return "candidate_unsupported_entry"

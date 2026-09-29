@@ -3,7 +3,6 @@
 These exercise the actual standalone CLI, scanner and collector without any account,
 provider, external evidence target or production room access.
 """
-import json
 import unittest
 from unittest import mock
 

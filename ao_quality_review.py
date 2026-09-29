@@ -205,7 +205,6 @@ def _settlement_valid(record, release, request):
 
 def _settlement(reader, request):
     """The existing settlement contract, read through the bounded owned reader."""
-    from ao_outcomes import native_quota_failure
     name = request["request_id"]
     sha = request.get("outcome_resume_sha256")
     _require(_hash(sha))

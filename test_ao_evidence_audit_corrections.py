@@ -7,7 +7,6 @@ are exercised; no Service, model, network, subprocess collector, state repair or
 
 import json
 import os
-from pathlib import Path
 import shutil
 import sqlite3
 import unittest

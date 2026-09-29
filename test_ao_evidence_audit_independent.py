@@ -275,7 +275,6 @@ class PreservedDiagnosticCases(AuditFixture, unittest.TestCase):
 
 
     def test_actor_collision_defeats_child_attribution(self):
-        target = str(self.evidence / "a.txt")
         self.write_transcript([self.human(),
                                self.assistant_tools("u-launch", "2026-01-01T00:00:11+00:00",
                                                     [{"type": "tool_use", "id": "t1", "name": "Agent",
