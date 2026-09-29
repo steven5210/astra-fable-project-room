@@ -40,25 +40,22 @@ Report each fact separately and keep the underlying receipts private.
 
 For diagnosed provider limits, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
 
-At the start of each new or resumed AO work session, compare the installed and
-running AO release with the official [latest stable release](https://github.com/Untrivial-ai/agent-orchestrator/releases/latest).
-The machine-readable feed is `https://api.github.com/repos/Untrivial-ai/agent-orchestrator/releases/latest`;
-exclude drafts and prereleases. Do not treat the initial validation version above
-as a permanent pin, or a development branch as a stable update.
+At the start of each new or resumed AO work session, call `ao_release_check` once
+before the first new model dispatch. It compares the running macOS bundled daemon
+with the official latest stable release, stores private evidence in
+`PROJECT_ROOM_HOME/ao/version-check.json`, and returns `up_to_date`,
+`update_available`, `mismatch` or `unknown`. `up_to_date` verifies the running
+bundle matches the latest stable release. For `update_available`, review the
+release and arrange an update between jobs as below. For `mismatch`, restart AO
+between jobs and recheck. For `unknown`, warn with the reported reasons, never
+treat it as up to date, and do not block status, sync or recovery.
 
-Identify the actual daemon through its configured endpoint's `GET /healthz`
-`executablePath`, and inspect that executable's version and installation provenance.
-Some official bundled daemons report `dev`; on macOS, corroborate the containing
-signed app's `CFBundleShortVersionString` with the saved verified release receipt.
-A config string alone does not prove the running version. If AO is stopped, report
-the installed version separately and check the running daemon after startup.
-
-Save the UTC check time, installed/running/latest versions, their evidence, release
-URL and outcome in private `PROJECT_ROOM_HOME/ao/version-check.json`. Fetch failure,
-rate limiting or ambiguous local identity means **unknown**, never "up to date";
-retain the last successful check separately. Warn about a new release, a version
-mismatch or a check failure. Do not prevent read-only status, reconciliation or
-recovery, and do not interrupt active workers to complete this check.
+For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
+from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's
+version and installation provenance; a configured version string alone does not
+prove which binary is running. Compare it with the official latest stable release,
+excluding drafts and prereleases, and report the result to the user as unknown
+until proven. Leave `version-check.json` to the tool.
 
 When a newer stable release is available, review its changes and arrange an update
 between jobs. Preserve the existing runtime/state and a consistent backup before
