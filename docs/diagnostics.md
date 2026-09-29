@@ -152,7 +152,7 @@ Unattributable responses and compaction markers inside an interval make the
 affected coverage incomplete. `native_totals.combined` is present only when both
 primary and worker subtotals are complete. The AO primary-counter relation is an
 observation, not an accounting assertion. DeepSeek jobs are selected only by their
-parsed timestamps within the request/receipt window, expose allowlisted usage
+parsed timestamps inclusively within the request/receipt window, expose allowlisted usage
 vocabulary, and never contribute to native totals.
 Delegate model IDs outside the accepted syntax are null with
 `delegate_model_unavailable`; more than 10,000 room rows makes ledger coverage

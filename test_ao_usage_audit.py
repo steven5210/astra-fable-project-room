@@ -568,6 +568,27 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(non_regular_report["api_delegates"],
                          {"coverage": "unavailable", "reason": "delegate_ledger_unsafe"})
 
+    def test_delegate_window_is_inclusive_at_start_and_receipt_end(self):
+        self.write_transcript([self.human()])
+        self.build()
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        ledger.parent.mkdir(parents=True)
+        job_times = {
+            "before-start": "2026-01-01T00:00:09+00:00",
+            "at-start": "2026-01-01T00:00:10+00:00",
+            "at-receipt-end": "2026-01-01T00:01:10+00:00",
+            "after-receipt-end": "2026-01-01T00:01:11+00:00",
+        }
+        with sqlite3.connect(ledger) as db:
+            db.executescript(deepseek_adapter.SCHEMA)
+            for job_id, created_at in job_times.items():
+                self.create_ledger_job(db, job_id=job_id, created_at=created_at,
+                                       usage={"prompt_tokens": 1, "completion_tokens": 2})
+        report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        jobs = {item["job_sha256"] for item in report["api_delegates"]["jobs"]}
+        self.assertEqual(jobs, {hashlib.sha256(job_id.encode()).hexdigest()
+                                for job_id in ("at-start", "at-receipt-end")})
+
     def test_delegate_model_identifiers_are_validated_and_private(self):
         self.write_transcript([self.human()])
         self.build()

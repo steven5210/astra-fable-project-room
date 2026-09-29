@@ -38,12 +38,7 @@ def _sum_counters(values):
 
 
 def _marker_in_interval(interval, number, timestamp):
-    if interval.contains(number, timestamp):
-        return True
-    if timestamp is not None:
-        return False
-    contains_number = getattr(interval, "contains_number", None)
-    return contains_number(number) if callable(contains_number) else True
+    return interval.contains(number, timestamp) if timestamp is not None else interval.contains_number(number)
 
 
 def _actor_unavailable(configured_model, reasons):
@@ -146,8 +141,12 @@ def _api_delegates(home, state, request, receipt, room):
         connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
         try:
             cursor = connection.execute(
-                "SELECT id, requested_model, observed_model, usage_json, usage_source, state, created_at "
-                "FROM jobs WHERE room_id=? ORDER BY rowid LIMIT ?", (room, MAX_DELEGATE_ROWS + 1))
+                "SELECT substr(id,1,1024), substr(requested_model,1,256), substr(observed_model,1,256), "
+                "CASE WHEN length(usage_json) > ? THEN NULL ELSE usage_json END, "
+                "substr(usage_source,1,256), substr(state,1,256), substr(created_at,1,256), "
+                "length(usage_json) > ? AS usage_oversized "
+                "FROM jobs WHERE room_id=? ORDER BY rowid LIMIT ?",
+                (MAX_USAGE_JSON_CHARS, MAX_USAGE_JSON_CHARS, room, MAX_DELEGATE_ROWS + 1))
             rows = []
             for row in cursor:
                 rows.append(row)
@@ -169,7 +168,8 @@ def _api_delegates(home, state, request, receipt, room):
             continue
         if start <= created_at <= end:
             selected.append(row)
-    for job_id, requested_model, observed_model, usage_json, usage_source, _state, _created_at in selected:
+    for (job_id, requested_model, observed_model, usage_json, usage_source, _state, _created_at,
+         usage_oversized) in selected:
         if not native.bounded_text(job_id):
             reasons.add("delegate_job_identity_unavailable")
             continue
@@ -183,7 +183,10 @@ def _api_delegates(home, state, request, receipt, room):
         if usage_source not in ("final_chunk", "usage_only_chunk"):
             reasons.add("delegate_usage_source_unavailable")
             usage_source = None
-        usage = None if isinstance(usage_json, str) and len(usage_json) > MAX_USAGE_JSON_CHARS else _job_usage(usage_json)
+        if usage_oversized:
+            usage = None
+        else:
+            usage = _job_usage(usage_json)
         if usage is None:
             reasons.add("delegate_usage_unavailable")
         jobs.append({"job_sha256": hashlib.sha256(job_id.encode("utf-8")).hexdigest(),
