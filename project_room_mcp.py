@@ -4,7 +4,9 @@
 import json
 import math
 from pathlib import Path
+import queue
 import sys
+import threading
 
 RUNTIME = None
 INPUT_CWD = None
@@ -20,6 +22,7 @@ if __name__ == "__main__":
         sys.stderr.write("Project Room MCP runtime could not be retained: " + str(exc) + "\n")
         raise SystemExit(1)
 
+import ao_project_room
 import project_room
 
 RELATIVE_PATH_ARGUMENTS = {
@@ -55,7 +58,7 @@ MAX_LINE = 3_000_000
 AO_INSTRUCTIONS = (
     "AO rooms use ao_room_*: Fable owns normal engineering/delegation; Astra owns product/spec and independent acceptance. "
     "An Astra-led exception requires actual per-task authorization. Prepare private delegates before native Fable launch, "
-    "bind exact roles/models, obtain Fable acceptance of the exact spec, then hand off. Pin gates; send once, sync (bounded waits <=45s while a turn runs), verify, "
+    "bind exact roles/models, obtain Fable acceptance of the exact spec, then hand off. Pin gates; send once; while a turn runs, wait only via ao_room_sync at the listed wait_seconds maximum, never shell/script watchers or sleep loops; verify, "
     "then accept the exact independent reviewer verdict. Usage is an attributable native subtotal, not quota. "
 )
 LEGACY_INSTRUCTIONS = (
@@ -81,6 +84,22 @@ LEGACY_TOOLS_HIDDEN_ERROR = (
 
 def _legacy_tools_visible(service):
     return service.legacy_tools_visible() if isinstance(service, project_room.Service) else True
+
+
+def _listed_schema(name, schema, service):
+    if name != "ao_room_sync" or not isinstance(service, project_room.Service):
+        return schema
+    try:
+        maximum = service.sync_wait_max_seconds()
+    except project_room.room.RoomError:
+        maximum = 45
+    return {
+        **schema,
+        "properties": {
+            **schema["properties"],
+            "wait_seconds": {**schema["properties"]["wait_seconds"], "maximum": maximum},
+        },
+    }
 
 
 def error_response(identifier, code, message):
@@ -123,7 +142,7 @@ def handle(message, service):
     elif method == "tools/list":
         legacy_visible = _legacy_tools_visible(service)
         readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list", "ao_room_engineer_model_audit"}
-        result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
+        result = {"tools": [{"name": name, "description": description, "inputSchema": _listed_schema(name, schema, service),
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
                                              "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify", "ao_room_engineer_model_audit", "ao_room_engineer_model_transition", "ao_room_engineer_model_transition_abandon", "ao_release_check")}}
                             for name, (description, schema) in project_room.TOOL_SCHEMAS.items()
@@ -149,23 +168,54 @@ def handle(message, service):
 
 def main():
     service = project_room.Service()
-    while True:
-        line = sys.stdin.buffer.readline(MAX_LINE + 1)
-        if not line:
-            break
-        if len(line) > MAX_LINE:
-            while line and not line.endswith(b"\n"):
-                line = sys.stdin.buffer.readline(MAX_LINE + 1)
-            response = error_response(None, -32600, "Request exceeds maximum size")
-        else:
-            try:
-                message = json.loads(line, parse_float=finite_float, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON number")))
-                response = handle(message, service)
-            except (ValueError, UnicodeDecodeError, RecursionError):
-                response = error_response(None, -32700, "Invalid JSON")
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n")
-            sys.stdout.flush()
+    messages = queue.Queue()
+    messages_lock = threading.Lock()
+    interrupt = threading.Event()
+    eof = object()
+
+    def enqueue(item):
+        with messages_lock:
+            messages.put(item)
+            interrupt.set()
+
+    def read_messages():
+        while True:
+            line = sys.stdin.buffer.readline(MAX_LINE + 1)
+            if not line:
+                enqueue(eof)
+                return
+            oversized = len(line) > MAX_LINE
+            if oversized:
+                while line and not line.endswith(b"\n"):
+                    line = sys.stdin.buffer.readline(MAX_LINE + 1)
+            enqueue((line, oversized))
+
+    previous_interrupt = ao_project_room.SYNC_WAIT_INTERRUPT
+    ao_project_room.SYNC_WAIT_INTERRUPT = interrupt
+    reader = threading.Thread(target=read_messages, daemon=True)
+    reader.start()
+    try:
+        while True:
+            item = messages.get()
+            with messages_lock:
+                if messages.empty():
+                    interrupt.clear()
+            if item is eof:
+                break
+            line, oversized = item
+            if oversized:
+                response = error_response(None, -32600, "Request exceeds maximum size")
+            else:
+                try:
+                    message = json.loads(line, parse_float=finite_float, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON number")))
+                    response = handle(message, service)
+                except (ValueError, UnicodeDecodeError, RecursionError):
+                    response = error_response(None, -32700, "Invalid JSON")
+            if response is not None:
+                sys.stdout.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n")
+                sys.stdout.flush()
+    finally:
+        ao_project_room.SYNC_WAIT_INTERRUPT = previous_interrupt
 
 
 if __name__ == "__main__":

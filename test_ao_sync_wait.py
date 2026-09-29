@@ -1,3 +1,4 @@
+import copy
 import fcntl
 import json
 import math
@@ -5,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -60,6 +62,14 @@ class SyncWaitTests(unittest.TestCase):
 
     def state_path(self):
         return self.service.root / "rooms" / self.room / "state.json"
+
+    def write_sync_wait_config(self, value):
+        path = self.service.root / "config.json"
+        config = ao.read(path) if path.exists() else {}
+        if not isinstance(config, dict):
+            config = {}
+        config["sync_wait_max_seconds"] = value
+        path.write_text(json.dumps(config))
 
     def test_zero_and_omitted_wait_preserve_sync_output_without_sleep(self):
         self.prepare_running()
@@ -132,6 +142,77 @@ class SyncWaitTests(unittest.TestCase):
         self.assertTrue(all(seconds == ao.AO_SYNC_WAIT_POLL_SECONDS for seconds in clock.sleeps))
         self.assertLessEqual(clock.now, 45 + ao.AO_SYNC_WAIT_POLL_SECONDS)
 
+    def test_configured_wait_cap_allows_long_waits_and_boundary_values(self):
+        self.prepare_running()
+        self.write_sync_wait_config(600)
+        clock = FakeClock()
+        with patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once, \
+                patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+            result = self.service.ao_room_sync(self.room, wait_seconds=600)
+        self.assertEqual(result["wait"], {"requested_seconds": 600, "reason": "timeout", "settled": False})
+        self.assertLessEqual(sync_once.call_count, math.ceil(600 / ao.AO_SYNC_WAIT_POLL_SECONDS) + 1)
+        self.assertLessEqual(clock.now, 600 + ao.AO_SYNC_WAIT_POLL_SECONDS)
+
+        clock = FakeClock()
+        with patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+            result = self.service.ao_room_sync(self.room, wait_seconds=45.01)
+        self.assertEqual(result["wait"]["requested_seconds"], 45.01)
+        self.assertEqual(result["wait"]["reason"], "timeout")
+        with self.assertRaisesRegex(ao.RoomError, "wait_seconds must be finite and between 0 and 600"):
+            self.service.ao_room_sync(self.room, wait_seconds=600.01)
+
+    def test_invalid_wait_caps_refuse_without_sync_but_zero_still_works(self):
+        self.prepare_running()
+        path = self.service.root / "config.json"
+        invalid_values = (44, 1801, True, "600", 600.5, [])
+        for value in invalid_values:
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value))
+                before = self.state_path().read_bytes()
+                gets = self.fake.gets
+                with self.assertRaisesRegex(ao.RoomError, "sync_wait_max_seconds"):
+                    self.service.ao_room_sync(self.room, wait_seconds=5)
+                self.assertEqual(self.fake.gets, gets)
+                self.assertEqual(self.state_path().read_bytes(), before)
+                result = self.service.ao_room_sync(self.room, wait_seconds=0)
+                self.assertNotIn("wait", result)
+
+    def test_set_interrupt_returns_without_a_second_sync(self):
+        self.prepare_running()
+        interrupt = threading.Event()
+        interrupt.set()
+        with patch.object(ao, "SYNC_WAIT_INTERRUPT", interrupt), \
+                patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once:
+            result = self.service.ao_room_sync(self.room, wait_seconds=45)
+        self.assertEqual(sync_once.call_count, 1)
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False})
+
+    def test_wait_interrupt_event_can_interrupt_after_two_polls(self):
+        self.prepare_running()
+
+        class Interrupt:
+            def __init__(self):
+                self.wait_calls = 0
+
+            def is_set(self):
+                return False
+
+            def wait(self, _seconds):
+                self.wait_calls += 1
+                return self.wait_calls == 3
+
+        interrupt = Interrupt()
+        with patch.object(ao, "SYNC_WAIT_INTERRUPT", interrupt), \
+                patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once, \
+                patch("ao_project_room.time.sleep") as sleep:
+            result = self.service.ao_room_sync(self.room, wait_seconds=45)
+        self.assertEqual(interrupt.wait_calls, 3)
+        self.assertEqual(sync_once.call_count, 3)
+        sleep.assert_not_called()
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False})
+
     def test_no_active_request_syncs_once_without_sleep(self):
         clock = FakeClock()
         with patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once, \
@@ -199,12 +280,27 @@ class SyncWaitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
             controller = project_room.Service(home)
+            static_schema = copy.deepcopy(ao.TOOL_SCHEMAS["ao_room_sync"][1])
             listing = project_room_mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, controller)
             definition = next(tool for tool in listing["result"]["tools"] if tool["name"] == "ao_room_sync")
             self.assertEqual(definition["inputSchema"], ao.TOOL_SCHEMAS["ao_room_sync"][1])
             self.assertEqual(definition["inputSchema"]["properties"]["wait_seconds"],
                              {"type": "number", "minimum": 0, "maximum": 45})
             self.assertEqual(definition["inputSchema"]["required"], ["room_id"])
+            config = controller.home / "ao" / "config.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps({"sync_wait_max_seconds": 600}))
+            listing = project_room_mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}, controller)
+            definition = next(tool for tool in listing["result"]["tools"] if tool["name"] == "ao_room_sync")
+            self.assertEqual(definition["inputSchema"]["properties"]["wait_seconds"]["maximum"], 600)
+            expected_schema = copy.deepcopy(static_schema)
+            expected_schema["properties"]["wait_seconds"]["maximum"] = 600
+            self.assertEqual(definition["inputSchema"], expected_schema)
+            self.assertEqual(ao.TOOL_SCHEMAS["ao_room_sync"][1], static_schema)
+            config.write_text(json.dumps({"sync_wait_max_seconds": 44}))
+            listing = project_room_mcp.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}, controller)
+            definition = next(tool for tool in listing["result"]["tools"] if tool["name"] == "ao_room_sync")
+            self.assertEqual(definition["inputSchema"]["properties"]["wait_seconds"]["maximum"], 45)
             envelope = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                         "params": {"name": "ao_room_sync", "arguments": arguments}}
             with patch.object(project_room.ao_project_room, "Service") as adapter:

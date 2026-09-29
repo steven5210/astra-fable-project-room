@@ -1,13 +1,19 @@
 """MCP stdio/process tests; fake Claude only, no model or network dependencies."""
 
+from io import BytesIO, StringIO
 import json
 import os
 import selectors
 import subprocess
 import sys
+import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
+import ao_project_room
 import project_room
+import project_room_mcp
 from test_project_room import ProjectFixture, ROOT
 
 
@@ -170,6 +176,45 @@ class ProjectRoomMcpTests(ProjectFixture):
         data = b" " * 3_000_010 + b'{"jsonrpc":"2.0","id":8,"method":"ping"}\n'
         self.assertEqual(self.raw(data)["error"]["code"], -32600)
         self.assertEqual(self.request("ping", identifier=9)["id"], 9)
+
+    def test_in_process_main_queues_input_and_restores_sync_interrupt(self):
+        initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-06-18"}}
+        listing = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        notification = {"jsonrpc": "2.0", "method": "ping"}
+        data = (json.dumps(initialize).encode() + b"\n" +
+                json.dumps(listing).encode() + b"\n" +
+                json.dumps(notification).encode() + b"\n" +
+                b" " * (project_room_mcp.MAX_LINE + 1) + b"\n" +
+                b"{broken\n")
+
+        class BufferedInput:
+            def __init__(self, value):
+                self.buffer = BytesIO(value)
+
+        observed = []
+        previous_interrupt = ao_project_room.SYNC_WAIT_INTERRUPT
+        original_handle = project_room_mcp.handle
+
+        def observe(message, service):
+            observed.append(ao_project_room.SYNC_WAIT_INTERRUPT)
+            return original_handle(message, service)
+
+        with tempfile.TemporaryDirectory() as home, \
+                patch.dict(os.environ, {"PROJECT_ROOM_HOME": home}), \
+                patch.object(project_room_mcp, "handle", side_effect=observe), \
+                patch.object(project_room_mcp.sys, "stdin", BufferedInput(data)), \
+                patch.object(project_room_mcp.sys, "stdout", StringIO()) as output:
+            project_room_mcp.main()
+            responses = [json.loads(line) for line in output.getvalue().splitlines()]
+
+        self.assertEqual([response["id"] for response in responses], [1, 2, None, None])
+        self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, set(project_room.TOOL_SCHEMAS))
+        self.assertEqual(responses[2]["error"]["code"], -32600)
+        self.assertEqual(responses[3]["error"]["code"], -32700)
+        self.assertTrue(any(isinstance(event, threading.Event) for event in observed))
+        self.assertIs(ao_project_room.SYNC_WAIT_INTERRUPT, previous_interrupt)
 
     def test_nested_json_is_rejected_and_server_survives(self):
         data = b"[" * 1500 + b"0" + b"]" * 1500 + b"\n"

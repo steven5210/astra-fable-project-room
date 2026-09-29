@@ -14,6 +14,8 @@ All AO configuration lives in the private data directory, never in the plugin or
 
    Every new normal AO engineer preparation enables Claude's native automatic compaction with a **250,000-token window**, across projects and delegate providers. To select another window for future preparations, add `"auto_compact_window": 250000` to this same private file (an integer from 100,000 to 1,000,000). Preparation snapshots the choice in the ignored worktree settings; changing the default never rewrites an existing room. Fable stays at MAX. See [context compaction](context-compaction.md) for configuration, existing sessions and validation.
 
+   Optionally add `"sync_wait_max_seconds": 600` (an integer from 45 to 1800; default 45) so that a single `ao_room_sync` wait can block longer while Fable works and Astra wakes less often. First raise Codex's `tool_timeout_sec` for the Project Room MCP server above that value (Codex's default is 60 seconds), then restart Codex so that a new task lists the new `wait_seconds` maximum. A wait still returns early when a request's state changes, when no owned turn is active, or when Codex sends the server another message.
+
 2. **Delegate provider.** Record the first-tier provider for new rooms with the controller's setup command, which AO and legacy rooms share; new AO rooms accept `deepseek` or an explicit `none`, and a missing selection fails closed rather than downgrading silently:
 
    ```sh

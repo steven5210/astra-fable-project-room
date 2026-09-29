@@ -41,6 +41,10 @@ NATIVE_TERMINAL = TERMINAL | {"recovered"}
 COUNTERS = ("inputTokens", "outputTokens", "cachedTokens", "totalTokens")
 MAX_REVIEW_ATTEMPTS = 3
 AO_SYNC_WAIT_POLL_SECONDS = 5
+SYNC_WAIT_INTERRUPT = None
+SYNC_WAIT_MAX_SECONDS_ERROR = (
+    "sync_wait_max_seconds in PROJECT_ROOM_HOME/ao/config.json must be an integer from 45 to 1800"
+)
 
 
 def digest(value):
@@ -82,6 +86,21 @@ def atomic(path, value):
 
 def read(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sync_wait_max_seconds(ao_root):
+    try:
+        config = read(Path(ao_root) / "config.json")
+    except FileNotFoundError:
+        return 45
+    except (OSError, ValueError, RecursionError) as exc:
+        raise RoomError(SYNC_WAIT_MAX_SECONDS_ERROR) from exc
+    if not isinstance(config, dict):
+        raise RoomError(SYNC_WAIT_MAX_SECONDS_ERROR)
+    value = config.get("sync_wait_max_seconds", 45)
+    if type(value) is not int or not 45 <= value <= 1800:
+        raise RoomError(SYNC_WAIT_MAX_SECONDS_ERROR)
+    return value
 
 
 def git(path, *args):
@@ -870,13 +889,16 @@ class Service:
     def ao_room_sync(self, room_id, wait_seconds=0):
         try:
             invalid = (isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float))
-                       or not math.isfinite(wait_seconds) or not 0 <= wait_seconds <= 45)
+                       or not math.isfinite(wait_seconds))
         except (OverflowError, TypeError, ValueError):
             invalid = True
         if invalid:
             raise RoomError("wait_seconds must be finite and between 0 and 45")
         if wait_seconds == 0:
             return self._sync_once(room_id)[0]
+        maximum = sync_wait_max_seconds(self.root) if wait_seconds > 0 else 45
+        if not 0 <= wait_seconds <= maximum:
+            raise RoomError(f"wait_seconds must be finite and between 0 and {maximum}")
         deadline = time.monotonic() + wait_seconds
         summary, initial = self._sync_once(room_id)
         states = initial
@@ -892,7 +914,15 @@ class Service:
             if remaining <= 0:
                 reason = "timeout"
                 break
-            time.sleep(min(AO_SYNC_WAIT_POLL_SECONDS, remaining))
+            interrupt = SYNC_WAIT_INTERRUPT
+            if interrupt is not None and interrupt.is_set():
+                reason = "interrupted"
+                break
+            if interrupt is None:
+                time.sleep(min(AO_SYNC_WAIT_POLL_SECONDS, remaining))
+            elif interrupt.wait(min(AO_SYNC_WAIT_POLL_SECONDS, remaining)):
+                reason = "interrupted"
+                break
             summary, states = self._sync_once(room_id)
         summary["wait"] = {
             "requested_seconds": wait_seconds,
@@ -1266,7 +1296,7 @@ TOOL_SCHEMAS = {
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_release_check": ("Compare the running AO daemon with the official latest stable release once per new or resumed AO session. One bounded GitHub GET plus loopback /healthz and local bundle metadata; never invokes a model, restarts or updates AO, or touches rooms and workers. Outcome up_to_date | update_available | mismatch | unknown; unknown is never up to date. Saves private evidence in version-check.json.", schema({"ao_url": S}, [])),
-    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (<=45) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running or any request state changes; repeat bounded waits instead of polling each turn.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
+    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),

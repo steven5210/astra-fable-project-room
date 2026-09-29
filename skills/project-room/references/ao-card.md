@@ -14,10 +14,14 @@ Rules for every phase:
 - Use a stable, new `request_id` per logical send. An identical repeated call
   reads the saved record. Never resend under a new ID after `uncertain`,
   `failed`, `interrupted`, `cancelled`, `recovered` or a lost acknowledgement.
-- While an owned turn is submitted or running, call `ao_room_sync` with
-  `wait_seconds=45`, and give a brief update between waits. A `timeout` wait
-  reason is not a stall. `settled` is true only when every owned request is
-  terminal. Sync each turn to terminal before another send.
+- While an owned turn is submitted or running, wait only with `ao_room_sync`,
+  setting `wait_seconds` to the maximum its schema lists (45 unless the operator
+  raised `sync_wait_max_seconds`), and repeat. Never poll room files, receipts,
+  transcripts or the CLI with shell or Python watchers, `sleep` loops or short
+  repeated calls: every check is a full Astra model turn. Between waits, give
+  at most a one-line update, and only when something changed. A `timeout` or
+  `interrupted` wait reason is not a stall. `settled` is true only when every
+  owned request is terminal. Sync each turn to terminal before another send.
 - Report usage as the attributable native subtotal from status, with delegates
   separate. Unknown is never zero, and it is not quota or billing.
 - Keep room IDs, native IDs, paths and receipts private.
@@ -28,6 +32,14 @@ Rules for every phase:
 outcome; only `up_to_date` counts as current. Then `ao_room_list` (plus legacy
 `room_list` if it is listed), `ao_room_status`, and `ao_room_sync` for active work.
 Resume the recorded backend and state before anything new.
+After a context compaction, or when resuming a room in a new thread, reload only
+this card and the room's `ao_room_status`; status holds the spec, findings,
+dispositions, requests and holds. Open a full-guide section only when a **Stop**
+line or an uncovered situation calls for it. Keep one Astra thread per room:
+start a new thread when you move to a different room, never partway through one.
+Before switching, check that the user's product decisions for the room you are
+leaving are in its spec or finding dispositions; if one is not, tell the user
+first.
 **Stop:** outcome other than `up_to_date` → [stable-release check](ao.md#stable-release-check).
 Missing setup, URL or config → [setup and resume](ao.md#setup-and-resume).
 Provider limit, truncated output or a paused room → [efficient continuation](../../../docs/guides/efficient-continuation.md).
