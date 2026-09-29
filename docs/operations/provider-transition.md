@@ -28,7 +28,7 @@ Keep a durable private operator intent before each external AO lifecycle or
 configuration call. Reconcile its actual result after a lost acknowledgement;
 neither AO exit nor resume is an automatically retryable model operation.
 
-1. Perform the current [AO stable-release check](../skills/project-room/references/ao.md#stable-release-check).
+1. Perform the current [AO stable-release check](../../skills/project-room/references/ao.md#stable-release-check).
    Inspect the existing room and native conversations. Do not start a replacement
    room, repeat a provider job or dispatch a probe to test eligibility.
 2. Call `ao_room_provider_transition_audit(room_id, target_profile)`. The target is
