@@ -19,9 +19,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
+        shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
-    # The 1,129-test offline suite exceeded 30 minutes on a macOS runner while
-    # still passing tests. Allow setup, recovery timeout probes and cleanup to finish.
+    # The offline suite (about 1,800 tests and growing) runs as four module-level shards
+    # per interpreter (tests/run_test_shards.py); a shard is expected to take 10-25 minutes
+    # on a macOS runner. The budget covers setup, recovery timeout probes and cleanup.
     # This is a CI budget, not a Fable, model or gate deadline.
     timeout-minutes: 45
     steps:
@@ -34,7 +36,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run macOS tests with fake model and MCP backends
         if: runner.os == 'macOS'
-        run: python -m unittest discover -v
+        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 4 -v
       - name: Run Linux tests in an isolated process namespace
         if: runner.os == 'Linux'
         env:
@@ -55,7 +57,7 @@ jobs:
             --mount "type=bind,source=$project_room_candidate,target=/candidate,readonly" \
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
-            "$PROJECT_ROOM_TEST_IMAGE" python -B -m unittest discover -v
+            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 4 -v
 
   lint:
     runs-on: ubuntu-latest
