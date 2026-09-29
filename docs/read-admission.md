@@ -69,7 +69,8 @@ splits of one message are merged, exact duplicate records are deduplicated and
 conflicting duplicates refuse.
 
 * Unrelated native records (for example queue-operation rows without a `uuid`,
-system rows, summaries) are ignored; they are not treated as missing identity.
+system rows, summaries, and the `ai-title`, `atis-latch`, `last-prompt`, and `mode`
+metadata rows) are ignored; they are not treated as missing identity.
 * If the current call is absent from a complete, verified transcript revision, the
 guard waits briefly in the same hook invocation for a late native flush: at most
 `READ_CORRELATION_ATTEMPTS` (8) checks over at most

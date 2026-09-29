@@ -38,14 +38,6 @@ def _sum_counters(values):
     return result
 
 
-def _marker_in_interval(interval, number, timestamp):
-    if timestamp is not None:
-        return interval.contains(number, timestamp)
-    # Record numbers are actor-local: only a parent Interval can place a marker by number. A child
-    # interval is bounded by timestamps alone, so a marker without one cannot be excluded (fail closed).
-    return interval.contains_number(number) if isinstance(interval, native.Interval) else True
-
-
 def _actor_unavailable(configured_model, reasons):
     return {"coverage": "unavailable", "cache_coverage": "unavailable", "configured_model": configured_model,
             "attested_models": [], "responses": None, "repeated_response_records": None,
@@ -60,7 +52,8 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     observations = [item for item in scan.usage_observations if interval.contains(item[0], item[1])]
     reasons.update(reason for number, timestamp, reason in scan.usage_reasons
                    if interval.contains(number, timestamp))
-    if any(_marker_in_interval(interval, number, timestamp) for number, timestamp in scan.compaction_markers):
+    if any(native.marker_in_interval(interval, number, timestamp)
+           for number, timestamp in scan.compaction_markers):
         reasons.add("compaction_in_interval")
     groups = {}
     for observation in observations:
