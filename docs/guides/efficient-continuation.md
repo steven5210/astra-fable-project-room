@@ -405,7 +405,7 @@ public-error proof and a fresh positive diagnosis, and contradictory quota,
 safety or refusal evidence disqualifies it. The read-admission mitigation for
 that compaction lane binds only the exact settled diagnosis; it does not let a
 contradictory or ambiguous record bypass the fresh positive proof. See
-[compaction-failure recovery](compaction-failure-recovery.md).
+[compaction-failure recovery](../operations/compaction-failure-recovery.md).
 The original failed receipt, partial work, native identity and consumed attempts
 remain intact in either case. Neither state is successful engineering or
 acceptance. Unknown delivery, arbitrary crashes, unresolved paid delegates and

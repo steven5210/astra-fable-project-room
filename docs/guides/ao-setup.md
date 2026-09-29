@@ -1,0 +1,73 @@
+# AO backend setup and normal workflow
+
+## Configure the private AO backend
+
+All AO configuration lives in the private data directory, never in the plugin or the repository.
+
+1. **Endpoint.** Add the actual Git project in AO. Then either pass `ao_url` to `ao_room_open` or save it in `PROJECT_ROOM_HOME/ao/config.json`:
+
+   ```json
+   {"ao_url": "http://127.0.0.1:PORT", "default_backend": "ao"}
+   ```
+
+   The URL must be an explicit loopback IP and port; remote hosts, proxies, credentials in URLs and redirects are refused. The `PROJECT_ROOM_AO_URL` environment variable takes precedence over the file. `default_backend: "ao"` tells the skill to use AO for new Project Room work; when it is selected and no legacy room exists, MCP omits the legacy `room_*` tools and instructions, `"legacy_tools": true` in the same config restores them after an MCP restart, while CLI tools remain callable and nothing migrates.
+
+   Every new normal AO engineer preparation enables Claude's native automatic compaction with a **250,000-token window**, across projects and delegate providers. To select another window for future preparations, add `"auto_compact_window": 250000` to this same private file (an integer from 100,000 to 1,000,000). Preparation snapshots the choice in the ignored worktree settings; changing the default never rewrites an existing room. Fable stays at MAX. See [context compaction](context-compaction.md) for configuration, existing sessions and validation.
+
+2. **Delegate provider.** Record the first-tier provider for new rooms with the controller's setup command, which AO and legacy rooms share; new AO rooms accept `deepseek` or an explicit `none`, and a missing selection fails closed rather than downgrading silently:
+
+   ```sh
+   python3 project_room.py setup --deepseek-config /absolute/private/path/to/deepinfra-provider.json --delegate-provider deepseek
+   python3 deepseek_adapter.py set-key --home ~/.project-room --backend deepinfra
+   ```
+
+   Start the private provider file from [examples/deepinfra-provider.example.json](../../examples/deepinfra-provider.example.json) to select `backend: "deepinfra"`, `deepseek-ai/DeepSeek-V4.1-Flash`, reasoning effort `max` and 131,072 output tokens. The tool family stays named `deepseek`. The [official example](../../examples/deepseek-provider.example.json) retains `backend: "official"` and its 393,216-token budget; use `set-key --backend official` for that separate key. Both provider files are key-free; the key is entered interactively at your terminal and read only when a job sends its request or when you run the explicit paid `probe`. A room snapshots the adapter, policy and configuration when it opens, so rerunning setup never changes an existing room. See [the DeepSeek delegate guide](../reference/deepseek.md).
+
+3. **Repository ignore rule.** The engineer's repository must already ignore `.claude/` (or the three routing paths `.claude/settings.local.json`, `.claude/agents/pr-sonnet.md` and `.claude/agents/pr-opus.md`). Preparation refuses tracked, unignored, symlinked or conflicting paths and never edits ignore rules itself; adding the rule is a deliberate setup change that your existing AO setup authorization covers when it applies, not a fresh permission question for each routine ignore rule.
+
+4. **AO project rules.** Through stock AO project configuration, add the authorized Project Room delegation clause to the project `agentRules`, preserving the existing fields. Preparation snapshots the rules digest and refuses when the clause is absent; implementation and correction packets re-read the rules and refuse on drift. AO's generic worker prompt still forbids native subagents; the clause is the explicit task authorization for the two pinned agents.
+
+5. **Engineer preparation hook.** AO's stock `postCreate` project hook can run the preparation from the created worktree with fixed, quoted argv:
+
+   ```sh
+   python3 /absolute/path/to/ao_delegates.py --home /absolute/private/project-room-home --room ROOM_ID
+   ```
+
+   Install it only for the creation of the intended engineer, create the Astra reviewer before installing it or after restoring the previous configuration, and restore the prior hook afterwards. A failed preparation leaves the room unprepared and AO does not launch the paid worker. The full procedure, including the user and managed Claude settings that must not disable hooks or force subagent models, is in [Native delegation routing](../../skills/project-room/references/ao.md#native-delegation-routing).
+
+Long native histories use [bounded smaller history pages](../reference/ao-history-reads.md),
+including complete activity evidence. An oversized observation is never a reason
+to resend a model turn. The MCP connector also retains its own coherent runtime
+outside the replaceable plugin cache; see [connector updates](../reference/connector-runtime.md)
+for refresh and retention behavior.
+
+
+## Normal workflow on AO
+
+The skill walks Astra through these steps; the tool names are the `ao_room_*` MCP tools, which the CLI exposes with the same schemas.
+
+1. `ao_room_open` with the actual project path, a stable feature name, the existing AO project ID, your implementation authorization and `delegate_provider` set to `deepseek` (or an intentionally selected `none`). A normal room without a usable selection is refused rather than downgraded; only a provider that `setup --delegate-provider` recorded deliberately fills in an omitted argument, so pass it explicitly. An optional `engineering_model` pins this room's engineering selector — an engineer-role family alias (`fable`, the default, or `opus`) or a qualified exact identifier — instead of the default `fable` family; reopening with a different selector is refused. See [the engineering model transition guide](engineering-model-transition.md) for the qualified policy, the operator-selected source qualification artifact and how an existing room's selection changes later. Reopening returns the same room. Save its `room_id`. An Astra-led exception passes `workflow: "astra_led"` and the per-task `exception_authorization` here; see [the exception and delivery rules](../../skills/project-room/references/ao.md#explicit-astra-exception-and-historical-pilot-rooms).
+2. `ao_room_spec_put` with the exact UTF-8 spec content, a positive revision, Astra's approval text and nonempty argv gate arrays, for example `[["python3", "-m", "unittest", "discover", "-v"]]`. Revisions are immutable.
+3. Prepare the engineer worktree before Claude launches (the hook above, or `ao_room_prepare` for the exact workspace). Create an ordinary AO Claude chat worker without an initial prompt, configure the room's configured engineering selector (family alias or exact identifier) at `max`, and `ao_room_bind` it as `engineer`. Bind a separate native Codex chat worker at the requested Astra model and `max` as `reviewer`. After both binds and before the first qualified-family `spec_review`, call `ao_room_engineer_source_register` with the bound engineer's real AO owner database and its prospective or already owned Claude transcript path; a source-qualified family dispatch refuses without that registered source. Ordinary bindings and the engineer workspace are immutable. A [single audited recovery](../../skills/project-room/references/ao.md#recovery-of-a-reviewer-that-has-never-been-used) is available only for a stopped reviewer that has never received a request; it preserves the original binding and review limits.
+4. `ao_room_send` to the engineer with purpose `spec_review` and a stable `request_id`; `ao_room_sync` the completed turn. Fable's final JSON must carry `interpretation`, `findings`, `decision`, `spec_revision` and `spec_sha256`. Three spec reviews are available per room across revisions.
+5. `ao_room_handoff` for the bound engineer worktree pins the agreement, baseline commit, candidate, authorization, delegate preparation and gates. Send purpose `implementation` once for that handoff; Fable directs implementation and delegates under the policy; the assigned executor leaves the candidate uncommitted unless a commit is part of the intended candidate, and returns a structured engineering report (`outcome`, `implementation_complete`, `changes`, `tests_reported`, `review_findings`, `remaining_gaps`, `backlog`, `routing_log` with `delegate_job_ids`, and the exact spec and baseline identity). Sync promptly so the candidate is captured. A confirmed completed turn may receive focused `correction` requests in the same session, each a new turn rather than a replay; a `scope_change` report returns to the spec.
+6. `ao_room_verify` runs the pinned gates on the candidate worktree and binds the logs to the exact Git candidate before and after each gate.
+7. `ao_room_send` to the reviewer with purpose `acceptance_review`; sync its terminal response; `ao_room_accept` records it only when the completed verdict names the unchanged spec, candidate and evidence hashes. Three acceptance reviews are available per room.
+
+A completed response with valid JSON surrounded by prose can use [audited formatting recovery](../../skills/project-room/references/ao.md#completed-response-formatting-recovery): Astra reviews all surrounding text and records the exact object without a model call. Raw evidence and review limits remain intact; ambiguous content, stale candidates and missing completion evidence are refused. This does not approve the result or bypass independent acceptance.
+
+Transport completion is checked separately from semantic success. Shared quota/provider-error holds survive restarts and take precedence over truncated or missing output. `ao_room_outcome_audit` diagnoses the exact result without inference; `ao_room_outcome_resume` records actual authorization for one named continuation without replaying the failed turn or renewing review budgets. Unknown delivery remains blocked. `ao_room_instruction_stage` stores new operating instructions while a room is paused and delivers them once on a separately authorized send. The [guide](efficient-continuation.md) covers native evidence, compact report fields, the narrowly audited failed-turn quota settlement, and the explicit workaround for the affected AO 0.13 Claude bridge. It also documents separate, exact-source recognition of failed SDK task-notification history imports without releasing semantic holds.
+
+Every step refuses rather than guesses: unknown delivery is never replayed, an AO failure without an observed native turn ID stays uncertain, an active or unresolved delegate job blocks the next phase, and exhausted review budgets surface the decision to you instead of opening another room. The full contract, including the exact result fields and the historical pilot rooms, is in [Project Room on Agent Orchestrator](../../skills/project-room/references/ao.md).
+
+### CLI fallback
+
+The installed plugin's controller exposes every `ao_room_*` and legacy `room_*` operation with the MCP schemas, which lets an existing task with an older tool inventory continue a room without a new conversation:
+
+```sh
+python3 project_room.py call ao_room_status --args '{"room_id":"ROOM_ID"}'
+python3 project_room.py call ao_room_open --args-file /absolute/private/path/to/open-arguments.json
+python3 project_room.py call ao_room_list --args '{}'
+```
+
+Replace `ROOM_ID` with the `room_id` returned by `ao_room_open`; AO room IDs already start with `ao-`. From another directory, use the absolute path of `project_room.py`. Prefer `--args-file` for multiline specs and review notes. `python3 project_room.py transcript-audit --room ROOM_ID --handoff HANDOFF_ID --attempt N` is a read-only tool-use count of one legacy implementation attempt's exact session transcript. The complete legacy tool reference is in [operations](../../skills/project-room/references/operations.md).

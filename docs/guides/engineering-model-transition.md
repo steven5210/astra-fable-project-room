@@ -13,7 +13,7 @@ inference, how an already-open room adopts a new selection through an audited
 boundary, and the executable prerequisite a newer model may require. It does
 not change what the role owns: the configured engineering orchestrator retains
 engineering interpretation, delegation and the final engineering verdict as
-described in [Fable's policy](../skills/project-room/references/fable-policy.md);
+described in [Fable's policy](../../skills/project-room/references/fable-policy.md);
 only the configured model identity moves through a controlled, auditable path
 instead of an inferred or silent switch. Historical judgments keep the
 attribution recorded with them: Fable's prior judgments remain Fable's, and
@@ -306,7 +306,7 @@ any unknown delivery for diagnosis, and never repairs database state or
 injects digests. For an existing room whose pinned Claude Code build is below
 the target's compatibility floor, follow this sequence:
 
-1. Reconcile known states first. Perform the [stable-release check](../skills/project-room/references/ao.md#stable-release-check),
+1. Reconcile known states first. Perform the [stable-release check](../../skills/project-room/references/ao.md#stable-release-check),
    sync, and check status. Reconcile or settle every known owned terminal
    failure through the existing supported outcome tools
    (`ao_room_outcome_audit` / `ao_room_outcome_resume`); unknown delivery stays
