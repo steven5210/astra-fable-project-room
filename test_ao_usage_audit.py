@@ -136,6 +136,7 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(report["parent"]["coverage"], "incomplete")
         self.assertEqual(report["parent"]["responses"], 0)
         self.assertEqual(report["parent"]["reasons"], ["usage_unattributable"])
+        self.assertEqual(report["parent"]["cache_coverage"], "incomplete")
         self.assertIsNone(report["native_totals"]["primary"])
         self.assertEqual(report["ao_primary_counter_relation"], "unavailable")
 
@@ -366,6 +367,17 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(report["parent"]["reasons"], ["compaction_in_interval"])
         self.assertIsNone(report["native_totals"]["primary"])
 
+    def test_compaction_marker_without_timestamp_in_interval_is_incomplete(self):
+        compact = self.parent_record("system", "compact", "2026-01-01T00:00:15+00:00", "")
+        compact.pop("timestamp")
+        compact["subtype"] = "compact_boundary"
+        response = self.assistant("assistant", "2026-01-01T00:00:20+00:00", "message",
+                                  {"input_tokens": 1, "output_tokens": 2,
+                                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        report = self.report([self.human(), compact, response])
+        self.assertEqual(report["parent"]["coverage"], "incomplete")
+        self.assertIn("compaction_in_interval", report["parent"]["reasons"])
+
     def test_unknown_cache_splits_do_not_invalidate_token_coverage(self):
         response = self.assistant("assistant", "2026-01-01T00:00:20+00:00", "message",
                                   {"input_tokens": 12, "output_tokens": 4})
@@ -555,6 +567,59 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         non_regular_report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
         self.assertEqual(non_regular_report["api_delegates"],
                          {"coverage": "unavailable", "reason": "delegate_ledger_unsafe"})
+
+    def test_delegate_model_identifiers_are_validated_and_private(self):
+        self.write_transcript([self.human()])
+        self.build()
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        ledger.parent.mkdir(parents=True)
+        with sqlite3.connect(ledger) as db:
+            db.executescript(deepseek_adapter.SCHEMA)
+            self.create_ledger_job(db, job_id="invalid-observed-model",
+                                   created_at="2026-01-01T00:00:30+00:00",
+                                   usage={"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
+            db.execute("UPDATE jobs SET observed_model=? WHERE id=?",
+                       ("leak text\nhere", "invalid-observed-model"))
+        report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        self.assertIsNone(report["api_delegates"]["jobs"][0]["observed_model"])
+        self.assertIn("delegate_model_unavailable", report["api_delegates"]["reasons"])
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertNotIn("leak text\nhere", process.stdout)
+
+    def test_delegate_ledger_row_limit_returns_unavailable(self):
+        self.write_transcript([self.human()])
+        self.build()
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        ledger.parent.mkdir(parents=True)
+        with sqlite3.connect(ledger) as db:
+            db.executescript(deepseek_adapter.SCHEMA)
+            for index in range(4):
+                self.create_ledger_job(db, job_id=f"bounded-job-{index}",
+                                       created_at="2026-01-01T00:00:30+00:00",
+                                       usage={"prompt_tokens": index + 1, "completion_tokens": 1})
+        with patch.object(ao_usage_audit, "MAX_DELEGATE_ROWS", 3):
+            report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        self.assertEqual(report["api_delegates"],
+                         {"coverage": "unavailable", "reason": "delegate_ledger_limit"})
+
+    def test_oversized_delegate_usage_is_unavailable_without_parsing(self):
+        self.write_transcript([self.human()])
+        self.build()
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        ledger.parent.mkdir(parents=True)
+        with sqlite3.connect(ledger) as db:
+            db.executescript(deepseek_adapter.SCHEMA)
+            self.create_ledger_job(db, job_id="oversized-usage",
+                                   created_at="2026-01-01T00:00:30+00:00", usage="x" * 65537)
+        with patch.object(ao_usage_audit, "_job_usage",
+                          side_effect=AssertionError("oversized delegate usage must not be parsed")) as parse_usage:
+            report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        parse_usage.assert_not_called()
+        api = report["api_delegates"]
+        self.assertEqual(api["coverage"], "incomplete")
+        self.assertIn("delegate_usage_unavailable", api["reasons"])
+        self.assertIsNone(api["jobs"][0]["usage"])
 
     def test_binding_refusal_has_unavailable_totals_and_skips_delegate_evaluation(self):
         self.report([self.human()])

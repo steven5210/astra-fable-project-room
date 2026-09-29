@@ -145,15 +145,19 @@ in prepared agent routing; other transcript strings are not echoed. Configured m
 identity comes from the saved request or prepared agent routing and remains distinct
 from attested transcript models.
 
-Input/output counters require valid nonnegative token counts. Cache split counters
-remain null if any counted response has an unknown split; `cache_coverage` reports
-that uncertainty separately and it does not alone make token coverage incomplete.
+Input/output counters require valid nonnegative token counts. Cache coverage is
+incomplete whenever token coverage is incomplete or a counted response has an
+unknown cache split; a missing cache split alone does not make token coverage incomplete.
 Unattributable responses and compaction markers inside an interval make the
 affected coverage incomplete. `native_totals.combined` is present only when both
 primary and worker subtotals are complete. The AO primary-counter relation is an
 observation, not an accounting assertion. DeepSeek jobs are selected only by their
 parsed timestamps within the request/receipt window, expose allowlisted usage
 vocabulary, and never contribute to native totals.
+Delegate model IDs outside the accepted syntax are null with
+`delegate_model_unavailable`; more than 10,000 room rows makes ledger coverage
+unavailable (`delegate_ledger_limit`), and usage JSON over 65,536 characters is not
+parsed (`delegate_usage_unavailable`).
 
 The report contains opaque source/actor digests but no raw request, owner, session,
 message, path or transcript identifiers. Its fixed limitations make clear that the

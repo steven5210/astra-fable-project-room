@@ -17,6 +17,8 @@ LIMITATIONS = ("not_billing_or_quota", "single_request_not_workflow_total", "con
                "compaction_calls_not_logged", "bounded_time_correlation", "delegate_selection_by_time_window")
 COUNTER_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown"))
+MAX_DELEGATE_ROWS = 10000
+MAX_USAGE_JSON_CHARS = 65536
 
 
 def _empty_counters(value=None):
@@ -35,6 +37,15 @@ def _sum_counters(values):
     return result
 
 
+def _marker_in_interval(interval, number, timestamp):
+    if interval.contains(number, timestamp):
+        return True
+    if timestamp is not None:
+        return False
+    contains_number = getattr(interval, "contains_number", None)
+    return contains_number(number) if callable(contains_number) else True
+
+
 def _actor_unavailable(configured_model, reasons):
     return {"coverage": "unavailable", "cache_coverage": "unavailable", "configured_model": configured_model,
             "attested_models": [], "responses": None, "repeated_response_records": None,
@@ -49,7 +60,7 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
     observations = [item for item in scan.usage_observations if interval.contains(item[0], item[1])]
     reasons.update(reason for number, timestamp, reason in scan.usage_reasons
                    if interval.contains(number, timestamp))
-    if any(interval.contains(number, timestamp) for number, timestamp in scan.compaction_markers):
+    if any(_marker_in_interval(interval, number, timestamp) for number, timestamp in scan.compaction_markers):
         reasons.add("compaction_in_interval")
     groups = {}
     for observation in observations:
@@ -95,7 +106,7 @@ def _actor(scan, interval, configured_model, reasons=(), excluded_ids=()):
         reasons.add("configured_identity_unknown")
     token_reasons = reasons - NON_INCOMPLETE_REASONS
     coverage = "complete" if not token_reasons else "incomplete"
-    cache_coverage = "incomplete" if "cache_split_unavailable" in reasons else "complete"
+    cache_coverage = "incomplete" if coverage != "complete" or "cache_split_unavailable" in reasons else "complete"
     return ({"coverage": coverage, "cache_coverage": cache_coverage, "configured_model": configured_model,
              "attested_models": sorted(attested_models), "responses": responses,
              "repeated_response_records": repeated, "synthetic_responses": synthetic,
@@ -134,9 +145,14 @@ def _api_delegates(home, state, request, receipt, room):
     try:
         connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
         try:
-            rows = connection.execute(
+            cursor = connection.execute(
                 "SELECT id, requested_model, observed_model, usage_json, usage_source, state, created_at "
-                "FROM jobs WHERE room_id=?", (room,)).fetchall()
+                "FROM jobs WHERE room_id=? ORDER BY rowid LIMIT ?", (room, MAX_DELEGATE_ROWS + 1))
+            rows = []
+            for row in cursor:
+                rows.append(row)
+                if len(rows) > MAX_DELEGATE_ROWS:
+                    return {"coverage": "unavailable", "reason": "delegate_ledger_limit"}
         finally:
             connection.close()
     except (sqlite3.Error, OSError, ValueError):
@@ -157,8 +173,9 @@ def _api_delegates(home, state, request, receipt, room):
         if not native.bounded_text(job_id):
             reasons.add("delegate_job_identity_unavailable")
             continue
-        if not native.bounded_text(requested_model) or (observed_model is not None
-                                                         and not native.bounded_text(observed_model)):
+        safe_requested_model = requested_model if native.valid_model_id(requested_model) else None
+        safe_observed_model = observed_model if native.valid_model_id(observed_model) else None
+        if safe_requested_model is None or (observed_model is not None and safe_observed_model is None):
             reasons.add("delegate_model_unavailable")
         if usage_source is not None and not native.bounded_text(usage_source):
             reasons.add("delegate_usage_source_unavailable")
@@ -166,12 +183,11 @@ def _api_delegates(home, state, request, receipt, room):
         if usage_source not in ("final_chunk", "usage_only_chunk"):
             reasons.add("delegate_usage_source_unavailable")
             usage_source = None
-        usage = _job_usage(usage_json)
+        usage = None if isinstance(usage_json, str) and len(usage_json) > MAX_USAGE_JSON_CHARS else _job_usage(usage_json)
         if usage is None:
             reasons.add("delegate_usage_unavailable")
         jobs.append({"job_sha256": hashlib.sha256(job_id.encode("utf-8")).hexdigest(),
-                     "requested_model": requested_model if native.bounded_text(requested_model) else None,
-                     "observed_model": observed_model if native.bounded_text(observed_model) else None,
+                     "requested_model": safe_requested_model, "observed_model": safe_observed_model,
                      "usage_source": usage_source, "usage": usage})
     jobs.sort(key=lambda item: item["job_sha256"])
     coverage = "complete" if not reasons else "incomplete"

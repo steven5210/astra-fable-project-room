@@ -24,6 +24,7 @@ ROLES = ("engineer", "reviewer")
 AGENT_ID_PATTERN = re.compile("[A-Za-z0-9_-]{1,128}")
 IMAGE_MEDIA_TYPES = frozenset(("image/jpeg", "image/png", "image/gif", "image/webp"))
 READ_INPUT_KEYS = frozenset(("file_path", "offset", "limit", "pages"))
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}")
 LAUNCH_DENIED_KEYS = ("resume", "resume_from", "resumeFrom", "resumeFromId", "isolated", "isolation", "remote",
                       "remote_task", "run_in_remote", "isolationMode")
 TERMINAL_TURN_STATES = frozenset(("completed", "failed", "interrupted", "cancelled"))
@@ -82,6 +83,10 @@ def bounded_text(value, maximum=None):
     if size is None:
         return False
     return size <= (audit_io.MAX_IDENTITY_BYTES if maximum is None else maximum)
+
+
+def valid_model_id(value):
+    return isinstance(value, str) and (value == "<synthetic>" or MODEL_ID.fullmatch(value) is not None)
 
 
 def parse_timestamp(value):
@@ -453,6 +458,9 @@ class Interval:
     def contains(self, number, timestamp):
         if not self.contains_time(timestamp):
             return False
+        return self.contains_number(number)
+
+    def contains_number(self, number):
         if self.kind == "boundary":
             return self.anchor_number < number < self.end_number
         return number > self.anchor_number
@@ -743,10 +751,7 @@ class RecordScanner:
     def _usage(self, message, number, timestamp):
         message_id = message.get("id")
         model = message.get("model")
-        if not bounded_text(message_id) or not bounded_text(model):
-            self.usage_reasons.add((number, timestamp, "usage_unattributable"))
-            return
-        if model != "<synthetic>" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}", model) is None:
+        if not bounded_text(message_id) or not valid_model_id(model):
             self.usage_reasons.add((number, timestamp, "usage_unattributable"))
             return
         if model == "<synthetic>":
