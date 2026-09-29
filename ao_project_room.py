@@ -381,6 +381,13 @@ class Service:
             if busy(self.identity(client, state, binding)):
                 raise RoomError("A bound AO conversation has active work")
 
+    def ao_release_check(self, ao_url=None):
+        if ao_url is None:
+            config = self.root / "config.json"
+            ao_url = os.environ.get("PROJECT_ROOM_AO_URL") or (read(config).get("ao_url") if config.exists() else None)
+        import ao_release_check
+        return ao_release_check.check(self.root, ao_url)
+
     def ao_room_open(self, project_path, feature, ao_project_id, authorization, ao_url=None,
                      workflow=None, exception_authorization=None, delegate_provider=None):
         path = globals()["project_path"](project_path)
@@ -1070,6 +1077,7 @@ TOOL_SCHEMAS = {
     "ao_room_routing_adoption_activate": ("Activate only the identical staged routing-adoption request after the exact new project configuration, managed files and unchanged stopped native identity/history are observed. Pin the new preparation without changing provider snapshots, handoff or review budgets. No AO POST or inference; native MCP startup remains a separate dispatch gate.", schema({**R, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
+    "ao_release_check": ("Compare the running AO daemon with the official latest stable release once per new or resumed AO session. One bounded GitHub GET plus loopback /healthz and local bundle metadata; never invokes a model, restarts or updates AO, or touches rooms and workers. Outcome up_to_date | update_available | mismatch | unknown; unknown is never up to date. Saves private evidence in version-check.json.", schema({"ao_url": S}, [])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
