@@ -1741,6 +1741,10 @@ class Service:
             return getattr(ao_project_room.Service(self.home), name)(**arguments)
         return getattr(self, name)(**arguments)
 
+    def sync_wait_max_seconds(self):
+        import ao_project_room
+        return ao_project_room.sync_wait_max_seconds(self.home / "ao")
+
 
 def implementation_error_types():
     import implementation
