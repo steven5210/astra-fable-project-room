@@ -103,7 +103,9 @@ model. AO must be reachable for operations that check whether workers are idle.
 While an owned turn is submitted or running, call `ao_room_sync` with
 `wait_seconds=45` and repeat bounded waits, giving a brief update between them,
 instead of spending a turn on each immediate poll. A `timeout` wait reason is not
-a stall, failure or permission to replay.
+a stall, failure or permission to replay. `settled` is true only when every owned
+request is terminal; an `uncertain` request still needs sync/recovery, never
+replay.
 Saved status remains readable while a verification gate holds the mutation lock.
 Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
 with explicit truncation. Check legacy `room_list` before treating an ambiguous

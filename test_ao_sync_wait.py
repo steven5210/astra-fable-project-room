@@ -87,6 +87,38 @@ class SyncWaitTests(unittest.TestCase):
         receipt_path = self.service.root / "rooms" / self.room / request["receipt"]
         self.assertTrue(receipt_path.is_file())
 
+    def test_one_completed_request_does_not_settle_while_another_is_running(self):
+        initial_states = {"first": "running", "second": "running"}
+        final_states = {"first": "completed", "second": "running"}
+        initial = {"requests": [{"request_id": "first", "state": "running"},
+                                {"request_id": "second", "state": "running"}]}
+        final = {"requests": [{"request_id": "first", "state": "completed"},
+                              {"request_id": "second", "state": "running"}]}
+        clock = FakeClock()
+        with patch.object(self.service, "_sync_once", side_effect=[(initial, initial_states),
+                                                                    (final, final_states)]) as sync_once, \
+                patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+            result = self.service.ao_room_sync(self.room, wait_seconds=45)
+        self.assertEqual(sync_once.call_count, 2)
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "state_changed", "settled": False})
+        self.assertEqual([request["state"] for request in result["requests"]], ["completed", "running"])
+
+    def test_uncertain_request_is_not_settled_when_no_request_remains_active(self):
+        initial_states = {"first": "running"}
+        final_states = {"first": "uncertain"}
+        initial = {"requests": [{"request_id": "first", "state": "running"}]}
+        final = {"requests": [{"request_id": "first", "state": "uncertain"}]}
+        clock = FakeClock()
+        with patch.object(self.service, "_sync_once", side_effect=[(initial, initial_states),
+                                                                    (final, final_states)]) as sync_once, \
+                patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+            result = self.service.ao_room_sync(self.room, wait_seconds=45)
+        self.assertEqual(sync_once.call_count, 2)
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": False})
+        self.assertEqual(result["requests"][0]["state"], "uncertain")
+
     def test_running_turn_times_out_within_the_poll_bound(self):
         self.prepare_running()
         clock = FakeClock()

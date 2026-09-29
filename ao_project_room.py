@@ -743,7 +743,11 @@ class Service:
                 break
             time.sleep(min(AO_SYNC_WAIT_POLL_SECONDS, remaining))
             summary, states = self._sync_once(room_id)
-        summary["wait"] = {"requested_seconds": wait_seconds, "reason": reason, "settled": reason != "timeout"}
+        summary["wait"] = {
+            "requested_seconds": wait_seconds,
+            "reason": reason,
+            "settled": all(state in NATIVE_TERMINAL for state in states.values()),
+        }
         return summary
 
     def _sync_once(self, room_id):
