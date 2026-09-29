@@ -569,6 +569,7 @@ class ProviderToolSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = object.__new__(project_room.Service)
             controller.home = Path(temporary)
+            controller._legacy_tools_visible_cache = None
             listing = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, controller)
             definitions = {entry['name']: entry for entry in listing['result']['tools']}
             for name, module, function, arguments in cases:
