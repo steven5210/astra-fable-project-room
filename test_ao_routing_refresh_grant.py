@@ -8,11 +8,11 @@ from test_ao_review_extension import ReviewExtensionFixture
 
 
 class RoutingRefreshGrantTests(ReviewExtensionFixture):
-    def owner(self):
+    def read_native_owner(self):
         return extension.ao_native_identity.read_owner(str(self.database), 'engineer')
 
     def guard(self):
-        return extension.guard_routing_refresh(self.service, self.state(), self.owner())
+        return extension.guard_routing_refresh(self.service, self.state(), self.read_native_owner())
 
     def test_unused_and_inflight_fourth_review_stay_blocked(self):
         self.grant()
@@ -45,7 +45,7 @@ class RoutingRefreshGrantTests(ReviewExtensionFixture):
 
     def test_foreign_owner_refused_even_after_acceptance(self):
         self.grant(); self.send('spec_review', 'fourth'); self.finish_fourth()
-        owner = self.owner(); owner['provider_conversation_id'] = 'replacement'
+        owner = self.read_native_owner(); owner['provider_conversation_id'] = 'replacement'
         with self.assertRaisesRegex(ao.RoomError, 'same native owner'):
             extension.guard_routing_refresh(self.service, self.state(), owner)
 

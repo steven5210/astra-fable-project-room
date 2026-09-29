@@ -11,7 +11,9 @@ import ao_routing
 from implementation import candidate_snapshot, ImplementationError
 from room import RoomError
 
-FABLE_MODEL = "claude-fable-5-1"
+# The configured AO value of the default engineering selector for new rooms: the Fable family alias
+# (latest available member). Legacy rooms keep ao_engineering_model.LEGACY_MODEL; nothing compares against this.
+FABLE_MODEL = "fable"
 ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_reported", "review_findings",
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
@@ -80,7 +82,11 @@ def spec_review_report(service, directory, state, request):
     from ao_outcomes import usable
     usable(directory, request)
     verdict = final_json(directory, request)
-    if (request["role"] != "engineer" or request["harness"] != "claude-code" or request["model"] != FABLE_MODEL
+    import ao_engineering_model
+    ao_engineering_model.check_request(directory, state, request)  # the exact epoch that owned this turn
+    engineer = (state.get("bindings") or {}).get("engineer") or {}
+    if (request["role"] != "engineer" or request["harness"] != "claude-code" or request["reasoning_effort"] != "max"
+            or request["session_id"] != engineer.get("session_id")
             or verdict.get("decision") not in ("accept", "changes_required") or type(verdict.get("spec_revision")) is not int
             or verdict["spec_revision"] != spec["revision"] or verdict.get("spec_sha256") != spec["sha256"]
             or not isinstance(verdict.get("interpretation"), str) or not verdict["interpretation"].strip()
@@ -214,7 +220,14 @@ def _report_correction_proof(home, directory, state, request, error):
     """Evidence for correcting attribution only, never an accepted delegate claim."""
     from ao_project_room import digest
     from ao_outcomes import usable
-    binding = state["bindings"]["engineer"]
+    import ao_engineering_model
+    # The immutable binding expressed in the engineering epoch that owned this request, never compared
+    # directly with a post-transition request's configured model.
+    try:
+        ao_engineering_model.check_request(directory, state, request)
+        binding = ao_engineering_model.binding_for_request(directory, state, state["bindings"]["engineer"], request)
+    except RoomError as exc:
+        raise RoomError("Report-only correction requires the same completed engineer/spec binding") from exc
     if (state.get("provider_transition") or request.get("state") != "completed"
             or request.get("spec_record_sha256") != state["spec_record_sha256"]
             or any(request.get(k) != v for k, v in binding.items())):
@@ -379,7 +392,7 @@ def part_texts(prepared, policy):
         "baseline_rule": ("baseline_commit in the engineering report is the bound worktree HEAD at the start of the implementation "
                           "turn, before any commit of your own; corrections for the same handoff report that same baseline."),
     }
-    if (prepared.get("routing") or {}).get("version") == 2:
+    if (prepared.get("routing") or {}).get("version") in (2, 3):
         parts["report_contract"] = parts["report_contract"].replace(
             "Fable owns implementation, engineering review and eligible delegation",
             "Fable directs implementation, delegates execution, reviews evidence and owns the engineering verdict")
@@ -391,6 +404,46 @@ def part_texts(prepared, policy):
         for name in ("review_contract", "report_contract"):
             parts[name] += " The entire final response must be that JSON object, with no preamble, Markdown fence or trailing prose."
     return parts
+
+
+def superseded_routing_framing(directory, state, prepared):
+    """The bounded framing for one frozen routing part whose committed refresh already replaced it.
+
+    Returns None while no routing refresh is committed, or when the committed refresh's own target is
+    the routing record this preparation renders (nothing is superseded). Otherwise it returns the exact
+    separately assembled note that must accompany the one-time frozen routing paragraph: the paragraph
+    stays byte-for-byte its historical preparation text, is identified as historical and superseded by
+    the committed refresh it names, adds no workflow PARTS identity, journal, boundary notice or worker
+    expectation, authorizes no delegation, and its bytes are counted in the same PromptAssembly as the
+    paragraph it frames. The committed pointer is read through the immutable content-addressed journal
+    reader, never as an unclaimed raw file or today's mutable runtime configuration; a committed record
+    that does not match this room's retained preparation refuses instead of framing anything.
+    """
+    pointer = state.get("routing_refresh")
+    if not isinstance(pointer, dict):
+        return None
+    routing = (prepared or {}).get("routing")
+    if not isinstance(routing, dict):
+        return None
+    import ao_routing_refresh
+    record = ao_routing_refresh._read(directory, pointer)
+    if record.get("target") == routing:
+        return None
+    if (record.get("version") != 1 or record.get("room_id") != state.get("room_id")
+            or record.get("preparation") != state.get("preparation")
+            or record.get("preparation_sha256") != state.get("preparation_sha256")):
+        raise RoomError("The committed routing refresh does not match this room's retained preparation; preserve "
+                        "the room and diagnose it before delivering routing context")
+    return ("Historical routing framing: the native delegation routing paragraph immediately above is this "
+            "room's original frozen preparation text, delivered once and preserved byte-for-byte, and it is "
+            "historical and superseded by the committed routing refresh " + str(pointer["sha256"]) + " ("
+            + str(pointer["path"]) + "). It names the selectors configured before that boundary, not the current "
+            "effective worker selection, and it grants no delegation or worker authority by itself; a read-only "
+            "specification review stays read-only. A family-only refresh itself establishes no source "
+            "qualification for the current worker selection and authorizes no new delegating execution. An "
+            "eligible, separately authorized delegation-capable implementation or correction packet discloses "
+            "its then-qualified worker selection and configured MAX effort exactly once, under its own "
+            "authenticated boundary notice.")
 
 
 def carried_by(request):
@@ -418,7 +471,7 @@ def carried_by(request):
 
 def delivered(state, session_id, directory=None):
     """Context the controller itself delivered to one native session, from completed observed turns only."""
-    spec_record, parts = None, set()
+    spec_record, parts, notices = None, set(), []
     completed = [r for r in state["requests"].values()
                  if r.get("role") == "engineer" and r.get("session_id") == session_id and r.get("state") in ('completed', 'settled_failure')]
     for request in sorted(completed, key=lambda r: r["created_order"]):
@@ -438,7 +491,20 @@ def delivered(state, session_id, directory=None):
         if record:
             spec_record = record
         parts.update(names)
-    return {"spec_record_sha256": spec_record, "parts": sorted(parts), "completed_requests": len(completed)}
+        carried = request.get("carried") or {}
+        if "boundary_notices" in carried:
+            if directory is None:
+                notices = None  # Unverified without this room's own retained bytes; never assumed delivered.
+            elif notices is not None:
+                import ao_model_boundaries
+                for notice in carried["boundary_notices"]:
+                    # This request's own authenticated record, receipt and dispatch order recover the
+                    # notice's dispatch-time fragment; a stale or foreign copy refuses.
+                    identity = ao_model_boundaries.delivered_notice(directory, state, notice, request)
+                    if identity not in notices:
+                        notices.append(identity)
+    return {"spec_record_sha256": spec_record, "parts": sorted(parts), "completed_requests": len(completed),
+            "notices": notices}
 
 
 def context_summary(state, directory=None):
@@ -624,6 +690,13 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
             assembly.add("workflow", texts[name])
             carried["parts"].append(name)
             carried["part_sha256"][name] = digest(texts[name].encode())
+            if name == "routing":
+                # A committed refresh that precedes this one-time part's first delivery frames the frozen
+                # paragraph as historical in the same assembly; the paragraph and its recorded hash stay
+                # exactly the preparation's bytes and the framing is not a PARTS identity.
+                framing = superseded_routing_framing(directory, state, prepared)
+                if framing is not None:
+                    assembly.add("workflow", framing)
     if epoch is not None:
         import ao_provider_transition
         if not ao_provider_transition.amendment_delivered(directory, state):
@@ -664,5 +737,12 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
             carried['instruction_amendments'] = carried_amendments
     if quality["equivalence"] is not None:
         carried[ao_quality_review.EQUIVALENCE] = quality["equivalence"]
+    if role == "engineer":
+        # Current effective committed root/worker boundaries only, each disclosed once. Fragments go
+        # through this same assembly exactly once, so the stored projection equals the sent text.
+        import ao_model_boundaries
+        for pending in ao_model_boundaries.pending_notices(directory, state, purpose, held.get("notices") or ()):
+            assembly.add("workflow", pending["fragment"])
+            carried.setdefault("boundary_notices", []).append(ao_model_boundaries.carried_notice(pending))
     assembly.add("caller", message)
     return assembly.text, carried

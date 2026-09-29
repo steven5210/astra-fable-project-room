@@ -4,13 +4,25 @@ The original preparation is immutable. A hash-bound journal records replacement
 identity separately; every routing check validates it. The operator installs the
 binary and changes AO's launch path separately. This module never does either,
 never operates a native lifecycle, and never releases a semantic outcome hold.
-"""
+    A separate, explicitly authorized upgrade lane instead moves an intact recorded
+    executable to a strictly newer, already-qualified version; it never repairs
+    diagnosed loss or drift and is otherwise bound by the same audited journal.
+    Both lanes require a previously recorded successful identity. A preparation
+    that never recorded one (missing identity fields or a recorded probe error)
+    cannot be first-bound in place: no lane here may establish that first
+    authority, the room and its history stay unchanged and readable, and new
+    qualified worker execution needs a separately authorized, freshly prepared
+    room. A recorded historical identity is that room's own history, never current
+    readiness, and mutable configuration or a current probe response is never
+    historical authority.
+    """
 import argparse
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import time
 
@@ -132,33 +144,59 @@ def effective(directory, state, prepared):
     return target
 
 
-def _source_failure(source):
+def _version(text):
+    """A leading X.Y.Z token followed by whitespace or end of text, as three ints; else None."""
+    if not isinstance(text, str):
+        return None
+    match = re.match(r'([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s|$)', text)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _source_failure(source, upgrade=False):
     if not isinstance(source, dict) or not source.get('path') or not source.get('version') or source.get('error'):
-        raise RoomError('Executable repair requires a previously recorded successful identity')
+        raise RoomError('Executable repair requires a previously recorded successful identity; an upgrade requires one '
+                        'too. This preparation never recorded a successful identity (missing identity fields or a '
+                        'recorded probe error), so in-place first binding is unsupported: no audited lane can '
+                        'establish that absent historical identity. The room and its history stay unchanged and '
+                        'readable; new qualified worker execution requires a separately authorized, freshly prepared '
+                        'room with an intact executable. Never infer the missing identity from mutable controller '
+                        'configuration, and never treat a current probe response as historical authority.')
     try:
         current = _fingerprint(source['path']) if source.get('sha256') else None
         info = Path(source['path']).stat()
     except FileNotFoundError:
+        if upgrade:
+            raise RoomError('Recorded executable is missing; use the diagnosed repair lane without upgrade arguments')
         return 'missing'
     if ((info.st_size, info.st_mtime_ns) != (source['size'], source['mtime_ns'])
             or current is not None and current['sha256'] != source['sha256']):
+        if upgrade:
+            raise RoomError('Recorded executable changed; use the diagnosed repair lane without upgrade arguments')
         return 'changed'
+    if upgrade:
+        return 'authorized_upgrade'
     raise RoomError('Recorded executable is unchanged; this operation only repairs diagnosed loss or drift')
 
 
 def _inspect(service, directory, state, inputs, prepared, source):
+    import ao_engineering_model
     import ao_project_room as ao
     import ao_routing
     import ao_workflow
     from ao_provider_transition import _CompleteClient
     from ao_routing_adoption import _ReadOnly
-    if (not ao_workflow.normal(state)
-            or state['bindings'].get('engineer', {}).get('reasoning_effort') != 'max'
-            or state['bindings'].get('engineer', {}).get('model') != ao_workflow.FABLE_MODEL):
-        raise RoomError('Executable repair requires the existing normal Fable MAX engineer')
+    # Pinned evidence keeps the immutable stored binding; eligibility reads the epoch in force.
+    normal = ao_workflow.normal(state) and bool(state['bindings'].get('engineer'))
+    effective_engineer = ao_engineering_model.effective_binding(directory, state) if normal else {}
+    if (not normal or effective_engineer.get('harness') != 'claude-code'
+            or effective_engineer.get('reasoning_effort') != 'max'
+            or effective_engineer.get('model') != ao_engineering_model.current(directory, state)['model']):
+        raise RoomError('Executable repair requires the existing normal engineering orchestrator at its '
+                        'configured model and MAX')
     if any(r['state'] not in ('completed', 'settled_failure') for r in state['requests'].values()):
         raise RoomError('An unsettled owned request prevents executable repair')
-    failure = _source_failure(source)
+    upgrade = 'upgrade_authorization' in inputs
+    failure = _source_failure(source, upgrade)
     target = _fingerprint(inputs['executable_path'])
     version = ao_routing.claude_evidence(target['path'])
     if version.get('error') or not version.get('version') or any(version[k] != target[k] for k in ('path', 'size', 'mtime_ns')):
@@ -166,6 +204,25 @@ def _inspect(service, directory, state, inputs, prepared, source):
     if _fingerprint(target['path']) != target:
         raise RoomError('Replacement executable changed during its version probe')
     target.update(version=version['version'], error=None)
+    # Both lanes: the replacement must already satisfy the epoch in force, before any write.
+    minimum = ao_engineering_model.current_qualification(directory, state).get('minimum_claude_code_version')
+    observed = ao_engineering_model.parse_version(target['version']) if minimum else None
+    if minimum and (observed is None or observed < ao_engineering_model.parse_version(minimum)):
+        raise RoomError(ao_engineering_model.current(directory, state)['model'] + ' requires Claude Code ' + minimum
+                        + ' or newer; the replacement executable reports ' + str(target['version']))
+    upgrade_evidence = None
+    if upgrade:
+        target_version = _version(target['version'])
+        if target_version != _version(inputs['expected_version']):
+            raise RoomError('Replacement Claude version does not match the explicitly qualified expected_version')
+        source_version = _version(source['version'])
+        if source_version is None:
+            raise RoomError('Recorded executable version is not comparable; an upgrade cannot be established')
+        if target_version <= source_version:
+            raise RoomError('An executable upgrade must move to a strictly newer qualified version; use the repair lane for diagnosed loss or drift')
+        upgrade_evidence = {'expected_version': inputs['expected_version'],
+                            'source_version': '.'.join(map(str, source_version)),
+                            'target_version': '.'.join(map(str, target_version))}
     launch = _launch(inputs['launch_path'], target['path'])
     from ao_routing_refresh import effective as refreshed_routing
     # Validate routing ancestry against the original immutable preparation before
@@ -187,21 +244,36 @@ def _inspect(service, directory, state, inputs, prepared, source):
     if (owner['ao_conversation_id'] != engineer['conversation_id'] or owner['active_branch_id'] != engineer['branch_id']
             or owner['workspace_path'] != prepared['worktree'] or owner['project_id'] != state['ao_project_id']):
         raise RoomError('Native owner does not match the recorded engineer workspace and branch')
-    return {'source_failure': failure, 'native_owner': owner,
+    evidence = {'source_failure': failure, 'native_owner': owner,
             'public_history_sha256': ao.digest({k: snapshot.get(k) for k in ('turns', 'messages', 'activities')}),
             'settings': snapshot.get('settings'), 'controller': 'stopped',
             'requests_sha256': ao.digest(state['requests']), 'target': target, 'launch': launch}
+    if upgrade_evidence is not None:
+        evidence['upgrade'] = upgrade_evidence
+    return evidence
 
 
-def bind(service, room_id, request_id, executable_path, launch_path, database_path, authorization, diagnosis):
-    """Append one exact authorized repair; no prompts, lifecycle or old-pin edits."""
+def bind(service, room_id, request_id, executable_path, launch_path, database_path, authorization, diagnosis,
+         upgrade_authorization=None, expected_version=None):
+    """Append one exact authorized repair, or an explicit upgrade of an intact executable; no prompts, lifecycle or old-pin edits."""
     import ao_project_room as ao
     import ao_delegates
+    if (upgrade_authorization is None) != (expected_version is None):
+        raise RoomError('An executable upgrade requires both upgrade_authorization and expected_version')
     ao.identifier(request_id)
     ao.nonempty(authorization, 'authorization', 6000); ao.nonempty(diagnosis, 'diagnosis', 6000)
     inputs = dict(request_id=request_id, executable_path=executable_path, launch_path=launch_path,
                   database_path=database_path, authorization=authorization, diagnosis=diagnosis)
+    if upgrade_authorization is not None:
+        ao.nonempty(upgrade_authorization, 'upgrade_authorization', 6000)
+        if not isinstance(expected_version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', expected_version):
+            raise RoomError('expected_version must be an exact X.Y.Z version')
+        inputs.update(upgrade_authorization=upgrade_authorization, expected_version=expected_version)
+    lane = 'upgrade' if 'upgrade_authorization' in inputs else 'repair'
     with service.locked(room_id) as (directory, state):
+        import ao_engineering_model
+        # An uncommitted engineering model transition blocks every executable change first.
+        ao_engineering_model.guard_pending(directory, state)
         prepared = ao_delegates.validate_preparation(directory, state, state['bindings']['engineer']['session_id'], check_routing=False)
         relative = BASE + '/' + request_id + '.json'
         target_path = directory / relative
@@ -211,7 +283,7 @@ def bind(service, room_id, request_id, executable_path, launch_path, database_pa
         pointer = {'path': relative, 'sha256': ao.digest(existing)} if existing is not None else None
         if existing is not None and state.get('executable_binding') == pointer:
             effective(directory, state, prepared)
-            return {**pointer, 'model_dispatch': False, 'idempotent': True}
+            return {**pointer, 'model_dispatch': False, 'idempotent': True, 'lane': lane}
         from ao_review_extension import guard_pending_receipts
         guard_pending_receipts(directory, state)
         # A crash between durable intent and state commit may only replay this
@@ -241,7 +313,7 @@ def bind(service, room_id, request_id, executable_path, launch_path, database_pa
         proposed = {**state, 'executable_binding': pointer}
         effective(directory, proposed, prepared)
         service.save(directory, proposed)
-        return {**pointer, 'model_dispatch': False, 'idempotent': False,
+        return {**pointer, 'model_dispatch': False, 'idempotent': False, 'lane': lane,
                 'original_preparation_preserved': True, 'controller': 'stopped', 'claude': record['target']}
 
 
@@ -249,9 +321,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('home', 'room-id', 'request-id', 'executable-path', 'launch-path', 'database-path', 'authorization', 'diagnosis'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--upgrade-authorization')
+    parser.add_argument('--expected-version')
     args = vars(parser.parse_args())
     from ao_project_room import Service
     service = Service(args.pop('home'))
+    upgrade_authorization = args.pop('upgrade_authorization')
+    expected_version = args.pop('expected_version')
+    if upgrade_authorization is not None:
+        args['upgrade_authorization'] = upgrade_authorization
+    if expected_version is not None:
+        args['expected_version'] = expected_version
     print(json.dumps(bind(service, **args), indent=2))
 
 

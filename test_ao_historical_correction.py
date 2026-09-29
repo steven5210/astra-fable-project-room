@@ -41,11 +41,13 @@ class HistoricalCorrectionTests(AdoptionFixture):
 
     def ready(self):
         self.prepared = self.configure_routing()
+        self.qualify_worker_routing()
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.start_attachment(self.prepared)
 
     def complete(self, ids=None, **overrides):
         self.service.ao_room_send(self.room, 'engineer', 'Author one bounded section.', 'section', purpose='implementation')
+        self.note_native_turn('section')
         report = self.report(outcome='changes_required', implementation_complete=False, remaining_gaps=['Other sections'],
                              routing_log=[{'step':'current native work', 'delegate_job_ids':[]},
                                           {'step':'previous provider attempts', 'delegate_job_ids':self.source_jobs if ids is None else ids}])
@@ -55,7 +57,27 @@ class HistoricalCorrectionTests(AdoptionFixture):
         return self.state()['requests']['section']
 
     def correct(self, key='correction', text='Continue.'):
-        return self.service.ao_room_send(self.room, 'engineer', text, key, purpose='correction')
+        result = self.service.ao_room_send(self.room, 'engineer', text, key, purpose='correction')
+        self.note_native_turn(key)
+        return result
+
+    def native_failure(self, request_id):
+        from datetime import datetime, timezone
+        request = self.state()['requests'][request_id]
+        workspace = self.native_row_workspace()
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                    datetime.now(timezone.utc)).isoformat()
+        self.native_events.extend([
+            {'type': 'user', 'uuid': request_id + '-caller', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.001), 'cwd': workspace, 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': request_id + '-failure', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.002), 'cwd': workspace, 'isSidechain': False,
+             'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>',
+                         'content': [{'type': 'text', 'text': 'Synthetic native quota rejection.'}]}}])
+        self.transcript.write_text(''.join(json.dumps(event) + chr(10) for event in self.native_events))
+        self.native_requests.add(request_id)
 
     def assert_refused(self, pattern=None):
         before = (self.directory()/'state.json').read_bytes()
@@ -68,37 +90,27 @@ class HistoricalCorrectionTests(AdoptionFixture):
         self.assertEqual(self.fake.posts, posts)
 
     def test_transitioned_room_continues_once_after_audited_native_quota_settlement(self):
-        from unittest.mock import patch
-        import ao_native_outcome
         self.ready()
         self.service.ao_room_send(self.room, 'engineer', 'Finish one section.', 'section', purpose='implementation')
+        self.native_failure('section')
         self.fake.finish('engineer', state='failed'); self.service.ao_room_sync(self.room)
-        state = self.state(); state['native_outcome_source'] = {'session_id':'engineer'}
-        ao.atomic(self.directory()/'state.json', state)
-        proof = {'anchor_uuid':'exact-native-packet','next_human_uuid':None,'errors':[{'error':'rate_limit','http_status':429}],
-                 'stop_reasons':[], 'source_sha256':'f'*64}
-        with patch.object(ao_native_outcome, 'inspect', return_value=proof):
-            audit = self.service.ao_room_outcome_audit(self.room)
-            self.service.ao_room_outcome_resume(self.room, 'section', audit['outcome_sha256'], 'correction',
-                                               'Exact native quota rejection inspected; user confirmed reset', 'Continue once')
-            before = self.state()['requests']['section']
-            self.correct()
-            self.assertEqual(self.state()['requests']['section']['receipt_sha256'], before['receipt_sha256'])
-            self.assertEqual(self.state()['requests']['section']['state'], 'settled_failure')
-            self.assertNotIn('provider_amendment_sha256', self.state()['requests']['correction']['carried'])
-            self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
-        (self.repo/'feature.txt').write_text('implemented\n')
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.service.ao_room_outcome_resume(self.room, 'section', audit['outcome_sha256'], 'correction',
+                                           'Exact native quota rejection inspected; user confirmed reset', 'Continue once')
+        before = self.state()['requests']['section']
+        self.correct()
+        self.assertEqual(self.state()['requests']['section']['receipt_sha256'], before['receipt_sha256'])
+        self.assertEqual(self.state()['requests']['section']['state'], 'settled_failure')
+        self.assertNotIn('provider_amendment_sha256', self.state()['requests']['correction']['carried'])
+        self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
+        (self.repo/'feature.txt').write_text('implemented' + chr(10))
         self.fake.finish('engineer', json.dumps(self.report()))
-        # A later request reads only its own native interval; this synthetic hook supplies that interval.
-        with patch.object(ao_native_outcome, 'inspect', return_value={'anchor_uuid':'successor','next_human_uuid':None,
-            'errors':[],'stop_reasons':['end_turn'],'source_sha256':'e'*64}):
-            self.service.ao_room_sync(self.room)
-            self.review()
-            self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+        self.service.ao_room_sync(self.room)
+        self.review()
+        self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
     def test_native_compaction_import_is_context_only_after_exact_evidence_audit(self):
-        from unittest.mock import patch
-        import ao_native_outcome
+        import ao_outcomes
         self.ready(); self.complete(ids=[])
         snapshot = self.fake.snapshots['engineer']; branch = snapshot['activeBranchId']; identity = 'compact-summary'
         turn = {'id':'imported-summary','state':'recovered',
@@ -107,22 +119,49 @@ class HistoricalCorrectionTests(AdoptionFixture):
                    'streaming':False,'sequence':1000}
         snapshot['turns'].append(turn); snapshot['messages'].append(message)
         with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'): self.correct()
-        state = self.state(); source = {'session_id':'engineer'}; state['native_outcome_source'] = source
-        ao.atomic(self.directory()/'state.json', state)
-        native_row = {'type':'user','sessionId':'native','isSidechain':False,'isCompactSummary':True,
-                      'isVisibleInTranscriptOnly':True,'uuid':identity,'message':{'content':message['text']}}
-        proof = {'anchor_uuid':'owned-packet','next_human_uuid':None,'errors':[],'stop_reasons':['end_turn'],
-                 'source':source,'source_sha256':'f'*64,
-                 'compaction_imports':ao_native_outcome.compaction_imports([native_row],'native',snapshot)}
-        with patch.object(ao_native_outcome, 'inspect', return_value=proof):
-            audit = self.service.ao_room_outcome_audit(self.room)
-            self.assertEqual(audit['native']['compaction_imports'][0]['turn_id'], turn['id'])
-            message['text'] = 'A genuine new instruction cannot hide behind the summary ID'
-            with self.assertRaisesRegex(ao.RoomError, 'compaction import changed'): self.correct()
-            message['text'] = 'Saved compact context'
+        from datetime import datetime, timezone
+        native_row = {'type':'user','sessionId':self.NATIVE,'cwd':self.native_row_workspace(),
+                      'timestamp':datetime.now(timezone.utc).isoformat(),
+                      'isSidechain':False,'isCompactSummary':True,'isVisibleInTranscriptOnly':True,
+                      'uuid':identity,'message':{'role':'user','content':message['text']}}
+        self.native_events.append(native_row)
+        self.transcript.write_text(''.join(json.dumps(event) + chr(10) for event in self.native_events))
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(audit['native']['compaction_imports'][0]['turn_id'], turn['id'])
+        self.assertEqual(audit['outcome']['kind'], 'final_available')
+        self.assertFalse(audit['outcome']['hold'])
+        retained = self.state()['requests']['section']
+        record = ao_outcomes.load(self.directory(), retained)
+        self.assertEqual(record['outcome']['kind'], 'final_available')
+        self.assertFalse(record['outcome']['hold'])
+        evidence = record.get('worker_observations')
+        self.assertIsInstance(evidence, dict)
+        self.assertTrue(evidence.get('qualified'))
+        self.assertEqual(evidence.get('coverage'), 'complete')
+        state = self.state()
+        request = state['requests']['section']
+        receipt_path = self.directory() / request['receipt']
+        outcome_path = self.directory() / request['semantic_outcome']
+        receipt_bytes = receipt_path.read_bytes()
+        outcome_bytes = outcome_path.read_bytes()
+        self.assertEqual(ao_outcomes.known_compaction_turns(self.directory(), state, snapshot), {turn['id']})
+        message['text'] = 'A genuine new instruction cannot hide behind the summary ID'
+        with self.assertRaisesRegex(ao.RoomError, 'Verified native compaction import changed'):
+            ao_outcomes.known_compaction_turns(self.directory(), self.state(), snapshot)
+        posts = copy.deepcopy(self.fake.posts)
+        requests = set(self.state()['requests'])
+        with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'):
             self.correct()
-            self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
-            self.assertEqual(snapshot['turns'][-2], turn)  # Retain the recovered import; do not rewrite history.
+        self.assertEqual(self.fake.posts, posts)
+        self.assertEqual(set(self.state()['requests']), requests)
+        self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+        self.assertEqual(outcome_path.read_bytes(), outcome_bytes)
+        message['text'] = 'Saved compact context'
+        self.correct()
+        self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
+        self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+        self.assertEqual(outcome_path.read_bytes(), outcome_bytes)
+        self.assertEqual(snapshot['turns'][-2], turn)  # Retain the recovered import; do not rewrite history.
 
     def test_active_epoch_cannot_recommit_a_compaction_augmented_history(self):
         from unittest.mock import patch

@@ -108,7 +108,6 @@ class AdoptedGuardParentDurabilityTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         case.setUp()
         prepared = case.configure_routing()
-        extension_fixtures.ReviewExtensionFixture.make_database(case)
         case.database.chmod(0o600)
         source = case.directory() / 'routing-adoption/v2/ao_routing_guard.py'
         self.assertEqual(prepared['routing']['guard_path'], str(source))
@@ -125,7 +124,7 @@ class AdoptedGuardParentDurabilityTests(unittest.TestCase):
 
         with patch.object(refresh, '_sync_directory', side_effect=observe):
             result = refresh.refresh(case.service, case.room, 'refresh-adopted-guard', str(case.database),
-                'synthetic-native-owner', 'Synthetic authorization for the retained routing update.',
+                case.NATIVE, 'Synthetic authorization for the retained routing update.',
                 'Synthetic source guard comes from supported v2 routing adoption.')
         self.assertFalse(result['model_dispatch'])
         record = refresh._read(case.directory(), case.state()['routing_refresh'])

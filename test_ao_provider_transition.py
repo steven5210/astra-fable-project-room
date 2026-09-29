@@ -23,6 +23,82 @@ from test_ao_adoption import AdoptionFixture
 import test_ao_routing_v1_fixture as frozen
 
 
+def _historical_implementation(fixture, report, request_id='implementation'):
+    import time
+    from datetime import datetime, timezone
+    import ao_engineering_model
+    state = fixture.state()
+    snapshot = fixture.fake.snapshots['engineer']
+    binding = state['bindings']['engineer']
+    spec = fixture.service.spec(fixture.directory(), state)
+    prepared = ao_delegates.preparation(fixture.directory(), state)
+    frozen = ao_engineering_model.freeze_request(fixture.directory(), state)
+    baseline = {'turn_ids': sorted(turn['id'] for turn in snapshot.get('turns', [])),
+                'conversation_id': snapshot.get('conversationId'),
+                'branch_id': snapshot.get('activeBranchId'),
+                'usage': snapshot.get('usage') or {}}
+    turn_id = 'historical-' + request_id + '-turn'
+    provider_turn_id = 'native-historical-' + request_id
+    text = ('[Project Room historical request implementation]' + chr(10)
+            + 'Historical workflow/policy/report/settings/routing.' + chr(10)
+            + 'Exact specification revision ' + str(spec['revision']) + ', SHA256 ' + spec['sha256'] + chr(10)
+            + '<specification>' + chr(10) + spec['content'] + chr(10) + '</specification>' + chr(10)
+            + 'Agreed gates: ' + json.dumps(spec['gates']) + chr(10) + 'Task instruction:' + chr(10) + 'Continue.')
+    response = json.dumps(report)
+    snapshot['turns'].append({'id': turn_id, 'providerTurnId': provider_turn_id, 'state': 'completed',
+                              'stopReason': 'end_turn'})
+    sequence = len(snapshot['messages']) + 1
+    user = {'id': 'user-' + turn_id, 'role': 'user', 'text': text, 'turnId': turn_id, 'sequence': sequence}
+    assistant = {'id': 'answer-' + turn_id, 'role': 'assistant', 'text': response, 'turnId': turn_id,
+                 'sequence': sequence + 1}
+    snapshot['messages'].extend([user, assistant])
+    payload = {'turn': snapshot['turns'][-1], 'messages': [user, assistant], 'settings': snapshot.get('settings'),
+               'usage': snapshot.get('usage'), 'history_truncated': False}
+    pointer = 'receipts/' + request_id + '/' + ao.digest(payload) + '.json'
+    ao.atomic(fixture.directory() / pointer, payload)
+    request = {'request_id': request_id, 'role': 'engineer',
+               **{field: binding[field] for field in ('session_id', 'harness', 'model', 'reasoning_effort',
+                                                      'conversation_id', 'branch_id')},
+               'text': text, 'text_sha256': ao.digest(text.encode()), 'state': 'completed',
+               'spec_record_sha256': state['spec_record_sha256'], 'purpose': 'implementation',
+               'handoff_sha256': state['handoff_sha256'], 'created_at': time.time(),
+               'created_order': len(state['requests']) + 1, 'turn_id': turn_id,
+               'provider_turn_id': provider_turn_id, 'baseline': baseline,
+               'receipt': pointer, 'receipt_sha256': ao.digest(payload),
+               'engineering_resolution': frozen}
+    request['reported_delegate_job_ids'] = ao_delegates.report_job_ids(report)
+    evidence = ao_delegates.verify_delegation(fixture.home, fixture.directory(), state, report)
+    record = {'candidate': ao_workflow.candidate_snapshot(prepared['worktree']),
+              'report_sha256': ao.digest(report), 'receipt_sha256': ao.digest(payload),
+              'delegation': evidence}
+    record_path = 'engineering/' + request_id + '.json'
+    ao.atomic(fixture.directory() / record_path, record)
+    request['engineering_record'] = record_path
+    request['engineering_record_sha256'] = ao.digest(record)
+    request['result_candidate_sha256'] = record['candidate']['sha256']
+    request['delegate_job_ids'] = [item['job_id'] for item in evidence]
+    state['requests'][request_id] = request
+    fixture.service.save(fixture.directory(), state)
+    stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                datetime.now(timezone.utc)).isoformat()
+    model = (frozen or {}).get('expected_model') or request['model']
+    fixture.native_events.extend([
+        {'type': 'user', 'uuid': request_id + '-caller', 'sessionId': fixture.NATIVE,
+         'timestamp': stamp(0.001), 'cwd': fixture.native_row_workspace(), 'isSidechain': False,
+         'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': text}},
+        {'type': 'assistant', 'uuid': request_id + '-reply', 'sessionId': fixture.NATIVE,
+         'timestamp': stamp(0.002), 'cwd': fixture.native_row_workspace(), 'isSidechain': False,
+         'message': {'role': 'assistant', 'model': model, 'id': request_id + '-m0',
+                     'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}}])
+    fixture.transcript.write_text(''.join(json.dumps(event) + chr(10) for event in fixture.native_events))
+    fixture.native_requests.add(request_id)
+    import ao_outcomes
+    observed = ao_outcomes.observe(fixture.service, fixture.directory(), state, request, snapshot)
+    if observed.get('outcome', {}).get('kind') != 'final_available' or observed['outcome'].get('hold'):
+        raise ao.RoomError('Historical implementation observation did not establish final availability: ' + json.dumps(observed.get('outcome')))
+    return request
+
+
 class CompleteHistoryPaginationTests(unittest.TestCase):
     class RawPages:
         def __init__(self, pages):
@@ -299,14 +375,14 @@ class ProviderTransitionTests(DelegateFixture):
         self.assertTrue(self.service.ao_room_routing_adoption_audit(self.room)['eligible'])
 
     def test_provider_requires_actual_historical_v1_routing_before_any_transition_intent(self):
-        for kind in (None, 'v2'):
+        for kind in (None, 'current'):
             with self.subTest(routing=kind):
                 fixture = ProviderTransitionTests()
                 fixture.routing_kind = kind
                 try:
                     fixture.setUp()
                     prepared = ao_delegates.preparation(fixture.directory(), fixture.state())
-                    self.assertEqual((prepared.get('routing') or {}).get('version'), 2 if kind == 'v2' else None)
+                    self.assertEqual((prepared.get('routing') or {}).get('version'), 3 if kind == 'current' else None)
                     fixture.assert_refused_without_change(fixture.audit_transition, 'historical v1 routing')
                     self.assertFalse((fixture.directory() / transition.BASE).exists())
                 finally:
@@ -327,11 +403,24 @@ class ProviderTransitionTests(DelegateFixture):
             transition.validate(self.service, state)
 
     def test_historical_report_keeps_source_profile_and_cannot_be_accepted_for_new_epoch(self):
-        self.implement(routing_log=[{'delegate_job_ids': [format(1, '032x')]}])
+        source_job = format(1, '032x')
+        _historical_implementation(self, self.report(routing_log=[{'delegate_job_ids': [source_job]}]))
         source_request = self.state()['requests']['implementation']
         self.assertIn('engineering_record', source_request)
+        sealed_path = self.directory() / source_request['engineering_record']
+        sealed_bytes = sealed_path.read_bytes()
+        sealed = ao.read(sealed_path)
+        self.assertEqual(source_request['reported_delegate_job_ids'], [source_job])
+        self.assertEqual(source_request['delegate_job_ids'], [source_job])
+        self.assertEqual([item['job_id'] for item in sealed['delegation']], [source_job])
+        self.assertEqual(sealed['delegation'][0]['requested_model'], transition.SOURCE['model'])
+        self.assertEqual(sealed['delegation'][0]['classification'], 'non_result')
+        self.assertEqual(sealed['delegation'][0]['profile_sha256'],
+                         ao_delegates.expected_profile(self.state()['delegate']['inventory']))
         self.commit_transition()
         state = self.state()
+        self.assertEqual(sealed_path.read_bytes(), sealed_bytes)
+        self.assertEqual(state['requests']['implementation'], source_request)
         self.assert_refused_without_change(lambda: ao_workflow.engineering_ready(self.service, self.directory(), self.state()),
                                           'current provider epoch')
         report = ao_workflow.final_json(self.directory(), source_request)
@@ -510,13 +599,17 @@ class LaterSpecHandoffTests(AdoptionFixture):
 
     def test_later_spec_handoff_uses_adopted_preparation_and_requires_fresh_engineering(self):
         self.fake.snapshots['engineer']['controller'] = 'ready'
-        self.implement()
+        # Fixture prerequisite: the genuine completed candidate (implemented plus LF, matching the
+        # room's normal implementation and existing gate) before the historical seal and baseline.
+        (self.repo / 'feature.txt').write_bytes(bytes.fromhex('696d706c656d656e7465640a'))
+        _historical_implementation(self, self.report())
         original = self.state()
         old_handoff = self.directory() / original['handoff']
         old_bytes = old_handoff.read_bytes()
         old_result = copy.deepcopy(original['requests']['implementation'])
         self.fake.snapshots['engineer']['controller'] = 'stopped'
         prepared = self.configure_routing()
+        self.qualify_worker_routing()
         active_preparation = self.state()['preparation_sha256']
         self.assertNotEqual(active_preparation, original['preparation_sha256'])
         self.assertEqual(ao_workflow.handoff_record(self.directory(), self.state())['preparation_sha256'],
@@ -548,11 +641,33 @@ class LaterSpecHandoffTests(AdoptionFixture):
             self.service.ao_room_verify(self.room, str(self.repo))
 
         # A new completed native result and new gates are still required, even when the candidate bytes are unchanged.
-        self.service.ao_room_send(self.room, 'engineer', 'Implement the newly agreed specification.', 'new-implementation',
-                                  purpose='implementation')
-        self.assertEqual(self.state()['requests']['new-implementation']['text'], 'Implement the newly agreed specification.')
+        caller = 'Implement the newly agreed specification.'
+        self.service.ao_room_send(self.room, 'engineer', caller, 'new-implementation', purpose='implementation')
+        self.note_native_turn('new-implementation')
+        import ao_model_boundaries
+        request = self.state()['requests']['new-implementation']
+        boundary = ao_model_boundaries.current_worker_boundary(self.directory(), self.state())
+        self.assertEqual(boundary['kind'], ao_model_boundaries.WORKER_ROUTING)
+        worker_text = ao_model_boundaries.fragment_text(boundary)
+        expected_notice = ao_model_boundaries.carried_notice(
+            {'kind': boundary['kind'], 'authority': boundary['authority'], 'fragment': worker_text})
+        notices = request['carried']['boundary_notices']
+        self.assertEqual(notices, [expected_notice])
+        self.assertEqual(ao_model_boundaries.notice_fragment(self.directory(), self.state(), notices[0]), worker_text)
+        self.assertEqual(request['text'], worker_text + chr(10) + caller)
+        self.assertEqual(request['text'].count(worker_text), 1)
+        self.assertEqual(request['prompt_projection'], {
+            'version': 1, 'text_sha256': ao.digest((worker_text + chr(10) + caller).encode()),
+            'total_bytes': len((worker_text + chr(10) + caller).encode()), 'caller_bytes': len(caller.encode()),
+            'specification_bytes': 0, 'workflow_bytes': len(worker_text.encode()), 'separator_bytes': 1,
+            'spec_delivery': 'none'})
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
+        completed = self.state()['requests']['new-implementation']
+        receipt = ao.read(self.directory() / completed['receipt'])
+        self.assertEqual(receipt['carried_sha256'], ao.digest(completed['carried']))
+        from ao_prompt_metrics import projection_binding
+        self.assertEqual(receipt['prompt_projection_sha256'], projection_binding(completed, completed['prompt_projection']))
         result = ao_workflow.engineering_ready(self.service, self.directory(), self.state())
         self.assertEqual(result['request_id'], 'new-implementation')
         self.assertEqual(result['provider_epoch'], 2)
@@ -582,6 +697,7 @@ class ReviewerRecoveryAdoptionTests(AdoptionFixture):
     def test_public_unused_reviewer_recovery_then_sync_first_review_and_acceptance_preserve_adoption(self):
         import ao_routing_adoption
         prepared = self.configure_routing()
+        self.qualify_worker_routing()
         process = self.start_attachment(prepared)
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.implement()

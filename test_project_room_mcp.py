@@ -76,6 +76,11 @@ class ProjectRoomMcpTests(ProjectFixture):
         discovered = self.request("tools/list")["result"]["tools"]
         self.assertEqual({tool["name"] for tool in discovered}, set(project_room.TOOL_SCHEMAS))
         self.assertTrue(all(tool["inputSchema"]["additionalProperties"] is False for tool in discovered))
+        annotations = {tool["name"]: tool["annotations"] for tool in discovered}
+        self.assertTrue(annotations["ao_room_engineer_model_audit"]["readOnlyHint"])
+        self.assertFalse(annotations["ao_room_engineer_model_transition"]["readOnlyHint"])
+        self.assertFalse(annotations["ao_room_engineer_model_transition_abandon"]["readOnlyHint"])
+        self.assertFalse(annotations["ao_room_engineer_source_register"]["readOnlyHint"])
         doctor = self.tool("room_doctor")
         self.assertTrue(doctor["claude_auth"]["loggedIn"])
         self.assertNotIn("DO_NOT_EXPOSE", json.dumps(doctor))

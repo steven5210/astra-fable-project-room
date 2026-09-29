@@ -2,10 +2,12 @@
 import json
 import unittest
 
+import ao_model_boundaries
 import ao_native_outcome as native
 import ao_outcomes as outcomes
 from datetime import datetime, timezone
 import ao_project_room as ao
+import ao_prompt_metrics
 import ao_quality_review as quality
 import test_ao_routing_refresh as routing_fixtures
 
@@ -289,6 +291,11 @@ class CompactionServiceFixture(unittest.TestCase):
                                           'session_id': request['session_id'],
                                           'native_session_id': f.native_session}
         ao.atomic(f.directory() / 'state.json', state)
+        # The inherited normal fixture supplies this synthetic read_owner owner mapping. Its
+        # provider conversation identity must match the exact native session UUID and SQLite owner
+        # this composition actually registered above, so the outcome audit and settlement validate
+        # one coherent synthetic owner. No production state or validator is edited.
+        f.owner["provider_conversation_id"] = f.native_session
 
     def stamp(self, request, delta):
         return datetime.fromtimestamp(request['created_at'] + delta, timezone.utc).isoformat()
@@ -342,7 +349,19 @@ class RefreshedCompactionServiceTests(CompactionServiceFixture):
         self.assertFalse(result['model_dispatch'])
         self.assert_no_posts(posts)
         f.service.ao_room_send(f.room, 'engineer', 'Continue.', 'resume', purpose='correction')
-        self.assertEqual(f.state()['requests']['resume']['text'], 'Continue.')
+        directory, state = f.directory(), f.state()
+        request = state['requests']['resume']
+        notices = request['carried']['boundary_notices']
+        self.assertEqual([item['kind'] for item in notices], [ao_model_boundaries.WORKER_ROUTING])
+        notice = notices[0]
+        self.assertEqual(notice['authority']['kind'], 'routing_refresh')
+        self.assertEqual(notice['authority']['routing_refresh'], state['routing_refresh'])
+        fragment = ao_model_boundaries.notice_fragment(directory, state, notice)
+        self.assertEqual(request['text'], fragment + '\n' + 'Continue.')
+        projection = ao_prompt_metrics.validate_projection(request['prompt_projection'], request['text'])
+        self.assertIsNotNone(projection)
+        self.assertEqual(projection['caller_bytes'], len('Continue.'.encode()))
+        self.assertEqual(projection['specification_bytes'], 0)
         self.assertEqual(self.posts(), posts + 1)
 
     def test_stale_source_between_settlement_and_refresh_refuses_without_intent(self):

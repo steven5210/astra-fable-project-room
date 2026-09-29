@@ -16,10 +16,12 @@ class InstructionAmendmentTests(Fixture):
         self.assertEqual(len(self.fake.posts), count)
         self.assertEqual(self.state()['requests'], before['requests'])
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'resume', purpose='correction')
+        self.note_native_turn('resume')
         self.assertEqual(self.state()['requests']['resume']['text'], args[2] + '\nContinue.')
         self.fake.finish('engineer', json.dumps(self.report())); self.service.ao_room_sync(self.room)
         self.service = ao.Service(self.home, lambda url: self.fake)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'next', purpose='correction')
+        self.note_native_turn('next')
         self.assertEqual(self.state()['requests']['next']['text'], 'Continue.')
 
     def test_stage_never_releases_quota_or_rewrites_same_identity(self):

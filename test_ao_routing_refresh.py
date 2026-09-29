@@ -22,11 +22,47 @@ from test_ao_review_extension import ReviewExtensionFixture
 OLD_GUARD = b'"""Synthetic historical deny-only guard with no quota inspection."""\nimport json,sys\njson.loads(sys.stdin.read())\n'
 
 
+def historical_routing(test, agents, selection, basis):
+    """Rewrite a fresh source-qualified preparation into a retained historical worker-selector shape.
+
+    Only each agent's model line and the recorded selector fields differ from the fresh render. The
+    file pins, the preparation digest and the state are then recorded exactly as the historical
+    writer recorded them. Old-format fixtures build their own saved historical bytes here, in a
+    scoped fixture, instead of weakening the new source-qualified runtime requirement globally.
+    """
+    directory, state = test.directory(), test.state()
+    path = directory / state['preparation']
+    prepared = ao.read(path)
+    routing = prepared['routing']
+    current = dict(routing['agents'])
+    for name, model in agents.items():
+        relative = '.claude/agents/' + name + '.md'
+        agent = Path(prepared['worktree']) / relative
+        text = agent.read_text()
+        line = 'model: ' + json.dumps(current[name]) + '\n'
+        test.assertEqual(text.count(line), 1)
+        agent.write_text(text.replace(line, 'model: ' + json.dumps(model) + '\n'))
+        routing['files'][relative] = ao.digest(agent.read_bytes())
+    routing['version'] = 2
+    routing['agents'] = dict(agents)
+    if agents == ao_routing.EXACT_AGENTS:
+        routing.pop('agent_selection', None)
+        routing.pop('agent_identity_basis', None)
+    else:
+        routing['agent_selection'] = {name: dict(item) for name, item in selection.items()}
+        routing['agent_identity_basis'] = basis
+    routing.pop('worker_qualification', None)
+    ao.atomic(path, prepared)
+    state['preparation_sha256'] = ao.digest(prepared)
+    ao.atomic(directory / 'state.json', state)
+    return prepared
+
+
 class RoutingRefreshTests(Fixture):
     def setUp(self):
         super().setUp()
         self.cli = self.root / 'fake-claude-version'
-        self.cli.write_text('#!' + sys.executable + '\nprint("synthetic (Claude Code)")\n')
+        self.cli.write_text('#!' + sys.executable + '\nprint("2.1.282 (Claude Code)")\n')
         self.cli.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.cli), 'claude_config_dir': str(self.claude_env)})
         self.room = self.open(); self.spec()
@@ -37,7 +73,8 @@ class RoutingRefreshTests(Fixture):
             return OLD_GUARD if path == guard_source else original_bytes(path)
 
         with patch.object(Path, 'read_bytes', historical), patch.object(ao_routing, 'agent_definition',
-                side_effect=lambda name: original_definition(name) + '\nSynthetic archived worker instructions.\n'), \
+                side_effect=lambda name, model=None: original_definition(name, model)
+                + '\nSynthetic archived worker instructions.\n'), \
                 patch.object(ao_routing, 'foreground_settings', side_effect=lambda settings: settings):
             self.bind()
         self.agree()
@@ -117,6 +154,8 @@ class RoutingRefreshTests(Fixture):
         self.assertEqual(refresh.effective(self.directory(), current, self.prepared), record['target'])
         self.assertEqual(record['target']['effort'], 'max')
         self.assertEqual(record['target']['agents'], record['source']['agents'])
+        self.assertNotIn('agent_selection_change', record['evidence'])  # selectors change only on explicit request
+        self.assertNotIn('agent_selection', record['inputs'])
 
     def test_prepared_target_guard_blocks_actual_synthetic_quota_before_opus(self):
         self.do_refresh()
@@ -480,7 +519,8 @@ refresh._publish_intent(Path(sys.argv[1]), json.loads(sys.argv[2]))
     def test_second_refresh_extends_exact_source_chain_and_preserves_first_bytes(self):
         first = self.do_refresh(); original = (self.directory() / first['path']).read_bytes()
         definition = ao_routing.agent_definition
-        with patch.object(ao_routing, 'agent_definition', side_effect=lambda name: definition(name) + '\nNew bounded instruction.\n'):
+        # Refresh renders each worker from the record's own selector map.
+        with patch.object(ao_routing, 'agent_definition', side_effect=lambda name, *model: definition(name, *model) + '\nNew bounded instruction.\n'):
             self.do_refresh(request_id='refresh-two')
         self.assertEqual((self.directory() / first['path']).read_bytes(), original)
         record = self.journal()
@@ -496,7 +536,7 @@ refresh._publish_intent(Path(sys.argv[1]), json.loads(sys.argv[2]))
             journal = {path.name: path.read_bytes() for path in (self.directory() / refresh.BASE).iterdir()}
             runtime = {name: (self.repo / name).read_bytes() for name in ao_routing.FILES}
             definition = ao_routing.agent_definition
-            with patch.object(ao_routing, 'agent_definition', side_effect=lambda name: definition(name) + '\nNew target.\n'), \
+            with patch.object(ao_routing, 'agent_definition', side_effect=lambda name, *model: definition(name, *model) + '\nNew target.\n'), \
                     patch.object(refresh, '_build', wraps=refresh._build) as build, \
                     patch.object(refresh, '_inspect', wraps=refresh._inspect) as inspect:
                 with self.assertRaisesRegex(ao.RoomError, 'at capacity; no new intent'):
@@ -578,7 +618,7 @@ refresh._publish_intent(Path(sys.argv[1]), json.loads(sys.argv[2]))
 class AcceptedFourthReviewRefreshTests(ReviewExtensionFixture):
     def configure_runtime(self):
         cli = self.root / 'fake-refresh-claude'
-        cli.write_text('#!' + sys.executable + '\nprint("synthetic (Claude Code)")\n'); cli.chmod(0o700)
+        cli.write_text('#!' + sys.executable + '\nprint("2.1.282 (Claude Code)")\n'); cli.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(cli), 'claude_config_dir': str(self.claude_env)})
 
     def bind(self):

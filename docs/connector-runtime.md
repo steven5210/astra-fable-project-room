@@ -12,7 +12,10 @@ digest covers every copied file's SHA-256 and the package name/version. A privat
 publication lock serializes concurrent starts; the complete copy is verified and
 published atomically. Existing copies are verified before reuse. Missing,
 modified, linked, or unexpected files are refused rather than replaced or loaded
-from another release. The runtime files and directory are read-only, under an
+from another release. The roster covers every distributable production module
+and no test module, including the newly added `ao_engineering_transition.py`,
+`ao_model_qualification.py`, `ao_model_boundaries.py` and
+`ao_worker_identity.py`. The runtime files and directory are read-only, under an
 owned private parent directory.
 
 Only the package version is read from `.codex-plugin/plugin.json`. Configuration,
@@ -67,4 +70,16 @@ The offline tests in `test_project_room_runtime.py` exercise cold status after
 installation eviction, exact release identity, concurrent publication, refusal
 of damaged inputs, exclusion of private files, unchanged API imports, and a real
 controller worker using only a fake backend that performs a late import and
-sibling-file read after its MCP exits and the installation is removed.
+sibling-file read after its MCP exits and the installation is removed. They also
+verify that the retained roster equals every distributable non-test Python
+module, that the newly retained transition, qualification, boundary and
+worker-identity modules import after the source tree is removed without
+changing the retained bytes, and that tool discovery, a cold `ao_room_status`
+and a retained reconnect still work after the installation is removed. A saved
+focused run of `test_ao_project_room`, `test_project_room_mcp` and
+`test_project_room_runtime` records 93 passing tests in 17.053 seconds with exit
+code 0 for the historical P1c interface snapshot; that saved result is genuine
+historical evidence, verified against its complete saved log and summary. This
+earlier run does not prove that later source revisions pass. These are offline
+fake-transport and synthetic-fixture results: they do not establish live
+adoption, provider availability, quota or a passed live verification.

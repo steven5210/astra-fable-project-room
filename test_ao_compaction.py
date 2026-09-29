@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import ao_delegates
+import ao_model_qualification as qmod
 import ao_project_room as ao
 import ao_routing
 import ao_routing_adoption as adoption
@@ -22,6 +23,7 @@ import ao_routing_guard
 import ao_workflow
 import test_ao_adoption as adoption_tests
 import test_ao_normal as normal
+import test_ao_routing_family as routing_family
 import test_ao_routing_v1_fixture as frozen
 
 
@@ -57,7 +59,7 @@ class CompactionFixture(normal.Fixture):
             'with Path(' + repr(str(self.claude_log)) + ').open("a") as stream:\n'
             '    stream.write(json.dumps(sys.argv[1:]) + "\\n")\n'
             'assert sys.argv[1:] == ["--version"], "inference is forbidden"\n'
-            'print("0.0-fake (Claude Code)")\n')
+            'print("2.1.282 (Claude Code)")\n')
         self.fake_claude.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude),
                                              'claude_config_dir': str(self.claude_env)})
@@ -68,7 +70,9 @@ class CompactionFixture(normal.Fixture):
         return self.service.ao_room_prepare(self.room, str(self.repo))
 
     def set_window(self, value):
-        ao.atomic(self.service.root / 'config.json', {'auto_compact_window': value})
+        path = self.service.root / 'config.json'
+        config = ao.read(path) if path.exists() else {}
+        ao.atomic(path, {**config, 'auto_compact_window': value})
 
     def settings(self):
         return ao.read(self.repo / '.claude/settings.local.json')
@@ -128,14 +132,19 @@ class CompactionPreparationTests(CompactionFixture):
         prepared = self.assert_window(250000)
         routing = prepared['routing']
         self.assertEqual((routing['version'], routing['execution_policy'], routing['matcher']),
-                         (2, 'orchestrator', '.*'))
+                         (3, 'orchestrator', '.*'))
         self.assertEqual(routing['effort'], 'max')
         self.assertEqual(routing['rules']['preserved_fields']['worker.model'], 'claude-fable-5-1')
         self.assertEqual(self.fake.snapshots['engineer']['settings']['reasoningEffort'], 'max')
         self.assertEqual(Path(routing['guard_path']).read_bytes(), Path(ao_routing_guard.__file__).read_bytes())
-        for name, model in (('pr-sonnet', 'claude-sonnet-5'), ('pr-opus', 'claude-opus-5')):
+        self.assertEqual(routing['agents'], self.QUALIFIED_WORKERS)  # source-qualified exact model map
+        self.assertEqual(routing['worker_qualification']['snapshot']['sha256'],
+                         qmod.digest(self.qualification_artifact()))
+        for name, family in (('pr-sonnet', 'sonnet'), ('pr-opus', 'opus')):
             fields = ao_routing.parse_definition((self.repo / '.claude/agents' / (name + '.md')).read_text())
-            self.assertEqual((fields['model'], fields['effort']), (model, 'max'))
+            self.assertEqual((fields['model'], fields['effort']), (self.QUALIFIED_WORKERS[name], 'max'))
+            self.assertEqual(routing['agent_selection'][name], {'kind': 'family', 'family': family})
+        self.assertEqual(routing['agent_identity_basis'], ao_routing.QUALIFIED_IDENTITY_BASIS)
         self.assertEqual(self.state()['delegate'], delegate)
         self.assertEqual(self.fake.config, config)
         self.assertEqual(ao.candidate_snapshot(self.repo), candidate)
@@ -283,8 +292,10 @@ class HistoricalCompactionTests(CompactionFixture):
             with patch.object(ao_routing, 'prepare', self.install_frozen_routing):
                 return self.prepare()
         # The v2 guard is unchanged. Restore the complete pre-compaction v2
-        # settings/preparation shape, then repin only these synthetic bytes.
-        prepared = self.prepare()
+        # settings/preparation shape, including its historical exact worker
+        # pins, then repin only these synthetic bytes.
+        self.prepare()
+        prepared = routing_family.historical_exact(self)
         prepared['routing'].pop('compaction')
         prepared['routing']['env'].pop(WINDOW_ENV)
         settings = self.settings()
@@ -304,6 +315,8 @@ class HistoricalCompactionTests(CompactionFixture):
         prepared = self.historical(version)
         self.assertNotIn('compaction', prepared['routing'])
         self.assertEqual(prepared['routing']['env'], LEGACY_ENV)
+        self.assertEqual(prepared['routing']['agents'], routing_family.EXACT)  # historical rooms keep exact pins
+        self.assertNotIn('agent_selection', prepared['routing'])
         before = self.immutable_bytes(prepared)
         policy = ao_delegates.validate_provider(self.directory(), self.state())
         workflow = ao_workflow.part_texts(prepared, policy)
@@ -317,7 +330,8 @@ class HistoricalCompactionTests(CompactionFixture):
                 self.assertEqual(ao_routing.validate_local(prepared), prepared['routing'])
                 observed = ao_routing.observe_rules(self.fake, self.state())
                 self.assertTrue(ao_routing.rules_match(observed, prepared['routing']['rules']))
-                ao_routing.before_dispatch(self.service, self.directory(), self.state(), prepared, 'implementation')
+                with self.assertRaisesRegex(ao.RoomError, 'no source-qualified worker selection'):
+                    ao_routing.before_dispatch(self.service, self.directory(), self.state(), prepared, 'implementation')
                 ao_routing.observe_on_sync(self.service, self.directory(), self.state())
         self.assertTrue(self.state()['routing_rules']['consistent'])
         self.assertEqual(ao_workflow.part_texts(prepared, policy), workflow)
@@ -374,7 +388,8 @@ class HistoricalAdoptionCompactionTests(adoption_tests.AdoptionFixture):
             adoption.validate(self.service, self.state())
             observed = ao_routing.observe_rules(self.fake, self.state())
             self.assertTrue(ao_routing.rules_match(observed, prepared['routing']['rules']))
-            ao_routing.before_dispatch(self.service, self.directory(), self.state(), prepared, 'implementation')
+            with self.assertRaisesRegex(ao.RoomError, 'no source-qualified worker selection'):
+                ao_routing.before_dispatch(self.service, self.directory(), self.state(), prepared, 'implementation')
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(len(self.fake.posts), self.posts_before)
 

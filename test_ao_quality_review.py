@@ -50,9 +50,40 @@ class MigrationTests(fixtures.Fixture):
     def continue_request(self, name='continue', message='Continue.'):
         return self.service.ao_room_send(self.room, 'engineer', message, name, purpose='correction')
 
-    def finish(self):
+    def finish(self, request_id=None):
+        # A direct continuation is dispatched by continue_request rather than by the shared send
+        # helper, so it still needs its own exact native caller/result rows before its first sync.
+        self.note_native_turn(request_id or self.latest_engineer())
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
+
+    def latest_engineer(self):
+        rows = [r for r in self.state()['requests'].values() if r['role'] == 'engineer']
+        return max(rows, key=lambda r: r['created_order'])['request_id']
+
+    def fail_native_turn(self, request_id):
+        """One saved request's own exact caller interval, ending in a typed native rate limit.
+
+        The registered transcript under the prepared owner config/projects path receives this saved
+        request's exact caller bytes and one real typed synthetic rate-limit error row. No successful
+        terminal stop is manufactured for a request whose AO turn actually failed.
+        """
+        if request_id in self.native_requests:
+            return
+        request = self.state()['requests'][request_id]
+        workspace = self.native_row_workspace()
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                    datetime.now(timezone.utc)).isoformat()
+        self.native_events.extend([
+            {'type': 'user', 'uuid': request_id + '-caller', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.001), 'cwd': workspace, 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': request_id + '-native-quota', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.002), 'cwd': workspace, 'isSidechain': False, 'isApiErrorMessage': True,
+             'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>'}}])
+        self.transcript.write_text(''.join(json.dumps(event) + '\n' for event in self.native_events))
+        self.native_requests.add(request_id)
 
     def restart(self):
         self.service = ao.Service(self.home, lambda url: self.fake)
@@ -119,7 +150,21 @@ class MigrationTests(fixtures.Fixture):
         self.assertEqual(req['carried']['instruction_amendments'], [first['sha256'], second['sha256']])
         self.assertNotIn(quality.EQUIVALENCE, req['carried'])
         self.restart(); self.implement()
-        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
+        import ao_model_boundaries
+        boundary = ao_model_boundaries.current_worker_boundary(self.directory(), self.state())
+        fragment = ao_model_boundaries.fragment_text(boundary)
+        request = self.state()['requests']['implementation']
+        # The first implementation packet discloses the once-only worker boundary fragment before the
+        # untouched caller bytes; the frozen quality instruction is not repeated.
+        self.assertEqual(request['text'], fragment + '\nPerform the exact authorized purpose.')
+        self.assertEqual(request['carried']['boundary_notices'],
+                         [ao_model_boundaries.carried_notice({'kind': boundary['kind'],
+                                                              'authority': boundary['authority'],
+                                                              'fragment': fragment})])
+        self.assertEqual(request['prompt_projection']['caller_bytes'], len('Perform the exact authorized purpose.'))
+        receipt = ao.read(self.directory() / request['receipt'])
+        self.assertEqual(receipt['prompt_projection_sha256'], quality.receipt_projection_sha256(request))
+        self.assertNotIn(FROZEN.decode(), request['text'])
         self.assertEqual(self.quality_status()['equivalent_amendment_sha256'], sorted([first['sha256'], second['sha256']]))
 
     def test_held_part_satisfies_later_amendments_through_explicit_root(self):
@@ -207,16 +252,37 @@ class MigrationTests(fixtures.Fixture):
         self.assertEqual(len(self.fake.posts), posts)
 
     def test_historical_canonical_packet_migrates_without_rewriting_evidence(self):
-        self.send('spec_review')
-        state = self.state(); req = state['requests']['spec_review']
-        spec = self.service.spec(self.directory(), state)
-        req.pop('carried'); req.pop('prompt_projection')
-        req['text'] = ('Historical workflow.\nExact specification revision 1, SHA256 ' + spec['sha256']
-                       + '\n<specification>\n' + spec['content'] + '\n</specification>\nAgreed gates: '
-                       + json.dumps(spec['gates']) + '\nTask instruction:\nReview.')
-        req['text_sha256'] = hashlib.sha256(req['text'].encode()).hexdigest()
+        # The retained writer bodies are schema reference only. This room's documented historical
+        # packet is built in its own shape -- no carried record and no prompt projection at all --
+        # before its native caller, its receipt and any observation, and before its baseline. No
+        # modern saved field is deleted and no reader is stubbed to fabricate the absence.
+        import ao_engineering_model
+        state = self.state(); spec = self.service.spec(self.directory(), state)
+        binding = state['bindings']['engineer']
+        text = ('Historical workflow.\nExact specification revision 1, SHA256 ' + spec['sha256']
+                + '\n<specification>\n' + spec['content'] + '\n</specification>\nAgreed gates: '
+                + json.dumps(spec['gates']) + '\nTask instruction:\nReview.')
+        snapshot = self.fake.snapshots['engineer']
+        request = {**binding, 'request_id': 'spec_review', 'role': 'engineer',
+                   'key': ao.digest({'role': 'engineer', 'message': 'Review.', 'request_id': 'spec_review',
+                                     'purpose': 'spec_review'}),
+                   'text': text, 'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+                   'spec_record_sha256': state['spec_record_sha256'], 'review': None, 'state': 'uncertain',
+                   'client_message_id': 'historical-spec-review',
+                   'created_at': datetime.now(timezone.utc).timestamp(),
+                   'created_order': len(state['requests']) + 1, 'purpose': 'spec_review',
+                   'engineering_resolution': ao_engineering_model.freeze_request(self.directory(), state),
+                   'baseline': {'turn_ids': sorted(ao.turn_ids(snapshot)),
+                                'conversation_id': snapshot.get('conversationId'),
+                                'branch_id': snapshot.get('activeBranchId'),
+                                'usage': snapshot.get('usage') or {}}}
+        state['requests']['spec_review'] = request
         self.service.save(self.directory(), state)
-        self.fake.snapshots['engineer']['messages'][-1]['text'] = req['text']
+        acknowledgement = self.fake.request('POST', '/sessions/' + binding['session_id'] + '/conversation/messages',
+                                           {'text': text, 'clientMessageId': request['client_message_id']})
+        request.update(turn_id=acknowledgement['turnId'], state='submitted', acknowledgement=acknowledgement)
+        self.service.save(self.directory(), state)
+        self.note_native_turn('spec_review')
         self.fake.finish('engineer', json.dumps({'interpretation': 'Exact scope', 'findings': [],
             'decision': 'accept', 'spec_revision': 1, 'spec_sha256': spec['sha256']}))
         self.service.ao_room_sync(self.room)
@@ -230,35 +296,34 @@ class MigrationTests(fixtures.Fixture):
             self.assertEqual(hashlib.sha256((self.directory() / key).read_bytes()).hexdigest(), value)
 
     def test_verified_settled_failure_holds_delivery_but_does_not_release_gate(self):
-        import ao_native_outcome
         self.old_session(); self.stage('pilot')
         with patch.object(ao_workflow, 'PARTS', tuple(p for p in ao_workflow.PARTS if p != PART)):
             self.continue_request('failed-pilot')
-        self.fake.finish('engineer', state='failed'); self.service.ao_room_sync(self.room)
-        state = self.state(); state['native_outcome_source'] = {'session_id': 'engineer'}
-        self.service.save(self.directory(), state)
+        self.fake.finish('engineer', state='failed')
+        # The real typed native rate limit inside this request's own exact caller interval; the
+        # complete registered engineer source, owner/config/projects path and saved request text
+        # stay intact, and no successful stop is manufactured for the failed request.
+        self.fail_native_turn('failed-pilot')
+        self.service.ao_room_sync(self.room)
         self.assertEqual(self.quality_status()['delivery'], 'undelivered')
-        observed = {'anchor_uuid': 'synthetic-packet', 'next_human_uuid': None,
-                    'errors': [{'uuid': 'synthetic-quota', 'error': 'rate_limit', 'http_status': 429}],
-                    'stop_reasons': [], 'source_sha256': 'f' * 64}
-        with patch.object(ao_native_outcome, 'inspect', return_value=observed):
-            audit = self.service.ao_room_outcome_audit(self.room)
-            self.service.ao_room_outcome_resume(self.room, 'failed-pilot', audit['outcome_sha256'], 'resume',
-                                               'Synthetic user confirmed capacity after native quota', 'Continue once')
-            before = self.immutable_files()
-            self.restart()
-            self.assertEqual(self.quality_status()['delivery'], 'verified_equivalent')
-            posts = len(self.fake.posts)
-            with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
-                self.continue_request('unauthorized-resume')
-            self.assertEqual(len(self.fake.posts), posts)
-            self.continue_request('resume')
-            self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')
-            request = self.state()['requests']['failed-pilot']
-            self.assertEqual(request['state'], 'settled_failure')
-            self.assertEqual(ao.read(self.directory() / request['receipt'])['turn']['state'], 'failed')
-            for key, value in before.items():
-                self.assertEqual(hashlib.sha256((self.directory() / key).read_bytes()).hexdigest(), value)
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.assertTrue(audit['resume_eligible'])
+        self.service.ao_room_outcome_resume(self.room, 'failed-pilot', audit['outcome_sha256'], 'resume',
+                                           'Synthetic user confirmed capacity after native quota', 'Continue once')
+        before = self.immutable_files()
+        self.restart()
+        self.assertEqual(self.quality_status()['delivery'], 'verified_equivalent')
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'semantic hold'):
+            self.continue_request('unauthorized-resume')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.continue_request('resume')
+        self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')  # No repeated quality instruction.
+        request = self.state()['requests']['failed-pilot']
+        self.assertEqual(request['state'], 'settled_failure')
+        self.assertEqual(ao.read(self.directory() / request['receipt'])['turn']['state'], 'failed')
+        for key, value in before.items():
+            self.assertEqual(hashlib.sha256((self.directory() / key).read_bytes()).hexdigest(), value)
 
     def test_single_prompt_assembly_metrics_and_unchanged_role_budget_fields(self):
         import ao_prompt_metrics
@@ -645,22 +710,42 @@ class HistoricalSourceQualityTests(unittest.TestCase):
         return {str(path.relative_to(directory)): path.read_bytes()
                 for path in directory.rglob('*') if path.is_file()}
 
+    def write_registered_native(self):
+        """Rewrite the registered native file through the History fixture's own producer.
+
+        Writing only ``f.events`` would erase the registered charter/implementation prefix after a
+        coherent History repair; the producer keeps the retained prefix and the mutable target
+        slice and targets whatever transcript the room currently registers.
+        """
+        f = self.fixture
+        f.write_native()
+        return Path(f.state()['native_outcome_source']['transcript'])
+
     def complete_successor(self):
         f = self.fixture
         f.release(f.audit())
         f.service.ao_room_send(f.room, 'engineer', 'Complete the one authorized successor.',
                                'continue-once', purpose='correction')
         successor = f.state()['requests']['continue-once']
-        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        workspace = f.native_row_workspace()
+        stamp = lambda t: min(datetime.fromtimestamp(t, timezone.utc),
+                              datetime.now(timezone.utc)).isoformat()
+        # The exact frozen expected model of this successor's own family epoch; an alias is never a
+        # native model. The rows stay ordered and clamped inside the successor's own completion
+        # window, and they are appended before the first capture of the successor receipt.
+        model = (successor.get('engineering_resolution') or {}).get('expected_model') or successor['model']
         f.events.extend([
-            {'type': 'user', 'uuid': 'successor-caller', 'sessionId': 'native-fixture',
-             'timestamp': stamp(successor['created_at'] + 0.1), 'origin': {'kind': 'human'},
-             'message': {'content': successor['text']}},
-            {'type': 'assistant', 'uuid': 'successor-final', 'sessionId': 'native-fixture',
-             'timestamp': stamp(successor['created_at'] + 0.2),
-             'message': {'model': successor['model'], 'id': 'successor-response', 'stop_reason': 'end_turn'}},
+            {'type': 'user', 'uuid': 'successor-caller', 'sessionId': f.NATIVE, 'cwd': workspace,
+             'timestamp': stamp(successor['created_at'] + 0.001), 'isSidechain': False,
+             'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': successor['text']}},
+            {'type': 'assistant', 'uuid': 'successor-final', 'sessionId': f.NATIVE, 'cwd': workspace,
+             'timestamp': stamp(successor['created_at'] + 0.002), 'isSidechain': False,
+             'message': {'role': 'assistant', 'model': model, 'id': 'successor-response',
+                         'content': [{'type': 'text', 'text': 'Successor complete.'}],
+                         'stop_reason': 'end_turn'}},
         ])
-        f.write_native()
+        self.write_registered_native()
         (f.repo / 'feature.txt').write_text('implemented\n')
         f.fake.finish('engineer', json.dumps(f.report()))
         f.service.ao_room_sync(f.room)
@@ -781,7 +866,11 @@ class HistoricalSourceQualityTests(unittest.TestCase):
 
 
 class FreshLedgerFixture(fixtures.DelegateFixture):
+    # ReviewExtensionFixture's real SQL registration and NATIVE identity, composed explicitly and
+    # installed by bind() before the first charter; the DeepSeek ledger stays untouched.
+    NATIVE = extension_fixtures.ReviewExtensionFixture.NATIVE
     make_database = extension_fixtures.ReviewExtensionFixture.make_database
+    register_native_source = extension_fixtures.ReviewExtensionFixture.register_native_source
     register = extension_fixtures.ReviewExtensionFixture.register
     audit = extension_fixtures.ReviewExtensionFixture.audit
     grant_inputs = extension_fixtures.ReviewExtensionFixture.grant_inputs
@@ -805,7 +894,7 @@ class FreshLedgerFixture(fixtures.DelegateFixture):
             self.agree(key='charter-' + str(number))
         self.implement(); self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
-        self.make_database(); self.target_spec = None
+        self.target_spec = None
 
 
 class ExtensionQualityTests(unittest.TestCase):

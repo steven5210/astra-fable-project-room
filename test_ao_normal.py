@@ -1,5 +1,7 @@
 """Offline normal-role contracts and private MCP attachment; no account/model calls."""
 import copy
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import ao_model_boundaries
+import ao_model_qualification as qmod
+import ao_native_outcome
 import ao_project_room as ao
 import ao_delegates
 import ao_delegate_launcher as launcher
@@ -39,7 +44,9 @@ class NativeFake(FakeAO):
         if state == 'completed':
             # Positive native completion evidence for known formatting-error fixtures.
             # Tests for missing/unknown stop evidence remove this field explicitly.
-            self.snapshots[name]['turns'][-1]['stopReason'] = 'end_turn'
+            turn = self.snapshots[name]['turns'][-1]
+            turn['stopReason'] = 'end_turn'
+            turn['completedAt'] = datetime.now(timezone.utc).isoformat()
 
 
 class Fixture(unittest.TestCase):
@@ -57,17 +64,86 @@ class Fixture(unittest.TestCase):
         self.home = self.root / 'state'
         # Hermetic Claude user settings and no inherited subagent knobs from the test host.
         self.claude_env = self.root / 'claude-env'; self.claude_env.mkdir()
+        # A concrete, floor-compatible fake executable: qualified worker floors require real version
+        # evidence and dispatch re-checks the actual bytes, never a fabricated version string.
+        self.fixture_claude = self.root / 'fixture-claude-version'
+        self.fixture_claude.write_text('#!' + sys.executable + '\nimport sys\n'
+                                       'print("2.1.282 (Claude Code)" if sys.argv[1:] == ["--version"] else "unexpected")\n')
+        self.fixture_claude.chmod(0o700)
         patcher = patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.claude_env)}); patcher.start(); self.addCleanup(patcher.stop)
         for key in list(os.environ):
-            if key in ao_routing.RECORDED_ENV or key in ao_routing.FOREGROUND_ENV:
+            if (key in ao_routing.RECORDED_ENV or key in ao_routing.FOREGROUND_ENV
+                    or key in ao_routing.ALIAS_ENV or key in ao_routing.GATEWAY_ENV):
                 del os.environ[key]
         self.fake = NativeFake(self.repo)
         self.service = ao.Service(self.home, lambda url: self.fake)
+        self.home.mkdir(parents=True, exist_ok=True)
+        controller = self.home / 'config.json'
+        value = ao.read(controller) if controller.exists() else {}
+        value.setdefault('claude_bin', str(self.fixture_claude))
+        value.setdefault('claude_config_dir', str(self.claude_env))
+        ao.atomic(controller, value)
+        for name in ('native_outcome_source', 'native_events', 'native_requests', 'transcript', 'database', 'owner'):
+            self.__dict__.pop(name, None)
         self.gates = [[sys.executable, '-c', "from pathlib import Path; assert Path('feature.txt').read_text() == 'implemented\\n'"]]
 
+    QUALIFIED_MODEL = 'claude-fable-5-1'
+    QUALIFIED_WORKERS = {'pr-sonnet': 'claude-sonnet-5-5', 'pr-opus': 'claude-opus-5-5'}
+    WORKER_FLOOR = '2.1.280'
+    NATIVE = 'native-normal'
+
     def open(self, feature='normal', provider='none'):
+        self.qualify()
         return self.service.ao_room_open(str(self.repo), feature, 'project', 'User authorized this feature',
                                          'http://127.0.0.1:1234', delegate_provider=provider)['room_id']
+
+    def qualify(self):
+        """Pin the operator-selected family qualification a new family dispatch requires.
+
+        The corrected dispatcher refuses a new family request without a pre-inference exact
+        expectation. The fixture writes one synthetic private artifact and its capture, exactly as
+        an operator would, into the same private configuration key the service reads; no guard is
+        bypassed.
+        """
+        artifact_path = self.root / 'qualification.json'
+        if artifact_path.exists():
+            return
+        evidence = self.root / 'qualification-evidence.txt'
+        evidence.write_text('Synthetic operator-selected documentation capture.\n')
+        evidence.chmod(0o600)
+        artifact = {'format': qmod.FORMAT, 'revision': 1, 'qualified_at': '2026-06-02T00:00:00Z',
+                    'scope': copy.deepcopy(qmod.SCOPE),
+                    'families': {'fable': {'expected_model': self.QUALIFIED_MODEL,
+                                           'source_ids': ['synthetic-doc']},
+                                 'opus': {'expected_model': self.QUALIFIED_WORKERS['pr-opus'],
+                                          'source_ids': ['synthetic-doc'],
+                                          'minimum_claude_code_version': self.WORKER_FLOOR},
+                                 'sonnet': {'expected_model': self.QUALIFIED_WORKERS['pr-sonnet'],
+                                            'source_ids': ['synthetic-doc']}},
+                    'sources': [{'id': 'synthetic-doc', 'uri': 'https://docs.invalid.example/claude/fable',
+                                 'captured_at': '2026-06-01T00:00:00Z',
+                                 'sha256': hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                                 'evidence_file': str(evidence)}]}
+        artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True))
+        artifact_path.chmod(0o600)
+        config_path = self.home / 'ao' / 'config.json'
+        value = ao.read(config_path) if config_path.exists() else {}
+        value['family_qualification'] = {'path': str(artifact_path), 'sha256': qmod.digest(artifact)}
+        ao.atomic(config_path, value)
+
+    def qualification_artifact(self):
+        """The synthetic private qualification artifact currently configured."""
+        return json.loads((self.root / 'qualification.json').read_text())
+
+    def configure_qualification(self, artifact):
+        """Rewrite the private qualification pointer with a different synthetic artifact value."""
+        path = self.root / 'qualification.json'
+        path.write_text(json.dumps(artifact, indent=2, sort_keys=True))
+        path.chmod(0o600)
+        value = ao.read(self.home / 'ao' / 'config.json')
+        value['family_qualification'] = {'path': str(path), 'sha256': qmod.digest(artifact)}
+        ao.atomic(self.home / 'ao' / 'config.json', value)
+        return path
 
     def directory(self, room=None):
         return self.home / 'ao' / 'rooms' / (room or self.room)
@@ -82,10 +158,112 @@ class Fixture(unittest.TestCase):
         self.service.ao_room_prepare(self.room, str(self.repo))
         self.service.ao_room_bind(self.room, 'engineer', 'engineer', ao_workflow.FABLE_MODEL, 'max')
         self.service.ao_room_bind(self.room, 'reviewer', 'reviewer', 'astra', 'max')
+        self.register_native_source()
+
+    def prepared_routing(self):
+        """The real preparation record's routing object, or an empty mapping."""
+        path = self.directory() / 'preparation.json'
+        if not path.exists():
+            return {}
+        prepared = ao.read(path)
+        routing = prepared.get('routing') if isinstance(prepared, dict) else None
+        return routing if isinstance(routing, dict) else {}
+
+    def native_config_root(self):
+        routing = self.prepared_routing()
+        value = routing.get('claude_config_dir')
+        return Path(value) if isinstance(value, str) and value else self.claude_env
+
+    def native_row_workspace(self):
+        """The exact workspace every synthetic native row must carry.
+
+        The disclosed mocked-owner fixture installs ``self.owner``; real-owner subclasses create
+        actual SQLite ownership instead and never install that attribute, so derive the workspace
+        from the real prepared worktree rather than reading an attribute that may not exist. No
+        owner reader is mocked here and no SQL ownership change is hidden.
+        """
+        owner = getattr(self, 'owner', None)
+        if isinstance(owner, dict) and isinstance(owner.get('workspace_path'), str) and owner['workspace_path']:
+            return owner['workspace_path']
+        path = self.directory() / 'preparation.json'
+        if path.exists():
+            prepared = ao.read(path)
+            worktree = prepared.get('worktree') if isinstance(prepared, dict) else None
+            if isinstance(worktree, str) and worktree:
+                return worktree
+        return str(self.repo)
+
+    def register_native_source(self):
+        """Register the prospective native outcome source a qualified dispatch verifies before send.
+
+        The synthetic transcript lives under the prepared config root's ``projects`` hierarchy and
+        every synthetic row carries the prepared workspace, so the real bounded collector can read
+        it. The shared fixture keeps its disclosed ``read_owner`` deepcopy patch so tests that
+        mutate ``self.owner`` still exercise their intended path; the real-Service W3 fixture
+        overrides this method with actual SQL ownership.
+        """
+        if getattr(self, 'native_outcome_source', None) is not None:
+            return
+        state = self.state()
+        binding = (state.get('bindings') or {}).get('engineer')
+        if not binding:
+            return
+        config_root = self.native_config_root()
+        project_dir = config_root / 'projects' / str(self.repo).replace('/', '-')
+        self.transcript = project_dir / (self.NATIVE + '.jsonl')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript.write_text('')
+        self.native_events = []
+        self.native_requests = set()
+        self.owner = {'id': binding['session_id'], 'project_id': state['ao_project_id'],
+                      'harness': 'claude-code', 'session_mode': 'chat', 'is_terminated': 0,
+                      'activity_state': 'idle', 'workspace_path': str(self.repo),
+                      'provider_conversation_id': self.NATIVE, 'controller_generation': 'generation-1',
+                      'ao_conversation_id': binding['conversation_id'], 'active_branch_id': binding['branch_id'],
+                      'branch_provider_conversation_id': self.NATIVE, 'branch_session_id': binding['session_id'],
+                      'strategy': 'native', 'replay_truncated': 0}
+        patcher = patch('ao_native_identity.read_owner', side_effect=lambda *a: copy.deepcopy(self.owner))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        source = {'database': str(self.root / 'owner.db'), 'transcript': str(self.transcript),
+                  'session_id': binding['session_id'], 'native_session_id': self.NATIVE}
+        ao_native_outcome.preflight_source(self.directory(), state, source['database'], source['transcript'])
+        ao.atomic(self.directory() / 'state.json', state)
+        self.native_outcome_source = source
+
+    def note_native_turn(self, request_id):
+        """Append one saved request's synthetic native stop evidence once, before its first sync."""
+        if getattr(self, 'native_outcome_source', None) is None or request_id in self.native_requests:
+            return
+        request = self.state()['requests'][request_id]
+        if request.get('state') in ('completed', 'settled_failure'):
+            return
+        model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+        workspace = self.native_row_workspace()
+        # Bounded synthetic timestamps: each row keeps its intended offset from this request's own
+        # creation while that instant is already in the past and is otherwise clamped to this append,
+        # so the caller/response pair always lies inside the window the AO completion and the receipt
+        # observation prove. No sleep and no future-dated row are used.
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                    datetime.now(timezone.utc)).isoformat()
+        self.native_events.extend([
+            {'type': 'user', 'uuid': request_id + '-caller', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.001), 'cwd': workspace, 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': request_id + '-reply', 'sessionId': self.NATIVE,
+             'timestamp': stamp(0.002), 'cwd': workspace, 'isSidechain': False,
+             'message': {'role': 'assistant', 'model': model, 'id': request_id + '-m0',
+                         'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}}])
+        self.transcript.write_text(''.join(json.dumps(event) + '\n' for event in self.native_events))
+        self.native_requests.add(request_id)
 
     def send(self, purpose, key=None):
         role = 'reviewer' if purpose == 'acceptance_review' else 'engineer'
-        return self.service.ao_room_send(self.room, role, 'Perform the exact authorized purpose.', key or purpose, purpose=purpose)
+        result = self.service.ao_room_send(self.room, role, 'Perform the exact authorized purpose.', key or purpose,
+                                           purpose=purpose)
+        if role == 'engineer':
+            self.note_native_turn(key or purpose)
+        return result
 
     def agree(self, decision='accept', revision=1, key='spec_review'):
         self.send('spec_review', key)
@@ -177,13 +355,20 @@ class NormalWorkflowTests(Fixture):
         self.implement(); self.review()
         result = self.service.ao_room_accept(self.room, 'acceptance_review')
         self.assertTrue(result['accepted']); self.assertEqual(result['workflow'], 'fable_engineering')
-        # The one-time workflow parts reach the session with its first packet; implementation carries only the caller's bytes.
+        # The one-time workflow parts reach the session with its first packet; the first
+        # delegation-capable packet additionally carries the current worker boundary notice once, and
+        # only that exact notice, before the caller's bytes.
         initial = ao_workflow.latest(self.state(), {'spec_review'})['text']
-        self.assertIn('Fable directs implementation, delegates execution', initial)
+        self.assertIn('Fable directs implementation, delegates execution, reviews evidence', initial)
+        self.assertIn('Execution ownership includes validation probes and tests', initial)
         self.assertIn('with no preamble, Markdown fence or trailing prose', initial)
         self.assertNotIn('No routine Fable', initial)
-        self.assertIn('Fable is the implementation orchestrator', initial)
-        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
+        self.assertIn('The engineering orchestrator directs this work', initial)
+        implementation = self.state()['requests']['implementation']
+        notices = implementation['carried']['boundary_notices']
+        self.assertEqual([notice['kind'] for notice in notices], [ao_model_boundaries.WORKER_ROUTING])
+        notice = ao_model_boundaries.notice_fragment(self.directory(), self.state(), notices[0])
+        self.assertEqual(implementation['text'], notice + '\nPerform the exact authorized purpose.')
         self.assertEqual(self.service.ao_room_status(self.room)['delegate']['provider'], 'none')
         self.assertFalse(self.service.ao_room_status(self.room)['usage']['includes_delegates'])
 
@@ -317,12 +502,17 @@ class DelegateFixture(Fixture):
     def setUp(self):
         super().setUp()
         self.claude_config = self.root / 'claude-config'; self.claude_config.mkdir()
+        self.claude_env = self.claude_config
+        value = ao.read(self.home / 'config.json')
+        ao.atomic(self.home / 'config.json', {**value, 'claude_config_dir': str(self.claude_config)})
+        anchor = patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.claude_config)})
+        anchor.start(); self.addCleanup(anchor.stop)
         self.fake_cli = self.root / 'fake-claude'
         self.fake_cli.write_text('#!' + sys.executable + '\n' + '''import json,os,subprocess,sys
 from pathlib import Path
 args=sys.argv[1:]
 if args==['--version']:
-    print('0.0-fake (Claude Code)'); sys.exit(0)
+    print('2.1.282 (Claude Code)'); sys.exit(0)
 assert args[:3]==['mcp','add-json','deepseek'] and args[-2:]==['--scope','local']
 p=Path(os.environ['CLAUDE_CONFIG_DIR'])/'.claude.json'
 project=subprocess.check_output(['git','worktree','list','--porcelain'],text=True).splitlines()[0][9:]
@@ -447,7 +637,7 @@ class RoutingTests(Fixture):
     def setUp(self):
         super().setUp()
         self.fake_claude = self.root / 'fake-claude-version'
-        self.fake_claude.write_text('#!' + sys.executable + '\nimport sys\nprint("0.0-fake (Claude Code)" if sys.argv[1:] == ["--version"] else "unexpected")\n')
+        self.fake_claude.write_text('#!' + sys.executable + '\nimport sys\nprint("2.1.282 (Claude Code)" if sys.argv[1:] == ["--version"] else "unexpected")\n')
         self.fake_claude.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude), 'claude_config_dir': str(self.claude_env)})
         self.room = self.open(provider='none'); self.spec()
@@ -478,15 +668,22 @@ class RoutingTests(Fixture):
         self.assertEqual(exclude.read_bytes() if exclude.exists() else None, exclude_before)
         self.assertEqual((self.claude_env / 'settings.json').read_text(), '{"permissions": {"defaultMode": "auto"}}')
         routing = prepared['routing']
-        self.assertEqual((routing['version'], routing['execution_policy']), (2, 'orchestrator'))
-        self.assertEqual(routing['agents'], {'pr-sonnet': 'claude-sonnet-5', 'pr-opus': 'claude-opus-5'})
+        self.assertEqual((routing['version'], routing['execution_policy']), (3, 'orchestrator'))
+        # New preparations derive both worker families from the operator-selected source qualification.
+        self.assertEqual(routing['agents'], self.QUALIFIED_WORKERS)
+        self.assertEqual(routing['agent_selection'], {'pr-sonnet': {'kind': 'family', 'family': 'sonnet'},
+                                                      'pr-opus': {'kind': 'family', 'family': 'opus'}})
+        self.assertEqual(routing['agent_identity_basis'], ao_routing.QUALIFIED_IDENTITY_BASIS)
+        self.assertEqual(routing['worker_qualification']['snapshot']['sha256'],
+                         qmod.digest(self.qualification_artifact()))
+        self.assertEqual(routing['effort'], 'max')
         self.assertEqual(routing['browser_skill'], 'claude-in-chrome')
-        self.assertEqual(routing['claude']['version'], '0.0-fake (Claude Code)')
+        self.assertEqual(routing['claude']['version'], '2.1.282 (Claude Code)')
         self.assertEqual(routing['claude']['path'], str(self.fake_claude))
         for name in ('pr-sonnet', 'pr-opus'):
             text = (self.repo / '.claude' / 'agents' / (name + '.md')).read_text()
             fields = ao_routing.parse_definition(text)
-            self.assertEqual((fields['model'], fields['effort']), (ao_routing.MODELS[name], 'max'))
+            self.assertEqual((fields['model'], fields['effort']), (self.QUALIFIED_WORKERS[name], 'max'))
             self.assertIn('Agent', fields['disallowedTools'])
             try:
                 import yaml
@@ -668,18 +865,26 @@ class RoutingTests(Fixture):
         self.assertEqual(self.routing()['execution_policy'], 'orchestrator')
         self.assertEqual(Path(routing['guard_path']).read_bytes(), Path(routing_guard.__file__).read_bytes())
 
-    def test_routing_v2_refuses_policy_drift_and_v1_is_not_relabelled(self):
+    def test_routing_v2_and_v3_refuse_policy_drift_and_v1_is_not_relabelled(self):
         self.bind()
         prepared = self.prepared()
         original = json.dumps(prepared, sort_keys=True)
-        for field, value in (('execution_policy', 'unrestricted'), ('matcher', 'Agent'), ('version', 3), ('version', True)):
+        for field, value in (('execution_policy', 'unrestricted'), ('matcher', 'Agent'), ('version', 4), ('version', True)):
             changed = json.loads(original)
             changed['routing'][field] = value
             with self.assertRaises(ao.RoomError):
                 ao_routing.validate_local(changed)
+        dropped = json.loads(original)
+        dropped['routing'].pop('worker_qualification')
+        with self.assertRaisesRegex(ao.RoomError, 'version 3 routing record'):
+            ao_routing.validate_local(dropped)
         historical = json.loads(original)
         historical['routing']['version'] = 1
         historical['routing'].pop('execution_policy')
+        historical['routing'].pop('worker_qualification')
+        historical['routing'].pop('agent_selection')
+        historical['routing'].pop('agent_identity_basis')
+        historical['routing']['agents'] = {'pr-sonnet': 'claude-sonnet-5', 'pr-opus': 'claude-opus-5'}
         # Frozen old rooms keep their recorded evidence, never acquire a new policy label or prompt.
         before = json.dumps(historical, sort_keys=True)
         self.assertEqual(ao_routing.status(historical, {})['execution_policy'], 'historical_unrestricted_root')
@@ -690,8 +895,9 @@ class RoutingTests(Fixture):
         text = ao_routing.agent_definition('pr-sonnet')
         ao_routing.validate_definition('pr-sonnet', text)
         tools_line = 'disallowedTools: ' + json.dumps(ao_routing.parse_definition(text)['disallowedTools'])
-        cases = [('"claude-sonnet-5"', '"inherit"', 'inherits'), ('"claude-sonnet-5"', '"claude-fable-5-1"', 'Fable'),
-                 ('model: "claude-sonnet-5"\n', '', 'omits'), ('"claude-sonnet-5"', '"claude-opus-5"', 'pinned mapping'),
+        cases = [('"sonnet"', '"inherit"', 'inherits'), ('"sonnet"', '"claude-fable-5-1"', 'Fable'), ('"sonnet"', '"fable"', 'Fable'),
+                 ('model: "sonnet"\n', '', 'omits'), ('"sonnet"', '"opus"', 'pinned mapping'),
+                 ('"sonnet"', '"claude-sonnet-5"', 'pinned mapping'),  # a fixed id never satisfies a family preparation
                  ('effort: "max"', 'effort: "high"', 'effort'),
                  (tools_line, 'disallowedTools: "Skill"', 'delegate'),
                  (tools_line, 'disallowedTools: "Agent, Workflow, SendMessage, ' + ao_routing.CHILD_DENIED + '"', 'skills'),
@@ -708,7 +914,8 @@ class RoutingTests(Fixture):
         self.bind()
         self.assertEqual(self.routing()['status'], 'configured')
         path = self.repo / '.claude' / 'agents' / 'pr-opus.md'; original = path.read_bytes()
-        drifted = original.replace(b'"claude-opus-5"', b'"inherit"')
+        drifted = original.replace(b'model: "' + self.QUALIFIED_WORKERS['pr-opus'].encode() + b'"', b'model: "inherit"')
+        self.assertNotEqual(drifted, original)
         path.write_bytes(drifted)
         status = self.routing(); self.assertEqual(status['status'], 'unverified'); self.assertIn('changed', status['error'])
         self.assertEqual(self.service.ao_room_status(self.room)['delegate']['attachment'], 'configuration_verified')
@@ -734,8 +941,9 @@ class RoutingTests(Fixture):
         self.assertIn('not ignored', self.routing()['error'])
         (self.repo / '.gitignore').write_text('.claude/\n'); self.commit('restore ignore')
         for content, message in (({'env': {'CLAUDE_CODE_SUBAGENT_MODEL_FORCE': 'claude-fable-5-1'}}, 'override'),
-                                 ({'availableModels': ['claude-fable-5-1', 'claude-sonnet-5']}, 'availableModels'),
-                                 ({'modelOverrides': {'claude-opus-5': 'claude-fable-5-1'}}, 'modelOverrides'),
+                                 ({'availableModels': ['claude-fable-5-1', 'sonnet']}, 'availableModels'),
+                                 ({'availableModels': ['claude-sonnet-5', 'claude-opus-5']}, 'availableModels'),  # aliases required
+                                 ({'modelOverrides': {'opus': 'claude-fable-5-1'}}, 'modelOverrides'),
                                  ({'disableAllHooks': True}, 'disable hooks')):
             (self.claude_env / 'settings.json').write_text(json.dumps(content))
             self.assertIn(message, self.routing()['error'])
@@ -806,8 +1014,16 @@ class RoutingTests(Fixture):
         self.assertEqual(self.routing()['status'], 'verified')
         self.implement()
         initial = ao_workflow.latest(self.state(), {'spec_review'})['text']  # routing text is delivered once, with the first packet
-        self.assertIn('pr-sonnet (claude-sonnet-5', initial); self.assertIn('pr-opus (claude-opus-5', initial)
-        self.assertEqual(self.state()['requests']['implementation']['text'], 'Perform the exact authorized purpose.')
+        self.assertIn('pr-sonnet (source-qualified exact model ' + self.QUALIFIED_WORKERS['pr-sonnet'], initial)
+        self.assertIn('pr-opus (source-qualified exact model ' + self.QUALIFIED_WORKERS['pr-opus'], initial)
+        self.assertIn('the expected exact models come from the operator-selected source qualification retained with '
+                      'this preparation', initial)
+        self.assertIn('effort is configured MAX, not observed', initial)
+        self.assertNotIn('family alias sonnet', initial)
+        implementation = self.state()['requests']['implementation']
+        notice = ao_model_boundaries.notice_fragment(
+            self.directory(), self.state(), implementation['carried']['boundary_notices'][0])
+        self.assertEqual(implementation['text'], notice + '\nPerform the exact authorized purpose.')
         self.review()
         self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
@@ -878,13 +1094,24 @@ class RoutingTests(Fixture):
         self.assertNotIn('routing_rules', self.state())
         self.assertEqual(self.routing()['status'], 'not_configured')
 
-    def test_rooms_without_executable_evidence_never_reach_verified(self):
+    def test_missing_executable_evidence_refuses_new_preparation_and_caps_status(self):
         (self.home / 'config.json').unlink()
-        self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo))
-        self.assertIsNone(self.prepared()['routing']['claude']['path'])
-        self.service.ao_room_sync(self.room)
+        with self.assertRaisesRegex(ao.RoomError, 'concrete existing Claude executable identity'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertIsNone(self.state().get('preparation'))
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.fake_claude),
+                                              'claude_config_dir': str(self.claude_env)})
+        self.bind(); self.agree()
+        prepared = self.prepared()
+        prepared['routing']['claude'] = {'path': None, 'size': None, 'mtime_ns': None, 'version': None,
+                                         'error': 'no configured claude_bin'}
+        ao.atomic(self.directory() / self.state()['preparation'], prepared)
+        state = self.state(); state['preparation_sha256'] = ao.digest(prepared)
+        ao.atomic(self.directory() / 'state.json', state)
         status = self.routing()
-        self.assertEqual(status['status'], 'configured'); self.assertIn('version evidence is missing', status['note'])
+        self.assertEqual(status['status'], 'unverified')
+        self.assertIn('concrete existing Claude executable identity', status['error'])
+        self.assertEqual(self.service.ao_room_status(self.room)['delegate']['attachment'], 'configuration_verified')
 
     def test_managed_hooks_only_refuses_preparation_and_delegation_but_not_review(self):
         managed = self.root / 'managed-settings.json'
@@ -919,13 +1146,10 @@ class RoutingTests(Fixture):
             self.review()  # read-only acceptance review is still allowed
             self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
 
-    def test_failed_version_probe_is_recorded_and_caps_status(self):
+    def test_failed_version_probe_refuses_new_preparation(self):
         self.fake_claude.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(1)\n')
-        self.bind(); self.agree(); self.service.ao_room_handoff(self.room, str(self.repo))
-        claude = self.prepared()['routing']['claude']
-        self.assertEqual((claude['version'], claude['error']), (None, 'version probe exit 1'))
-        self.service.ao_room_sync(self.room)
-        status = self.routing()
-        self.assertEqual(status['status'], 'configured'); self.assertIn('version probe exit 1', status['note'])
+        with self.assertRaisesRegex(ao.RoomError, 'concrete existing Claude executable identity'):
+            self.service.ao_room_prepare(self.room, str(self.repo))
+        self.assertIsNone(self.state().get('preparation'))
         ao.atomic(self.home / 'config.json', {'claude_bin': 'claude', 'claude_config_dir': str(self.claude_env)})
         self.assertEqual(ao_routing.claude_evidence('claude')['error'], 'claude_bin is not an absolute path')

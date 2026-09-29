@@ -669,6 +669,344 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(annotations["ao_room_sync"]["readOnlyHint"])
         self.assertTrue(annotations["ao_room_send"]["openWorldHint"])
 
+    def test_engineering_model_service_methods_forward_exactly_without_wrapper_lock(self):
+        audit_arguments = {"room_id": "room", "target_model": "claude-opus-5-5",
+                           "native_owner_database": "/synthetic/owner.sqlite",
+                           "native_transcript_path": "/synthetic/native.jsonl"}
+        transition_arguments = {"room_id": "room", "request_id": "model-2",
+                                "source_model": "claude-fable-5-1", "target_model": "claude-opus-5-5",
+                                "audit_sha256": "a" * 64, "spec_record_sha256": "b" * 64,
+                                "candidate_sha256": "c" * 64, "native_history_sha256": "d" * 64,
+                                "native_owner_database": "/synthetic/owner.sqlite",
+                                "native_transcript_path": "/synthetic/native.jsonl",
+                                "authorization": "Synthetic user authorization",
+                                "reason": "Synthetic engineering transition"}
+        abandon_arguments = {"room_id": "room", "request_id": "model-2",
+                             "native_owner_database": "/synthetic/owner.sqlite",
+                             "native_transcript_path": "/synthetic/native.jsonl",
+                             "authorization": "Synthetic user authorization",
+                             "diagnosis": "Synthetic abandonment diagnosis"}
+        cases = (("ao_room_engineer_model_audit", "audit", audit_arguments),
+                 ("ao_room_engineer_model_transition", "transition", transition_arguments),
+                 ("ao_room_engineer_model_transition_abandon", "abandon", abandon_arguments))
+        for method, function, arguments in cases:
+            with self.subTest(method=method):
+                with patch("ao_engineering_transition." + function) as core, \
+                        patch.object(self.service, "locked", side_effect=AssertionError("wrapper lock")):
+                    core.return_value = {"synthetic": method}
+                    self.assertEqual(getattr(self.service, method)(**arguments), {"synthetic": method})
+                    self.assertEqual(core.call_args.args, (self.service, *arguments.values()))
+                    self.assertEqual(core.call_args.kwargs, {})
+
+    def test_generic_cli_call_and_mcp_forward_engineering_model_arguments_exactly(self):
+        arguments = {"room_id": "synthetic-room", "target_model": "claude-opus-5-5",
+                     "native_owner_database": "../owner.sqlite", "native_transcript_path": "../native.jsonl"}
+        with patch.object(project_room.ao_project_room, "Service") as factory:
+            factory.return_value.ao_room_engineer_model_audit.return_value = {"eligible": True}
+            result = project_room.Service(self.root / "state").call("ao_room_engineer_model_audit", arguments)
+            self.assertEqual(result, {"eligible": True})
+            factory.return_value.ao_room_engineer_model_audit.assert_called_once_with(**arguments)
+            factory.return_value.ao_room_engineer_model_audit.reset_mock()
+            path = self.root / "engineering-model-arguments.json"
+            path.write_text(json.dumps(arguments))
+            with patch("sys.stdout"):
+                status = project_room.main(["--home", str(self.root / "state"), "call",
+                                            "ao_room_engineer_model_audit", "--args-file", str(path)])
+            self.assertEqual(status, 0)
+            factory.return_value.ao_room_engineer_model_audit.assert_called_once_with(**arguments)
+        capture = {}
+
+        class Capture:
+            def call(self, name, value):
+                capture["name"] = name
+                capture["value"] = value
+                return {"ok": True}
+
+        response = project_room_mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                            "params": {"name": "ao_room_engineer_model_audit", "arguments": arguments}}, Capture())
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(capture, {"name": "ao_room_engineer_model_audit", "value": arguments})
+
+
+class EngineerSourceRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
+        (self.repo / "feature.txt").write_text("synthetic\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "feature.txt"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid",
+                        "commit", "-q", "-m", "synthetic"], check=True, capture_output=True)
+        self.home = self.root / "state"
+        self.service = ao.Service(self.home, lambda url: None)
+        self.room = "ao-source-registration"
+        self.directory = self.service.root / "rooms" / self.room
+        self.directory.mkdir(parents=True, mode=0o700)
+        self.transcript_directory = self.root / "claude"
+        self.transcript_directory.mkdir(mode=0o700)
+        self.transcript = self.transcript_directory / "native-1.jsonl"
+        self.database = self.make_owner()
+        state = self.build_state()
+        ao.atomic(self.directory / "state.json", state)
+        self.original = (self.directory / "state.json").read_bytes()
+
+    def build_state(self):
+        state = {"version": 2, "room_id": self.room, "project_path": str(self.repo),
+                 "git_common_dir": str(ao.common_dir(self.repo)), "feature": "source registration",
+                 "ao_project_id": "project", "ao_url": "http://127.0.0.1:1234",
+                 "workflow": "fable_engineering", "authorization": "Synthetic user authorization",
+                 "bindings": {"engineer": {"session_id": "engineer", "model": "fable", "reasoning_effort": "max",
+                                           "harness": "claude-code", "conversation_id": "conversation-1",
+                                           "branch_id": "branch-1", "fable_reason": "Synthetic Fable engineering role",
+                                           "identity_basis": "synthetic"}},
+                 "requests": {}, "exception_authorization": None, "verifications": [], "acceptances": [],
+                 "created_at": 0}
+        import ao_delegates
+        ao_delegates.initialize(self.service, self.directory, state, "none")
+        prepared = {"room_id": self.room, "worktree": str(self.repo), "provider": "none",
+                    "delegate_sha256": ao.digest(state["delegate"])}
+        ao.atomic(self.directory / "preparation.json", prepared)
+        state.update(preparation="preparation.json", preparation_sha256=ao.digest(prepared),
+                     preparation_status="configured")
+        return state
+
+    def make_owner(self, project="project", conversation="conversation-1", branch="branch-1",
+                   workspace=None, native="native-1"):
+        import sqlite3
+        path = self.root / "ao.sqlite"
+        if path.exists():
+            path.unlink()
+        database = sqlite3.connect(path)
+        database.executescript(
+            "CREATE TABLE sessions(id TEXT, project_id TEXT, harness TEXT, session_mode TEXT,"
+            " is_terminated INTEGER, activity_state TEXT, workspace_path TEXT,"
+            " provider_conversation_id TEXT, controller_generation TEXT);"
+            "CREATE TABLE conversations(id TEXT, current_session_id TEXT, active_branch_id TEXT);"
+            "CREATE TABLE conversation_branches(id TEXT, conversation_id TEXT, provider_conversation_id TEXT,"
+            " session_id TEXT, strategy TEXT, replay_truncated INTEGER);")
+        database.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)",
+                         ("engineer", project, "claude-code", "chat", 0, "idle", workspace or str(self.repo),
+                          native, "generation-1"))
+        database.execute("INSERT INTO conversations VALUES(?,?,?)", (conversation, "engineer", branch))
+        database.execute("INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)",
+                         (branch, conversation, native, "engineer", "native", 0))
+        database.commit()
+        database.close()
+        path.chmod(0o600)
+        return path
+
+    def register(self, database=None, transcript=None):
+        return self.service.ao_room_engineer_source_register(
+            self.room, str(database or self.database), str(transcript or self.transcript))
+
+    def saved(self):
+        return ao.read(self.directory / "state.json")
+
+    def write_state(self, state):
+        ao.atomic(self.directory / "state.json", state)
+
+    def restore(self):
+        (self.directory / "state.json").write_bytes(self.original)
+
+    def add_request(self, request_id, role, order, held=False, omit_order=False):
+        import ao_outcomes
+        value = {"request_id": request_id, "role": role, "session_id": role, "state": "completed",
+                 "provider_turn_id": "native-" + request_id, "turn_id": "turn-" + request_id,
+                 "text_sha256": ao.digest(request_id.encode())}
+        if not omit_order:
+            value["created_order"] = order
+        receipt = {"turn": {"id": value["turn_id"], "state": "completed",
+                            "providerTurnId": value["provider_turn_id"]},
+                   "messages": [{"role": "assistant", "text": "{}"}], "history_truncated": False}
+        value["receipt"] = "receipts/" + request_id + "/saved.json"
+        value["receipt_sha256"] = ao.digest(receipt)
+        outcome = {"kind": "quota_limit" if held else "final_available", "hold": bool(held),
+                   "reason": "Synthetic retained semantic outcome"}
+        record = {"version": 1, "room_id": self.room, "request_id": request_id,
+                  "receipt_sha256": value["receipt_sha256"], "text_sha256": value["text_sha256"],
+                  "turn_id": value["turn_id"], "provider_turn_id": value["provider_turn_id"],
+                  "outcome": outcome, "native": None}
+        digest = ao.digest(record)
+        value.update(semantic_outcome_sha256=digest, semantic_status=outcome)
+        value["semantic_outcome"] = "outcomes/" + request_id + "/" + digest + ".json"
+        ao.atomic(self.directory / value["receipt"], receipt)
+        ao.atomic(self.directory / value["semantic_outcome"], record)
+        self.assertEqual(ao_outcomes.load(self.directory, value), record)
+        state = self.saved()
+        state["requests"][request_id] = value
+        self.write_state(state)
+        return value
+
+    def bind_reviewer(self):
+        state = self.saved()
+        state["bindings"]["reviewer"] = {"session_id": "reviewer", "model": "astra", "reasoning_effort": "max",
+                                         "harness": "codex", "conversation_id": "reviewer-conversation",
+                                         "branch_id": "reviewer-branch", "fable_reason": None,
+                                         "identity_basis": "synthetic reviewer binding"}
+        self.write_state(state)
+
+    def test_reviewer_hold_blocks_registration_when_engineer_has_no_prior_request(self):
+        self.bind_reviewer()
+        self.add_request("review-held", "reviewer", 1, held=True)
+        before = (self.directory / "state.json").read_bytes()
+        with self.assertRaisesRegex(ao.RoomError, "held"):
+            self.register()
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+        saved = self.saved()
+        self.assertNotIn("native_outcome_source", saved)
+        self.assertTrue(saved["requests"]["review-held"]["semantic_status"]["hold"])
+
+    def test_malformed_or_duplicate_order_refuses_before_selecting_a_latest_request(self):
+        cases = (
+            ("duplicate_integer", (("clear", "engineer", 1, False), ("held", "engineer", 1, True))),
+            ("string_orders", (("clear-9", "engineer", "9", False), ("held-10", "engineer", "10", True))),
+            ("missing_order", (("held", "engineer", None, True, True),)),
+            ("boolean_order", (("held", "engineer", True, True),)),
+        )
+        for name, rows in cases:
+            with self.subTest(name=name):
+                self.restore()
+                for row in rows:
+                    self.add_request(row[0], row[1], row[2], held=row[3],
+                                     omit_order=len(row) > 4 and row[4])
+                before = (self.directory / "state.json").read_bytes()
+                with self.assertRaisesRegex(ao.RoomError, "creation order"):
+                    self.register()
+                self.assertEqual((self.directory / "state.json").read_bytes(), before)
+                self.assertNotIn("native_outcome_source", self.saved())
+
+    def test_valid_ordering_registers_and_identical_revalidation_is_read_only(self):
+        self.bind_reviewer()
+        self.add_request("engineer-clear", "engineer", 1, held=False)
+        self.add_request("reviewer-clear", "reviewer", 2, held=False)
+        result = self.register()
+        self.assertEqual(result["registered"], "created")
+        saved = self.saved()
+        self.assertEqual(saved["native_outcome_source"]["session_id"], "engineer")
+        before = (self.directory / "state.json").read_bytes()
+        again = self.register()
+        self.assertEqual(again["registered"], "identical")
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+
+    def test_registered_source_is_accepted_by_qualified_dispatch_consumer(self):
+        import ao_engineering_model as em
+        import test_ao_engineering_transition_admission as transition_fixtures
+        fixture = transition_fixtures.QualifiedTransitionCase()
+        fixture.setUp()
+        try:
+            artifact = fixture.fable_artifact()
+            fixture.qualified_room(model="fable", artifact=artifact)
+            directory = fixture.directory
+            state = fixture.state()
+            request = state["requests"]["spec_review"]
+            self.assertEqual(request["created_order"], 1)
+            self.assertEqual(request["purpose"], "spec_review")
+            receipt = ao.read(directory / request["receipt"])
+            self.assertEqual(receipt["turn"]["id"], request["turn_id"])
+            self.assertEqual(receipt["turn"]["providerTurnId"], request["provider_turn_id"])
+            self.assertEqual(request["receipt_sha256"], ao.digest(receipt))
+            outcome = {"kind": "final_available", "hold": False,
+                       "reason": "Synthetic fixture-cleared final outcome"}
+            record = {"version": 1, "room_id": transition_fixtures.ROOM, "request_id": request["request_id"],
+                      "receipt_sha256": request["receipt_sha256"], "text_sha256": request["text_sha256"],
+                      "turn_id": request["turn_id"], "provider_turn_id": request["provider_turn_id"],
+                      "outcome": outcome, "native": None}
+            digest = ao.digest(record)
+            relative = "outcomes/" + request["request_id"] + "/" + digest + ".json"
+            request.update(semantic_outcome=relative, semantic_outcome_sha256=digest,
+                           semantic_status=outcome)
+            ao.atomic(directory / relative, record)
+            ao.atomic(directory / "state.json", state)
+            evidence = fixture.service.ao_room_engineer_source_register(
+                transition_fixtures.ROOM, str(fixture.database), str(fixture.transcript))
+            self.assertEqual(evidence["registered"], "created")
+            source = {"database": str(fixture.database), "transcript": str(fixture.transcript),
+                      "session_id": transition_fixtures.SESSION,
+                      "native_session_id": transition_fixtures.NATIVE}
+            self.assertEqual(evidence["source"], source)
+            current = fixture.state()
+            self.assertEqual(current["native_outcome_source"], source)
+            frozen = em.freeze_request(directory, current)
+            self.assertEqual(frozen["version"], 2)
+            self.assertEqual(frozen["selector"], {"kind": "family", "family": "fable"})
+            self.assertEqual(frozen["configured_model"], "fable")
+            self.assertEqual(frozen["expected_model"], transition_fixtures.FABLE)
+            self.assertEqual(frozen["qualification_sha256"], transition_fixtures.qmod.digest(artifact))
+            self.assertIsNone(frozen["resolution_sha256"])
+        finally:
+            fixture.doCleanups()
+
+    def test_prospective_absent_transcript_registers_and_existing_dispatch_reads_it(self):
+        self.assertFalse(self.transcript.exists())
+        result = self.register()
+        self.assertEqual(result["registered"], "created")
+        self.assertFalse(result["transcript_present"])
+        source = self.saved()["native_outcome_source"]
+        self.assertEqual(source, {"database": str(self.database), "transcript": str(self.transcript),
+                                  "session_id": "engineer", "native_session_id": "native-1"})
+        import ao_native_outcome
+        observed = ao_native_outcome.validate_registered_source(self.directory, self.saved(), "engineer")
+        self.assertEqual(observed["source"], source)
+        self.assertFalse(observed["transcript_present"])
+
+    def test_existing_owned_transcript_is_accepted_without_rewriting_identity(self):
+        self.transcript.write_text('{"synthetic": true}\n')
+        self.transcript.chmod(0o600)
+        result = self.register()
+        self.assertTrue(result["transcript_present"])
+        self.assertEqual(self.saved()["native_outcome_source"]["transcript"], str(self.transcript))
+
+    def test_foreign_owner_and_changed_prospective_transcript_refuse_without_state_drift(self):
+        foreign = self.make_owner(project="another-project")
+        with self.assertRaisesRegex(ao.RoomError, "another AO project"):
+            self.register(database=foreign)
+        self.assertEqual((self.directory / "state.json").read_bytes(), self.original)
+        self.make_owner()
+        self.register()
+        before = (self.directory / "state.json").read_bytes()
+        second = self.transcript_directory / "second.jsonl"
+        second.write_text("{}\n")
+        second.chmod(0o600)
+        with self.assertRaisesRegex(ao.RoomError, "provider conversation identity"):
+            self.register(transcript=second)
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+
+    def test_conflicting_registered_source_is_never_replaced(self):
+        self.register()
+        before = (self.directory / "state.json").read_bytes()
+        second_database = self.root / "second-owner.sqlite"
+        self.make_owner()
+        import shutil
+        shutil.copyfile(self.database, second_database)
+        second_database.chmod(0o600)
+        with self.assertRaisesRegex(ao.RoomError, "conflicting native outcome source"):
+            self.register(database=second_database)
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+
+    def test_registration_calls_settled_and_refuses_held_or_pending_rooms_without_state_drift(self):
+        with patch.object(self.service, "settled", side_effect=ao.RoomError("uncommitted engineering model transition exists")):
+            with self.assertRaisesRegex(ao.RoomError, "uncommitted"):
+                self.register()
+        self.assertEqual((self.directory / "state.json").read_bytes(), self.original)
+        held = {"request_id": "first", "role": "engineer", "state": "completed"}
+        record = {"version": 1, "outcome": {"kind": "final_available", "hold": True, "reason": "synthetic hold"},
+                  "native": None}
+        with patch.object(self.service, "settled"), \
+                patch("ao_outcomes.latest_for_role", return_value=held), \
+                patch("ao_outcomes.load", return_value=record):
+            with self.assertRaisesRegex(ao.RoomError, "held"):
+                self.register()
+        self.assertEqual((self.directory / "state.json").read_bytes(), self.original)
+        with patch.object(self.service, "settled"), \
+                patch("ao_outcomes.latest_for_role", return_value={"request_id": "first", "role": "engineer"}), \
+                patch("ao_outcomes.load", return_value=None):
+            with self.assertRaisesRegex(ao.RoomError, "no retained authenticated semantic outcome"):
+                self.register()
+        self.assertEqual((self.directory / "state.json").read_bytes(), self.original)
+
 
 class ClientTests(unittest.TestCase):
     def test_only_explicit_loopback_without_proxy_redirects_or_credentials(self):

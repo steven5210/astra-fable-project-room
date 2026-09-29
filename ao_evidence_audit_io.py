@@ -146,6 +146,37 @@ class DirectoryChain:
         self.fd = None
 
 
+class DirectoryBinding:
+    """One retained owned directory chain below a bound root, for cross-pass identity proof.
+
+    ``find_lineage`` returns these; every opened no-follow descriptor and its descriptor/name
+    relationship stay verifiable until the binding is closed. A same-name inode substitution -- a
+    replaced project or native-id directory whose original files were moved back -- therefore fails
+    ``verify`` even though the names, the containing listing identity and every retained regular
+    file are unchanged. The owning root closes each retained binding on ``Root.close``; a caller may
+    close one earlier, and closing twice is safe.
+    """
+
+    def __init__(self, root, parts, chain):
+        self.root = root
+        self.parts = tuple(parts)
+        self.chain = chain
+        root.directories.append(self)
+
+    def verify(self):
+        if self.chain is None:
+            return False
+        try:
+            return self.chain.verify()
+        except (OSError, ValueError, SourceError):
+            return False
+
+    def close(self):
+        if self.chain is not None:
+            chain, self.chain = self.chain, None
+            chain.close()
+
+
 def _absolute_directory(path):
     text, parts = _absolute_parts(path)
     chain = DirectoryChain()
@@ -205,6 +236,7 @@ class Root:
         self.fd = None
         self.chain = None
         self.bindings = {}
+        self.directories = []
         try:
             self.path, self.chain = _absolute_directory(path)
             self.fd = self.chain.fd
@@ -215,6 +247,9 @@ class Root:
             raise SourceError(unsafe_reason) from exc
 
     def close(self):
+        for binding in self.directories:
+            binding.close()
+        self.directories.clear()
         if self.chain is not None:
             self.chain.close()
             self.chain = None
@@ -329,6 +364,121 @@ class Root:
                         continue
                     if not _owned_regular(leaf):
                         raise SourceError("source_unsafe")
+                    if not child.verify():
+                        raise SourceError("source_changed")
+                    matches.append(name)
+                finally:
+                    child.close()
+            if not projects.verify():
+                raise SourceError("source_changed")
+            return matches
+        except OSError as exc:
+            raise SourceError("source_unsafe") from exc
+        finally:
+            projects.close()
+
+    def find_lineage(self, directory_names, dirname):
+        """Retained owned native-id directory lineages under already bounded project names.
+
+        The companion to ``find_directory`` for consumers that must prove, after a second complete
+        pass, that the same project directory and the same native-id directory are still in place.
+        Every returned ``DirectoryBinding`` keeps its no-follow descriptors and descriptor/name
+        relationships open, so a same-name inode substitution -- even one that moved the original
+        subagents and files back -- fails ``verify``. Symlinks, non-directories, unowned entries, a
+        vanished project member or a duplicate project match are refused or reported by the caller;
+        nothing here walks recursive descendants or guesses a first match. The caller owns each
+        binding and must close it; the root also closes each retained binding.
+        """
+        if not valid_parts((dirname,)) or len(directory_names) > MAX_DIRECTORY_ENTRIES:
+            raise SourceError("source_unsafe")
+        bindings = []
+        projects = self._directory(("projects",), "source_missing", "source_unsafe")
+        try:
+            try:
+                for name in directory_names:
+                    if not valid_parts((name,)):
+                        raise SourceError("source_unsafe")
+                    try:
+                        info = os.stat(name, dir_fd=projects.fd, follow_symlinks=False)
+                    except FileNotFoundError as exc:
+                        raise SourceError("source_changed") from exc
+                    if stat.S_ISLNK(info.st_mode):
+                        raise SourceError("source_unsafe")
+                    if not stat.S_ISDIR(info.st_mode):
+                        continue
+                    child = self._directory(("projects", name), "source_changed", "source_unsafe")
+                    try:
+                        try:
+                            leaf = os.stat(dirname, dir_fd=child.fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            if not child.verify():
+                                raise SourceError("source_changed")
+                            child.close()
+                            continue
+                        if not stat.S_ISDIR(leaf.st_mode):
+                            raise SourceError("source_unsafe")
+                        child.append(dirname, owned=True)
+                        if not child.verify():
+                            raise SourceError("source_changed")
+                        bindings.append(DirectoryBinding(self, ("projects", name, dirname), child))
+                    except BaseException:
+                        child.close()
+                        raise
+                if not projects.verify():
+                    raise SourceError("source_changed")
+                return bindings
+            except OSError as exc:
+                raise SourceError("source_unsafe") from exc
+        except BaseException:
+            for binding in bindings:
+                binding.close()
+            raise
+        finally:
+            projects.close()
+
+    def find_directory(self, directory_names, dirname):
+        """Metadata only: exact owned native-id directory under already bounded project names.
+
+        ``find_exact`` keeps its regular-file meaning for parent transcripts. This companion answers
+        the surviving child-lineage question after a canonical parent file has been deleted: one
+        exact directory name directly under an owned project directory. A symlink, a non-directory,
+        an unowned directory, a vanished project entry or a duplicate project match is refused or
+        reported by the caller; nothing here walks recursive descendants or guesses a first match.
+        """
+        if not valid_parts((dirname,)) or len(directory_names) > MAX_DIRECTORY_ENTRIES:
+            raise SourceError("source_unsafe")
+        projects = self._directory(("projects",), "source_missing", "source_unsafe")
+        matches = []
+        try:
+            for name in directory_names:
+                if not valid_parts((name,)):
+                    raise SourceError("source_unsafe")
+                try:
+                    info = os.stat(name, dir_fd=projects.fd, follow_symlinks=False)
+                except FileNotFoundError as exc:
+                    raise SourceError("source_changed") from exc
+                if stat.S_ISLNK(info.st_mode):
+                    raise SourceError("source_unsafe")
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                child = self._directory(("projects", name), "source_changed", "source_unsafe")
+                try:
+                    try:
+                        leaf = os.stat(dirname, dir_fd=child.fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        if not child.verify():
+                            raise SourceError("source_changed")
+                        continue
+                    if not stat.S_ISDIR(leaf.st_mode):
+                        raise SourceError("source_unsafe")
+                    opened = _open_component(dirname, DIRECTORY_FLAGS, child.fd)
+                    try:
+                        held = os.fstat(opened)
+                        if (identity(held) != identity(leaf) or not _owned_directory(held)
+                                or not _owned_directory(leaf)):
+                            raise SourceError("source_unsafe")
+                    finally:
+                        os.close(opened)
                     if not child.verify():
                         raise SourceError("source_changed")
                     matches.append(name)

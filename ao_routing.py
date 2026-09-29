@@ -11,9 +11,12 @@ paths. Nothing here launches a model, edits shared Git exclusions, or touches
 settings outside the prepared worktree and the private controller state.
 """
 
+import copy
+from collections.abc import Mapping
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -22,8 +25,44 @@ import time
 from ao_delegate_launcher import owned_bytes
 from room import RoomError
 
-MODELS = {"pr-sonnet": "claude-sonnet-5", "pr-opus": "claude-opus-5"}
+# Worker selectors are frozen record values. New preparations pin the family aliases,
+# so Claude Code resolves the latest available model within each family; retained
+# preparations that recorded the historical exact pins keep validating against their
+# own map. No other map is supported, and a map is never compared with a moving default.
+EXACT_AGENTS = {"pr-sonnet": "claude-sonnet-5", "pr-opus": "claude-opus-5"}
+FAMILY_AGENTS = {"pr-sonnet": "sonnet", "pr-opus": "opus"}
+# The historical renderer default. Old records and the unchanged reproduction of their bundles keep
+# this map; a new preparation passes its source-qualified exact models explicitly instead.
+MODELS = FAMILY_AGENTS
+AGENT_SELECTION = {name: {"kind": "family", "family": family} for name, family in FAMILY_AGENTS.items()}
+AGENT_IDENTITY_BASIS = "configured family selector; child execution identity is not attributed by the controller"
+QUALIFIED_IDENTITY_BASIS = ("operator-selected source qualification; the exact expected worker model comes from the "
+                            "retained qualification artifact and the controller does not attribute actual child model identity")
+WORKER_FAMILIES = {"pr-sonnet": "sonnet", "pr-opus": "opus"}
+WORKER_QUALIFICATION_VERSION = 1
+WORKER_QUALIFICATION_FIELDS = frozenset(("version", "snapshot", "families", "effort", "basis"))
+WORKER_SNAPSHOT_FIELDS = frozenset(("artifact", "sha256", "record", "evidence"))
+WORKER_REFERENCE_FIELDS = frozenset(("routing_sha256", "routing_version", "qualification_sha256",
+                                     "qualification_record"))
+WORKER_QUALIFICATION_BASIS = ("the enabled worker families are qualified to exact expected models from the operator-selected "
+                              "retained source evidence; family intent and MAX are configured, not observed")
+QUALIFIED_WORKER_IDENTITY = ("Source-qualified family selectors: expected exact models come from the retained operator-selected "
+                             "qualification artifact, while the controller does not attribute actual child model identity and "
+                             "effort max is configured intent, not observed effective effort. Family intent is recorded; a "
+                             "served child model is never inferred.")
+AGENT_FIELDS = ("agents", "agent_selection", "agent_identity_basis", "worker_qualification")
+# These keys remap the family aliases (the bundled Agent SDK recognizes them and AO 0.13.1 treats them as
+# the effective configured alias); exact pins were never subject to them, so only family maps refuse them.
+ALIAS_ENV = ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL")
+# A custom routing destination contradicts the declared first-party qualification scope. Only the key
+# name is ever reported, so no URL or credential text reaches diagnostics.
+GATEWAY_ENV = ("ANTHROPIC_BASE_URL",)
 EFFORT = "max"
+WORKER_IDENTITY = ("Configured selectors, not attributed identities: the controller does not attribute actual child model "
+                   "identity, and effort max is configured intent, not observed effective effort.")
+FAMILY_IDENTITY = (" Per Claude Code documentation, a family alias in the parent session's own family runs on the parent's "
+                   "exact model (an Opus 5.5 parent runs pr-opus on Opus 5.5); an alias outside it, such as sonnet under an "
+                   "Opus parent, resolves on its own under the installed CLI, provider and account restrictions.")
 ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2",
        "CLAUDE_CODE_DISABLE_WORKFLOWS": "1", "CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS": "1"}
 # This setting is pinned by new local-settings bytes, not added to historical
@@ -57,6 +96,10 @@ PRESERVED = (("worker.agent", ("worker", "agent")), ("worker.model", ("worker", 
              ("containerReap.disabled", ("containerReap", "disabled")), ("defaultBranch", ("defaultBranch",)))
 MEANING = ("Configured worktree files, executable identity and observed AO project rules, validated offline. Not "
            "proof of native enforcement, served models or efforts, concurrency/depth caps, resumption paths or compaction.")
+DELEGATING_PURPOSES = ("implementation", "correction")
+UNQUALIFIED_ROUTING = ("This routing record has no source-qualified worker selection; new delegating execution requires the "
+                       "audited explicit routing refresh with agent_selection='qualified'. Reading the old record and its "
+                       "history remains permitted and nothing was changed.")
 NOT_CONFIGURED = ("Prepared before native routing or not prepared: no native delegation protection exists for this "
                   "worker and none is claimed; the room stays readable and is never relabeled.")
 MAX_SETTINGS_BYTES = 4_000_000
@@ -75,8 +118,208 @@ def _scalar(value):
     return json.dumps(value, ensure_ascii=True)
 
 
-def agent_definition(name):
-    model = MODELS[name]
+def _hex_digest(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+def qualified_worker_map(value):
+    """Authenticate one versioned worker qualification value and return its exact role map.
+
+    The map is derived only from the recorded artifact snapshot: the expected model of each enabled
+    worker family, at MAX. Retained room bytes and the effective executable are verified separately by
+    callers that have a room and an executable, so this helper stays pure and reads no mutable config.
+    """
+    from ao_model_qualification import digest as qualification_digest
+    from ao_model_qualification import evidence_entries, record_path, validate_qualification
+    if not isinstance(value, dict) or set(value) != WORKER_QUALIFICATION_FIELDS:
+        raise RoomError("Recorded worker qualification declares exactly version, snapshot, families, effort and basis")
+    if type(value["version"]) is not int or value["version"] != WORKER_QUALIFICATION_VERSION:
+        raise RoomError("Unsupported recorded worker qualification version")
+    if value["effort"] != EFFORT:
+        raise RoomError("Recorded worker qualification is not at max effort")
+    if not isinstance(value["basis"], str) or not value["basis"].strip():
+        raise RoomError("Recorded worker qualification lacks its recorded basis")
+    snapshot = value["snapshot"]
+    if (not isinstance(snapshot, dict) or set(snapshot) != WORKER_SNAPSHOT_FIELDS
+            or not _hex_digest(snapshot.get("sha256"))):
+        raise RoomError("Recorded worker qualification declares exactly its artifact, digest, retained record and evidence")
+    artifact = snapshot["artifact"]
+    validate_qualification(artifact, bundled=False)
+    if qualification_digest(artifact) != snapshot["sha256"]:
+        raise RoomError("Recorded worker qualification artifact does not match its digest")
+    if snapshot["record"] != record_path(snapshot["sha256"]):
+        raise RoomError("Recorded worker qualification names a different retained record")
+    if snapshot["evidence"] != evidence_entries(artifact, snapshot["sha256"]):
+        raise RoomError("Recorded worker qualification declares inconsistent retained source evidence")
+    families = value["families"]
+    if not isinstance(families, dict) or set(families) != set(WORKER_FAMILIES):
+        raise RoomError("Recorded worker qualification maps exactly the enabled worker families")
+    derived = {}
+    for role, family in WORKER_FAMILIES.items():
+        declared = artifact["families"].get(family)
+        if declared is None:
+            raise RoomError("Recorded worker qualification does not map worker family " + family)
+        if families[role] != {"family": family, "expected_model": declared["expected_model"],
+                              "minimum_claude_code_version": declared.get("minimum_claude_code_version")}:
+            raise RoomError("Recorded worker qualification entry for " + role + " is not its selected artifact's own "
+                            "family mapping")
+        derived[role] = declared["expected_model"]
+    return derived
+
+
+def worker_floors(value):
+    """The strongest effective compatibility floor per worker role of an authenticated qualification value."""
+    from ao_engineering_model import required_minimum
+    return {role: required_minimum(family, value["families"][role]) for role, family in WORKER_FAMILIES.items()}
+
+
+def worker_qualification_value(qualification):
+    """The versioned routing metadata block one retained qualification snapshot pins."""
+    if (not isinstance(qualification, dict) or not _hex_digest(qualification.get("sha256"))
+            or not isinstance(qualification.get("record"), str) or not isinstance(qualification.get("evidence"), list)
+            or not isinstance(qualification.get("artifact"), dict)):
+        raise RoomError("A retained worker qualification snapshot declares its artifact, digest, record and evidence")
+    artifact = qualification["artifact"]
+    families = {}
+    for role, family in WORKER_FAMILIES.items():
+        declared = artifact.get("families", {}).get(family) if isinstance(artifact.get("families"), dict) else None
+        if declared is None:
+            raise RoomError("The selected family qualification does not map worker family " + family)
+        families[role] = {"family": family, "expected_model": declared["expected_model"],
+                          "minimum_claude_code_version": declared.get("minimum_claude_code_version")}
+    value = {"version": WORKER_QUALIFICATION_VERSION,
+             "snapshot": {"artifact": copy.deepcopy(artifact), "sha256": qualification["sha256"],
+                          "record": qualification["record"], "evidence": copy.deepcopy(qualification["evidence"])},
+             "families": families, "effort": EFFORT, "basis": WORKER_QUALIFICATION_BASIS}
+    qualified_worker_map(value)  # nothing may pin a value that does not authenticate
+    return value
+
+
+def select_worker_qualification(service, directory):
+    """Select the active operator-configured qualification once and retain it create-once in the room.
+
+    A new preparation and a qualified refresh both need both enabled worker families qualified from the
+    selected artifact before any runtime file is written. The private originals are required only here;
+    the returned snapshot value pins the artifact and every selected source capture inside the room.
+    """
+    from ao_engineering_model import configured_qualification
+    from ao_model_qualification import load, retain, snapshot
+    pointer = configured_qualification(service.root)
+    if pointer is None:
+        raise RoomError("A source-qualified worker preparation requires the operator-selected family_qualification "
+                        "artifact mapping both pr-sonnet (sonnet) and pr-opus (opus) to exact expected models; "
+                        "configure it and prepare again. Nothing was written.")
+    selected = load(pointer)
+    for role, family in sorted(WORKER_FAMILIES.items()):
+        if family not in selected["artifact"]["families"]:
+            raise RoomError("The selected family qualification does not map worker family " + family + " required by "
+                            + role + "; a source-qualified worker preparation needs both enabled worker families")
+    return retain(directory, snapshot(selected))
+
+
+def concrete_executable_evidence(evidence, label="the effective Claude executable"):
+    """Refuse a partial executable identity; the lower pure comparison needs concrete supplied bytes."""
+    if not isinstance(evidence, dict):
+        raise RoomError("Qualified worker work requires concrete Claude executable evidence for " + label)
+    error, path, size, mtime, version = (evidence.get("error"), evidence.get("path"), evidence.get("size"),
+                                         evidence.get("mtime_ns"), evidence.get("version"))
+    if (error is not None or not isinstance(path, str) or not path.startswith("/") or "\x00" in path
+            or type(size) is not int or size < 0 or type(mtime) is not int or mtime < 0
+            or not isinstance(version, str) or not version.strip()):
+        raise RoomError("Qualified worker work requires concrete existing Claude executable identity for " + label
+                        + ": an absolute path, nonnegative size and mtime, a version and no error. "
+                        + str(error or "The supplied evidence is missing or partial"))
+
+
+def check_qualified_floors(value, evidence):
+    """Refuse when the concrete effective executable misses a qualified worker floor."""
+    qualified_worker_map(value)
+    concrete_executable_evidence(evidence)
+    from ao_engineering_model import parse_version
+    observed = parse_version(evidence.get("version"))
+    for role, floor in sorted(worker_floors(value).items()):
+        if floor is None:
+            continue
+        if observed is None or observed < parse_version(floor):
+            raise RoomError(role + " requires Claude Code " + floor + " or newer; the effective executable reports "
+                            + str(evidence.get("version") or "no version"))
+    return evidence
+
+
+def check_worker_executable(routing, evidence):
+    """Refuse a qualified worker routing record whose effective executable misses a floor or its identity."""
+    value = (routing or {}).get("worker_qualification")
+    if value is None:
+        return None
+    return check_qualified_floors(value, evidence)
+
+
+def recorded_agents(routing):
+    """The routing record's own authenticated worker selectors, at MAX.
+
+    Three shapes stay distinct: the historical exact pins, the historical family aliases, and a
+    versioned worker qualification whose exact map is derived from its recorded source-qualified
+    artifact snapshot. An arbitrary map of syntactically valid Claude identifiers is never accepted.
+    """
+    if not isinstance(routing, dict):
+        raise RoomError("Recorded native worker routing is not an object")
+    agents, value = routing.get("agents"), routing.get("worker_qualification")
+    if value is not None:
+        if routing.get("version") != 3:
+            raise RoomError("Recorded worker qualification requires the version 3 routing record that pinned it")
+        if agents != qualified_worker_map(value):
+            raise RoomError("Recorded native worker map is not the exact map its source qualification derives")
+        if routing.get("agent_selection") != AGENT_SELECTION:
+            raise RoomError("Qualified worker selectors lack their exact recorded family intents")
+        if routing.get("agent_identity_basis") != QUALIFIED_IDENTITY_BASIS:
+            raise RoomError("Qualified worker selectors lack their exact recorded identity basis")
+    elif routing.get("version") == 3:
+        raise RoomError("A version 3 routing record requires its source-qualified worker qualification metadata")
+    elif agents == FAMILY_AGENTS:
+        if (routing.get("agent_selection") != AGENT_SELECTION
+                or routing.get("agent_identity_basis") != AGENT_IDENTITY_BASIS):
+            raise RoomError("Family worker selectors lack their exact recorded selection and identity basis")
+    elif agents != EXACT_AGENTS or "agent_selection" in routing or "agent_identity_basis" in routing:
+        raise RoomError("Recorded native worker models are neither the historical exact pins nor the family selectors")
+    if routing.get("effort") != EFFORT:
+        raise RoomError("Recorded native worker effort is not max")
+    return dict(agents)
+
+
+def selector_labels(agents, qualification=None):
+    """Configured selectors as text for status; never a served or attributed model identity."""
+    if qualification is not None:
+        derived = qualified_worker_map(qualification)
+        families = {role: qualification["families"][role]["family"] for role in sorted(derived)}
+        return {name: "source-qualified exact model id " + str(model) + " (family intent " + families[name] + ")"
+                for name, model in derived.items()} if isinstance(agents, dict) else {}
+    kind = "family alias " if agents == FAMILY_AGENTS else "exact model id " if agents == EXACT_AGENTS else "unsupported selector "
+    return {name: kind + str(model) for name, model in agents.items()} if isinstance(agents, dict) else {}
+
+
+def worker_summary(routing):
+    agents = recorded_agents(routing)
+    value = routing.get("worker_qualification")
+    summary = {"agents": agents, "worker_selectors": selector_labels(agents, value),
+               "worker_identity": WORKER_IDENTITY + (FAMILY_IDENTITY if agents == FAMILY_AGENTS else "")}
+    if value is not None:
+        snapshot = value["snapshot"]
+        summary["worker_identity"] = QUALIFIED_WORKER_IDENTITY
+        summary["worker_qualification"] = {
+            "version": value["version"], "sha256": snapshot["sha256"], "record": snapshot["record"],
+            "revision": snapshot["artifact"]["revision"], "qualified_at": snapshot["artifact"]["qualified_at"],
+            "families": {role: dict(value["families"][role]) for role in sorted(value["families"])},
+            "effective_floors": worker_floors(value),
+            "source_ids": {role: list(snapshot["artifact"]["families"][value["families"][role]["family"]]["source_ids"])
+                           for role in sorted(value["families"])},
+            "evidence": copy.deepcopy(snapshot["evidence"]), "basis": value["basis"],
+            "meaning": "Expected worker model ids derived from the retained operator-selected source qualification; "
+                       "not an attributed served identity, provider availability, entitlement or effective effort"}
+    return summary
+
+
+def agent_definition(name, model=None):
+    model = MODELS[name] if model is None else model
     if name == "pr-sonnet":
         description = ("Project Room bounded implementation and test worker on Sonnet. Implement from self-contained "
                        "requirements, verified interfaces and acceptance checks supplied by Fable; apply an existing "
@@ -144,7 +387,23 @@ def parse_definition(text):
     return fields
 
 
-def validate_definition(name, text):
+def validate_definition(name, text, agents=None, qualification=None):
+    """Validate against the preparation's recorded map; only a fresh historical render defaults to MODELS.
+
+    ``qualification`` is the authenticated versioned worker qualification the map was derived from,
+    when one exists: a source-qualified exact map is then accepted only while it still derives exactly
+    from that recorded artifact, and never for a syntactically valid identifier on its own.
+    """
+    agents = MODELS if agents is None else agents
+    if qualification is None:
+        if agents not in (EXACT_AGENTS, FAMILY_AGENTS):
+            raise RoomError("Recorded native worker models are neither the historical exact pins nor the family "
+                            "selectors")
+    else:
+        if agents != qualified_worker_map(qualification):
+            raise RoomError("Recorded native worker map is not the exact map its source qualification derives")
+        if name not in agents:
+            raise RoomError("Recorded native worker map does not pin this worker role")
     fields = parse_definition(text)
     if fields.get("name") != name:
         raise RoomError("Agent definition name mismatch")
@@ -153,7 +412,7 @@ def validate_definition(name, text):
         raise RoomError("Agent definition omits an explicit model")
     if model == "inherit" or "fable" in model.lower():
         raise RoomError("Agent definition inherits or names the Fable model")
-    if model != MODELS.get(name):
+    if model != agents.get(name):
         raise RoomError("Agent definition model is not the pinned mapping")
     if fields.get("effort") != EFFORT:
         raise RoomError("Agent definition effort is not max")
@@ -181,21 +440,83 @@ def _mapping(value, label):
     return value
 
 
+def _environment(value, label):
+    """One process or project environment mapping: any supported read-only mapping of text keys.
+
+    ``os.environ`` is an ``os._Environ``, not a ``dict``; a JSON-object check would reject the real
+    process environment even when it is empty of conflicting keys. Recognized keys are still checked
+    individually and no environment value is ever echoed in an error. JSON settings objects keep
+    their own strict object check, and an explicitly supplied mapping is never replaced by ambient
+    process state.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise RoomError(label + " must be a mapping of text keys")
+    return value
+
+
 def _contradictory_env(env):
     return sorted(key for key in env if key in CONTRADICTORY_ENV or (key in ENV and str(env[key]) != ENV[key]))
 
 
-def _model_policy(data, label):
-    """Refuse settings whose effective model mapping cannot be proven to keep the pinned workers."""
+def _alias_sensitive(agents, qualification=None):
+    """True when this worker map resolves through family aliases or is claimed as source-qualified."""
+    return agents == FAMILY_AGENTS or qualification is not None
+
+
+def _model_policy(data, label, agents=None, qualification=None):
+    """Refuse settings whose effective model mapping cannot be proven to keep the recorded worker selectors."""
+    agents = MODELS if agents is None else agents
     if data.get("modelOverrides"):
         raise RoomError(label + " Claude settings define modelOverrides; effective model mappings cannot be proven safe")
     allowed = data.get("availableModels")
-    if allowed is not None and (not isinstance(allowed, list) or any(model not in allowed for model in MODELS.values())):
+    if allowed is not None and (not isinstance(allowed, list) or any(model not in allowed for model in agents.values())):
         raise RoomError(label + " Claude settings restrict availableModels without both pinned worker models")
+    if _alias_sensitive(agents, qualification):
+        _alias_env(data.get("env"), label + " Claude settings")
+    if qualification is not None:
+        _gateway_env(data.get("env"), label + " Claude settings")
+
+
+def _alias_env(value, label):
+    """Family selectors must resolve through Claude Code's own alias mapping, never a configured remap."""
+    env = _environment(value, label + " env")
+    bad = [key for key in ALIAS_ENV if env.get(key) not in (None, "")]
+    if bad:
+        raise RoomError(label + ": " + ", ".join(bad) + " remaps a family worker alias; the configured family cannot be proven")
+
+
+def _gateway_env(value, label):
+    """Source-qualified work refuses a routing destination the declared first-party scope cannot cover.
+
+    The value is never included: only the key name is reported, so no URL secret reaches diagnostics.
+    """
+    env = _environment(value, label + " env")
+    if any(env.get(key) not in (None, "") for key in GATEWAY_ENV):
+        raise RoomError(label + ": " + ", ".join(GATEWAY_ENV) + " changes the routing destination; the declared "
+                        "first-party qualification scope cannot be asserted for an unverified gateway")
+
+
+def _alias_project(client, state):
+    raw = client.request("GET", "/projects/" + state["ao_project_id"])
+    project = raw.get("project", raw) if isinstance(raw, dict) else {}
+    if not isinstance(project, dict) or project.get("id", project.get("projectId")) != state["ao_project_id"]:
+        raise RoomError("AO project identity mismatch while checking family worker aliases")
+    _alias_env(_mapping(project.get("config"), "AO project configuration").get("env"), "AO project environment")
+
+
+def _gateway_project(client, state):
+    """Source-qualified work refuses an AO project environment that changes the routing destination.
+
+    The concrete configured AO project mapping is read once, read-only; only the key name is ever
+    reported, so no URL or credential text reaches diagnostics.
+    """
+    _gateway_env(_project_env(client, state), "AO project environment")
 
 
 def _foreground_env(value, label):
-    env = _mapping(value, label + " env")
+    env = _environment(value, label + " env")
     if any(key in env and env[key] != expected for key, expected in FOREGROUND_ENV.items()):
         raise RoomError(label + " conflicts with foreground native delegation (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS must be exactly '1')")
 
@@ -205,11 +526,11 @@ def foreground_settings(settings):
     return {**settings, "env": {**_mapping(settings.get("env"), "Local settings env"), **FOREGROUND_ENV}}
 
 
-def settings_document(existing, command, *, foreground=False):
+def settings_document(existing, command, *, foreground=False, agents=None, qualification=None):
     existing = _mapping(existing, "Existing local settings")
     if existing.get("disableAllHooks") or existing.get("allowManagedHooksOnly"):
         raise RoomError("Existing local settings disable or suppress local hooks")
-    _model_policy(existing, "existing local")
+    _model_policy(existing, "existing local", agents, qualification)
     env = dict(_mapping(existing.get("env"), "Existing local settings env"))
     bad = _contradictory_env(env)
     if bad:
@@ -236,7 +557,8 @@ def check_settings(settings, routing):
     settings = _mapping(settings, "Local settings")
     if settings.get("disableAllHooks") or settings.get("allowManagedHooksOnly"):
         raise RoomError("Local settings disable or suppress local hooks")
-    _model_policy(settings, "local")
+    qualification = routing.get("worker_qualification")
+    _model_policy(settings, "local", recorded_agents(routing), qualification)
     env = _mapping(settings.get("env"), "Local settings env")
     if any(env.get(key) != value for key, value in routing["env"].items()) or _contradictory_env(env):
         raise RoomError("Local settings no longer pin the native routing knobs")
@@ -258,8 +580,55 @@ def check_settings(settings, routing):
             raise RoomError("Local settings no longer pin the prepared compaction window")
 
 
+def check_settings_document(settings, *, agents=None, foreground=False, qualification=None):
+    """Safe read-only validation of one local/planned settings document; never writes it.
+
+    ``agents`` is the checked worker map when available; without it, modelOverrides and alias
+    remaps are still refused, while availableModels cannot be proven safe and is refused rather
+    than silently accepted. ``qualification`` is the authenticated source-qualified worker
+    metadata when the map came from one; it additionally forbids a custom routing destination.
+    """
+    settings = _mapping(settings, "Local settings")
+    if settings.get("disableAllHooks") or settings.get("allowManagedHooksOnly"):
+        raise RoomError("Local settings disable or suppress local hooks")
+    if settings.get("modelOverrides"):
+        raise RoomError("Local settings define modelOverrides; effective model mappings cannot be proven safe")
+    if agents is not None:
+        _model_policy(settings, "local", agents, qualification)
+    else:
+        _alias_env(settings.get("env"), "Local settings")
+        if qualification is not None:
+            _gateway_env(settings.get("env"), "Local settings")
+        if settings.get("availableModels") is not None:
+            raise RoomError("Local settings restrict availableModels; the worker map was not supplied to prove them")
+    env = _mapping(settings.get("env"), "Local settings env")
+    bad = _contradictory_env(env)
+    if bad:
+        raise RoomError("Local settings override native routing knobs: " + ", ".join(bad))
+    if foreground:
+        _foreground_env(env, "Local settings")
+    return settings
+
+
+def check_settings_file(path, *, agents=None, foreground=False, qualification=None):
+    """Validate one settings file when it is present; genuine absence is not checked."""
+    data = _settings_file(path)
+    if data is None:
+        return None
+    check_settings_document(data, agents=agents, foreground=foreground, qualification=qualification)
+    return data
+
+
 def managed_settings_path(environ):
-    explicit = environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH")
+    """The managed settings path of one supported environment mapping; an explicit override wins.
+
+    ``os.environ`` is an ``os._Environ``, not a dict, so the supported process mapping is accepted
+    here as any read-only mapping; only the recognized key is read and only its own malformed type is
+    refused, and the value itself is never echoed.
+    """
+    explicit = environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") if isinstance(environ, Mapping) else None
+    if explicit is not None and not isinstance(explicit, str):
+        raise RoomError("CLAUDE_CODE_MANAGED_SETTINGS_PATH must be a text path, not " + type(explicit).__name__)
     if explicit:
         return Path(explicit)
     if sys.platform == "darwin":
@@ -285,9 +654,18 @@ def _settings_file(path):
     return _mapping(value, str(path))
 
 
-def contradictions(config_dir, worktree=None, environ=None, *, foreground=False):
-    """Refuse configuration that would silently override or disable the routing protections."""
-    sources = [("user", Path(config_dir) / "settings.json"), ("managed", managed_settings_path(environ or os.environ))]
+def contradictions(config_dir, worktree=None, environ=None, *, foreground=False, agents=None, qualification=None):
+    """Refuse configuration that would silently override or disable the routing protections.
+
+    ``agents`` is the checked routing record's own authenticated worker map and ``qualification``
+    its source-qualified metadata when one exists; only a fresh preparation uses the default.
+    ``environ=None`` means the ambient process environment, while an explicitly supplied empty
+    mapping is honored exactly and never falls back to unrelated ambient state.
+    """
+    sources = []
+    if config_dir is not None:
+        sources.append(("user", Path(config_dir) / "settings.json"))
+    sources.append(("managed", managed_settings_path(os.environ if environ is None else environ)))
     if worktree is not None:
         sources.append(("project", Path(worktree) / ".claude" / "settings.json"))
     for label, path in sources:
@@ -298,25 +676,41 @@ def contradictions(config_dir, worktree=None, environ=None, *, foreground=False)
             raise RoomError(label + " Claude settings disable hooks; native routing cannot be protected")
         if data.get("allowManagedHooksOnly"):
             raise RoomError(label + " Claude settings allow managed hooks only; the local routing guard would be suppressed")
-        _model_policy(data, label)
+        _model_policy(data, label, agents, qualification)
         bad = _contradictory_env(_mapping(data.get("env"), label + " settings env"))
         if bad:
             raise RoomError(label + " Claude settings override native routing knobs: " + ", ".join(bad))
+        if qualification is not None:
+            _gateway_env(data.get("env"), label + " Claude settings")
         if foreground:
             _foreground_env(data.get("env"), label + " Claude settings")
     if foreground and worktree is not None:
         local = _settings_file(Path(worktree) / ".claude/settings.local.json")
         if local is not None:
             _foreground_env(local.get("env"), "Local settings")
-    for name in MODELS:
-        if (Path(config_dir) / "agents" / (name + ".md")).exists():
-            raise RoomError("user-level agent definition " + name + " exists; the pinned worktree definition cannot be proven effective")
+    if config_dir is not None:
+        for name in MODELS:
+            if (Path(config_dir) / "agents" / (name + ".md")).exists():
+                raise RoomError("user-level agent definition " + name + " exists; the pinned worktree definition cannot be proven effective")
     if environ is not None:
         bad = _contradictory_env({key: environ[key] for key in environ if key in ENV or key in CONTRADICTORY_ENV})
         if bad:
             raise RoomError("Process environment overrides native routing knobs: " + ", ".join(bad))
+        if _alias_sensitive(agents, qualification):
+            _alias_env(environ, "Process environment")
+        if qualification is not None:
+            _gateway_env(environ, "Process environment")
         if foreground:
             _foreground_env(dict(environ), "Process environment")
+
+
+def _project_env(client, state):
+    """The configured AO project environment mapping, read-only, for explicit admission evidence."""
+    raw = client.request("GET", "/projects/" + state["ao_project_id"])
+    project = raw.get("project", raw) if isinstance(raw, dict) else {}
+    if not isinstance(project, dict) or project.get("id", project.get("projectId")) != state["ao_project_id"]:
+        raise RoomError("AO project identity mismatch while reading its environment")
+    return _mapping(_mapping(project.get("config"), "AO project configuration").get("env"), "AO project env")
 
 
 def _foreground_project(client, state):
@@ -330,7 +724,7 @@ def _foreground_project(client, state):
 
 def foreground_configured(worktree, routing):
     """Read the pinned settings choice; only the hook can check its inherited process environment."""
-    if routing.get("version") != 2:
+    if routing.get("version") not in (2, 3):
         return False
     settings = _settings_file(Path(worktree) / ".claude/settings.local.json") or {}
     env = _mapping(settings.get("env"), "Local settings env")
@@ -529,7 +923,15 @@ def _write(worktree, relative, data, previous=None):
 
 
 def prepare(service, directory, state, worktree, prepared):
-    """Write and snapshot the routing files for one prepared worktree; refuse before writing on any conflict."""
+    """Write and snapshot the routing files for one prepared worktree; refuse before writing on any conflict.
+
+    A new preparation is prospective: it selects the active operator-configured qualification once,
+    retains the artifact and every selected source capture create-once with durable barriers, checks
+    concrete executable evidence against the qualified compatibility floors, and only then renders and
+    writes the pinned worktree files. No bound native response or local pinned file is required first,
+    and no model or provider call is made. Historical v1/v2 records keep their own reader and refresh
+    paths, and a root engineer may stay on an older historical exact id.
+    """
     from ao_project_room import atomic, digest
     stage = "context"
     try:
@@ -541,6 +943,9 @@ def prepare(service, directory, state, worktree, prepared):
         stage = "settings"
         contradictions(settings["claude_config_dir"], worktree, os.environ, foreground=True)
         _foreground_project(service.client(state), state)
+        project_env = _project_env(service.client(state), state)
+        _alias_env(project_env, "AO project environment")
+        _gateway_env(project_env, "AO project environment")
         compaction = compaction_policy(service)
         _compaction_sources(compaction, settings["claude_config_dir"], worktree, os.environ)
         _compaction_project(service.client(state), state, compaction)
@@ -550,6 +955,13 @@ def prepare(service, directory, state, worktree, prepared):
             raise RoomError("AO project agentRules do not contain the authorized Project Room delegation clause; install it before preparing the engineer")
         if rules["contradictory_env"]:
             raise RoomError("AO project env overrides native routing knobs: " + ", ".join(rules["contradictory_env"]))
+        stage = "qualification"
+        qualification = select_worker_qualification(service, directory)
+        worker_qualification = worker_qualification_value(qualification)
+        worker_map = qualified_worker_map(worker_qualification)
+        stage = "executable"
+        claude = claude_evidence(settings["claude_bin"])
+        check_qualified_floors(worker_qualification, claude)
         stage = "guard"
         data = Path(__file__).with_name("ao_routing_guard.py").read_bytes()
         guard_hash = digest(data)
@@ -563,23 +975,32 @@ def prepare(service, directory, state, worktree, prepared):
                 stream.write(data)
             guard.chmod(0o600)
         command = hook_command(settings["python"], guard)
-        stage = "claude"
-        claude = claude_evidence(settings["claude_bin"])
         stage = "render"
         documents = {}
-        for name in MODELS:
-            text = agent_definition(name)
-            validate_definition(name, text)
+        for name in worker_map:
+            text = agent_definition(name, worker_map[name])
+            validate_definition(name, text, worker_map, worker_qualification)
             documents[".claude/agents/" + name + ".md"] = text.encode()
         settings_path, _ = _target(worktree, ".claude/settings.local.json")
         existing_bytes = owned_bytes(settings_path) if settings_path.exists() else None
         existing = json.loads(existing_bytes) if existing_bytes is not None else None
-        merged = settings_document(existing, command, foreground=True)
+        merged = settings_document(existing, command, foreground=True, agents=worker_map,
+                                   qualification=worker_qualification)
         # Only fresh preparations receive this default. The unchanged renderer is
         # also used to reproduce immutable historical routing-adoption bundles.
         merged.update(autoCompactEnabled=True, autoCompactWindow=compaction["window"])
         merged["env"][COMPACTION_KEY] = str(compaction["window"])
         documents[".claude/settings.local.json"] = (json.dumps(merged, indent=2, sort_keys=True) + "\n").encode()
+        stage = "admission"
+        from ao_model_qualification import admit_qualification
+        for family in sorted(set(WORKER_FAMILIES.values())):
+            admit_qualification(qualification, family, directory=directory, executable=claude,
+                                configuration={"config_dir": settings["claude_config_dir"],
+                                               "worktree": str(worktree), "agents": worker_map,
+                                               "foreground": True, "environ": dict(os.environ),
+                                               "local_settings": merged, "project_env": project_env},
+                                origin={"context": "pending_routing_snapshot"},
+                                worker_roles=WORKER_FAMILIES)
         stage = "preflight"
         plan = []
         for relative, content in documents.items():
@@ -595,9 +1016,12 @@ def prepare(service, directory, state, worktree, prepared):
             _write(worktree, relative, content, existing_bytes if relative == ".claude/settings.local.json" else None)
         files = {relative: digest(owned_bytes(worktree / relative)) for relative in FILES}
         prepared["routing"] = {
-            "version": 2, "execution_policy": EXECUTION_POLICY,
+            "version": 3, "execution_policy": EXECUTION_POLICY,
             "files": files, "guard_path": str(guard), "guard_sha256": guard_hash, "hook_command": command,
-            "python": settings["python"], "agents": dict(MODELS), "effort": EFFORT,
+            "python": settings["python"], "agents": dict(worker_map),
+            "agent_selection": {name: dict(item) for name, item in AGENT_SELECTION.items()},
+            "agent_identity_basis": QUALIFIED_IDENTITY_BASIS,
+            "worker_qualification": worker_qualification, "effort": EFFORT,
             "env": {**ENV, COMPACTION_KEY: str(compaction["window"])}, "compaction": compaction, "deny": list(DENY),
             "matcher": MATCHER, "browser_skill": BROWSER_SKILL, "claude_config_dir": settings["claude_config_dir"],
             "claude": claude, "rules": rules,
@@ -611,7 +1035,14 @@ def prepare(service, directory, state, worktree, prepared):
 
 
 def validate_local(prepared, state=None, directory=None):
-    """Offline re-validation: pinned files, ignore status, guard, interpreter, executable identity, surrounding settings."""
+    """Offline re-validation: pinned files, ignore status, guard, interpreter, executable identity, surrounding settings.
+
+    This is caller-level file validation and never calls qualification admission, so the lower
+    admission helper and this boundary keep distinct responsibilities and cannot recurse. A version 3
+    record additionally re-verifies its retained qualification bytes and the qualified executable
+    floors; today's private configuration pointer is never consulted, so a later pointer change alone
+    cannot alter the pinned expectation.
+    """
     from ao_project_room import digest
     routing = prepared.get("routing") if prepared else None
     if not routing:
@@ -621,10 +1052,18 @@ def validate_local(prepared, state=None, directory=None):
             from ao_routing_refresh import effective as refreshed_routing
             routing = refreshed_routing(directory, state, prepared) or routing
         version = routing.get("version", 1)
-        if type(version) is not int or version not in (1, 2):
+        if type(version) is not int or version not in (1, 2, 3):
             raise RoomError("Unsupported native routing version")
-        if version == 2 and (routing.get("execution_policy") != EXECUTION_POLICY or routing.get("matcher") != MATCHER):
+        if version >= 2 and (routing.get("execution_policy") != EXECUTION_POLICY or routing.get("matcher") != MATCHER):
             raise RoomError("Native routing no longer pins orchestration ownership for every tool")
+        agents = recorded_agents(routing)  # this preparation's (or its committed refresh's) own map
+        qualification = routing.get("worker_qualification")
+        if qualification is not None and directory is not None and state is not None:
+            from ao_model_qualification import verify_reference
+            snapshot = qualification["snapshot"]
+            verify_reference(directory, {"sha256": snapshot["sha256"], "record": snapshot["record"],
+                                         "evidence": snapshot["evidence"]},
+                             "The retained worker qualification evidence is missing or changed")
         worktree = Path(prepared["worktree"])
         for relative, expected in routing["files"].items():
             _require_ignored(worktree, relative)
@@ -632,7 +1071,7 @@ def validate_local(prepared, state=None, directory=None):
             if digest(data) != expected:
                 raise RoomError("Pinned routing file changed: " + relative)
             if relative.endswith(".md"):
-                validate_definition(Path(relative).stem, data.decode())
+                validate_definition(Path(relative).stem, data.decode(), agents, qualification)
             else:
                 check_settings(json.loads(data), routing)
         if digest(owned_bytes(routing["guard_path"])) != routing["guard_sha256"]:
@@ -645,9 +1084,13 @@ def validate_local(prepared, state=None, directory=None):
         if state is not None and directory is not None:
             from ao_executable_binding import effective
             replacement = effective(directory, state, prepared)
-        check_claude(replacement or routing.get("claude") or {})
+        evidence = replacement or routing.get("claude") or {}
+        check_claude(evidence)
+        if qualification is not None:
+            check_qualified_floors(qualification, evidence)
         foreground = foreground_configured(worktree, routing)
-        contradictions(routing["claude_config_dir"], worktree, os.environ if foreground else None, foreground=foreground)
+        contradictions(routing["claude_config_dir"], worktree, os.environ if foreground else None, foreground=foreground,
+                       agents=agents, qualification=qualification)
         if "compaction" in routing:
             _compaction_sources(routing["compaction"], routing["claude_config_dir"], worktree, os.environ)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -672,13 +1115,25 @@ def record_observation(service, directory, state, observed, source, consistent):
 
 
 def before_dispatch(service, directory, state, prepared, purpose):
-    """Local validation for every engineer dispatch; live rules check before implementation/correction."""
+    """Local validation for every engineer dispatch; live rules check before implementation/correction.
+
+    Reading an old record stays permitted, but new delegating execution against a record without a
+    source-qualified worker selection refuses with explicit-refresh readiness instead of silently
+    running historical or moving selectors.
+    """
     routing = validate_local(prepared, state, directory)
     if routing is None:
         return routing
+    if routing.get("worker_qualification") is None and purpose in DELEGATING_PURPOSES:
+        raise RoomError(UNQUALIFIED_ROUTING)
     try:
         if foreground_configured(prepared["worktree"], routing):
             _foreground_project(service.client(state), state)
+        selection = routing.get("worker_qualification")
+        if routing["agents"] == FAMILY_AGENTS or selection is not None:
+            _alias_project(service.client(state), state)
+        if selection is not None:
+            _gateway_project(service.client(state), state)
         if "compaction" in routing:
             _compaction_project(service.client(state), state, routing["compaction"])
         if purpose not in ("implementation", "correction"):
@@ -726,7 +1181,7 @@ def status(prepared, state, directory=None):
         current_guard_sha256 = digest(Path(__file__).with_name('ao_routing_guard.py').read_bytes())
     except OSError:
         current_guard_sha256 = None
-    known_guard = (configured and (prepared.get('routing') or {}).get('version') == 2
+    known_guard = (configured and (prepared.get('routing') or {}).get('version') in (2, 3)
                    and current_guard_sha256 is not None and result.get('guard_sha256') == current_guard_sha256)
     result['worker_recovery'] = {
         'native_child_context_resume': False if known_guard else None,
@@ -751,11 +1206,16 @@ def routing_status(prepared, state, directory=None):
         return {"status": "not_configured", "error": None, "meaning": NOT_CONFIGURED}
     routing = prepared["routing"]
     claude = routing.get("claude") or {}
-    summary = {"agents": routing["agents"], "effort": routing["effort"], "env": routing["env"], "deny": routing["deny"],
-               "execution_policy": routing.get("execution_policy") if routing.get("version") == 2 else "historical_unrestricted_root",
-               "browser_skill": routing["browser_skill"], "files": routing["files"], "guard_sha256": routing["guard_sha256"],
-               "claude": claude, "rules_snapshot": routing["rules"], "last_observed_rules": state.get("routing_rules"),
-               "meaning": MEANING}
+    try:
+        summary = {**worker_summary(routing), "effort": routing["effort"], "env": routing["env"], "deny": routing["deny"],
+                   "execution_policy": (routing.get("execution_policy") if routing.get("version") in (2, 3)
+                                        else "historical_unrestricted_root"),
+                   "browser_skill": routing["browser_skill"], "files": routing["files"], "guard_sha256": routing["guard_sha256"],
+                   "claude": claude, "rules_snapshot": routing["rules"], "last_observed_rules": state.get("routing_rules"),
+                   "meaning": MEANING}
+    except (RoomError, KeyError, TypeError) as exc:
+        return {"status": "unverified", "error": "Recorded worker selection is inconsistent: " + str(exc),
+                "agents": routing.get("agents") if isinstance(routing, dict) else None, "meaning": MEANING}
     if "compaction" in routing:
         summary["compaction"] = routing["compaction"]
         summary["compaction_meaning"] = "Configured native window; actual compaction, continuity, quality and usage need observation."
@@ -767,6 +1227,12 @@ def routing_status(prepared, state, directory=None):
             summary["guard_sha256"] = current["guard_sha256"]
             summary["files"] = current["files"]
             summary["routing_refresh"] = state["routing_refresh"]
+            if (current.get("agents") != routing.get("agents")
+                    or current.get("worker_qualification") != routing.get("worker_qualification")):
+                summary["original_agents"] = routing.get("agents")
+                if routing.get("worker_qualification") is not None:
+                    summary["original_worker_qualification"] = worker_summary(routing)["worker_qualification"]
+                summary.update(worker_summary(current))
         if directory is not None and state.get("executable_binding"):
             from ao_executable_binding import effective
             summary["original_claude"] = claude
@@ -793,9 +1259,216 @@ def routing_status(prepared, state, directory=None):
     return {"status": "verified", "error": None, **summary}
 
 
+def worker_qualification_reference(routing):
+    """The compact immutable reference a frozen worker expectation records for one routing record.
+
+    The full routing metadata is authenticated first, so a reference is never derived from a record
+    whose worker map, family intents or effort do not actually hold.
+    """
+    from ao_project_room import digest
+    if not isinstance(routing, dict):
+        return None
+    recorded_agents(routing)
+    value = routing.get("worker_qualification")
+    snapshot = value["snapshot"] if isinstance(value, dict) else None
+    return {"routing_sha256": digest(routing), "routing_version": routing.get("version"),
+            "qualification_sha256": snapshot["sha256"] if snapshot else None,
+            "qualification_record": snapshot["record"] if snapshot else None}
+
+
+def fresh_executable_identity(directory, state, prepared, routing):
+    """The predecessor's tested fresh reported-version consistency check, reused at a new boundary.
+
+    ``validate_local`` and ``check_claude`` compare only the recorded size and mtime, so an unchanged
+    wrapper that now reports a different version would silently pass a new qualified request on a
+    stale value. The audited replacement fingerprint/ownership chain stays authoritative: the same
+    effective identity ``validate_local`` used is re-resolved through ``ao_executable_binding`` and
+    re-probed, and today's mutable controller configuration is never consulted. This is consistent
+    admission at the request boundary, not provider availability or effective-effort attestation.
+    """
+    from ao_executable_binding import effective
+    from ao_routing_refresh import _current_executable
+    # The predecessor's exact check reads only the recorded effective identity and one fresh bounded
+    # probe; it needs no service handle for that comparison.
+    return _current_executable(None, directory, state, routing, effective(directory, state, prepared))
+
+
+def effective_worker_selection(prepared, state=None, directory=None):
+    """Authenticated read-only snapshot of the effective worker selection for a future request freeze.
+
+    Returns the routing digest, the retained qualification digest and exact role map, the family
+    intents, the configured effort and the authenticated preparation path paired with its digest.
+    The recorded identity comes only from the immutable preparation/refresh ancestry and the
+    room-retained qualification bytes, and today's private configuration pointer is never consulted,
+    so a later refresh cannot reinterpret what an already-recorded request froze. This call is a
+    NEW-dispatch boundary: it re-validates the current worktree files, surrounding settings and the
+    effective executable exactly as a dispatch would, and it never rewrites history. This is
+    configured intent only.
+    """
+    from ao_project_room import digest
+    routing = validate_local(prepared, state, directory)
+    if routing is None:
+        return None
+    if (state is not None and directory is not None and routing.get("worker_qualification") is not None):
+        # A source-qualified worker selection is a new-dispatch boundary exactly like a qualified
+        # request freeze: an unchanged wrapper that now reports another version refuses here rather
+        # than letting a new qualified request continue on the recorded value.
+        fresh_executable_identity(directory, state, prepared, routing)
+    agents = recorded_agents(routing)
+    value = routing.get("worker_qualification")
+    return {"routing_version": routing.get("version"), "routing_sha256": digest(routing),
+            "agents": agents, "agent_selection": copy.deepcopy(routing.get("agent_selection")),
+            "effort": routing.get("effort"), "source_qualified": value is not None,
+            "qualification_sha256": value["snapshot"]["sha256"] if value else None,
+            "qualification_record": value["snapshot"]["record"] if value else None,
+            "worker_families": ({role: value["families"][role]["family"] for role in sorted(WORKER_FAMILIES)}
+                                if value else {}),
+            "expected_models": ({role: value["families"][role]["expected_model"] for role in sorted(WORKER_FAMILIES)}
+                                if value else {}),
+            # The preparation object carries no such key; the authentication is the state's own
+            # preparation path paired with the digest validate_local just authenticated it under.
+            "preparation": (state or {}).get("preparation"),
+            "preparation_sha256": (state or {}).get("preparation_sha256"),
+            "routing_refresh": copy.deepcopy((state or {}).get("routing_refresh")),
+            "basis": "The routing record's own authenticated selector map and retained qualification snapshot; "
+                     "configured intent only, never an attributed served identity or effective effort"}
+
+
+def historical_routing(directory, state, prepared, reference, authority=None):
+    """Re-validate one frozen worker-selection reference against its own historical routing epoch.
+
+    ``authority`` optionally names the exact immutable authority that was frozen: the initial
+    preparation (``{"kind": "preparation"}``) or one exact committed routing-refresh pointer
+    (``{"kind": "routing_refresh", "path": ..., "sha256": ...}``). When it is supplied, that exact
+    record must carry the reference digest: two committed refreshes with equal routing bytes are
+    never conflated with the newest matching digest, and a valid old reference is never rejected for
+    naming an older ancestor. Existing callers that omit it keep the preparation-first/newest
+    matching-digest behavior exactly.
+
+    Epoch zero is the routing record retained inside the immutable preparation; a later epoch is the
+    target stored in the named immutable routing-refresh record. The supplied preparation bytes are
+    authenticated against the state's own preparation digest, and the whole committed refresh
+    ancestry is validated with its own ownership, continuity, cycle and bound checks before any
+    record is described, so a read-only historical lookup never silently trusts malformed ancestry.
+    Current mutable runtime files and today's private configuration are never read, so a later
+    refresh cannot retroactively change a request's own historical expectation. Bounded lookup only;
+    old requests are never modified.
+    """
+    from ao_project_room import digest
+    from ao_model_qualification import record_path as qualification_record_path
+    if (not isinstance(reference, dict) or set(reference) != WORKER_REFERENCE_FIELDS
+            or not _hex_digest(reference.get("routing_sha256"))
+            or type(reference.get("routing_version")) is not int
+            or reference["routing_version"] not in (1, 2, 3)):
+        raise RoomError("A frozen worker selection reference declares its routing digest, version and qualification reference")
+    if ((reference.get("qualification_sha256") is None) != (reference.get("qualification_record") is None)
+            or (reference.get("qualification_sha256") is not None
+                and (not _hex_digest(reference["qualification_sha256"])
+                     or reference["qualification_record"]
+                     != qualification_record_path(reference["qualification_sha256"])))):
+        raise RoomError("A frozen worker selection qualification reference names its digest and its retained record")
+    if (not isinstance(state, dict) or not _hex_digest(state.get("preparation_sha256"))
+            or not isinstance(prepared, dict) or digest(prepared) != state["preparation_sha256"]):
+        raise RoomError("A frozen worker selection is looked up against this room's own retained preparation bytes only")
+    import ao_routing_refresh
+    try:
+        ao_routing_refresh._chain(directory, state, prepared)
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise RoomError("The frozen worker selection's committed routing ancestry is unreadable or inconsistent") from exc
+    exact_kind = None
+    if authority is not None:
+        if (not isinstance(authority, dict) or authority.get("kind") not in ("preparation", "routing_refresh")
+                or (authority["kind"] == "routing_refresh"
+                    and (set(authority) != {"kind", "path", "sha256"}
+                         or not isinstance(authority.get("path"), str)
+                         or not _hex_digest(authority.get("sha256"))))):
+            raise RoomError("A frozen worker selection authority is the initial preparation or one exact committed "
+                            "routing-refresh pointer")
+        exact_kind = authority["kind"]
+    routing = (prepared or {}).get("routing")
+    found = None
+    if (exact_kind != "routing_refresh" and isinstance(routing, dict)
+            and digest(routing) == reference["routing_sha256"]):
+        found = {"routing": copy.deepcopy(routing), "source": "preparation", "routing_refresh": None}
+    elif exact_kind == "preparation":
+        raise RoomError("The frozen worker selection names the initial preparation, but its retained routing record "
+                        "does not carry the frozen digest")
+    if found is None:
+        found, pointer, seen = None, state.get("routing_refresh"), set()
+        while pointer is not None:
+            name = pointer.get("path") if isinstance(pointer, dict) else None
+            if name is None or name in seen or len(seen) >= ao_routing_refresh.MAX_CHAIN:
+                raise RoomError("The frozen worker selection's committed routing ancestry is cyclic or exceeds its bound")
+            seen.add(name)
+            record = ao_routing_refresh._read(directory, pointer)
+            target = record.get("target")
+            if (exact_kind == "routing_refresh"
+                    and (pointer["path"] != authority["path"] or pointer["sha256"] != authority["sha256"])):
+                pointer = record.get("previous")
+                continue
+            if isinstance(target, dict) and digest(target) == reference["routing_sha256"]:
+                found = {"routing": copy.deepcopy(target), "source": "routing_refresh",
+                         "routing_refresh": {"path": pointer["path"], "sha256": pointer["sha256"]}}
+                break
+            if exact_kind == "routing_refresh":
+                raise RoomError("The exact committed routing refresh this frozen worker selection names does not carry "
+                                "its recorded digest")
+            pointer = record.get("previous")
+        if found is None:
+            raise RoomError("The frozen worker selection names a routing record this room's immutable preparation and "
+                            "refresh ancestry do not contain")
+    if found["routing"].get("version") != reference["routing_version"]:
+        raise RoomError("The frozen worker selection version differs from its historical routing record")
+    value = found["routing"].get("worker_qualification")
+    snapshot = value["snapshot"] if isinstance(value, dict) else None
+    if ((snapshot or {}).get("sha256") != reference["qualification_sha256"]
+            or (snapshot or {}).get("record") != reference["qualification_record"]):
+        raise RoomError("The frozen worker selection qualification reference differs from its historical routing record")
+    if value is not None:
+        from ao_model_qualification import verify_reference
+        verify_reference(directory, {"sha256": snapshot["sha256"], "record": snapshot["record"],
+                                     "evidence": snapshot["evidence"]},
+                         "The frozen worker selection's retained qualification evidence is missing or changed")
+    recorded_agents(found["routing"])
+    return found
+
+
 def packet_text(prepared):
     if prepared and prepared.get("routing"):
-        agents = prepared["routing"]["agents"]
+        routing = prepared["routing"]
+        # The complete routing metadata is authenticated before it is described: an unsupported or
+        # inconsistent worker map is refused here exactly as validate_local refuses it.
+        agents = recorded_agents(routing)
+        value = routing.get("worker_qualification")
+        if value is not None:
+            families = {role: value["families"][role]["family"] for role in sorted(agents)}
+            ownership = ("The engineering orchestrator directs this work: inspect evidence with Read/Grep/Glob, direct the "
+                         "pinned provider and native workers, adjudicate results and give the final engineering verdict. "
+                         "The guard denies root shell commands, edits, tests, browser work and unknown execution tools. "
+                         "Routine implementation and checks belong to the assigned operator or delegates, including probes "
+                         "used for verification. If a check is assigned to Astra, request its result and wait; do not "
+                         "duplicate it or reassign it without an actual task change. Do not reconstruct specifications or "
+                         "hashes: the controller checks exact source, native identity and candidate evidence; use the "
+                         "supplied identities. Choose Sonnet or Opus when needed for full quality; judgment remains yours. "
+                         "If the authorized tools cannot achieve the quality bar, report the capability gap instead of "
+                         "bypassing the guard. ")
+            return (ownership + "Native delegation routing is configured for this worktree: launch only the pinned native "
+                    "agents pr-sonnet (source-qualified exact model " + agents["pr-sonnet"] + " for family "
+                    + families["pr-sonnet"] + ", bounded implementation and tests) and pr-opus (source-qualified exact "
+                    "model " + agents["pr-opus"] + " for family " + families["pr-opus"] + ", bounded judgment/review and "
+                    "the pinned browser skill when the AO browser capability is present); the expected exact models come "
+                    "from the operator-selected source qualification retained with this preparation, family intent is "
+                    "retained and effort is configured MAX, not observed. One layer, at most two concurrent, no model "
+                    "overrides, built-in agent types, forks, isolation, resume, messaging, workflows, teams or review "
+                    "skills; the routing guard denies other routes. Record each native route in routing_log with the "
+                    "configured qualified selector and any observed native model evidence; never report an expected "
+                    "exact id as the observed served model.")
+        # Historical exact pins keep their delivered bytes; family selectors are presented as configured intent.
+        family = agents == FAMILY_AGENTS
+        label = "family alias " if family else ""
+        record = (WORKER_IDENTITY + FAMILY_IDENTITY + " Record each native route in routing_log with the configured selector "
+                  "and any observed native model evidence; never report an alias as an observed model." if family else
+                  "Record each native route in routing_log with the requested model and the observed native evidence.")
         sonnet_work = "bounded implementation" if prepared["routing"].get("version") == 2 else "mechanical implementation"
         ownership = ("Fable is the orchestrator: inspect evidence with Read/Grep/Glob, direct the pinned provider and "
                      "native workers, adjudicate results and give the final engineering verdict. The guard denies root "
@@ -808,11 +1481,10 @@ def packet_text(prepared):
                      "tools cannot achieve the quality bar, report the capability gap instead of bypassing the guard. "
                      if prepared["routing"].get("version") == 2 else "")
         return (ownership + "Native delegation routing is configured for this worktree: launch only the pinned native agents pr-sonnet ("
-                + agents["pr-sonnet"] + ", " + sonnet_work + " and tests) and pr-opus (" + agents["pr-opus"]
+                + label + agents["pr-sonnet"] + ", " + sonnet_work + " and tests) and pr-opus (" + label + agents["pr-opus"]
                 + ", bounded judgment/review and the pinned browser skill when the AO browser capability is present); "
                 "one layer, at most two concurrent, no model overrides, built-in agent types, forks, isolation, resume, "
-                "messaging, workflows, teams or review skills; the routing guard denies other routes. Record each native "
-                "route in routing_log with the requested model and the observed native evidence.")
+                "messaging, workflows, teams or review skills; the routing guard denies other routes. " + record)
     return ("Native delegation routing is not configured for this worktree (prepared before routing protections): do "
             "not launch native subagents, workflows or review skills; use the pinned delegate tools and Fable only, "
             "and record that limitation.")

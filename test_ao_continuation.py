@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import ao_delegates
+import ao_model_boundaries
 import ao_project_room as ao
 import ao_workflow
 import deepseek_adapter as ds
@@ -26,8 +27,11 @@ class ContinuationTests(Fixture):
         self.agree()
         self.service.ao_room_handoff(self.room, str(self.repo))
 
-    def message(self, key, purpose='correction', text='Continue.'):
-        return self.service.ao_room_send(self.room, 'engineer', text, key, purpose=purpose)
+    def message(self, key, purpose='correction', text='Continue.', native=True):
+        result = self.service.ao_room_send(self.room, 'engineer', text, key, purpose=purpose)
+        if native:
+            self.note_native_turn(key)
+        return result
 
     def finish(self, text=None):
         self.fake.finish('engineer', text if text is not None else json.dumps(self.report(
@@ -48,8 +52,13 @@ class ContinuationTests(Fixture):
         self.assertEqual(initial['carried']['parts'], list(ao_workflow.PARTS))
         text = 'Implement the agreed plan.\n\nKeep these exact bytes.  '
         self.message('implementation', 'implementation', text)
-        self.assertEqual(self.fake.posts[-1][1]['text'], text)
-        self.assertEqual(self.state()['requests']['implementation']['text'], text)
+        request = self.state()['requests']['implementation']
+        notices = request['carried']['boundary_notices']
+        self.assertEqual([notice['kind'] for notice in notices], [ao_model_boundaries.WORKER_ROUTING])
+        notice = ao_model_boundaries.notice_fragment(self.directory(), self.state(), notices[0])
+        self.assertEqual(self.fake.posts[-1][1]['text'], notice + '\n' + text)
+        self.assertEqual(request['text'], notice + '\n' + text)
+        self.assertEqual(request['prompt_projection']['text_sha256'], ao.digest(request['text'].encode()))
 
     def test_three_identical_corrections_settle_as_distinct_turns(self):
         self.begin()
@@ -132,7 +141,7 @@ class ContinuationTests(Fixture):
             with self.subTest(state=native_state):
                 self.setUp()
                 self.ready()
-                self.message('implementation', 'implementation')
+                self.message('implementation', 'implementation', native=False)
                 self.fake.finish('engineer', 'Partial', state=native_state)
                 self.service.ao_room_sync(self.room)
                 before = copy.deepcopy(self.state())
@@ -157,7 +166,12 @@ class ContinuationTests(Fixture):
         self.assertGreater(len(req['text']), len('X'))
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.message('implementation', 'implementation')
-        self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')
+        request = self.state()['requests']['implementation']
+        notices = request['carried']['boundary_notices']
+        self.assertEqual([notice['kind'] for notice in notices], [ao_model_boundaries.WORKER_ROUTING])
+        notice = ao_model_boundaries.notice_fragment(self.directory(), self.state(), notices[0])
+        self.assertEqual(self.fake.posts[-1][1]['text'], notice + '\nContinue.')
+        self.assertEqual(request['text'], notice + '\nContinue.')
 
     def test_revision_omits_unchanged_surrounding_requirements(self):
         self.agree()
@@ -268,22 +282,54 @@ class ContinuationTests(Fixture):
             self.message('report-fix-' + str(index))
             self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')
 
-    def historical_review(self):
-        self.send('spec_review')
-        state = self.state(); req = state['requests']['spec_review']
-        spec = self.service.spec(self.directory(), state)
-        req.pop('carried')
-        req.pop('prompt_projection', None)  # Pre-instrumentation requests never had a projection.
-        req['text'] = ('[Project Room historical request spec_review]\nWorkflow: Fable engineering with independent Astra acceptance.\n'
-                       'Fable owns engineering interpretation. Review this exact specification read-only, without implementation or delegates.\n'
-                       'Exact specification revision 1, SHA256 ' + spec['sha256'] + '\n<specification>\n' + spec['content']
-                       + '\n</specification>\nAgreed gates: ' + json.dumps(spec['gates']) + '\nTask instruction:\nReview.')
-        req['text_sha256'] = ao.digest(req['text'].encode())
+    def historical_request(self, key, purpose, text, response):
+        import time
+        import ao_engineering_model
+        state = self.state()
+        snapshot = self.fake.snapshots['engineer']
+        binding = state['bindings']['engineer']
+        frozen = ao_engineering_model.freeze_request(self.directory(), state)
+        baseline = {'turn_ids': sorted(turn['id'] for turn in snapshot['turns']),
+                    'conversation_id': snapshot['conversationId'],
+                    'branch_id': snapshot['activeBranchId'],
+                    'usage': snapshot.get('usage') or {}}
+        order = len(state['requests']) + 1
+        turn_id = 'historical-' + key
+        provider_turn_id = 'native-historical-' + key
+        snapshot['turns'].append({'id': turn_id, 'providerTurnId': provider_turn_id, 'state': 'completed',
+                                  'stopReason': 'end_turn'})
+        sequence = len(snapshot['messages']) + 1
+        snapshot['messages'].append({'id': 'user-' + turn_id, 'role': 'user', 'text': text,
+                                     'turnId': turn_id, 'sequence': sequence})
+        snapshot['messages'].append({'id': 'answer-' + turn_id, 'role': 'assistant', 'text': response,
+                                     'turnId': turn_id, 'sequence': sequence + 1})
+        request = {'request_id': key, 'role': 'engineer',
+                   **{field: binding[field] for field in ('session_id', 'harness', 'model', 'reasoning_effort',
+                                                          'conversation_id', 'branch_id')},
+                   'text': text, 'text_sha256': ao.digest(text.encode()),
+                   'spec_record_sha256': state['spec_record_sha256'], 'state': 'submitted',
+                   'created_at': time.time(), 'created_order': order, 'turn_id': turn_id,
+                   'purpose': purpose, 'engineering_resolution': frozen, 'baseline': baseline}
+        if purpose in ('implementation', 'correction'):
+            request['handoff_sha256'] = state['handoff_sha256']
+        state['requests'][key] = request
         self.service.save(self.directory(), state)
-        self.fake.snapshots['engineer']['messages'][-1]['text'] = req['text']
-        self.fake.finish('engineer', json.dumps({'interpretation': 'Exact scope', 'findings': [], 'decision': 'accept',
-                                              'spec_revision': 1, 'spec_sha256': spec['sha256']}))
+        self.note_native_turn(key)
         self.service.ao_room_sync(self.room)
+        return self.state()['requests'][key]
+
+    def historical_review(self):
+        state = self.state()
+        spec = self.service.spec(self.directory(), state)
+        text = ('[Project Room historical request spec_review]' + chr(10)
+                + 'Workflow: Fable engineering with independent Astra acceptance.' + chr(10)
+                + 'Fable owns engineering interpretation. Review this exact specification read-only, without implementation or delegates.' + chr(10)
+                + 'Exact specification revision 1, SHA256 ' + spec['sha256'] + chr(10)
+                + '<specification>' + chr(10) + spec['content'] + chr(10) + '</specification>' + chr(10)
+                + 'Agreed gates: ' + json.dumps(spec['gates']) + chr(10) + 'Task instruction:' + chr(10) + 'Review.')
+        response = json.dumps({'interpretation': 'Exact scope', 'findings': [], 'decision': 'accept',
+                               'spec_revision': 1, 'spec_sha256': spec['sha256']})
+        self.historical_request('spec_review', 'spec_review', text, response)
 
     def test_existing_room_gets_only_undelivered_workflow_parts_once(self):
         self.historical_review()
@@ -304,21 +350,18 @@ class ContinuationTests(Fixture):
     def test_historical_implementation_and_correction_continue_without_repeating_spec_or_policy(self):
         self.historical_review()
         self.service.ao_room_handoff(self.room, str(self.repo))
+        state = self.state(); spec = self.service.spec(self.directory(), state)
+        response = json.dumps(self.report(outcome='changes_required', implementation_complete=False, remaining_gaps=['Unfinished work']))
         for purpose in ('implementation', 'correction'):
-            self.message('old-' + purpose, purpose)
-            state = self.state(); req = state['requests']['old-' + purpose]
-            spec = self.service.spec(self.directory(), state)
-            req.pop('carried')
-            req.pop('prompt_projection', None)  # Match the historical format before replacing its bytes.
+            key = 'old-' + purpose
             # The canonical substring is the pre-upgrade implementation/correction template, also verified
             # against a retained real implementation packet during review. Other old instructions stay opaque.
-            req['text'] = ('[Project Room historical request ' + purpose + ']\nHistorical workflow/policy/report/settings/routing.\n'
-                           'Exact specification revision 1, SHA256 ' + spec['sha256'] + '\n<specification>\n' + spec['content']
-                           + '\n</specification>\nAgreed gates: ' + json.dumps(spec['gates']) + '\nTask instruction:\nContinue.')
-            req['text_sha256'] = ao.digest(req['text'].encode())
-            self.service.save(self.directory(), state)
-            self.fake.snapshots['engineer']['messages'][-1]['text'] = req['text']
-            self.finish()
+            text = ('[Project Room historical request ' + purpose + ']' + chr(10)
+                    + 'Historical workflow/policy/report/settings/routing.' + chr(10)
+                    + 'Exact specification revision 1, SHA256 ' + spec['sha256'] + chr(10)
+                    + '<specification>' + chr(10) + spec['content'] + chr(10) + '</specification>' + chr(10)
+                    + 'Agreed gates: ' + json.dumps(spec['gates']) + chr(10) + 'Task instruction:' + chr(10) + 'Continue.')
+            self.historical_request(key, purpose, text, response)
         previous = copy.deepcopy(self.state()['requests'])
         receipts = {r['receipt']: (self.directory() / r['receipt']).read_bytes() for r in previous.values()}
         self.message('new-correction')

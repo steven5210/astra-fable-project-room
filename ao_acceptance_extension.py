@@ -30,7 +30,8 @@ PINNED = ('room_id', 'project_path', 'git_common_dir', 'ao_project_id', 'ao_url'
 UNUSED_PINNED = ('bindings', 'spec', 'spec_record_sha256', 'handoff', 'handoff_sha256', 'checkpoint',
                  'checkpoint_sha256', 'authorization', 'exception_authorization', 'delegate', 'preparation',
                  'preparation_sha256', 'provider_transition', 'routing_adoption', 'reviewer_recovery',
-                 'spec_review_extension', 'executable_binding', 'routing_refresh')
+                 'spec_review_extension', 'executable_binding', 'routing_refresh',
+                 'engineering_model', 'engineering_model_transition', 'engineering_model_resolutions')
 GRANT_INPUTS = frozenset(('request_id', 'audit_sha256', 'authorization', 'authorization_reference', 'diagnosis'))
 GRANT_FIELDS = frozenset(('review_request_id', 'message_sha256', 'purpose', 'role', 'additional_acceptance_reviews'))
 HEX = re.compile('[0-9a-f]{64}')
@@ -381,13 +382,16 @@ def _owner(state, role, database, native_session_id, workspace):
             or owner.get('workspace_path') != str(workspace)):
         raise RoomError('The native ' + role + ' owner differs from the retained room, session, workspace or '
                         'supplied native session')
-    if role == 'engineer':
-        source = state.get('native_outcome_source')
-        if (source and (source.get('database') != database or source.get('native_session_id') != native_session_id
-                        or source.get('session_id') != binding.get('session_id'))):
-            raise RoomError('Retained native source evidence contradicts the supplied owner database or session')
     # Runtime liveness/generation are observations, not replacement-provider authority.
     return {key: value for key, value in owner.items() if key not in ('activity_state', 'controller_generation')}
+
+
+def _owner_source(state, database, native_session_id):
+    # The retained engineer native source must agree with the supplied owner database and session.
+    source = state.get('native_outcome_source')
+    if (source and (source.get('database') != database or source.get('native_session_id') != native_session_id
+                    or source.get('session_id') != (state.get('bindings') or {}).get('engineer', {}).get('session_id'))):
+        raise RoomError('Retained native source evidence contradicts the supplied owner database or session')
 
 
 def _retained_owners(directory, entries):
@@ -456,12 +460,16 @@ def _inspect(service, directory, state, target, phase):
     if not ao_workflow.normal(state):
         raise RoomError('An additional acceptance review is only available for a normal Fable engineering room')
     bindings = state.get('bindings') or {}
+    import ao_engineering_model
     engineer, reviewer = bindings.get('engineer'), bindings.get('reviewer')
-    if (not engineer or engineer.get('harness') != 'claude-code' or engineer.get('model') != ao_workflow.FABLE_MODEL
-            or engineer.get('reasoning_effort') != 'max' or not reviewer or reviewer.get('harness') != 'codex'
+    # Pinned evidence keeps the immutable stored binding; eligibility reads the epoch in force.
+    effective = ao_engineering_model.effective_binding(directory, state) if engineer else None
+    if (not effective or effective.get('harness') != 'claude-code'
+            or effective.get('model') != ao_engineering_model.current(directory, state)['model']
+            or effective.get('reasoning_effort') != 'max' or not reviewer or reviewer.get('harness') != 'codex'
             or reviewer.get('reasoning_effort') != 'max'):
-        raise RoomError('An additional acceptance review requires the bound native Fable engineer and Codex '
-                        'reviewer at max effort')
+        raise RoomError('An additional acceptance review requires the existing normal engineering orchestrator at '
+                        'its configured model and MAX and the bound native Codex reviewer at max effort')
     for request in (state.get('requests') or {}).values():
         if request.get('role') == 'reviewer' and any(request.get(key) != reviewer.get(key)
                                                     for key in ('session_id', 'model', 'reasoning_effort', 'harness')):
@@ -515,14 +523,7 @@ def _inspect(service, directory, state, target, phase):
         raise RoomError('Unknown acceptance-review continuation phase')
     spec = service.spec(directory, state)
     checkpoint = service.checkpoint(directory, state)
-    engineering_request = ao_workflow.engineering_ready(service, directory, state)
-    ao_workflow.engineering_report(directory, state, engineering_request)
-    handoff = ao_workflow.handoff_record(directory, state)
     actual = ao_workflow.workspace(service, directory, state, check_routing=False)
-    if checkpoint['candidate_path'] != str(actual) or str(actual) != handoff['worktree']:
-        raise RoomError('The passed checkpoint, engineer workspace and handoff must name the same candidate')
-    if checkpoint['candidate_sha256'] != engineering_request['result_candidate_sha256']:
-        raise RoomError('The passed checkpoint does not match the completed engineering candidate')
     if state.get('executable_binding') or list((directory / 'executable-bindings').glob('*.json')):
         import ao_executable_binding
         ao_executable_binding._chain(directory, state, _load(_relative(directory, state['preparation'])))
@@ -537,15 +538,6 @@ def _inspect(service, directory, state, target, phase):
         if ao.busy(snapshot):
             raise RoomError('A bound AO conversation has active work; the acceptance-review continuation '
                             'refuses before any write')
-    try:
-        native = {role: ao_review_extension._native_evidence(directory, state, bindings[role], snapshots[role])
-                  for role in ('engineer', 'reviewer')}
-    except RoomError:
-        raise
-    except (KeyError, TypeError, ValueError, OSError, AttributeError, IndexError) as exc:
-        raise RoomError('Native acceptance-review evidence is unreadable or incomplete') from exc
-    import ao_outcomes
-    ao_outcomes.gate(service, directory, state, 'reviewer', target['review_request_id'], snapshots['reviewer'])
     from ao_reviewer_recovery import _workspace
     reviewer_workspace = _workspace(service, state, reviewer['session_id'], str(actual))
     owners = {'engineer': _owner(state, 'engineer', target['native_owner_database'],
@@ -563,6 +555,23 @@ def _inspect(service, directory, state, target, phase):
                 raise RoomError('The native ' + role + ' owner differs from the ownership retained by earlier '
                                 'acceptance-review grants; a fresh audit cannot redefine the retained native '
                                 + role)
+    _owner_source(state, target['native_owner_database'], target['engineer_native_session_id'])
+    engineering_request = ao_workflow.engineering_ready(service, directory, state)
+    ao_workflow.engineering_report(directory, state, engineering_request)
+    handoff = ao_workflow.handoff_record(directory, state)
+    if checkpoint['candidate_path'] != str(actual) or str(actual) != handoff['worktree']:
+        raise RoomError('The passed checkpoint, engineer workspace and handoff must name the same candidate')
+    if checkpoint['candidate_sha256'] != engineering_request['result_candidate_sha256']:
+        raise RoomError('The passed checkpoint does not match the completed engineering candidate')
+    try:
+        native = {role: ao_review_extension._native_evidence(directory, state, bindings[role], snapshots[role])
+                  for role in ('engineer', 'reviewer')}
+    except RoomError:
+        raise
+    except (KeyError, TypeError, ValueError, OSError, AttributeError, IndexError) as exc:
+        raise RoomError('Native acceptance-review evidence is unreadable or incomplete') from exc
+    import ao_outcomes
+    ao_outcomes.gate(service, directory, state, 'reviewer', target['review_request_id'], snapshots['reviewer'])
     engineering_record = _load(_relative(directory, engineering_request['engineering_record']))
     reviewer_requests = _reviewer_requests(state)
     journal_entries = committed['entries'] if committed else []

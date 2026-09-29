@@ -2,6 +2,7 @@
 import copy
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import ao_project_room as ao
@@ -12,10 +13,17 @@ from test_ao_reviewer_native_outcome import ReviewerNativeFixture
 
 
 class HistoryReconciliationTests(Fixture):
+    NATIVE = 'native-fixture'
+
     def setUp(self):
         super().setUp()
         self.room = self.open(); self.spec(); self.bind(); self.agree()
         self.service.ao_room_handoff(self.room, str(self.repo))
+        # One complete owned canonical source from the start: the inherited register_native_source
+        # contract already registered this room's exact native-fixture identity, its full owner
+        # schema and the disclosed deepcopy owner mock through the actual pre-dispatch preflight
+        # before the first charter receipt. The source, owner and prefix are never late-replaced.
+        self.source = self.native_outcome_source
         original_request = self.fake.request
         def paged_request(method, path, payload=None):
             if method == 'GET' and '/conversation?' in path:
@@ -24,7 +32,30 @@ class HistoryReconciliationTests(Fixture):
             return original_request(method, path, payload)
         paging = patch.object(self.fake, 'request', side_effect=paged_request)
         paging.start(); self.addCleanup(paging.stop)
+        prefix_count = len(self.native_events)
         self.send('implementation')
+        request = self.state()['requests']['implementation']
+        # The inherited send appended one provisional caller/response pair for this request's
+        # still-unsealed interval. Only those two rows are replaced with one coherent typed quota
+        # failure inside the request's own completion window; the earlier charter prefix keeps its
+        # exact bytes and no provisional success stop survives in the failed interval.
+        self.prefix = self.native_events[:prefix_count]
+        created = request['created_at']
+        stamp = lambda t: min(datetime.fromtimestamp(t, timezone.utc),
+                              datetime.now(timezone.utc)).isoformat()
+        workspace = self.native_row_workspace()
+        self.events = [
+            {'type': 'user', 'uuid': 'caller', 'sessionId': self.NATIVE, 'cwd': workspace,
+             'timestamp': stamp(created + 0.001), 'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': 'quota', 'sessionId': self.NATIVE, 'cwd': workspace,
+             'timestamp': stamp(created + 0.002), 'isSidechain': False,
+             'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>',
+                         'content': [{'type': 'text', 'text': 'Rate limited before a response.'}]}},
+        ]
+        self.native_events = self.prefix + self.events
+        self.write_native()
         self.fake.finish('engineer', '')
         self.snapshot = self.fake.snapshots['engineer']
         self.snapshot['history_truncated'] = True
@@ -39,30 +70,36 @@ class HistoryReconciliationTests(Fixture):
         self.receipt_bytes = self.receipt_path.read_bytes()
         self.original_usage = copy.deepcopy(self.request['usage'])
         self.original_history = copy.deepcopy(self.request['receipt_history'])
-        self.transcript = self.root / 'native-fixture.jsonl'
-        self.source = {'database': str(self.root / 'owner.db'), 'transcript': str(self.transcript),
-                       'session_id': 'engineer', 'native_session_id': 'native-fixture'}
-        self.owner = {'project_id': 'project', 'provider_conversation_id': 'native-fixture',
-                      'workspace_path': str(self.repo), 'ao_conversation_id': 'engineer-native',
-                      'active_branch_id': 'root'}
-        created = self.request['created_at']
-        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
-        self.events = [
-            {'type': 'user', 'uuid': 'caller', 'sessionId': 'native-fixture',
-             'timestamp': stamp(created + 0.1), 'origin': {'kind': 'human'},
-             'message': {'content': self.request['text']}},
-            {'type': 'assistant', 'uuid': 'quota', 'sessionId': 'native-fixture',
-             'timestamp': stamp(created + 0.2), 'isApiErrorMessage': True,
-             'error': 'rate_limit', 'apiErrorStatus': 429, 'message': {'model': '<synthetic>'}},
-        ]
-        self.write_native()
-        state = self.state(); state['native_outcome_source'] = self.source
-        ao.atomic(self.directory() / 'state.json', state)
-        patcher = patch('ao_native_identity.read_owner', side_effect=lambda *a: copy.deepcopy(self.owner))
-        patcher.start(); self.addCleanup(patcher.stop)
+        # The source, owner and typed failed native interval are already installed above, before
+        # the first receipt. Nothing is late-replaced after capture.
 
     def write_native(self):
-        self.transcript.write_text(''.join(json.dumps(e) + '\n' for e in self.events))
+        """Rewrite the registered transcript from the retained prefix and the mutable target slice.
+
+        The earlier charter rows are preserved byte-for-byte and the write target is the room's
+        currently registered transcript, so a public source move is honored instead of being
+        silently rewritten at a stale path. ``self.events`` stays the intended implementation
+        interval the existing negatives edit: the caller first and the typed quota row last.
+        """
+        self.native_events = self.prefix + self.events
+        path = Path(self.state()['native_outcome_source']['transcript'])
+        path.write_text(''.join(json.dumps(event) + '\n' for event in self.native_events))
+
+    def note_native_turn(self, request_id):
+        """Append one request's synthetic rows through the currently registered transcript.
+
+        The inherited helper writes the fixture's original ``self.transcript``, which is stale after
+        an audited public source move. Only the append target is synchronized to the room's actual
+        registered source path; the inherited row producer and its once-only accounting stay in
+        force.
+        """
+        registered = Path(self.state()['native_outcome_source']['transcript'])
+        stale = self.transcript
+        self.transcript = registered
+        try:
+            return super().note_native_turn(request_id)
+        finally:
+            self.transcript = stale
 
     def current(self):
         return self.state()['requests']['implementation']
@@ -145,7 +182,8 @@ class HistoryReconciliationTests(Fixture):
         final = copy.deepcopy(self.events[-1]); final.update(uuid='answer', isApiErrorMessage=False)
         final.pop('error'); final.pop('apiErrorStatus')
         final['timestamp'] = datetime.fromtimestamp(self.request['created_at'] + 0.3, timezone.utc).isoformat()
-        final['message'] = {'model': self.request['model'], 'id': 'response', 'stop_reason': 'end_turn'}
+        # The exact served member of the room's fable family; an alias is never a native model.
+        final['message'] = {'model': 'claude-fable-5-1', 'id': 'response', 'stop_reason': 'end_turn'}
         self.events.append(final); self.write_native()
         self.assertFalse(self.audit()['resume_eligible'])
         self.assertNotIn(reconciliation.PROOF, self.current())
