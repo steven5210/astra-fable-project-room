@@ -50,8 +50,12 @@ release and arrange an update between jobs as below. For `mismatch`, restart AO
 between jobs and recheck. For `unknown`, warn with the reported reasons, never
 treat it as up to date, and do not block status, sync or recovery.
 
-For Linux/AppImage or `executable_not_app_bundle`, verify the daemon and installed
-version manually as before; do not overwrite the tool's version-check file.
+For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
+from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's
+version and installation provenance; a configured version string alone does not
+prove which binary is running. Compare it with the official latest stable release,
+excluding drafts and prereleases, and report the result to the user as unknown
+until proven. Leave `version-check.json` to the tool.
 
 When a newer stable release is available, review its changes and arrange an update
 between jobs. Preserve the existing runtime/state and a consistent backup before

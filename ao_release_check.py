@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import urllib.request
 
 import ao_project_room
+import deepseek_adapter
 
 
 SCHEMA = "ao-release-check/v1"
@@ -35,8 +36,6 @@ class _FetchFailure(Exception):
 
 
 def _fetch_latest():
-    import deepseek_adapter
-
     connection = http.client.HTTPSConnection(
         GITHUB_HOST, 443, context=deepseek_adapter.tls_context(), timeout=10
     )
@@ -72,7 +71,7 @@ def _fetch_health(ao_url):
         client.base + "/healthz", method="GET", headers={"Accept": "application/json"}
     )
     with client.opener.open(request, timeout=15) as response:
-        if getattr(response, "status", 200) != 200:
+        if response.status != 200:
             raise OSError("AO health endpoint returned a non-200 status")
         body = response.read(MAX_RESPONSE_BYTES + 1)
     if len(body) > MAX_RESPONSE_BYTES:
@@ -84,7 +83,7 @@ def _fetch_health(ao_url):
 
 
 def _read_bounded_regular(path, maximum):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as stream:
         before = os.fstat(stream.fileno())
@@ -134,6 +133,17 @@ def _daemon(value):
     }
 
 
+def _bundle_timestamps(executable, info):
+    executable_stat = executable.stat()
+    info_stat = info.stat()
+    return (
+        executable_stat.st_mtime,
+        executable_stat.st_ctime,
+        info_stat.st_mtime,
+        info_stat.st_ctime,
+    )
+
+
 def _bundle(executable_path):
     try:
         executable = Path(executable_path).resolve()
@@ -159,11 +169,10 @@ def _bundle(executable_path):
     if not isinstance(version, str) or VERSION_PATTERN.fullmatch(version) is None:
         return None, None, "bundle_version_dev"
     try:
-        executable_mtime = executable.stat().st_mtime
-        info_mtime = info.stat().st_mtime
+        timestamps = _bundle_timestamps(executable, info)
     except OSError:
         return None, None, "bundle_version_unreadable"
-    return version, (executable_mtime, info_mtime), None
+    return version, timestamps, None
 
 
 def _process_start(pid, run):
@@ -197,7 +206,10 @@ def _existing_record(path):
         return value
     legacy = path.with_name("version-check.legacy.json")
     if not os.path.lexists(legacy):
-        os.replace(path, legacy)
+        try:
+            os.replace(path, legacy)
+        except OSError:
+            pass
     return None
 
 
@@ -235,6 +247,8 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
         try:
             fetch = _fetch_health if fetch_health is None else fetch_health
             raw_health = fetch(ao_url)
+        except ao_project_room.RoomError:
+            reasons.add("daemon_url_invalid")
         except Exception:
             reasons.add("daemon_unreachable")
         else:

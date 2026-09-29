@@ -64,7 +64,7 @@ class ReleaseCheckTests(unittest.TestCase):
         self.app = self.base / "Agent Orchestrator.app"
         self.executable = self.app / "Contents" / "Resources" / "daemon" / "ao"
         self.info = self.app / "Contents" / "Info.plist"
-        self.process_start = 1_700_000_000
+        self.process_start = int(time.time()) + 3600
         self.checked_time = self.process_start + 100
         self.ao_url = "http://127.0.0.1:1234"
         self.health = {
@@ -139,6 +139,19 @@ class ReleaseCheckTests(unittest.TestCase):
     def test_bundle_changed_after_process_start_is_mismatch(self):
         os.utime(self.executable, (self.process_start + 2, self.process_start + 2))
         result = self.check()
+        self.assertEqual(result["outcome"], "mismatch")
+        self.assertIn("bundle_replaced_since_daemon_start", result["reasons"])
+        self.assertIsNone(result["running_version"])
+
+    def test_bundle_ctime_after_process_start_is_mismatch_even_when_mtimes_are_old(self):
+        timestamps = (
+            self.process_start - 10,
+            self.process_start + 2,
+            self.process_start - 10,
+            self.process_start - 10,
+        )
+        with patch.object(ao_release_check, "_bundle_timestamps", return_value=timestamps):
+            result = self.check()
         self.assertEqual(result["outcome"], "mismatch")
         self.assertIn("bundle_replaced_since_daemon_start", result["reasons"])
         self.assertIsNone(result["running_version"])
@@ -275,6 +288,25 @@ class ReleaseCheckTests(unittest.TestCase):
         self.check(root=malformed_root)
         self.assertEqual((malformed_root / "version-check.legacy.json").read_bytes(), malformed)
 
+    def test_legacy_migration_replace_failure_does_not_abort_the_check(self):
+        path = self.root / "version-check.json"
+        path.write_text("invalid legacy record", encoding="utf-8")
+        original_replace = os.replace
+        replacements = 0
+
+        def fail_migration_then_replace(source, destination):
+            nonlocal replacements
+            replacements += 1
+            if replacements == 1:
+                raise OSError("synthetic legacy migration failure")
+            return original_replace(source, destination)
+
+        with patch.object(ao_release_check.os, "replace", side_effect=fail_migration_then_replace):
+            result = self.check()
+        self.assertEqual(result["outcome"], "up_to_date")
+        self.assertFalse((self.root / "version-check.legacy.json").exists())
+        self.assertEqual(json.loads(path.read_bytes())["schema"], ao_release_check.SCHEMA)
+
     def test_public_result_has_no_executable_path_pid_or_root(self):
         result = self.check()
         encoded = json.dumps(result)
@@ -348,8 +380,12 @@ class ReleaseCheckTests(unittest.TestCase):
 
     def test_real_health_fetch_refuses_non_loopback_before_building_an_opener(self):
         with patch.object(ao_project_room.urllib.request, "build_opener") as build_opener:
-            with self.assertRaises(ao_project_room.RoomError):
-                ao_release_check._fetch_health("http://example.com:1234")
+            result = ao_release_check.check(
+                self.root, "http://example.com:1234",
+                fetch_latest=self.fetch_latest, run=self.run, now=lambda: self.checked_time
+            )
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("daemon_url_invalid", result["reasons"])
         build_opener.assert_not_called()
 
     def test_health_fetch_uses_healthz_and_reads_only_one_megabyte_plus_one_byte(self):
