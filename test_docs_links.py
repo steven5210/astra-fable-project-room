@@ -1,6 +1,6 @@
 """Check the documentation link graph after the docs reorganization: every
-relative link ending in .md (optionally with a #anchor) in README.md, AGENTS.md,
-docs/ and skills/ must resolve to an existing file, and a link carrying an
+relative link ending in .md (optionally with a #anchor) in every Markdown file of
+the repository must resolve to an existing file, and a link carrying an
 anchor must find a heading in the target file whose GitHub-style slug equals
 that anchor; a second test requires docs/README.md to link to every Markdown
 document under docs/ except itself.
@@ -26,10 +26,8 @@ def heading_slugs(path):
 
 
 def markdown_files():
-    files = [ROOT / "README.md", ROOT / "AGENTS.md"]
-    files += sorted((ROOT / "docs").rglob("*.md"))
-    files += sorted((ROOT / "skills").rglob("*.md"))
-    return files
+    return sorted(path for path in ROOT.rglob("*.md")
+                  if not any(part.startswith(".") for part in path.relative_to(ROOT).parts))
 
 
 class DocsLinkTests(unittest.TestCase):
