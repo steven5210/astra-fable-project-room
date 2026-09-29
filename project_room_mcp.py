@@ -55,6 +55,7 @@ def input_arguments(name, arguments):
 
 
 MAX_LINE = 3_000_000
+MAX_PENDING_MESSAGES = 4
 AO_INSTRUCTIONS = (
     "AO rooms use ao_room_*: Fable owns normal engineering/delegation; Astra owns product/spec and independent acceptance. "
     "An Astra-led exception requires actual per-task authorization. Prepare private delegates before native Fable launch, "
@@ -169,6 +170,7 @@ def handle(message, service):
 def main():
     service = project_room.Service()
     messages = queue.Queue()
+    slots = threading.Semaphore(MAX_PENDING_MESSAGES)
     messages_lock = threading.Lock()
     interrupt = threading.Event()
     eof = object()
@@ -180,6 +182,7 @@ def main():
 
     def read_messages():
         while True:
+            slots.acquire()
             line = sys.stdin.buffer.readline(MAX_LINE + 1)
             if not line:
                 enqueue(eof)
@@ -201,19 +204,23 @@ def main():
                 if messages.empty():
                     interrupt.clear()
             if item is eof:
+                slots.release()
                 break
-            line, oversized = item
-            if oversized:
-                response = error_response(None, -32600, "Request exceeds maximum size")
-            else:
-                try:
-                    message = json.loads(line, parse_float=finite_float, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON number")))
-                    response = handle(message, service)
-                except (ValueError, UnicodeDecodeError, RecursionError):
-                    response = error_response(None, -32700, "Invalid JSON")
-            if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n")
-                sys.stdout.flush()
+            try:
+                line, oversized = item
+                if oversized:
+                    response = error_response(None, -32600, "Request exceeds maximum size")
+                else:
+                    try:
+                        message = json.loads(line, parse_float=finite_float, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON number")))
+                        response = handle(message, service)
+                    except (ValueError, UnicodeDecodeError, RecursionError):
+                        response = error_response(None, -32700, "Invalid JSON")
+                if response is not None:
+                    sys.stdout.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n")
+                    sys.stdout.flush()
+            finally:
+                slots.release()
     finally:
         ao_project_room.SYNC_WAIT_INTERRUPT = previous_interrupt
 

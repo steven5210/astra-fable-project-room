@@ -216,6 +216,72 @@ class ProjectRoomMcpTests(ProjectFixture):
         self.assertTrue(any(isinstance(event, threading.Event) for event in observed))
         self.assertIs(ao_project_room.SYNC_WAIT_INTERRUPT, previous_interrupt)
 
+    def test_in_process_main_bounds_queued_input_until_response_finishes(self):
+        requests = [json.dumps({"jsonrpc": "2.0", "id": index, "method": "ping"}).encode() + b"\n"
+                    for index in range(1, 7)]
+
+        class CountingBuffer:
+            def __init__(self, values):
+                self.values = iter(values + [b""])
+                self.lock = threading.Lock()
+                self.read_calls = 0
+
+            def readline(self, _limit):
+                with self.lock:
+                    self.read_calls += 1
+                    return next(self.values)
+
+            def call_count(self):
+                with self.lock:
+                    return self.read_calls
+
+        class BufferedInput:
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+        buffer = CountingBuffer(requests)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        errors = []
+        previous_interrupt = ao_project_room.SYNC_WAIT_INTERRUPT
+        original_handle = project_room_mcp.handle
+
+        def block_first(message, service):
+            if message.get("id") == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("first request was not released")
+            return original_handle(message, service)
+
+        def run_main():
+            try:
+                project_room_mcp.main()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as home, \
+                patch.dict(os.environ, {"PROJECT_ROOM_HOME": home}), \
+                patch.object(project_room_mcp, "MAX_PENDING_MESSAGES", 2), \
+                patch.object(project_room_mcp, "handle", side_effect=block_first), \
+                patch.object(project_room_mcp.sys, "stdin", BufferedInput(buffer)), \
+                patch.object(project_room_mcp.sys, "stdout", StringIO()) as output:
+            worker = threading.Thread(target=run_main)
+            worker.start()
+            try:
+                self.assertTrue(first_started.wait(5), "first request was not handled")
+                release_first.wait(0.3)
+                self.assertLessEqual(buffer.call_count(), 2)
+            finally:
+                release_first.set()
+                worker.join(10)
+            self.assertFalse(worker.is_alive(), "MCP main did not finish")
+            self.assertEqual(errors, [])
+            responses = [json.loads(line) for line in output.getvalue().splitlines()]
+
+        self.assertEqual([response["id"] for response in responses], list(range(1, 7)))
+        self.assertEqual(buffer.call_count(), 7)
+        self.assertIs(ao_project_room.SYNC_WAIT_INTERRUPT, previous_interrupt)
+
     def test_nested_json_is_rejected_and_server_survives(self):
         data = b"[" * 1500 + b"0" + b"]" * 1500 + b"\n"
         # Decoder nesting limits differ across Python versions. This is valid
