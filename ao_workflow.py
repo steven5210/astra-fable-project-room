@@ -268,8 +268,12 @@ def validate_report_correction(home, directory, state, request):
         prior = state["requests"].get(proof["request_id"])
         if (not prior or request.get("purpose") != "correction"
                 or type(prior.get("created_order")) is not int
-                or type(request.get("created_order")) is not int
-                or prior["created_order"] >= request["created_order"]):
+                or type(request.get("created_order")) is not int):
+            raise RoomError("Invalid report-only correction predecessor")
+        if proof["request_id"] in seen:
+            request = prior
+            continue
+        if prior["created_order"] >= request["created_order"]:
             raise RoomError("Invalid report-only correction predecessor")
         report = engineering_report(directory, state, prior)
         ao_delegates.assert_settled(home, state, directory)
