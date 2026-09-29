@@ -163,9 +163,7 @@ def _api_delegates(home, state, request, receipt, room):
     selected = []
     for row in rows:
         created_at = native.parse_timestamp(row[6])
-        if created_at is None or start is None or end is None:
-            reasons.add("delegate_time_unparsable")
-            continue
+        if usage_source not in ("final_chunk", "usage_only_chunk", "content_chunk"):
         if start <= created_at <= end:
             selected.append(row)
     for (job_id, requested_model, observed_model, usage_json, usage_source, _state, _created_at,
