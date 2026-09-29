@@ -316,7 +316,7 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
             "running_version": running_version,
             "daemon": daemon,
         }
-        if outcome != "unknown":
+        if outcome != "unknown" and latest is not None:
             record["last_successful"] = dict(record)
         else:
             record["last_successful"] = previous.get("last_successful") if previous is not None else None

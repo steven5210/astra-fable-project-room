@@ -143,6 +143,28 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIn("bundle_replaced_since_daemon_start", result["reasons"])
         self.assertIsNone(result["running_version"])
 
+    def test_failed_latest_with_replaced_bundle_keeps_previous_last_successful(self):
+        self.check()
+        previous = json.loads((self.root / "version-check.json").read_bytes())["last_successful"]
+
+        def fail_fetch():
+            raise OSError("synthetic release fetch failure")
+
+        os.utime(self.executable, (self.process_start + 2, self.process_start + 2))
+        result = self.check(fetch_latest=fail_fetch)
+        record = json.loads((self.root / "version-check.json").read_bytes())
+        self.assertEqual(result["outcome"], "mismatch")
+        self.assertIn("latest_fetch_failed", result["reasons"])
+        self.assertIn("bundle_replaced_since_daemon_start", result["reasons"])
+        self.assertIsNone(record["latest"])
+        self.assertEqual(record["last_successful"], previous)
+
+        fresh_root = self.base / "fresh"
+        result = self.check(root=fresh_root, fetch_latest=fail_fetch)
+        fresh_record = json.loads((fresh_root / "version-check.json").read_bytes())
+        self.assertEqual(result["outcome"], "mismatch")
+        self.assertIsNone(fresh_record["last_successful"])
+
     def test_bundle_ctime_after_process_start_is_mismatch_even_when_mtimes_are_old(self):
         timestamps = (
             self.process_start - 10,
