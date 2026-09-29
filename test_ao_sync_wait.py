@@ -141,6 +141,7 @@ class SyncWaitTests(unittest.TestCase):
         self.assertEqual(sync_once.call_count, 10)
         self.assertTrue(all(seconds == ao.AO_SYNC_WAIT_POLL_SECONDS for seconds in clock.sleeps))
         self.assertLessEqual(clock.now, 45 + ao.AO_SYNC_WAIT_POLL_SECONDS)
+        self.assertNotIn("config_warning", result["wait"])
 
     def test_configured_wait_cap_allows_long_waits_and_boundary_values(self):
         self.prepare_running()
@@ -151,6 +152,7 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=600)
         self.assertEqual(result["wait"], {"requested_seconds": 600, "reason": "timeout", "settled": False})
+        self.assertNotIn("config_warning", result["wait"])
         self.assertLessEqual(sync_once.call_count, math.ceil(600 / ao.AO_SYNC_WAIT_POLL_SECONDS) + 1)
         self.assertLessEqual(clock.now, 600 + ao.AO_SYNC_WAIT_POLL_SECONDS)
 
@@ -163,7 +165,7 @@ class SyncWaitTests(unittest.TestCase):
         with self.assertRaisesRegex(ao.RoomError, "wait_seconds must be finite and between 0 and 600"):
             self.service.ao_room_sync(self.room, wait_seconds=600.01)
 
-    def test_invalid_wait_caps_refuse_without_sync_but_zero_still_works(self):
+    def test_invalid_wait_caps_fall_back_with_warning_and_reject_over_limit(self):
         self.prepare_running()
         path = self.service.root / "config.json"
         invalid_values = (44, 1801, True, "600", 600.5, [])
@@ -172,11 +174,18 @@ class SyncWaitTests(unittest.TestCase):
                 path.write_text(json.dumps(value if isinstance(value, list) else {"sync_wait_max_seconds": value}))
                 before = self.state_path().read_bytes()
                 gets = self.fake.gets
-                with self.assertRaisesRegex(ao.RoomError, "sync_wait_max_seconds"):
-                    self.service.ao_room_sync(self.room, wait_seconds=5)
+                with self.assertRaisesRegex(ao.RoomError, "wait_seconds must be finite and between 0 and 45"):
+                    self.service.ao_room_sync(self.room, wait_seconds=45.01)
                 self.assertEqual(self.fake.gets, gets)
                 self.assertEqual(self.state_path().read_bytes(), before)
-                result = self.service.ao_room_sync(self.room, wait_seconds=0)
+                clock = FakeClock()
+                with patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                        patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+                    result = self.service.ao_room_sync(self.room, wait_seconds=45)
+                self.assertEqual(result["wait"]["reason"], "timeout")
+                self.assertEqual(result["wait"]["config_warning"], ao.SYNC_WAIT_MAX_SECONDS_ERROR)
+                with patch("ao_project_room.sync_wait_max_seconds", side_effect=AssertionError("config read")):
+                    result = self.service.ao_room_sync(self.room, wait_seconds=0)
                 self.assertNotIn("wait", result)
 
     def test_set_interrupt_returns_without_a_second_sync(self):

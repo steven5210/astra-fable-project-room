@@ -896,7 +896,12 @@ class Service:
             raise RoomError("wait_seconds must be finite and between 0 and 45")
         if wait_seconds == 0:
             return self._sync_once(room_id)[0]
-        maximum = sync_wait_max_seconds(self.root) if wait_seconds > 0 else 45
+        config_warning = None
+        try:
+            maximum = sync_wait_max_seconds(self.root)
+        except RoomError as exc:
+            maximum = 45
+            config_warning = str(exc)
         if not 0 <= wait_seconds <= maximum:
             raise RoomError(f"wait_seconds must be finite and between 0 and {maximum}")
         deadline = time.monotonic() + wait_seconds
@@ -924,11 +929,14 @@ class Service:
                 reason = "interrupted"
                 break
             summary, states = self._sync_once(room_id)
-        summary["wait"] = {
+        wait = {
             "requested_seconds": wait_seconds,
             "reason": reason,
             "settled": all(state in NATIVE_TERMINAL for state in states.values()),
         }
+        if config_warning is not None:
+            wait["config_warning"] = config_warning
+        summary["wait"] = wait
         return summary
 
     def _sync_once(self, room_id):
