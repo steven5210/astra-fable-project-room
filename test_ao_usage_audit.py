@@ -532,6 +532,30 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         none = self.report([self.human()], delegate=NO_DELEGATE)
         self.assertEqual(none["api_delegates"], {"coverage": "not_applicable"})
 
+    def test_deepseek_content_chunk_usage_source_is_counted(self):
+        self.write_transcript([self.human()])
+        self.build()
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        ledger.parent.mkdir(parents=True)
+        usage = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+        with sqlite3.connect(ledger) as db:
+            db.executescript(deepseek_adapter.SCHEMA)
+            self.create_ledger_job(db, job_id="content-chunk",
+                                   created_at="2026-01-01T00:00:30+00:00", usage=usage,
+                                   usage_source="content_chunk")
+        report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        api = report["api_delegates"]
+        self.assertEqual(api["coverage"], "complete")
+        self.assertEqual(api["reasons"], ["delegate_usage_non_final_chunk"])
+        self.assertNotIn("delegate_usage_source_unavailable", api["reasons"])
+        self.assertEqual(api["jobs"][0]["usage_source"], "content_chunk")
+        self.assertEqual(api["jobs"][0]["usage"], usage)
+        self.assertEqual(report["coverage"], "complete")
+        self.assertIn("delegate_usage_non_final_chunk", report["reasons"])
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(json.loads(process.stdout)["coverage"], "complete")
+
     def test_deepseek_failed_missing_usage_boundaries_and_unsafe_ledger(self):
         self.write_transcript([self.human()])
         self.build()

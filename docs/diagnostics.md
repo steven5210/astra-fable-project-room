@@ -154,6 +154,10 @@ primary and worker subtotals are complete. The AO primary-counter relation is an
 observation, not an accounting assertion. DeepSeek jobs are selected only by their
 parsed timestamps inclusively within the request/receipt window, expose allowlisted usage
 vocabulary, and never contribute to native totals.
+Accepted DeepSeek usage sources are `final_chunk`, `usage_only_chunk`, and
+`content_chunk`; `content_chunk` means usage reported on a non-final content chunk
+and is taken as reported. It adds the informational reason
+`delegate_usage_non_final_chunk` without making delegate or overall coverage incomplete.
 Delegate model IDs outside the accepted syntax are null with
 `delegate_model_unavailable`; more than 10,000 room rows makes ledger coverage
 unavailable (`delegate_ledger_limit`), and usage JSON over 65,536 characters is not

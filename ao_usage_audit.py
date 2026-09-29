@@ -17,6 +17,7 @@ LIMITATIONS = ("not_billing_or_quota", "single_request_not_workflow_total", "con
                "compaction_calls_not_logged", "bounded_time_correlation", "delegate_selection_by_time_window")
 COUNTER_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 NON_INCOMPLETE_REASONS = frozenset(("cache_split_unavailable", "configured_identity_unknown"))
+NON_INCOMPLETE_DELEGATE_REASONS = frozenset(("delegate_usage_non_final_chunk",))
 MAX_DELEGATE_ROWS = 10000
 MAX_USAGE_JSON_CHARS = 65536
 
@@ -163,7 +164,9 @@ def _api_delegates(home, state, request, receipt, room):
     selected = []
     for row in rows:
         created_at = native.parse_timestamp(row[6])
-        if usage_source not in ("final_chunk", "usage_only_chunk", "content_chunk"):
+        if created_at is None or start is None or end is None:
+            reasons.add("delegate_time_unparsable")
+            continue
         if start <= created_at <= end:
             selected.append(row)
     for (job_id, requested_model, observed_model, usage_json, usage_source, _state, _created_at,
@@ -178,9 +181,11 @@ def _api_delegates(home, state, request, receipt, room):
         if usage_source is not None and not native.bounded_text(usage_source):
             reasons.add("delegate_usage_source_unavailable")
             usage_source = None
-        if usage_source not in ("final_chunk", "usage_only_chunk"):
+        if usage_source not in ("final_chunk", "usage_only_chunk", "content_chunk"):
             reasons.add("delegate_usage_source_unavailable")
             usage_source = None
+        elif usage_source == "content_chunk":
+            reasons.add("delegate_usage_non_final_chunk")
         if usage_oversized:
             usage = None
         else:
@@ -191,7 +196,7 @@ def _api_delegates(home, state, request, receipt, room):
                      "requested_model": safe_requested_model, "observed_model": safe_observed_model,
                      "usage_source": usage_source, "usage": usage})
     jobs.sort(key=lambda item: item["job_sha256"])
-    coverage = "complete" if not reasons else "incomplete"
+    coverage = "complete" if not (reasons - NON_INCOMPLETE_DELEGATE_REASONS) else "incomplete"
     return {"coverage": coverage, "jobs": jobs, "reasons": sorted(reasons)}
 
 
@@ -329,7 +334,7 @@ def _report(binding, gathered, parent, child_actors, child_coverage, api_delegat
     reasons.update(api_delegates.get("reasons", ()))
     if api_delegates.get("coverage") == "unavailable":
         reasons.add(api_delegates.get("reason"))
-    incomplete_reasons = reasons - NON_INCOMPLETE_REASONS
+    incomplete_reasons = reasons - NON_INCOMPLETE_REASONS - NON_INCOMPLETE_DELEGATE_REASONS
     coverage = ("complete" if totals["coverage"] == "complete"
                 and api_delegates["coverage"] in ("complete", "not_applicable")
                 and not incomplete_reasons else "incomplete")
