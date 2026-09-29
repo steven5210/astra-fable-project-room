@@ -18,6 +18,7 @@ Project Room's documents are grouped into guides, references and operations runb
 - [Architecture](reference/architecture.md) — the runtime module map and component responsibilities.
 - [MCP runtime lifetime](reference/connector-runtime.md) — how the connector retains a coherent runtime outside the replaceable plugin cache.
 - [DeepSeek delegate](reference/deepseek.md) — setup, invocation and evidence reference for the optional DeepSeek delegate provider.
+- [Text delegate profiles](reference/text-delegate.md) — profile schema, transport rules and the standalone text delegate's bounded state.
 - [AO prompt and evidence-read diagnostics](reference/diagnostics.md) — prompt bytes, delivery proof, logged reads, native usage counters and their limits.
 - [Deterministic change-set plan, apply, audit and resume](reference/changesets.md) — the dependency-free change-set tool and its boundaries.
 - [Bounded native history reads](reference/ao-history-reads.md) — smaller history pages when a native history exceeds the response limit.
