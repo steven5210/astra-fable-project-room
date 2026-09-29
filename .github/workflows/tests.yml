@@ -51,3 +51,26 @@ jobs:
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
             "$PROJECT_ROOM_TEST_IMAGE" python -B -m unittest discover -v
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyflakes==3.2.0
+      - name: Pyflakes (star-import notices in the changeset modules are intentional)
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run([sys.executable, "-m", "pyflakes", "."], capture_output=True, text=True)
+          ignored = ("may be undefined, or defined from star imports", "used; unable to detect undefined names")
+          problems = [line for line in (out.stdout + out.stderr).splitlines()
+                      if line.strip() and not any(text in line for text in ignored)]
+          print("\n".join(problems))
+          sys.exit(1 if problems else 0)
+          PY

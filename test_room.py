@@ -428,7 +428,7 @@ class RoomTests(unittest.TestCase):
     def test_legacy_reconcile_records_control_flow_inference_without_inventing_measured_code(self):
         self.mode.write_text("mixed-good")
         evidence = self.evidence_path()
-        failed = self.ask(expected=2)
+        self.ask(expected=2)
         legacy_error = "Actual model identity is missing or unexpected: ['fable-exact-test', 'helper-test']"
         with sqlite3.connect(self.room / "room.sqlite3") as db:
             db.execute("UPDATE turns SET return_code=NULL, stdout_sha256=NULL, error=?", (legacy_error,))

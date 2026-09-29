@@ -17,7 +17,6 @@ import ao_project_room as ao
 import ao_provider_transition as provider
 import ao_routing
 import ao_routing_adoption as routing
-import ao_workflow
 import deepseek_adapter
 from implementation import candidate_snapshot
 from test_ao_normal import DelegateFixture
@@ -364,7 +363,7 @@ class RoutingAdoptionTests(AdoptionFixture):
         result = self.stage_routing()
         self.fake.config = json.loads(Path(result['project_config_payload']).read_text())['config']
         job = 'd' * 32
-        current = self.state()
+        self.state()
         profile = ao_delegates.expected_profile(self.original['delegate']['inventory'])
         with self.ledger.transaction() as db:
             db.execute('INSERT INTO jobs(id,room_id,request_id,lane,payload_sha256,profile_sha256,state,created_at,requested_model,thinking,reasoning_effort,max_tokens,input_bytes,possibly_billed,reserved_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -507,7 +506,7 @@ class RoutingAdoptionTests(AdoptionFixture):
         self.assertEqual(self.state()['routing_adoption']['phase'], 'pending')
 
     def test_active_record_corruption_and_changed_request_ids_refuse(self):
-        prepared = self.configure_routing()
+        self.configure_routing()
         self.assertEqual(routing.activate(self.service, self.room, 'routing-change')['phase'], 'configured')
         changed = list(self.stage_args)
         changed[-1] = 'different'

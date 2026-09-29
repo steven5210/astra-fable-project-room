@@ -3,7 +3,6 @@ import copy
 import json
 import unittest
 
-import ao_delegates
 import ao_project_room as ao
 import deepseek_adapter as ds
 from test_ao_normal import DelegateFixture
@@ -184,7 +183,7 @@ class ReportCorrectionTests(DelegateFixture):
                 self.assertNotIn('second', self.state()['requests'])
 
     def test_unchanged_second_report_correction_keeps_original_evidence(self):
-        self.job(); original = self.capture(ids=[self.BAD, self.JOB]); self.correction()
+        self.job(); self.capture(ids=[self.BAD, self.JOB]); self.correction()
         self.finish_correction(ids=[self.BAD, self.JOB])
         self.service.ao_room_send(self.room, 'engineer', 'Correct only the report.', 'second', purpose='correction')
         self.fake.finish('engineer', json.dumps(self.report(routing_log=[{'delegate_job_ids': [self.JOB]}])))

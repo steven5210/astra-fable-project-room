@@ -1,5 +1,4 @@
 """Compact report projection preserves the native verdict and exact evidence."""
-import copy
 import json
 
 import ao_project_room as ao

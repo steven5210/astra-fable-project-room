@@ -1,20 +1,13 @@
 """Offline exact autocompact-thrashing settlement tests; fake AO and synthetic fixtures."""
-import copy
 import json
-from pathlib import Path
-from unittest.mock import patch
 import unittest
 
-import ao_delegates
 import ao_native_outcome as native
 import ao_outcomes as outcomes
 from datetime import datetime, timezone
 import ao_project_room as ao
 import ao_quality_review as quality
-import ao_routing
-import ao_routing_guard
 import test_ao_routing_refresh as routing_fixtures
-from test_ao_normal import Fixture
 
 ERROR_TEXT = native.COMPACTION_THRASHING_TEXT
 WORKSPACE = '/synthetic/worktree'

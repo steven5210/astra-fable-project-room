@@ -296,7 +296,6 @@ def expected_profile(inventory):
 
 def verify_content(home, room_id, export_dir, row, maximum):
     """A claimed completed answer must still exist with exactly its recorded digest, read owned and bounded."""
-    import deepseek_adapter
     job_id, expected = row["id"], row["content_sha256"]
     if not isinstance(expected, str) or not CONTENT_DIGEST.fullmatch(expected):
         raise RoomError("Completed delegate job " + job_id + " has no recorded content digest")

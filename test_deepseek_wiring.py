@@ -18,7 +18,6 @@ import implementation
 import progress
 import project_room
 import project_room_mcp
-import recovery
 import room
 from test_implementation import FAKE as IMPLEMENTATION_FAKE
 from test_project_room import ProjectFixture, ROOT
@@ -454,7 +453,6 @@ class InventoryRefusalTests(WiringFixture):
             result = original(inventory, repair_export_dir)
             self.config_copy.write_text(json.dumps({**pinned, "reasoning_effort": "low", "max_tokens": 8192}))  # after the check, before the packet
             return result
-        swapped = []
         with mock.patch.object(implementation, "verify_provider_inventory", swap_after_check):
             completed = implementation.run_implementation(self.handoff["handoff_path"])  # in-process: the swap really runs after the check
         self.assertEqual(completed["phase"], "awaiting_astra_review", completed)

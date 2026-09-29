@@ -1,6 +1,5 @@
 """A user product decision permits a bounded next round, never a delivery bypass."""
 
-import json
 import sqlite3
 import unittest
 

@@ -256,7 +256,7 @@ class ImplementationTests(unittest.TestCase):
 
     def test_stale_spec_cannot_run_accept_or_request_corrections(self):
         handoff=self.prepare()
-        result=impl.run_implementation(handoff["handoff_path"])
+        impl.run_implementation(handoff["handoff_path"])
         prepared=self.prepare(authorization="Separate authorization to test stale start")
         self.fixture.spec.write_text("Revision two changes requirements")
         self.fixture.call("spec","--revision","2","--file",str(self.fixture.spec))

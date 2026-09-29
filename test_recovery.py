@@ -4,7 +4,6 @@ import datetime
 import json
 import os
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 import time
@@ -377,7 +376,6 @@ class RecoveryTests(ProjectFixture):
             with self.service.db() as db:
                 db.execute("DELETE FROM issues WHERE id='open-1'")
         case("open finding", open_finding, close_finding, "open_findings")
-        extra = self.worktree / "extra.txt"
         for name, setup, teardown, expected in cases:
             with self.subTest(case=name):
                 setup()

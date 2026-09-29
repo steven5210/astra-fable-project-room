@@ -422,7 +422,7 @@ class NotificationOutcomeTests(unittest.TestCase):
 class NotificationProviderTests(unittest.TestCase):
     def test_native_accounting_and_dispatch_admit_only_audited_context_with_no_post(self):
         case = adoption_fixtures.AdoptionFixture('runTest'); self.addCleanup(case.doCleanups); case.setUp()
-        prepared = case.configure_routing(); source_fixture(case)
+        case.configure_routing(); source_fixture(case)
         before_history = copy.deepcopy(case.snapshot)
         add_notifications(case)
         posts = copy.deepcopy(case.fake.posts)

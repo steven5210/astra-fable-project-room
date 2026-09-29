@@ -683,7 +683,6 @@ class AcceptanceMatrixTests(MatrixFixture):
         reviewer_snapshot = copy.deepcopy(self.fake.snapshots['reviewer'])
         engineer_snapshot = copy.deepcopy(self.fake.snapshots['engineer'])
         database_bytes = self.database.read_bytes()
-        reviewer_turn = state['requests']['prior-1']['turn_id']
 
         def state_case(change):
             def mutate():
@@ -1019,7 +1018,6 @@ class AcceptanceMatrixTests(MatrixFixture):
         original_state = self.state_bytes()
         base_state = self.state()
         fourth = base_state['requests']['fourth']
-        prior = base_state['requests']['prior-1']
         mutations = [
             ('detached',
              lambda state: [state['requests']['fourth'].pop(key, None)

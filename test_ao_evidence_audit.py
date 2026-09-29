@@ -11,17 +11,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 import ao_evidence_audit
-import ao_evidence_audit_io
-import ao_evidence_audit_native
 
 
 ROOT = Path(__file__).resolve().parent
