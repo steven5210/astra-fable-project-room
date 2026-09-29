@@ -31,6 +31,7 @@ class DelegationEfficiencyTests(Fixture):
         receipts = {p: p.read_bytes() for p in receipt_paths}
         self.service = ao.Service(self.home, lambda url: self.fake)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'updated', purpose='correction')
+        self.note_native_turn('updated')
         request = self.state()['requests']['updated']
         self.assertEqual(request['text'], contract.DELEGATION_INSTRUCTION + '\nContinue.')
         self.assertEqual(request['carried']['parts'], [contract.DELEGATION_PART])
@@ -43,6 +44,7 @@ class DelegationEfficiencyTests(Fixture):
         self.service.ao_room_sync(self.room)
         self.service = ao.Service(self.home, lambda url: self.fake)
         self.service.ao_room_send(self.room, 'engineer', 'A new correction only.', 'later', purpose='correction')
+        self.note_native_turn('later')
         later = self.state()['requests']['later']
         self.assertEqual(later['text'], 'A new correction only.')
         self.assertEqual(later['carried']['parts'], [])
@@ -62,6 +64,7 @@ class DelegationEfficiencyTests(Fixture):
 
     def test_repeated_request_id_does_not_repeat_the_amendment(self):
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'same', purpose='correction')
+        self.note_native_turn('same')
         original = copy.deepcopy(self.state()['requests']['same'])
         before = len(self.fake.posts)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'same', purpose='correction')

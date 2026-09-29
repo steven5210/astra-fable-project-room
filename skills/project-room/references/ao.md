@@ -97,6 +97,12 @@ the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
 `ao_room_sync` to reconcile active work. Status reads saved facts without network
 access. Sync makes bounded AO GET requests and saves evidence; it never invokes a
 model. AO must be reachable for operations that check whether workers are idle.
+While an owned turn is submitted or running, call `ao_room_sync` with
+`wait_seconds=45` and repeat bounded waits, giving a brief update between them,
+instead of spending a turn on each immediate poll. A `timeout` wait reason is not
+a stall, failure or permission to replay. `settled` is true only when every owned
+request is terminal; an `uncertain` request still needs sync/recovery, never
+replay.
 Saved status remains readable while a verification gate holds the mutation lock.
 Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
 with explicit truncation. Check legacy `room_list` before treating an ambiguous
@@ -126,13 +132,18 @@ Codex task discovers updated MCP tools after plugin installation.
    below into already-ignored paths and refuses before writing anything when a
    path is tracked, unignored, symlinked or conflicting.
 3. Create an ordinary AO Claude chat worker without an initial prompt; configure
-   exact `claude-fable-5-1` and `max`, then bind it as `engineer`. Prepare a separate
+   the room's configured engineering selector (the `fable` family alias by
+   default, `opus`, or a qualified exact identifier) and `max`, then bind it as
+   `engineer`. A selector with a recorded Claude Code compatibility floor
+   requires the effective executable to satisfy it at bind, and family dispatch
+   additionally requires the room's pinned qualification and its registered
+   prospective native outcome source. Prepare a separate
    native Codex chat worker at the requested Astra model and `max`, and bind it as
    `reviewer`. `ao_room_bind` checks AO's actual workspace, project, harness and
    conversation. Bindings and the engineer workspace cannot be replaced through
    ordinary binding. The narrowly audited unused-reviewer exception below is the
    only reviewer replacement operation.
-4. Send `ao_room_send` with engineer purpose `spec_review` and a stable request ID.
+4. Send `ao_room_send` with engineer purpose `spec_review` and a stable request ID. For a source-qualified family, register the bound engineer's prospective native outcome source with `ao_room_engineer_source_register` before this first response; it is an engineer-only mutation and never replaces a conflicting registered source.
    The first packet a session receives carries the one-time workflow parts (both
    contracts, pinned delegate policy and settings, native routing text, baseline
    rule) plus the complete spec with revision, SHA256 and gates; a later revision
@@ -208,6 +219,45 @@ snapshot hashes, then executes the retained room-specific DeepSeek server.
 Room paths, settings, export directories and model policy never enter candidate
 files. Unrelated MCP entries are preserved; a conflicting `deepseek` entry blocks
 preparation. Do not overwrite it, silently switch providers or relax the pins.
+
+## Engineering model selection and transition
+
+New rooms select the engineer through `ao_room_open`'s optional
+`engineering_model`: an engineer-role family alias (`fable`, the default, or
+`opus`) or a qualified exact identifier. A family alias records configured
+intent for the latest available member of that family at MAX; the room's
+operator-selected source qualification pins the exact expected model before
+inference. No automatic discovery of an unknown future model is promised, and
+qualification is not provider availability, account entitlement, a served
+model or observed effective effort. Reopening with a different selector is
+refused, and existing rooms never migrate on their own — editing a private
+artifact or configuration file changes no room. An existing room adopts a new
+selection, or pins a newly qualified mapping under the identical family
+selector, only through the audited transition tools
+`ao_room_engineer_model_audit`, `ao_room_engineer_model_transition` and
+`ao_room_engineer_model_transition_abandon`, which retain the same AO engineer
+session, conversation, branch, worktree, specification, counters, prior
+reviews and independent holds. `ao_room_engineer_model_audit` is read-only;
+the transition and abandon tools are mutations, and the core owns their lock,
+idempotency and exact retry semantics.
+
+A configured-model change sends exactly one guarded
+`PATCH /sessions/{id}/conversation/settings`; a same-selector
+qualification-only refresh pins a newly qualified mapping with zero PATCHes.
+That PATCH requires a live idle controller (`controller: ready`), while
+binding or replacing the pinned Claude executable requires a stopped owner,
+and a routing refresh with `--agent-selection qualified` requires the stopped
+native controller. Those are separate operations with their own standalone
+audited CLIs (`ao_executable_binding.py`, `ao_routing_refresh.py`), not an
+atomic stop/patch/restart, and none of them sends a prompt or authorizes a new
+request. Before a qualified family dispatch, register the bound engineer's
+prospective native outcome source with `ao_room_engineer_source_register`
+(engineer-only, a mutation, authenticated owner database and exact transcript,
+never a caller-supplied workspace); a conflicting registered source is never
+replaced. See
+[configured engineering model selection and transition](../../../docs/engineering-model-transition.md)
+for the qualification artifact, eligibility, the write-ahead/reconciliation
+contract, abandonment, the conditional PATCH and the full operator sequence.
 
 ## Recovery of a reviewer that has never been used
 
@@ -288,15 +338,25 @@ repository must already ignore: `.claude/settings.local.json`,
 `git check-ignore` and a tracked-file check for each path first, refuses
 tracked, unignored, symlinked or conflicting files before writing either agent
 file, never edits `.gitignore` or shared Git exclusions, and preserves unrelated
-keys of an existing local settings file. The definitions pin `pr-sonnet`
-(`claude-sonnet-5`, effort max, bounded implementation and tests from complete requirements, no skills)
-and `pr-opus` (`claude-opus-5`, effort max, bounded judgment/review plus the
-pinned browser skill when the AO browser capability is present); both refuse
+keys of an existing local settings file. The definitions pin each worker's model and effort at `max`: a source-qualified
+preparation pins the qualified exact expected model for `pr-sonnet` (bounded
+implementation and tests from complete requirements, no skills) and `pr-opus`
+(bounded judgment/review plus the pinned browser skill when the AO browser
+capability is present), with the worker family intent and the configured `max`
+recorded separately, while retained preparations that recorded the historical
+exact pins keep validating against their own map. Workers have their own
+qualification and executable compatibility: the root's artifact or observed
+version never qualifies them. The controller does not treat configured family
+intent, qualification or `max` as observed execution: bounded authenticated
+nonsynthetic native stop-row evidence may establish an observed served child
+model identity and is compared against the frozen exact role expectation, while
+effective effort, provider availability and entitlement remain unobserved and
+missing or ambiguous evidence stays insufficient. Both refuse
 further delegation, workflows and messaging, and both disallow the inherited
 MCP submission routes (the `mcp__deepseek`, `mcp__qwen-local` and
 `mcp__project-room` servers, plus the DeepSeek submit and ask tools by name) so
-a native worker cannot submit delegate or room work while the root Fable
-engineer keeps its pinned provider access. Their frontmatter scalars are quoted
+a native worker cannot submit delegate or room work while the root engineering
+orchestrator keeps its pinned provider access. Their frontmatter scalars are quoted
 so Claude's own YAML loader reads them. The local settings carry
 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`, `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2`,
 `CLAUDE_CODE_DISABLE_WORKFLOWS=1`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1`,
@@ -308,7 +368,7 @@ nested dispatch (an event carrying `agent_id` or `agent_type`), workflows,
 teams, `SendMessage` continuation routes, every skill except the pinned
 browser skill inside an event whose `agent_type` is exactly `pr-opus`, and any
 `mcp__deepseek__*`, `mcp__qwen-local__*` or `mcp__project-room__*` call made
-inside a native worker. New routing preparations use version 2 and match every tool (`.*`). The root engineer may inspect with Read/Grep/Glob, plan, use the explicitly listed DeepSeek tools and launch the pinned workers. Shell commands, edits, tests, browser tools, controller calls and unknown execution routes are denied at the root. Only a nonempty subagent-only `agent_id` together with a pinned `agent_type` retains execution tools; type alone can also describe a main session started with `--agent` and is refused as ambiguous. It never
+inside a native worker. New routing preparations use version 3, source-qualified to exact enabled worker models with their family intents and configured `max` effort, and match every tool (`.*`); retained version 1 and version 2 preparations keep their own historical readers and bytes. The root engineer may inspect with Read/Grep/Glob, plan, use the explicitly listed DeepSeek tools and launch the pinned workers. Shell commands, edits, tests, browser tools, controller calls and unknown execution routes are denied at the root. Only a nonempty subagent-only `agent_id` together with a pinned `agent_type` retains execution tools; type alone can also describe a main session started with `--agent` and is refused as ambiguous. It never
 grants a permission; a guard error, a missing interpreter or a missing script
 exits 2, so the call is blocked.
 
@@ -545,7 +605,7 @@ missing ledger block continuation, verification and acceptance. Only the user's 
 supported terminal action can resolve uncertain DeepSeek delivery; neither agent may
 self-resolve or replay it.
 
-A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. New preparations configure the native automatic-compaction window. Claude owns the actual compaction; the adapter never sends a compaction prompt or replays a turn to trigger it.
+A completed retained engineer session receives only the caller's new instruction on routine continuation. Delivered workflow metadata is tied to the immutable observed receipt; corrupt or unclassifiable evidence refuses without automatic re-sending. Controller reconstruction and known-completed quota stops do not trigger re-anchoring. A current effective undelivered committed root boundary is disclosed on the next separately authorized normal engineer request, including a read-only specification review, with its committed authority digest; a current effective undelivered worker/routing boundary waits for delegation-capable implementation or correction work. Superseded intermediate boundaries and previously authenticated deliveries are not replayed. Deliveries are authenticated against the owning request's verified receipt; pending or abandoned evidence is no notice, and uncertain delivery never authorizes a resend. Ordinary continuations then carry only actual new user content, with no full-specification replay. Worker identity evidence is stored in the semantic outcome record: a new delegation-capable request frozen with a qualified worker expectation is observed against that exact expectation, while a genuinely absent legacy field keeps its original record and reports unknown identity rather than a fabricated one. New delegates still need suitable complete inputs. Shorter packets do not remove earlier native history or demonstrate net quota savings. New preparations configure the native automatic-compaction window. Claude owns the actual compaction; the adapter never sends a compaction prompt or replays a turn to trigger it.
 Manual Claude compaction and a controlled native stop/resume are validated only
 as described under readiness above; automatic compaction thresholds and crash
 recovery still require their own live validation. Do not claim a smaller context

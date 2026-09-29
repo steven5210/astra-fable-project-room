@@ -248,10 +248,20 @@ def compaction_failure(events, request, session_id, workspace, outcome):
 
 
 def events_outcome(events, request, session_id, workspace=None):
+    """Owned native outcome. An exact request keeps exact model equality and its historical result shape.
+
+    A family engineer request (its frozen engineering_resolution names a family) accepts only exact
+    identifiers of that family on its non-synthetic stop rows, equal to its frozen expectation when
+    one exists, never more than one distinct model, and records them as observed_models.
+    """
     from ao_project_room import digest
+    from ao_engineering_model import _family_of, model_matches, qualification_of
     if (not isinstance(events, list) or any(not isinstance(x, dict) for x in events)
             or digest(request['text'].encode()) != request['text_sha256']):
         raise RoomError('Malformed native evidence or changed caller bytes')
+    family = None if workspace is not None else _family_of(request)
+    qualified = None if family is None else qualification_of(request)
+    observed, stop_rows = set(), []
     rows = sorted((x for x in events if x.get('sessionId') == session_id and not x.get('isSidechain')
                    and x.get('type') in ('user', 'assistant') and x.get('timestamp')),
                   key=lambda x: timestamp(x['timestamp']))
@@ -295,15 +305,39 @@ def events_outcome(events, request, session_id, workspace=None):
             status = row.get('apiErrorStatus', nested.get('status'))
             errors.append({'uuid': row['uuid'], 'error': row.get('error'), 'http_status': status})
         elif message.get('model') != '<synthetic>' and message.get('stop_reason'):
-            if message.get('model') != request['model']:
-                raise RoomError('Native response model contradicts the owned request')
+            if family is None:
+                if message.get('model') != request['model']:
+                    raise RoomError('Native response model contradicts the owned request')
+            else:
+                # Every attributable non-synthetic root stop row is collected before any mismatch is
+                # evaluated, so a qualified expectation retains the exact observed identities.
+                observed.add(message.get('model'))
+                stop_rows.append({'uuid': row['uuid'], 'model': message.get('model'),
+                                  'stop_reason': message['stop_reason']})
+                if qualified is None and (not model_matches(request, message.get('model')) or len(observed) > 1):
+                    raise RoomError('Native response model contradicts the owned family request')
             stops[message.get('id')] = message['stop_reason']
             if message['stop_reason'] == 'end_turn':
                 settled_errors.extend(errors)
                 errors = []
                 stops = {message.get('id'): 'end_turn'}
-    return {'anchor_uuid': anchor['uuid'], 'next_human_uuid': following[0]['uuid'] if following else None,
-            'errors': errors, 'settled_errors': settled_errors, 'stop_reasons': list(stops.values())}
+    result = {'anchor_uuid': anchor['uuid'], 'next_human_uuid': following[0]['uuid'] if following else None,
+              'errors': errors, 'settled_errors': settled_errors, 'stop_reasons': list(stops.values())}
+    if family is not None:  # Exact requests keep their historical result shape and digests.
+        result['observed_models'] = sorted(observed)
+    if qualified is not None:
+        expected, qualification_sha256 = qualified
+        result['expected_model'] = expected
+        result['qualification_sha256'] = qualification_sha256
+        result['stop_row_ids'] = sorted(row['uuid'] for row in stop_rows)
+        if sorted(observed) and sorted(observed) != [expected]:
+            # A qualified family must observe exactly its pre-inference expected model. The
+            # contradiction retains every attributable actual identity; it never falls back, and a
+            # missing observation is handled by the outcome classifier as an unknown hold.
+            result['model_contradiction'] = {'expected_model': expected, 'observed_models': sorted(observed),
+                                             'stop_row_ids': sorted(row['uuid'] for row in stop_rows),
+                                             'qualification_sha256': qualification_sha256}
+    return result
 
 
 
@@ -465,7 +499,9 @@ def validate_source(state, source, role='engineer'):
     except (ValueError, OSError) as exc:
         raise RoomError('Cannot establish the retained native outcome owner') from exc
     if (owner['project_id'] != state['ao_project_id']
-            or owner['provider_conversation_id'] != source['native_session_id']):
+            or owner['provider_conversation_id'] != source['native_session_id']
+            or owner['ao_conversation_id'] != binding.get('conversation_id')
+            or owner['active_branch_id'] != binding.get('branch_id')):
         raise RoomError('Native outcome owner changed')
     if role == 'reviewer':
         if (state.get('workflow') != 'astra_led' or state.get('spec_review_extension')
@@ -484,6 +520,146 @@ def validate_source(state, source, role='engineer'):
     return owner
 
 
+def preflight_source(directory, state, database, transcript, role='engineer', workspace=None):
+    """Pre-dispatch ownership preflight and source registration; no response or native event is required.
+
+    Validates the bound session's exact retained owner through the existing read-only identity API
+    and the prospective transcript path this session will write, before any inference exists. The
+    ordinary source schema is preserved and a conflicting registered source is never replaced.
+    Returns bounded audit evidence; the caller saves the state that now registers the binding.
+    """
+    from ao_native_identity import read_owner
+    if role not in ('engineer', 'reviewer'):
+        raise RoomError('Native outcome source requires an exact engineer or reviewer role')
+    if not isinstance(database, str) or not database:
+        raise RoomError('Pre-dispatch ownership requires the explicit verified AO owner database path')
+    if not isinstance(transcript, str) or not transcript:
+        raise RoomError('Pre-dispatch ownership requires the prospective native transcript path')
+    key, _ = source_keys(role)
+    binding = (state.get('bindings') or {}).get(role) or {}
+    if not binding or binding.get('harness') != 'claude-code':
+        raise RoomError('Pre-dispatch ownership requires the bound Claude ' + role)
+    if not isinstance(binding.get('session_id'), str) or not binding['session_id'].strip():
+        raise RoomError('Pre-dispatch ownership requires the bound AO session identity')
+    if any(not isinstance(binding.get(field), str) or not binding[field].strip()
+           for field in ('conversation_id', 'branch_id')):
+        raise RoomError('Pre-dispatch ownership requires the bound AO conversation and branch')
+    try:
+        owner = read_owner(database, binding['session_id'])
+    except (ValueError, OSError) as exc:
+        raise RoomError('Cannot establish the prospective native outcome owner') from exc
+    if owner['project_id'] != state.get('ao_project_id'):
+        raise RoomError('Prospective native owner belongs to another AO project')
+    if owner['ao_conversation_id'] != binding['conversation_id'] or owner['active_branch_id'] != binding['branch_id']:
+        raise RoomError('Prospective native owner contradicts the bound conversation or branch')
+    path = Path(transcript)
+    if not path.is_absolute():
+        raise RoomError('Use the exact absolute prospective native transcript path')
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise RoomError('Use the exact owned native transcript path without symlinks')
+    if path.name != owner['provider_conversation_id'] + '.jsonl':
+        raise RoomError('Prospective transcript name must be the retained provider conversation identity')
+    try:
+        parent = path.parent.lstat()
+    except OSError as exc:
+        raise RoomError('Prospective native transcript directory is unavailable') from exc
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid():
+        raise RoomError('Prospective native transcript directory is unsafe')
+    if path.exists():
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
+                or info.st_size > 64_000_000):
+            raise RoomError('Prospective native transcript file is unsafe')
+    if role == 'engineer' and workspace is None:
+        from ao_delegates import validate_preparation
+        workspace = validate_preparation(directory, state, binding['session_id'], check_routing=False)['worktree']
+    if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+        raise RoomError('Pre-dispatch ownership requires the exact bound workspace')
+    if owner['workspace_path'] != workspace:
+        raise RoomError('Prospective native owner workspace contradicts its exact bound preparation')
+    source = {'database': database, 'transcript': transcript, 'session_id': binding['session_id'],
+              'native_session_id': owner['provider_conversation_id']}
+    if role == 'reviewer':
+        source['workspace_path'] = workspace
+    previous, registered = state.get(key), 'identical'
+    if previous is None:
+        registered = 'created'
+    elif previous != source:
+        raise RoomError('A conflicting native outcome source is already registered; it is never replaced')
+    try:
+        validate_source(state, source, role)
+    except RoomError as exc:
+        raise RoomError('Prospective native outcome source cannot be validated: ' + str(exc)) from exc
+    if previous is None:
+        state[key] = source
+    return {'version': 1, 'role': role, 'source': source, 'native_owner': owner,
+            'transcript_present': path.exists(), 'registered': registered,
+            'basis': 'Read-only ownership preflight before dispatch; the native process environment, the actual '
+                     'provider and effective effort remain unobserved'}
+
+
+def validate_registered_source(directory, state, role='engineer'):
+    """Full read-only verification of one already-registered prospective source before dispatch.
+
+    Uses the existing owner database reader, the bound session and the prepared workspace the turn
+    is about to run in. The prospective transcript may not exist yet; when it does, it must be the
+    exact owned non-symlink file for the retained provider conversation. This never calls a model
+    and never requires a completed response; the first sync still requires the actual complete
+    identity proof.
+    """
+    from ao_native_identity import read_owner
+    if role not in ('engineer', 'reviewer'):
+        raise RoomError('Native outcome source requires an exact engineer or reviewer role')
+    key, _ = source_keys(role)
+    expected = {'database', 'transcript', 'session_id', 'native_session_id'}
+    if role == 'reviewer':
+        expected.add('workspace_path')
+    source = state.get(key)
+    binding = (state.get('bindings') or {}).get(role) or {}
+    if (not isinstance(source, dict) or set(source) != expected or binding.get('harness') != 'claude-code'
+            or source.get('session_id') != binding.get('session_id')):
+        raise RoomError('Native outcome source is not the bound Claude ' + role)
+    try:
+        owner = read_owner(source['database'], binding['session_id'])
+    except (ValueError, OSError) as exc:
+        raise RoomError('Cannot establish the retained native outcome owner') from exc
+    if owner['project_id'] != state.get('ao_project_id'):
+        raise RoomError('Prospective native owner belongs to another AO project')
+    if (owner['ao_conversation_id'] != binding.get('conversation_id')
+            or owner['active_branch_id'] != binding.get('branch_id')
+            or owner['provider_conversation_id'] != source['native_session_id']):
+        raise RoomError('Prospective native owner contradicts the bound conversation, branch or provider identity')
+    path = Path(source['transcript'])
+    if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)):
+        raise RoomError('Use the exact owned native transcript path without symlinks')
+    if path.name != owner['provider_conversation_id'] + '.jsonl':
+        raise RoomError('Prospective transcript name must be the retained provider conversation identity')
+    try:
+        parent = path.parent.lstat()
+    except OSError as exc:
+        raise RoomError('Prospective native transcript directory is unavailable') from exc
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid():
+        raise RoomError('Prospective native transcript directory is unsafe')
+    if path.exists():
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
+                or info.st_size > 64_000_000):
+            raise RoomError('Prospective native transcript file is unsafe')
+    if role == 'engineer':
+        from ao_delegates import validate_preparation
+        workspace = validate_preparation(directory, state, binding['session_id'], check_routing=False)['worktree']
+    else:
+        workspace = source.get('workspace_path')
+        if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+            raise RoomError('Native reviewer source requires its exact owner workspace')
+    if owner['workspace_path'] != workspace:
+        raise RoomError('Prospective native owner workspace contradicts its exact bound preparation')
+    return {'version': 1, 'role': role, 'source': dict(source), 'native_owner': owner,
+            'transcript_present': path.exists(),
+            'basis': 'Read-only ownership verification before dispatch; the native process environment, the actual '
+                     'provider and effective effort remain unobserved'}
+
+
 def inspect(directory, state, request, source, snapshot):
     from ao_project_room import digest
     role = request.get('role', 'engineer')
@@ -500,6 +676,11 @@ def inspect(directory, state, request, source, snapshot):
             raise RoomError('Native reviewer request/model/history contradicts its exact binding')
         workspace = source['workspace_path']
     else:
+        # A family request's frozen expectation is trusted only as its recorded engineering epoch requires.
+        # Exact requests keep their unchanged exact-equality inspection.
+        import ao_engineering_model
+        if ao_engineering_model._family_of(request) is not None:
+            ao_engineering_model.check_frozen(directory, state, request)
         # Engineer workspace retains its original immutable preparation proof.
         from ao_delegates import validate_preparation
         prepared = validate_preparation(directory, state, request['session_id'], check_routing=False)
@@ -522,6 +703,14 @@ def inspect(directory, state, request, source, snapshot):
     if (len(raw) != before.st_size or (before.st_ino, before.st_size, before.st_mtime_ns)
             != (after.st_ino, after.st_size, after.st_mtime_ns)):
         raise RoomError('Native transcript changed while being observed')
+    try:
+        named = path.lstat()
+    except OSError as exc:
+        raise RoomError('Native transcript changed while being observed') from exc
+    if ((named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or not stat.S_ISREG(named.st_mode)):
+        raise RoomError('Native transcript changed while being observed')
     events = [json.loads(line) for line in raw.splitlines() if line.strip()]
     result = events_outcome(events, request, source['native_session_id'],
                             workspace=workspace if role == 'reviewer' else None)
@@ -531,6 +720,13 @@ def inspect(directory, state, request, source, snapshot):
             result = {**result, 'compaction_failure': proof}
     result = {**result, 'source': source, 'source_sha256': digest(raw),
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
+    if result.get('model_contradiction') is not None:
+        # The existing unknown/hold path applies, with the observed identities, the expected
+        # qualification digest and the exact source digest retained.
+        result = {**result, 'model_contradiction': {**result['model_contradiction'],
+                                                   'source_sha256': result['source_sha256']},
+                  'unknown': 'Native response model contradicts the qualified expected model for this '
+                                        'family; the observed identities and their source evidence are retained'}
     if (role == 'engineer' and state.get('workflow') == 'fable_engineering'
             and snapshot.get('sessionId') == source['session_id'] == request['session_id']):
         notifications = task_notification_imports(events, source['native_session_id'], snapshot, workspace)

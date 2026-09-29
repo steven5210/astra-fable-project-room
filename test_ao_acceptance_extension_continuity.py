@@ -342,6 +342,53 @@ class NativeOwnerContinuityTests(NativeOwnerContinuityFixture):
             'supplied native session', 'reviewer', expected_state=None)
         self.assertTrue(self.audit('fourth')['eligible'])
 
+    def test_disallowed_owner_change_writes_nothing_and_exact_restoration_continues(self):
+        """A disallowed native owner change is refused by the ownership preflight before any
+        outcome, grant or dispatch write; exact restoration then continues the original path."""
+        self.consumed_fourth()
+        before_state = copy.deepcopy(self.state())
+        before_files = self.room_files()
+        before_lane = self.lane_snapshot()
+        posts = len(self.fake.posts)
+        cases = (
+            ('engineer', 'synthetic-replacement-engineer', 'synthetic-replacement-engineer',
+             'synthetic-native-reviewer'),
+            ('reviewer', 'synthetic-replacement-reviewer', 'synthetic-native-engineer',
+             'synthetic-replacement-reviewer'),
+        )
+        for role, replacement, engineer_id, reviewer_id in cases:
+            with self.subTest(role=role):
+                self.replace(role, replacement, 'new-generation')
+                try:
+                    with self.assertRaisesRegex(ao.RoomError,
+                                                'cannot redefine the retained native ' + role):
+                        self.audit_with(engineer_id, reviewer_id, 'fifth')
+                finally:
+                    self.restore(role)
+                self.assertEqual(len(self.fake.posts), posts)
+                self.assertEqual(self.room_files(), before_files)
+                self.assertEqual(self.lane_snapshot(), before_lane)
+                self.assertEqual(self.state(), before_state)
+                self.assertEqual(extension.summary(self.service, self.state())['state'], 'consumed')
+        inputs, grant = self.grant('fifth')
+        self.assertTrue(grant['extended'])
+        posts = len(self.fake.posts)
+        self.send('acceptance_review', 'fifth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.finish_review('fifth', 'approved')
+        self.assertTrue(self.service.ao_room_accept(self.room, 'fifth')['accepted'])
+
+    def test_unrecognized_activity_state_never_qualifies_the_worker_proof(self):
+        """Only idle and exited are positively stopped; a changed or unrecognized activity
+        state must remain unqualified even with exact ownership and terminal evidence."""
+        self.consumed_fourth()
+        self.sql('UPDATE sessions SET activity_state=? WHERE id=?', ('paused', 'engineer'))
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'qualified native worker identity is not established'):
+            self.audit('fifth')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(extension.summary(self.service, self.state())['state'], 'consumed')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

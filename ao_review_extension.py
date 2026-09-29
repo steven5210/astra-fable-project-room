@@ -370,11 +370,16 @@ def _inspect(service, directory, state, target, reconcile=False):
     if not reconcile and _pending(directory):
         raise RoomError('An uncommitted review-extension receipt exists; reconcile only its identical request')
     reviews = _reviews(state)
+    import ao_engineering_model
     engineer = state['bindings'].get('engineer')
-    if (len(reviews) != LIMIT or not engineer or engineer.get('harness') != 'claude-code'
-            or engineer.get('model') != ao_workflow.FABLE_MODEL or engineer.get('reasoning_effort') != 'max'
+    # Pinned evidence keeps the immutable stored binding; eligibility reads the epoch in force.
+    effective = ao_engineering_model.effective_binding(directory, state) if engineer else None
+    if (len(reviews) != LIMIT or not effective or effective.get('harness') != 'claude-code'
+            or effective.get('model') != ao_engineering_model.current(directory, state)['model']
+            or effective.get('reasoning_effort') != 'max'
             or any(r.get('role') != 'engineer' or r['session_id'] != engineer['session_id'] for r in reviews)):
-        raise RoomError('The one extension requires exactly three retained Fable review intents at MAX')
+        raise RoomError('The one extension requires exactly three retained review intents from the existing normal '
+                        'engineering orchestrator at its configured model and MAX')
     spec = service.spec(directory, state)
     prior_revision = max(ao_workflow.spec_record_file(directory, r['spec_record_sha256'])['revision'] for r in reviews)
     if (spec['revision'] != target['spec_revision'] or spec['sha256'] != target['spec_sha256']
@@ -631,11 +636,13 @@ def validate(service, state, allow_pending=False):
         claims = [r for r in state['requests'].values() if (r.get('carried') or {}).get('spec_review_extension_sha256')]
         if len(reviews) == LIMIT + 1:
             last = reviews[-1]
+            import ao_engineering_model
+            frozen = ao_engineering_model.binding_for_request(directory, state, evidence['state']['bindings']['engineer'], last)
             if (consumed is None or consumed['request_id'] != last['request_id']
                     or claims != [last] or last['spec_record_sha256'] != evidence['spec_record_sha256']
                     or last['role'] != 'engineer' or last['session_id'] != evidence['state']['bindings']['engineer']['session_id']
                     or last['carried']['spec_review_extension_sha256'] != reference['receipt_sha256']
-                    or any(last.get(k) != v for k, v in evidence['state']['bindings']['engineer'].items())):
+                    or any(last.get(k) != v for k, v in frozen.items())):
                 raise RoomError('The fourth review intent has no exact matching one-time grant')
         elif claims or consumed:
             raise RoomError('A review-extension claim was relabeled or removed from review accounting')
@@ -666,11 +673,12 @@ def consume(service, directory, state, request):
         raise RoomError('An unused exact one-time review grant is required before consuming its fourth intent')
     _, evidence = committed
     reference = state['spec_review_extension']
+    import ao_engineering_model
     if (request['request_id'] in state['requests'] or request.get('purpose') != 'spec_review'
             or request.get('role') != 'engineer' or request.get('state') != 'uncertain'
             or request.get('spec_record_sha256') != evidence['spec_record_sha256']
             or (request.get('carried') or {}).get('spec_review_extension_sha256') != reference['receipt_sha256']
-            or any(request.get(k) != v for k, v in state['bindings']['engineer'].items())):
+            or any(request.get(k) != v for k, v in ao_engineering_model.effective_binding(directory, state).items())):
         raise RoomError('Only the exact new fourth charter-review intent may consume this grant')
     record = {'version': 1, 'room_id': state['room_id'], 'grant_receipt_sha256': reference['receipt_sha256'],
               'request': copy.deepcopy(request)}

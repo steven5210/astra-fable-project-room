@@ -119,6 +119,32 @@ class OutcomeWorkflowTests(Fixture):
         self.fake.snapshots['engineer']['turns'][-1].update(turn)
         return self.service.ao_room_sync(self.room)
 
+    def set_native_stop(self, stop_reason):
+        """Rewrite this fixture's exact synthetic implementation reply native stop reason.
+
+        The shared fixture writes one positive ``end_turn`` nested under this request's reply row.
+        A fixture that needs genuinely unknown initial evidence removes that positive native value
+        rather than weakening the production classifier; positive evidence is then introduced
+        deliberately. Rows saved for earlier requests and every other field are preserved.
+        """
+        rows = [json.loads(line) for line in self.transcript.read_text().splitlines() if line.strip()]
+        target_uuid = 'implementation-reply'
+        targets = [row for row in rows if row.get('uuid') == target_uuid]
+        self.assertEqual(len(targets), 1, 'one exact synthetic implementation reply row')
+        target = targets[0]
+        message = target.get('message')
+        self.assertIsInstance(message, dict)
+        self.assertEqual((target.get('type'), message.get('role')), ('assistant', 'assistant'))
+        prior = [copy.deepcopy(row) for row in rows if row is not target]
+        if stop_reason is None:
+            message.pop('stop_reason', None)
+        else:
+            message['stop_reason'] = stop_reason
+        self.transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.native_events = rows
+        saved = [json.loads(line) for line in self.transcript.read_text().splitlines() if line.strip()]
+        self.assertEqual([row for row in saved if row.get('uuid') != target_uuid], prior)
+
     def test_unknown_completion_does_not_send_another_request_or_accept(self):
         self.failed()
         before = len(self.fake.posts)
@@ -195,8 +221,6 @@ class OutcomeWorkflowTests(Fixture):
     def test_failed_ao_turn_needs_exact_native_quota_and_authorized_settlement(self):
         self.send('implementation'); self.fake.finish('engineer', state='failed')
         self.service.ao_room_sync(self.room)
-        state = self.state(); state['native_outcome_source'] = {'session_id': 'engineer'}
-        ao.atomic(self.directory() / 'state.json', state)
         observed = {'anchor_uuid': 'owned-native-packet', 'next_human_uuid': None,
                     'errors': [{'uuid': 'native-quota', 'error': 'rate_limit', 'http_status': 429}],
                     'stop_reasons': [], 'source_sha256': 'f' * 64}
@@ -247,9 +271,18 @@ class OutcomeWorkflowTests(Fixture):
         self.assertEqual(len(self.fake.posts), before)
 
     def test_unknown_requires_explicit_audit_to_clear_with_positive_evidence(self):
-        self.failed('Unformatted but complete answer', stopReason=None)
+        # Genuinely unknown initial evidence on both sides: the AO turn reports no terminal stop and
+        # this request's synthetic native parent row carries no positive native stop either. The
+        # shared fixture's default end_turn row is removed here instead of weakening a classifier.
+        self.send('implementation')
+        self.fake.finish('engineer', 'Unformatted but complete answer')
+        self.fake.snapshots['engineer']['turns'][-1]['stopReason'] = None
+        self.set_native_stop(None)
+        self.service.ao_room_sync(self.room)
         self.assertEqual(self.state()['requests']['implementation']['semantic_status']['kind'], 'unknown')
+        # Positive evidence is introduced deliberately; the ordinary sync stays sticky.
         self.fake.snapshots['engineer']['turns'][-1]['stopReason'] = 'end_turn'
+        self.set_native_stop('end_turn')
         self.service.ao_room_sync(self.room)
         self.assertEqual(self.state()['requests']['implementation']['semantic_status']['kind'], 'unknown')
         self.assertEqual(self.service.ao_room_outcome_audit(self.room)['outcome']['kind'], 'final_available')

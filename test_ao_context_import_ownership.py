@@ -16,23 +16,25 @@ import ao_project_room as ao
 import ao_provider_transition as transition
 import ao_workflow
 from test_ao_adoption import AdoptionFixture
-from test_ao_task_notification_imports import (NATIVE_SESSION, envelope, imported, notification,
-                                               source_fixture, write_events, audit)
+from test_ao_task_notification_imports import (envelope, imported, notification, audit)
 
 
 class ContextOwnershipTests(unittest.TestCase):
     def collision(self, kind):
+        from datetime import datetime, timezone
         case = AdoptionFixture('runTest'); self.addCleanup(case.doCleanups); case.setUp()
         case.configure_routing()
+        case.qualify_worker_routing()
         snapshot = case.fake.snapshots['engineer']; snapshot['controller'] = 'ready'
         ao.atomic(case.directory() / 'delegate-launch.json', {
             'session_id': 'engineer', 'worktree': str(case.repo),
             'preparation_sha256': case.state()['preparation_sha256']})
         text = envelope() if kind == 'notification' else 'Synthetic exact retained context.'
-        row = notification(str(case.repo)) if kind == 'notification' else {
-            'type': 'user', 'sessionId': NATIVE_SESSION, 'cwd': str(case.repo), 'uuid': 'synthetic-summary',
+        row = notification(case.native_row_workspace()) if kind == 'notification' else {
+            'type': 'user', 'sessionId': case.NATIVE, 'cwd': case.native_row_workspace(), 'uuid': 'synthetic-summary',
             'isSidechain': False, 'isCompactSummary': True, 'isVisibleInTranscriptOnly': True,
             'message': {'content': text}}
+        row['sessionId'] = case.NATIVE
         identity = row['uuid']; branch = snapshot['activeBranchId']
         provider_id = ('acp-history-turn:' + str(len(branch.encode())) + ':' + branch
                        + str(len(identity.encode())) + ':' + identity)
@@ -45,6 +47,7 @@ class ContextOwnershipTests(unittest.TestCase):
             case.fake.finish('engineer', response)
             case.service.ao_room_sync(case.room)
             case.service.ao_room_send(case.room, 'engineer', text, 'prior-owned', purpose='correction')
+            case.note_native_turn('prior-owned')
             snapshot['turns'][-1]['providerTurnId'] = provider_id
             case.fake.finish('engineer', response)
             case.service.ao_room_sync(case.room)
@@ -52,19 +55,20 @@ class ContextOwnershipTests(unittest.TestCase):
             self.assertEqual(case.prior['text'], text)
             self.assertEqual(case.prior['provider_turn_id'], provider_id)
             case.service.ao_room_send(case.room, 'engineer', 'Continue.', 'latest', purpose='correction')
+            case.note_native_turn('latest')
             case.fake.finish('engineer', response)
             case.service.ao_room_sync(case.room)
-        source_fixture(case)
-        case.source = {'session_id': 'engineer', 'native_session_id': NATIVE_SESSION,
-                       'database': str(case.database), 'transcript': str(case.transcript)}
-        snapshot = case.snapshot
+        case.request = outcomes.latest_for_role(case.state(), 'engineer')
+        case.snapshot = snapshot
+        case.source = case.native_outcome_source
         self.assertIn(case.prior['turn_id'], case.request['baseline']['turn_ids'])
         snapshot['turns'] = [turn for turn in snapshot['turns'] if turn['id'] != case.prior['turn_id']]
         snapshot['messages'] = [message for message in snapshot['messages'] if message['turnId'] != case.prior['turn_id']]
         turn, message = imported(snapshot, row)
         turn['id'] = case.prior['turn_id']; message['turnId'] = case.prior['turn_id']
-        row['timestamp'] = case.notifications[0]['timestamp']
-        write_events(case, [case.anchor, case.final, row])
+        row['timestamp'] = datetime.fromtimestamp(case.request['created_at'] + 1, timezone.utc).isoformat()
+        case.native_events.append(row)
+        case.transcript.write_text(''.join(json.dumps(event) + chr(10) for event in case.native_events))
         case.proof_field = 'task_notification_imports' if kind == 'notification' else 'compaction_imports'
         # Prove this exercises the gap after existing integrity checks, rather
         # than merely relying on a forged request or mismatched receipt/text.

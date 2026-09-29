@@ -162,9 +162,29 @@ def _request_identity(request):
             or any(not _nonempty(item) for item in baseline["turn_ids"])
             or len(set(baseline["turn_ids"])) != len(baseline["turn_ids"])):
         raise RoomError("Saved request baseline is invalid")
-    return {"request_sha256": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
-            "role": request["role"], **{name: request[name] for name in fields},
-            "baseline": {name: baseline[name] for name in ("conversation_id", "branch_id", "turn_ids")}}
+    identity = {"request_sha256": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+                "role": request["role"], **{name: request[name] for name in fields},
+                "baseline": {name: baseline[name] for name in ("conversation_id", "branch_id", "turn_ids")}}
+    expectation = _worker_expectation(request)
+    if expectation is not None:
+        # Conditional binding: a present frozen worker expectation is part of this request's own
+        # identity, so substitution into a saved request contradicts its receipt/projection digest.
+        # An absent key adds nothing, and an explicit null/empty/malformed value raised above.
+        identity["native_worker_expectations"] = expectation
+    return identity
+
+
+def _worker_expectation(request):
+    """The validated frozen worker expectation when the key exists, else None.
+
+    An absent key is the only historical absence and adds nothing to any identity. An explicit
+    null, empty or malformed value is an error here, exactly as at every other reader; it never
+    degrades into "no expectation" and never validates because a dictionary is empty.
+    """
+    if not isinstance(request, dict) or "native_worker_expectations" not in request:
+        return None
+    from ao_model_boundaries import validate_worker_expectation
+    return validate_worker_expectation(request["native_worker_expectations"])
 
 
 def projection_binding(request, projection):
@@ -414,7 +434,8 @@ def _receipt_identity(request, receipt):
     if reroute is not None:
         if not isinstance(reroute, dict):
             return False
-        if (reroute.get("toModel") != request["model"]
+        from ao_engineering_model import model_matches  # exact equality, or the frozen family rule
+        if (not model_matches(request, reroute.get("toModel"))
                 and (not reroute.get("providerTurnId") or reroute.get("providerTurnId") == provider_id)):
             return False
     return True

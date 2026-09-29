@@ -15,18 +15,13 @@ class ExecutableBindingTests(Fixture):
         super().setUp()
         self.old = self.root / 'old-claude'
         self.new = self.root / 'new-claude'
-        for path, version in ((self.old, 'old'), (self.new, 'new')):
+        for path, version in ((self.old, '2.1.282 old'), (self.new, '2.1.283 new')):
             path.write_text('#!/bin/sh\nprintf "' + version + ' (Claude Code)\\n"\n')
             path.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.old), 'claude_config_dir': str(self.claude_env)})
         self.room = self.open(); self.spec(); self.bind()
         self.prepared = ao_delegates.preparation(self.directory(), self.state())
         self.prep_bytes = (self.directory() / self.state()['preparation']).read_bytes()
-        engineer = self.state()['bindings']['engineer']
-        self.owner = {'id': 'engineer', 'project_id': 'project', 'workspace_path': str(self.repo),
-            'ao_conversation_id': engineer['conversation_id'], 'active_branch_id': engineer['branch_id'],
-            'provider_conversation_id': 'native-uuid', 'controller_generation': 'generation-1',
-            'activity_state': 'exited', 'strategy': 'native'}
         p = patch.object(binding, 'read_owner', side_effect=lambda *a: copy.deepcopy(self.owner)); p.start(); self.addCleanup(p.stop)
         self.fake.sessions['engineer']['isTerminated'] = False
         self.fake.snapshots['engineer'].update(controller='stopped', hasMoreBefore=False, activities=[],
@@ -118,7 +113,7 @@ class ExecutableBindingTests(Fixture):
         self.assertEqual(self.fake.posts, [])
 
     def test_healthy_original_and_unsafe_target_refused(self):
-        self.old.write_text('#!/bin/sh\nprintf "old (Claude Code)\\n"\n'); self.old.chmod(0o700)
+        self.old.write_text('#!/bin/sh\nprintf "2.1.282 old (Claude Code)\\n"\n'); self.old.chmod(0o700)
         original = self.prepared['routing']['claude']
         os.utime(self.old, ns=(original['mtime_ns'], original['mtime_ns']))  # reconstruct synthetic fixture
         with self.assertRaisesRegex(ao.RoomError, 'unchanged'):

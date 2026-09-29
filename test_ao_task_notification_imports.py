@@ -28,8 +28,8 @@ def envelope(task='task1', tool='toolu_Ab123', status='failed'):
             '<summary>Synthetic task failed.</summary>\n<note>Uninterpreted synthetic note.</note>\n</task-notification>')
 
 
-def notification(workspace, identity=NOTIFICATION_UUID, text=None):
-    return {'type': 'user', 'sessionId': NATIVE_SESSION, 'cwd': workspace, 'uuid': identity,
+def notification(workspace, identity=NOTIFICATION_UUID, text=None, session_id=NATIVE_SESSION):
+    return {'type': 'user', 'sessionId': session_id, 'cwd': workspace, 'uuid': identity,
             'isSidechain': False, 'origin': {'kind': 'task-notification'}, 'promptSource': 'sdk',
             'queueSkipAttachments': True, 'userType': 'external', 'entrypoint': 'sdk-ts', 'version': '2.1.268',
             'message': {'role': 'user', 'content': envelope() if text is None else text}}
@@ -164,43 +164,147 @@ class TaskNotificationProofTests(unittest.TestCase):
 
 
 def write_events(case, rows):
+    '''Rewrite only the deliberate target interval, preserving the retained source prefix.
+
+    ``case.rows`` stays the target rows the existing negative assertions inspect; the complete
+    retained bytes on disk and the inherited append buffer include the original prefix before the
+    selected caller, so a later note_native_turn cannot drop imports or resurrect a removed target
+    stop row.
+    '''
     case.rows = copy.deepcopy(rows)
-    case.transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    complete = [*copy.deepcopy(getattr(case, 'prefix', [])), *copy.deepcopy(rows)]
+    case.transcript.write_text(''.join(json.dumps(row) + '\n' for row in complete))
     case.transcript.chmod(0o600)
+    case.native_events = copy.deepcopy(complete)
 
 
-def source_fixture(case):
-    case.request = outcomes.latest_for_role(case.state(), 'engineer')
-    binding = case.state()['bindings']['engineer']
+def register_real_source(case):
+    '''Register one real SQL owner/database and prepared-config-root transcript.
+
+    This is the notification fixture's pre-charter registration: the owner reader is never mocked,
+    so the module's SQL source mutation negatives exercise the actual retained storage bytes.
+    '''
+    if getattr(case, 'native_outcome_source', None) is not None:
+        return case.native_outcome_source
+    state = case.state()
+    binding = (state.get('bindings') or {}).get('engineer')
+    if not binding:
+        return None
     case.database = case.root / 'synthetic-owner.db'
-    case.transcript = case.root / (NATIVE_SESSION + '.jsonl')
     with sqlite3.connect(case.database) as db:
         db.executescript('''CREATE TABLE sessions(id,project_id,harness,session_mode,is_terminated,
           activity_state,workspace_path,provider_conversation_id,controller_generation);
           CREATE TABLE conversations(id,current_session_id,active_branch_id);
           CREATE TABLE conversation_branches(id,conversation_id,provider_conversation_id,session_id,strategy,replay_truncated);''')
-        db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)', ('engineer', 'project', 'claude-code', 'chat', 0,
-                   'idle', str(case.repo), NATIVE_SESSION, 'generation-one'))
-        db.execute('INSERT INTO conversations VALUES(?,?,?)', (binding['conversation_id'], 'engineer', binding['branch_id']))
+        db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
+                   (binding['session_id'], state['ao_project_id'], 'claude-code', 'chat', 0, 'idle',
+                    case.native_row_workspace(), NATIVE_SESSION, 'generation-one'))
+        db.execute('INSERT INTO conversations VALUES(?,?,?)',
+                   (binding['conversation_id'], binding['session_id'], binding['branch_id']))
         db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
-                   (binding['branch_id'], binding['conversation_id'], NATIVE_SESSION, 'engineer', 'native', 0))
+                   (binding['branch_id'], binding['conversation_id'], NATIVE_SESSION,
+                    binding['session_id'], 'native', 0))
     case.database.chmod(0o600)
-    stamp = lambda seconds: datetime.fromtimestamp(case.request['created_at'] + seconds, timezone.utc).isoformat()
-    case.anchor = {'type': 'user', 'uuid': 'owned-caller', 'sessionId': NATIVE_SESSION, 'cwd': str(case.repo),
-                   'isSidechain': False, 'timestamp': stamp(1), 'origin': {'kind': 'human'},
-                   'message': {'role': 'user', 'content': case.request['text']}}
-    case.final = {'type': 'assistant', 'uuid': 'owned-final', 'sessionId': NATIVE_SESSION, 'cwd': str(case.repo),
-                  'isSidechain': False, 'timestamp': stamp(2),
-                  'message': {'role': 'assistant', 'model': case.request['model'], 'id': 'owned-answer', 'stop_reason': 'end_turn'}}
-    case.error = {**case.final, 'uuid': 'typed-quota', 'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+    config_root = case.native_config_root()
+    project_dir = config_root / 'projects' / str(case.repo).replace('/', '-')
+    project_dir.mkdir(parents=True, exist_ok=True)
+    case.transcript = project_dir / (NATIVE_SESSION + '.jsonl')
+    case.transcript.write_text('')
+    case.transcript.chmod(0o600)
+    case.native_events = []
+    case.native_requests = set()
+    source = {'database': str(case.database), 'transcript': str(case.transcript),
+              'session_id': binding['session_id'], 'native_session_id': NATIVE_SESSION}
+    native.preflight_source(case.directory(), state, source['database'], source['transcript'])
+    ao.atomic(case.directory() / 'state.json', state)
+    case.native_outcome_source = source
+    return source
+
+
+def latest_native_rows(case):
+    '''The latest engineer request's own caller and terminal rows from the inherited producer.
+
+    The inherited producer writes one ``<request_id>-caller`` row and one ``<request_id>-reply``
+    terminal row per saved request, with the exact bound native session, workspace and request
+    timestamps. Repeated charters can share caller-only text, so this selects by the request's own
+    producer row identity and interval instead of by global text uniqueness; earlier history is
+    retained rather than truncated, and the terminal must follow its own caller.
+    '''
+    request = outcomes.latest_for_role(case.state(), 'engineer')
+    if not isinstance(request, dict):
+        raise ao.RoomError('The registered native source has no latest engineer request')
+    rows = [json.loads(line) for line in case.transcript.read_text().splitlines() if line.strip()]
+    native_id = case.native_outcome_source['native_session_id']
+    start = request['created_at']
+    end = start + 60
+
+    def in_interval(row):
+        try:
+            stamp = native.timestamp(row.get('timestamp'))
+        except ao.RoomError:
+            return False
+        return start <= stamp <= end
+
+    callers = [row for row in rows
+               if row.get('uuid') == request['request_id'] + '-caller'
+               and row.get('sessionId') == native_id and row.get('type') == 'user'
+               and row.get('isSidechain') is False and row.get('origin') == {'kind': 'human'}
+               and isinstance(row.get('cwd'), str) and row['cwd']
+               and isinstance(row.get('message'), dict) and row['message'].get('role') == 'user'
+               and isinstance(row['message'].get('content'), str)
+               and ao.digest(row['message']['content'].encode()) == request['text_sha256']
+               and in_interval(row)]
+    if len(callers) != 1:
+        raise ao.RoomError('The registered native transcript lacks one exact caller row for the latest request')
+    anchor = copy.deepcopy(callers[0])
+    index = next(position for position, row in enumerate(rows) if row.get('uuid') == callers[0]['uuid'])
+    workspace = anchor['cwd']
+    finals = [row for row in rows[index + 1:]
+              if row.get('uuid') == request['request_id'] + '-reply'
+              and row.get('sessionId') == native_id and row.get('type') == 'assistant'
+              and row.get('isSidechain') is False and row.get('cwd') == workspace
+              and isinstance(row.get('message'), dict) and row['message'].get('role') == 'assistant'
+              and row['message'].get('stop_reason') == 'end_turn'
+              and in_interval(row)
+              and native.timestamp(row['timestamp']) >= native.timestamp(anchor['timestamp'])]
+    if len(finals) != 1:
+        raise ao.RoomError('The registered native transcript lacks the latest terminal assistant row')
+    return request, rows, anchor, copy.deepcopy(finals[0])
+
+
+def source_fixture(case):
+    '''Point the tests at the one already-registered native source and its actual latest interval.
+
+    No second owner, database or root-level transcript is created after the request completed. The
+    exact caller and terminal rows are the rows the inherited bounded producer already wrote for
+    this request; the original prefix before this caller is retained so write_events rewrites only
+    the deliberate target interval. The inherited append buffer is synchronized with the complete
+    retained source, and integration notification rows carry this source's own native identity.
+    '''
+    source = register_real_source(case) or case.native_outcome_source
+    if not isinstance(source, dict):
+        raise ao.RoomError('The notification fixture requires its registered native source')
+    case.request, rows, case.anchor, case.final = latest_native_rows(case)
+    index = next(position for position, row in enumerate(rows)
+                 if row.get('uuid') == case.anchor['uuid'])
+    case.prefix = copy.deepcopy(rows[:index])
+    case.native_events = copy.deepcopy(rows)
+    case.database = Path(source['database'])
+    case.transcript = Path(source['transcript'])
+    workspace = case.anchor['cwd']
+    native_id = source['native_session_id']
+    case.error = {**case.final, 'uuid': 'typed-quota', 'isApiErrorMessage': True, 'error': 'rate_limit',
+                  'apiErrorStatus': 429,
                   'message': {'role': 'assistant', 'model': '<synthetic>', 'content': 'Synthetic quota rejection.'}}
-    case.notifications = [notification(str(case.repo)), notification(str(case.repo), '00000000-0000-4000-8000-000000000abd')]
+    case.notifications = [notification(workspace, session_id=native_id),
+                          notification(workspace, '00000000-0000-4000-8000-000000000abd', session_id=native_id)]
+    now = datetime.now(timezone.utc).timestamp()
     for index, row in enumerate(case.notifications, 3):
-        row['timestamp'] = stamp(index)
+        row['timestamp'] = datetime.fromtimestamp(min(case.request['created_at'] + index, now),
+                                                  timezone.utc).isoformat()
     case.snapshot = case.fake.snapshots['engineer']
     case.snapshot.update(controller='ready', history_truncated=False,
                          branchMaterialization={'strategy': 'native', 'replayTruncated': False})
-    write_events(case, [case.anchor, case.final])
 
 
 def add_notifications(case, terminal=None):
@@ -215,6 +319,12 @@ def audit(case):
 
 
 class NotificationFixture(normal.Fixture):
+    NATIVE = NATIVE_SESSION
+
+    def register_native_source(self):
+        '''Register the real SQL owner before the first charter; never mask SQL mutations.'''
+        register_real_source(self)
+
     def setUp(self):
         super().setUp()
         self.room = self.open(); self.spec(); self.bind(); self.agree()
@@ -232,14 +342,28 @@ class NotificationOutcomeTests(unittest.TestCase):
         return case
 
     def test_supported_audit_explains_imports_without_compaction_completion_or_history_rewrite(self):
-        case = self.fixture(); add_notifications(case)
+        case = self.fixture()
+        # The exact complete parent transcript before the recovered notification rows exist: the same
+        # owned caller/final and earlier history, with honest current proof absent. It is real prior
+        # evidence for the first no-path audit, never a deleted modern receipt-bound field.
+        parent = case.transcript.read_bytes()
+        add_notifications(case)
+        proven = case.transcript.read_bytes()
+        self.assertNotEqual(parent, proven)
         before_state = (case.directory() / 'state.json').read_bytes()
         receipt_path = case.directory() / case.request['receipt']; receipt = receipt_path.read_bytes()
         history, posts = copy.deepcopy(case.snapshot), copy.deepcopy(case.fake.posts)
         raw = case.transcript.read_bytes(); candidate = ao.candidate_snapshot(case.repo)
-        with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'):
-            case.service.ao_room_outcome_audit(case.room)
-        self.assertEqual((case.directory() / 'state.json').read_bytes(), before_state)
+        try:
+            # Only the parent bytes are exposed for the first no-path audit; the AO snapshot already
+            # holds the two recovered imports, so the existing unverified-context refusal is real.
+            case.transcript.write_bytes(parent)
+            with self.assertRaisesRegex(ao.RoomError, 'unverified recovered context'):
+                case.service.ao_room_outcome_audit(case.room)
+            self.assertEqual((case.directory() / 'state.json').read_bytes(), before_state)
+        finally:
+            case.transcript.write_bytes(proven)
+        self.assertEqual(case.transcript.read_bytes(), raw)
         result = audit(case)
         self.assertEqual(len(result['native']['task_notification_imports']), 2)
         self.assertEqual(result['native']['compaction_imports'], [])

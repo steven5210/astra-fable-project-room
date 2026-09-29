@@ -85,6 +85,14 @@ def classify(receipt, native=None, require_structured=True):
                 'reason': 'Correlated native provider failure takes precedence over output/transport completion'}
     if native and native.get('unknown'):
         return {'kind': 'unknown', 'hold': True, 'reason': native['unknown']}
+    if (native and not native.get('unknown') and native.get('expected_model')
+            and isinstance(native.get('observed_models'), list) and not native['observed_models']):
+        # A qualified family dispatch establishes its identity before inference; a turn with no
+        # attributable native stop row is missing evidence and cannot become qualified success. A
+        # typed native failure above still keeps its exact settlement lane.
+        return {'kind': 'unknown', 'hold': True,
+                'reason': 'Qualified native identity was not observed on the owned turn; missing evidence is not '
+                          'qualified success'}
     if 'max_tokens' in stops:
         return {'kind': 'output_truncated', 'hold': True, 'reason': 'Native output was truncated; inspect partial work before continuation'}
     finals = [m for m in messages if m.get('role') == 'assistant' and not m.get('streaming') and m.get('text', '').strip()]
@@ -357,6 +365,15 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
              'ao_terminal': turns[0], 'session_failures': observed['sessionFailures'], 'provider_failures': activities,
              'native': native, 'outcome': classify(observed, native,
                 require_structured=state['workflow'] == 'fable_engineering' or request['role'] == 'reviewer')}
+    # W3: this request's own frozen worker expectation is a separate proof. The reviewed W2 consumer
+    # runs before any legacy absent-field path, a worker identity gap is recorded as its own
+    # structured evidence, and only qualified final availability is withheld: the parent native
+    # outcome, its provider/quota lanes, refusals, truncation and original digests are untouched.
+    from ao_worker_identity import gated_outcome, observe_workers
+    worker_evidence = observe_workers(directory, state, request, saved, native)
+    if worker_evidence is not None:
+        value['worker_observations'] = worker_evidence
+        value['outcome'] = gated_outcome(value['outcome'], worker_evidence)
     if proof_sha256:
         value['history_reconciliation_sha256'] = proof_sha256
     old = load(directory, request) if request.get('semantic_outcome') else None
@@ -430,8 +447,52 @@ def load(directory, request):
     return record
 
 
+def _worker_boundary_notice(request):
+    carried = request.get("carried") if isinstance(request, dict) else None
+    notices = carried.get("boundary_notices") if isinstance(carried, dict) else None
+    if not isinstance(notices, list):
+        return False
+    from ao_model_boundaries import WORKER_ROUTING
+    return any(isinstance(notice, dict) and notice.get("kind") == WORKER_ROUTING for notice in notices)
+
+
+def _requires_worker_proof(request, record):
+    """Whether final availability must rest on qualified W3 worker evidence.
+
+    A present frozen field always requires it. A retained worker observation is honored even when
+    the request field was deleted, so a newly created worker hold cannot be discarded merely by
+    deleting the field. A delegation-capable request that carries this room's committed worker
+    boundary notice is a routing-era request and also requires the proof. Genuine pre-routing
+    history has no field, no retained observation and no worker notice, so it keeps its old path.
+    """
+    if not isinstance(request, dict) or request.get("role") != "engineer":
+        return bool(isinstance(record, dict) and "worker_observations" in record)
+    delegating = request.get("purpose") in ("implementation", "correction")
+    if "native_worker_expectations" in request:
+        return True
+    if isinstance(record, dict) and "worker_observations" in record:
+        return True
+    return delegating and _worker_boundary_notice(request)
+
+
 def usable(directory, request):
     record = load(directory, request)
+    # W3: a present frozen worker expectation, or a request whose retained outcome already records
+    # a worker observation, is part of final availability even when the request field was deleted.
+    # A newly created worker hold cannot be accepted merely because that field is absent. Before any
+    # retained worker evidence is trusted, this request's own persisted receipt and its conditional
+    # projection binding are authenticated through the reviewed W2 receipt-only primitive, using the
+    # retained in-memory request directly: no room state is reloaded, no second native source scan
+    # runs, and the historical-epoch expectation read stays in the guarded observer. Deleting the
+    # frozen expectation or the prompt projection -- including both on a previously qualified record
+    # whose receipt is unchanged -- is a provenance failure, never usable history.
+    if _requires_worker_proof(request, record):
+        from ao_model_boundaries import _authenticated_request
+        _authenticated_request(directory, request)
+        evidence = (record or {}).get('worker_observations')
+        if not (isinstance(evidence, dict) and evidence.get('qualified')):
+            raise RoomError('Native semantic hold: qualified native worker identity is not established '
+                            'for this request; re-observe the owned result and inspect its retained worker evidence')
     value = record['outcome'] if record else classify(receipt(directory, request))
     if value['hold']:
         raise RoomError('Native semantic hold: ' + value['kind'] + '; ' + value['reason'])

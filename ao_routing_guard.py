@@ -111,6 +111,13 @@ SDK_CALLER_ENVELOPE_PREFIXES = ("<task-notification", "<system-reminder", "<loca
                                 "<command-name", "<command-message")
 QUOTA_HOOK_FIELDS = ("session_id", "transcript_path", "cwd")
 NEW_WORK_TOOLS = frozenset({"Agent", "mcp__deepseek__deepseek_submit", "mcp__deepseek__deepseek_ask"})
+# Inherited process-environment disagreements that would override, remap or contradict the pinned
+# worker launch. Only key names are ever reported, so no value (including a URL) reaches diagnostics.
+# This file is copied standalone: these are explicit bounded key checks, not a model catalog import.
+FORCED_SUBAGENT_ENV = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
+ALIAS_REMAP_ENV = ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL")
+GATEWAY_ENV = "ANTHROPIC_BASE_URL"
+PINNED_WORKER_ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2"}
 # Native model-specific windows (for example seven_day_opus) are deliberately
 # excluded: a per-model rate limit does not establish a shared account stop.
 ACCOUNT_QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
@@ -1649,6 +1656,32 @@ def _read_denial(event, params):
                   "decide file access")
 
 
+def _inherited_worker_conflict():
+    """A denial reason when the inherited environment contradicts a pinned worker launch, else None.
+
+    The guard never echoes values: only the offending key name is reported. Absent keys are left to
+    the prepared local settings; a present key that forces a model, remaps a family alias, changes
+    the routing destination or contradicts the pinned delegation limits means the launch cannot be
+    proven to match the preparation, so it is refused. Generated exact definitions are not a bypass
+    for an inherited force flag.
+    """
+    if os.environ.get(FORCED_SUBAGENT_ENV):
+        return (FORCED_SUBAGENT_ENV + " is set in the inherited environment and would force a subagent model over "
+                "the pinned worker definition")
+    remaps = [key for key in ALIAS_REMAP_ENV if os.environ.get(key)]
+    if remaps:
+        return (", ".join(remaps) + " remaps a worker family alias in the inherited environment; the pinned worker "
+                "route cannot be proven")
+    if os.environ.get(GATEWAY_ENV):
+        return (GATEWAY_ENV + " is set in the inherited environment, so the routing destination is an unverified "
+                "gateway and the pinned first-party worker qualification does not apply")
+    for key in sorted(PINNED_WORKER_ENV):
+        value = os.environ.get(key)
+        if value is not None and value != PINNED_WORKER_ENV[key]:
+            return key + " in the inherited environment contradicts the pinned native delegation limits"
+    return None
+
+
 def _identity(event, key):
     """None when the key is absent or null; otherwise the text value (an empty string still counts as present)."""
     if key not in event or event[key] is None:
@@ -1693,6 +1726,9 @@ def decide(event):
             return "native agents must finish in the foreground; run_in_background=true is refused"
         if "run_in_background" in params and params["run_in_background"] is not False:
             return "run_in_background must be omitted or exactly false for foreground native delegation"
+        conflict = _inherited_worker_conflict()
+        if conflict is not None:
+            return conflict
         if os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") != "1":
             return ("foreground native delegation requires inherited CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1; "
                     "the current native process has not proven that setting")

@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+from pathlib import Path
 import sqlite3
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
+import ao_native_identity
+import ao_native_outcome
 import ao_project_room as ao
 import ao_review_extension as extension
 import ao_workflow
@@ -21,6 +24,10 @@ from test_ao_adoption import AdoptionFixture
 
 
 class ReviewExtensionFixture(Fixture):
+    """Synthetic fourth-review room whose one native source is the synthetic AO database below."""
+
+    NATIVE = 'synthetic-native-owner'
+
     def setUp(self):
         super().setUp()
         self.configure_runtime()
@@ -44,24 +51,50 @@ class ReviewExtensionFixture(Fixture):
         self.implement()
         self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
-        self.make_database()
         self.target_spec = None
+
+    def register_native_source(self):
+        """One coherent synthetic owner, database and source, registered before any dispatch.
+
+        The inherited normal fixture registers a fabricated owner against ``owner.db`` and patches the
+        read-only reader. This fixture instead registers the actual synthetic AO database its audits
+        and guards tamper with, through the same supported preflight, and leaves the real read-only
+        reader in place so owner, branch, workspace and SQL negatives observe real bytes.
+        """
+        self.make_database()
+        binding = self.state()['bindings']['engineer']
+        config_root = self.native_config_root()
+        project_dir = config_root / 'projects' / str(self.repo).replace('/', '-')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript = project_dir / (self.NATIVE + '.jsonl')
+        self.transcript.write_text('')
+        self.native_events = []
+        self.native_requests = set()
+        source = {'database': str(self.database), 'transcript': str(self.transcript),
+                  'session_id': binding['session_id'], 'native_session_id': self.NATIVE}
+        state = self.state()
+        ao_native_outcome.preflight_source(self.directory(), state, source['database'], source['transcript'])
+        ao.atomic(self.directory() / 'state.json', state)
+        self.native_outcome_source = source
+        self.owner = ao_native_identity.read_owner(str(self.database), binding['session_id'])
 
     def make_database(self):
         self.database = self.root / 'synthetic-ao.db'
-        binding = self.state()['bindings']['engineer']
+        state = self.state()
+        binding = state['bindings']['engineer']
+        workspace = self.native_row_workspace()
         with sqlite3.connect(self.database) as db:
             db.executescript('''CREATE TABLE sessions(id,project_id,harness,session_mode,is_terminated,
               activity_state,workspace_path,provider_conversation_id,controller_generation);
               CREATE TABLE conversations(id,current_session_id,active_branch_id);
               CREATE TABLE conversation_branches(id,conversation_id,provider_conversation_id,session_id,strategy,replay_truncated);''')
             db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
-                       ('engineer', 'project', 'claude-code', 'chat', 0, 'idle', str(self.repo),
-                        'synthetic-native-owner', 'generation-one'))
+                       (binding['session_id'], state['ao_project_id'], 'claude-code', 'chat', 0, 'idle', workspace,
+                        self.NATIVE, 'generation-one'))
             db.execute('INSERT INTO conversations VALUES(?,?,?)',
-                       (binding['conversation_id'], 'engineer', binding['branch_id']))
+                       (binding['conversation_id'], binding['session_id'], binding['branch_id']))
             db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
-                       (binding['branch_id'], binding['conversation_id'], 'synthetic-native-owner', 'engineer', 'native', 0))
+                       (binding['branch_id'], binding['conversation_id'], self.NATIVE, binding['session_id'], 'native', 0))
     def configure_runtime(self):
         pass
 
@@ -76,7 +109,7 @@ class ReviewExtensionFixture(Fixture):
         spec = self.register()
         inputs = {'room_id': self.room, 'spec_revision': 2, 'spec_sha256': spec['sha256'],
                   'retained_candidate_sha256': self.accepted['candidate_sha256'],
-                  'native_session_id': 'synthetic-native-owner', 'native_owner_database': str(self.database), **changes}
+                  'native_session_id': self.NATIVE, 'native_owner_database': str(self.database), **changes}
         return self.service.ao_room_spec_review_extension_audit(**inputs)
 
     def grant_inputs(self, audit=None, **changes):
@@ -451,8 +484,8 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         # fixture. The actual record/receipt validator remains active below.
         request = ao_outcomes.latest_for_role(state, 'engineer')
         record = ao.read(self.directory() / request['semantic_outcome'])
-        source = {'session_id': 'engineer', 'native_session_id': 'synthetic-native-owner',
-                  'database': str(self.database), 'transcript': str(self.root / 'synthetic-native-owner.jsonl')}
+        source = {'session_id': 'engineer', 'native_session_id': self.NATIVE,
+                  'database': str(self.database), 'transcript': str(self.transcript)}
         turn = {'id': 'compacted-turn', 'providerTurnId': 'acp-history-turn:synthetic', 'state': 'recovered'}
         message = {'id': 'compaction-message', 'turnId': turn['id'], 'role': 'user',
                    'text': 'Synthetic retained compacted context.', 'origin': 'human', 'streaming': False, 'sequence': 100}
@@ -592,24 +625,36 @@ class ReviewExtensionTests(ReviewExtensionFixture):
             finally:
                 ao.atomic(self.directory() / 'state.json', original)
 
-    def test_changed_charter_native_owner_and_history_cannot_use_committed_grant(self):
+    def test_changed_charter_native_owner_cannot_use_committed_grant(self):
         self.grant()
-        with sqlite3.connect(self.database) as db:
-            db.execute("UPDATE sessions SET provider_conversation_id='replacement'")
-            db.execute("UPDATE conversation_branches SET provider_conversation_id='replacement'")
-        with self.assertRaisesRegex(ao.RoomError, 'Native owner differs'):
-            self.send('spec_review', 'wrong-native')
-        with sqlite3.connect(self.database) as db:
-            db.execute("UPDATE sessions SET provider_conversation_id='synthetic-native-owner'")
-            db.execute("UPDATE conversation_branches SET provider_conversation_id='synthetic-native-owner'")
-        self.fake.snapshots['engineer']['messages'][0]['text'] += ' changed'
-        with self.assertRaises(ao.RoomError):
-            self.send('spec_review', 'wrong-history')
-        self.fake.snapshots['engineer']['messages'][0]['text'] = self.state()['requests']['charter-1']['text']
         before = (self.directory() / 'state.json').read_bytes()
         with self.assertRaisesRegex(ao.RoomError, 'unused fourth-review grant'):
             self.service.ao_room_spec_put(self.room, 3, 'Another authorized scope.', self.gates, 'Another exact approval')
         self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET provider_conversation_id='replacement'")
+            db.execute("UPDATE conversation_branches SET provider_conversation_id='replacement'")
+        with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold'):
+            self.send('spec_review', 'wrong-native')
+        self.assertNotIn('wrong-native', self.state()['requests'])
+        self.assertTrue(self.state()['requests']['implementation']['semantic_status']['hold'])
+        with self.assertRaisesRegex(ao.RoomError, 'Native owner differs'):
+            extension._owner(self.state(), str(self.database), self.NATIVE, str(self.repo))
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET provider_conversation_id='synthetic-native-owner'")
+            db.execute("UPDATE conversation_branches SET provider_conversation_id='synthetic-native-owner'")
+
+    def test_changed_native_history_cannot_use_committed_grant(self):
+        self.grant()
+        self.fake.snapshots['engineer']['messages'][0]['text'] += ' changed'
+        # The owning request's saved message no longer matches the observed native history, so the real
+        # provider ownership check refuses it first. The separate owner-tamper case keeps its persisted
+        # semantic hold; no new request may be created here either.
+        with self.assertRaisesRegex(ao.RoomError, 'Owning native request differs from its completed receipt or observed message'):
+            extension.admission(self.service, self.directory(), self.state())
+        with self.assertRaises(ao.RoomError):
+            self.send('spec_review', 'wrong-history')
+        self.assertNotIn('wrong-history', self.state()['requests'])
 
     def test_known_semantic_hold_is_preserved_and_still_blocks_dispatch(self):
         self.register()
@@ -626,11 +671,31 @@ class ReviewExtensionTests(ReviewExtensionFixture):
     def test_existing_provider_gate_still_runs_after_extension_admission(self):
         self.grant()
         # A controlled guard rejection proves the extension does not bypass the
-        # existing provider-validation path that follows review admission.
-        with patch.object(ao_workflow.ao_delegates, 'validate_provider', side_effect=ao.RoomError('pinned provider hold')):
+        # existing provider-validation path that follows review admission. The
+        # wrapper drives the real provider validation until the real extension
+        # admission has returned, then rejects only downstream calls.
+        real_admission, real_provider = extension.admission, ao_workflow.ao_delegates.validate_provider
+        state = {'admitting': False, 'admitted': False}
+        def admission(*args, **kwargs):
+            state['admitting'] = True
+            try:
+                result = real_admission(*args, **kwargs)
+            finally:
+                state['admitting'] = False
+            state['admitted'] = True
+            return result
+        def provider(*args, **kwargs):
+            if state['admitted']:
+                raise ao.RoomError('pinned provider hold')
+            return real_provider(*args, **kwargs)
+        posts = len(self.fake.posts)
+        with patch.object(extension, 'admission', side_effect=admission), \
+                patch.object(ao_workflow.ao_delegates, 'validate_provider', side_effect=provider):
             with self.assertRaisesRegex(ao.RoomError, 'pinned provider hold'):
                 self.send('spec_review', 'held-fourth')
+        self.assertTrue(state['admitted'])
         self.assertNotIn('held-fourth', self.state()['requests'])
+        self.assertEqual(len(self.fake.posts), posts)
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
 
     def test_mcp_callable_interfaces_require_explicit_complete_inputs(self):
@@ -682,17 +747,45 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             self.service.ao_room_status(self.room)
 
     def write_native(self, folder):
+        """Materialize one coherent native interval for the latest engineer request.
+
+        The room's currently registered transcript is the retained prefix (its full authenticated
+        prior history, including the charter and implementation rows), so a new external folder is
+        seeded from it instead of losing that prefix. Rows a completed request already owns are
+        reused byte-for-byte; otherwise one complete caller/response pair with stable per-request
+        identities is appended with ordered timestamps clamped inside the request's own completed
+        window.
+        """
         import ao_outcomes
         request = ao_outcomes.latest_for_role(self.state(), 'engineer')
+        folder = Path(folder)
         folder.mkdir(exist_ok=True)
-        path = folder / 'synthetic-native-owner.jsonl'
-        rows = [{'type': 'user', 'sessionId': 'synthetic-native-owner', 'uuid': 'synthetic-human',
-                 'timestamp': datetime.fromtimestamp(request['created_at'] + 1, timezone.utc).isoformat(),
-                 'origin': {'kind': 'human'}, 'message': {'content': request['text']}},
-                {'type': 'assistant', 'sessionId': 'synthetic-native-owner', 'uuid': 'synthetic-assistant',
-                 'timestamp': datetime.fromtimestamp(request['created_at'] + 2, timezone.utc).isoformat(),
-                 'message': {'id': 'synthetic-final', 'model': ao_workflow.FABLE_MODEL, 'stop_reason': 'end_turn'}}]
-        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        path = folder / (self.NATIVE + '.jsonl')
+        registered = Path(self.state()['native_outcome_source']['transcript'])
+        if not path.exists():
+            path.write_text(registered.read_text() if registered.is_file() else '')
+        existing = path.read_text()
+        if '"' + request['request_id'] + '-caller"' not in existing:
+            workspace = self.native_row_workspace()
+            model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+            receipt = ao.read(self.directory() / request['receipt']) if request.get('receipt') else {}
+            completed = receipt['turn'].get('completedAt') if isinstance(receipt.get('turn'), dict) else None
+            bound = (datetime.fromisoformat(completed).timestamp() if isinstance(completed, str)
+                     else receipt.get('observed_at', datetime.now(timezone.utc).timestamp()))
+            stamp = lambda seconds: min(request['created_at'] + seconds, bound)
+            rows = [{'type': 'user', 'sessionId': self.NATIVE, 'cwd': workspace,
+                     'uuid': request['request_id'] + '-caller',
+                     'timestamp': datetime.fromtimestamp(stamp(0.001), timezone.utc).isoformat(),
+                     'isSidechain': False, 'origin': {'kind': 'human'},
+                     'message': {'role': 'user', 'content': request['text']}},
+                    {'type': 'assistant', 'sessionId': self.NATIVE, 'cwd': workspace,
+                     'uuid': request['request_id'] + '-reply',
+                     'timestamp': datetime.fromtimestamp(stamp(0.002), timezone.utc).isoformat(),
+                     'isSidechain': False,
+                     'message': {'role': 'assistant', 'id': request['request_id'] + '-m0', 'model': model,
+                                 'content': [{'type': 'text', 'text': 'Done'}],
+                                 'stop_reason': 'end_turn'}}]
+            path.write_text(existing + ''.join(json.dumps(row) + '\n' for row in rows))
         return path
 
     def test_first_and_moved_native_source_remain_auditable_without_reopening_review(self):
@@ -732,6 +825,22 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database),
                                              native_transcript_path=str(self.root / 'replacement-native.jsonl'))
         self.assertEqual(self.room_files(), before)
+
+    def note_native_turn(self, request_id):
+        """Append one request's synthetic rows through the currently registered transcript.
+
+        The inherited helper writes the fixture's original ``self.transcript``, which goes stale
+        after an audited public source move or SQLite database move. Only the append target is
+        synchronized to the room's actual registered source; the inherited producer, its timestamps
+        and its once-only accounting stay in force.
+        """
+        registered = Path(self.state()['native_outcome_source']['transcript'])
+        stale = self.transcript
+        self.transcript = registered
+        try:
+            return super().note_native_turn(request_id)
+        finally:
+            self.transcript = stale
 
     def moved_source_hold(self, kind):
         self.grant()
@@ -938,7 +1047,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
 class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
     def configure_runtime(self):
         self.original_executable = self.root / 'original-claude'
-        self.original_executable.write_text('#!/bin/sh\nprintf "original (Claude Code)\\n"\n')
+        self.original_executable.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.original_executable.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.original_executable), 'claude_config_dir': str(self.claude_env)})
 
@@ -953,7 +1062,7 @@ class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
         self.assertTrue(audited['eligible'])
         inputs = self.grant_inputs(audited)
         target = self.root / 'orphan-repair-target'
-        target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n'); target.chmod(0o700)
         launch = self.root / 'orphan-repair-launch'; launch.symlink_to(target)
         args = (self.service, self.room, 'orphan-repair', str(target), str(launch), str(self.database),
                 'Actual repair approval preserves the retained owner.', 'Original executable is missing')
@@ -987,7 +1096,7 @@ class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
         previous = self.original_executable
         for number in (1, 2):
             target = self.root / ('replacement-' + str(number))
-            target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+            target.write_text('#!/bin/sh\nprintf "2.1.%d (Claude Code)\\n"\n' % (282 + number)); target.chmod(0o700)
             previous.unlink()
             if launch.is_symlink(): launch.unlink()
             launch.symlink_to(target)
@@ -1016,7 +1125,7 @@ class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
             with self.assertRaises(OSError): self.service.ao_room_spec_review_extend(**inputs)
         original_bytes = self.original_executable.read_bytes(); original_stat = self.original_executable.stat()
         self.original_executable.unlink()
-        target = self.root / 'repair-target'; target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        target = self.root / 'repair-target'; target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n'); target.chmod(0o700)
         launch = self.root / 'repair-launch'; launch.symlink_to(target)
         before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
         posts = copy.deepcopy(self.fake.posts)
@@ -1033,7 +1142,7 @@ class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
         import ao_executable_binding as executable
         self.grant()
         self.fake.snapshots['engineer']['controller'] = 'stopped'
-        target = self.root / 'changed-owner-target'; target.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n'); target.chmod(0o700)
+        target = self.root / 'changed-owner-target'; target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n'); target.chmod(0o700)
         launch = self.root / 'changed-owner-launch'; launch.symlink_to(target)
         self.original_executable.unlink()
         with sqlite3.connect(self.database) as db:
@@ -1055,7 +1164,7 @@ class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
 
 
 class ExtensionConfiguredIdempotenceTests(AdoptionFixture):
-    make_database = ReviewExtensionFixture.make_database
+    NATIVE = 'synthetic-native-owner'  # the source AdoptionFixture registers is reused by the grant
     register = ReviewExtensionFixture.register
     audit = ReviewExtensionFixture.audit
     grant_inputs = ReviewExtensionFixture.grant_inputs
@@ -1065,13 +1174,16 @@ class ExtensionConfiguredIdempotenceTests(AdoptionFixture):
         import ao_provider_transition as provider
         import ao_routing_adoption as routing
         prepared = self.configure_routing()
+        self.qualify_worker_routing()
         attachment = self.start_attachment(prepared)
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.implement(); self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
         attachment.stdin.close(); attachment.wait(timeout=10)
         self.fake.snapshots['engineer']['controller'] = 'stopped'
-        self.make_database(); self.target_spec = None
+        # The grant reuses the synthetic native source registered at bind time; the owner database
+        # is never recreated under a registered room.
+        self.target_spec = None
         grant = self.grant()
         provider_inputs = ao.read(self.directory() / self.state()['provider_transition']['receipt'])['inputs']
         before = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}

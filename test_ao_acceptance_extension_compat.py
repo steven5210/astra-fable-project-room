@@ -354,6 +354,7 @@ class ProviderTransitionAcceptanceContinuationFixture(AdoptionFixture):
     def setUp(self):
         super().setUp()
         prepared = self.configure_routing()
+        self.qualify_worker_routing()
         self.attachment = self.start_attachment(prepared)
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.implement()
@@ -369,20 +370,16 @@ class ProviderTransitionAcceptanceContinuationFixture(AdoptionFixture):
         self.fake.workspaces['reviewer'] = self.review_repo
         for number in self.prior_attempt_numbers:
             self.prior_attempt(number)
-        self.database = self.root / 'synthetic-owner.db'
+        binding = self.state()['bindings']['reviewer']
+        native = 'synthetic-native-reviewer'
         with sqlite3.connect(self.database) as db:
-            db.executescript('''CREATE TABLE sessions(id,project_id,harness,session_mode,is_terminated,
-              activity_state,workspace_path,provider_conversation_id,controller_generation);
-              CREATE TABLE conversations(id,current_session_id,active_branch_id);
-              CREATE TABLE conversation_branches(id,conversation_id,provider_conversation_id,session_id,strategy,replay_truncated);''')
-            for role, binding in self.state()['bindings'].items():
-                native = 'synthetic-native-' + role
-                db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
-                           (role, 'project', binding['harness'], 'chat', 0, 'idle', str(self.fake.workspaces[role]), native, 'generation'))
-                db.execute('INSERT INTO conversations VALUES(?,?,?)',
-                           (binding['conversation_id'], role, binding['branch_id']))
-                db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
-                           (binding['branch_id'], binding['conversation_id'], native, role, 'native', 0))
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
+                       ('reviewer', self.state()['ao_project_id'], 'codex', 'chat', 0, 'idle',
+                        str(self.review_repo), native, 'generation'))
+            db.execute('INSERT INTO conversations VALUES(?,?,?)',
+                       (binding['conversation_id'], 'reviewer', binding['branch_id']))
+            db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
+                       (binding['branch_id'], binding['conversation_id'], native, 'reviewer', 'native', 0))
         self.message = 'Perform the exact authorized purpose.'
 
     def prior_attempt(self, number):
@@ -399,7 +396,7 @@ class ProviderTransitionAcceptanceContinuationFixture(AdoptionFixture):
 
     def audit(self, review='fourth'):
         return self.service.ao_room_acceptance_review_audit(self.room, review, ao.digest(self.message.encode()),
-                               str(self.database), 'synthetic-native-engineer', 'synthetic-native-reviewer')
+                               str(self.database), self.NATIVE, 'synthetic-native-reviewer')
 
     def grant_inputs(self, review='fourth'):
         return dict(room_id=self.room, audit_sha256=self.audit(review)['audit_sha256'],
@@ -421,10 +418,12 @@ class ProviderTransitionCompatibilityTests(ProviderTransitionAcceptanceContinuat
     def test_continuation_preserves_transition_and_adoption_records_and_reports_consumed(self):
         transition_before = self._record_files(ao_provider_transition.BASE)
         adoption_before = self._record_files(ao_routing_adoption.BASE)
+        refresh_before = self._record_files(ao_routing_refresh.BASE)
         self.assertTrue(transition_before, 'the transitioned room must already carry provider-transition records')
         self.assertTrue(adoption_before, 'the transitioned room must already carry routing-adoption records')
-        self.assertFalse((self.directory() / 'routing-refresh').exists(),
-                          'no routing refresh was performed in this fixture; nothing to compare')
+        self.assertTrue(refresh_before, 'the real qualified routing refresh this fixture performs must carry its journal')
+        refresh_pointer = self.state()['routing_refresh']
+        self.assertIsNotNone(refresh_pointer, 'the qualified routing refresh commits its state projection')
         audit = self.audit()
         self.assertTrue(audit['eligible'])
         inputs, grant = self.grant()
@@ -438,6 +437,8 @@ class ProviderTransitionCompatibilityTests(ProviderTransitionAcceptanceContinuat
         self.assertTrue(self.service.ao_room_accept(self.room, 'fourth')['accepted'])
         self.assertEqual(self._record_files(ao_provider_transition.BASE), transition_before)
         self.assertEqual(self._record_files(ao_routing_adoption.BASE), adoption_before)
+        self.assertEqual(self._record_files(ao_routing_refresh.BASE), refresh_before)
+        self.assertEqual(self.state()['routing_refresh'], refresh_pointer)
         # Still validates as a normal committed provider transition with intact routing adoption.
         ao_provider_transition.validate(self.service, self.state())
         status = self.service.ao_room_status(self.room)
@@ -513,13 +514,34 @@ class SettledQuotaFailureAttemptTests(ProviderTransitionAcceptanceContinuationFi
         state = self.state()
         # ao_native_outcome.source_keys('reviewer') (ao_native_outcome.py:229-230) names this
         # key native_reviewer_outcome_source, distinct from the engineer's native_outcome_source.
-        state['native_reviewer_outcome_source'] = {'session_id': 'reviewer'}
+        failed_request = state['requests'][key]
+        self.assertEqual(failed_request['role'], 'reviewer')
+        expected_session = failed_request['session_id']
+        self.assertEqual(expected_session, state['bindings']['reviewer']['session_id'])
+        expected_source = {'session_id': expected_session}
+        state['native_reviewer_outcome_source'] = dict(expected_source)
         ao.atomic(self.directory() / 'state.json', state)
         observed = {'anchor_uuid': 'owned-native-packet', 'next_human_uuid': None,
                     'errors': [{'uuid': 'native-quota', 'error': 'rate_limit', 'http_status': 429}],
                     'stop_reasons': [], 'source_sha256': 'f' * 64}
+        real_inspect = ao_native_outcome.inspect
+
+        def reviewer_only_inspect(directory, state, request, source, snapshot):
+            """The disclosed synthetic reviewer-only proof; every other call is the real inspector.
+
+            This Codex reviewer fixture has no supported Claude reviewer-source registration, so this
+            one exact failed reviewer request/role/session/source is answered synthetically. The named
+            successor re-observes the engineer through engineering_ready, which must keep the real
+            inspector, the real engineer source and the real engineer worker digest.
+            """
+            if (request.get('role') == 'reviewer' and request.get('request_id') == key
+                    and request.get('session_id') == expected_session
+                    and source == expected_source):
+                return dict(observed)
+            return real_inspect(directory, state, request, source, snapshot)
+
         resume_key = key + '-resume'
-        with patch.object(ao_native_outcome, 'inspect', return_value=observed):
+        with patch.object(ao_native_outcome, 'inspect', side_effect=reviewer_only_inspect):
             outcome_audit = self.service.ao_room_outcome_audit(self.room, role='reviewer')
             self.assertTrue(outcome_audit['resume_eligible'])
             self.service.ao_room_outcome_resume(self.room, key, outcome_audit['outcome_sha256'], resume_key,
@@ -575,40 +597,32 @@ class OwnerSourceRestorationTests(AcceptanceContinuationFixture):
     def test_outcome_audit_source_path_drift_refuses_then_restores_named_send(self):
         alternate = self.root / 'synthetic-owner-copy.db'
         alternate.write_bytes(self.database.read_bytes())
-        transcript = self.root / 'synthetic-native-engineer.jsonl'
-        transcript.write_text('Synthetic native parser boundary.\n')
-
-        def inspect(directory, state, request, source, snapshot):
-            return {'anchor_uuid': 'synthetic-owned-packet', 'next_human_uuid': None,
-                    'errors': [], 'stop_reasons': ['end_turn'], 'source': dict(source),
-                    'source_sha256': ao.digest(transcript.read_bytes()), 'compaction_imports': []}
 
         def audit_source(path):
             return self.service.ao_room_outcome_audit(self.room, role='engineer',
-                       ao_database_path=str(path), native_transcript_path=str(transcript))
+                       ao_database_path=str(path), native_transcript_path=str(self.transcript))
 
-        with patch.object(ao_native_outcome, 'inspect', side_effect=inspect):
-            audit_source(self.database)
-            self.grant()
-            lane = self.directory() / extension.BASE
-            journal = {str(p.relative_to(lane)): p.read_bytes()
-                       for p in lane.rglob('*') if p.is_file()}
-            posts = len(self.fake.posts)
-            audit_source(alternate)
-            self.assertEqual(self.state()['native_outcome_source']['database'], str(alternate))
-            with self.assertRaisesRegex(ao.RoomError,
-                                        'Retained native source evidence contradicts the supplied owner database or session'):
-                self.send('acceptance_review', 'fourth')
-            self.assertEqual(len(self.fake.posts), posts)
-            self.assertNotIn('fourth', self.state()['requests'])
-            self.assertEqual(extension.summary(self.service, self.state())['state'], 'unconsumed')
-            self.assertEqual({str(p.relative_to(lane)): p.read_bytes()
-                              for p in lane.rglob('*') if p.is_file()}, journal)
-            audit_source(self.database)
-            self.assertEqual(self.state()['native_outcome_source']['database'], str(self.database))
+        audit_source(self.database)
+        self.grant()
+        lane = self.directory() / extension.BASE
+        journal = {str(p.relative_to(lane)): p.read_bytes()
+                   for p in lane.rglob('*') if p.is_file()}
+        posts = len(self.fake.posts)
+        audit_source(alternate)
+        self.assertEqual(self.state()['native_outcome_source']['database'], str(alternate))
+        with self.assertRaisesRegex(ao.RoomError,
+                                    'Retained native source evidence contradicts the supplied owner database or session'):
             self.send('acceptance_review', 'fourth')
-            self.assertEqual(len(self.fake.posts), posts + 1)
-            self.assertEqual(extension.summary(self.service, self.state())['state'], 'consumed')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertNotIn('fourth', self.state()['requests'])
+        self.assertEqual(extension.summary(self.service, self.state())['state'], 'unconsumed')
+        self.assertEqual({str(p.relative_to(lane)): p.read_bytes()
+                          for p in lane.rglob('*') if p.is_file()}, journal)
+        audit_source(self.database)
+        self.assertEqual(self.state()['native_outcome_source']['database'], str(self.database))
+        self.send('acceptance_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(extension.summary(self.service, self.state())['state'], 'consumed')
 
 
 class ExecutableRepairClaudeFixture(Fixture):
@@ -624,7 +638,7 @@ class ExecutableRepairClaudeFixture(Fixture):
     def setUp(self):
         super().setUp()
         self.original_claude = self.root / 'original-claude'
-        self.original_claude.write_text('#!/bin/sh\nprintf "original (Claude Code)\\n"\n')
+        self.original_claude.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.original_claude.chmod(0o700)
         ao.atomic(self.home / 'config.json',
                  {'claude_bin': str(self.original_claude), 'claude_config_dir': str(self.claude_env)})
@@ -657,7 +671,7 @@ class ExecutableRepairUnusedGrantFixture(AcceptanceContinuationFixture, Executab
         super().setUp()
         self.fake.snapshots['engineer']['controller'] = 'stopped'
         self.replacement_claude = self.root / 'replacement-claude'
-        self.replacement_claude.write_text('#!/bin/sh\nprintf "replacement (Claude Code)\\n"\n')
+        self.replacement_claude.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n')
         self.replacement_claude.chmod(0o700)
         self.launch_claude = self.root / 'launch-claude'
         self.launch_claude.symlink_to(self.replacement_claude)
@@ -720,7 +734,7 @@ class HistoricalRoutingFixture(Fixture):
     def setUp(self):
         super().setUp()
         self.native_cli = self.root / 'native-claude-version'
-        self.native_cli.write_text('#!/bin/sh\nprintf "synthetic (Claude Code)\\n"\n')
+        self.native_cli.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.native_cli.chmod(0o700)
         ao.atomic(self.home / 'config.json',
                  {'claude_bin': str(self.native_cli), 'claude_config_dir': str(self.claude_env)})
@@ -734,8 +748,8 @@ class HistoricalRoutingFixture(Fixture):
 
         original_definition = ao_routing.agent_definition
 
-        def stale_definition(name):
-            return original_definition(name) + '\nSynthetic archived worker instructions.\n'
+        def stale_definition(name, model=None):
+            return original_definition(name, model) + '\nSynthetic archived worker instructions.\n'
 
         # Scoped to only this call: everything AcceptanceContinuationFixture does afterwards (spec
         # agreement, implementation, the three reviewer attempts) sees the real, unpatched functions.

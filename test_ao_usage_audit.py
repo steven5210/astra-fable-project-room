@@ -378,6 +378,25 @@ class NativeUsageAuditTests(AuditFixture, unittest.TestCase):
         self.assertEqual(report["parent"]["coverage"], "incomplete")
         self.assertIn("compaction_in_interval", report["parent"]["reasons"])
 
+    def test_child_compaction_marker_without_timestamp_is_incomplete_not_an_error(self):
+        launch, completed = self.launch_records()
+        compact = self.child_record("system", "child-compact", "2026-01-01T00:00:15+00:00", "")
+        compact.pop("timestamp")
+        compact["subtype"] = "compact_boundary"
+        self.write_transcript([self.human(), launch, completed])
+        self.write_child("a1", [compact, self.child_assistant(
+            "child-response", "2026-01-01T00:00:20+00:00", "child-message",
+            {"input_tokens": 5, "output_tokens": 6, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2})])
+        self.build_without_delegate()
+        self.build_child_routing()
+        report = ao_usage_audit.audit(self.home, self.room, self.request_id, self.database)
+        self.assertEqual(report["parent"]["coverage"], "complete")
+        child = report["children"][0]["usage"]
+        self.assertEqual(child["coverage"], "incomplete")
+        self.assertIn("compaction_in_interval", child["reasons"])
+        self.assertEqual(report["child_coverage"], "incomplete")
+        self.assertIsNone(report["native_totals"]["workers"])
+
     def test_unknown_cache_splits_do_not_invalidate_token_coverage(self):
         response = self.assistant("assistant", "2026-01-01T00:00:20+00:00", "message",
                                   {"input_tokens": 12, "output_tokens": 4})
