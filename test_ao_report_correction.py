@@ -34,6 +34,9 @@ class ReportCorrectionTests(DelegateFixture):
         self.assertEqual(self.fake.posts, posts)
 
     def finish_correction(self, ids=None, **changes):
+        # The real shared producer binds this exact saved request's caller/model/owner/session and
+        # timestamps, so the intended correction completion has its own native rows before the sync.
+        self.note_native_turn('correction')
         self.fake.finish('engineer', json.dumps(self.report(
             routing_log=[{'delegate_job_ids': [self.JOB] if ids is None else ids,
                           'native_agent_ids': [self.BAD]}], **changes)))
@@ -186,6 +189,7 @@ class ReportCorrectionTests(DelegateFixture):
         self.job(); self.capture(ids=[self.BAD, self.JOB]); self.correction()
         self.finish_correction(ids=[self.BAD, self.JOB])
         self.service.ao_room_send(self.room, 'engineer', 'Correct only the report.', 'second', purpose='correction')
+        self.note_native_turn('second')  # A direct second correction needs its own exact native rows.
         self.fake.finish('engineer', json.dumps(self.report(routing_log=[{'delegate_job_ids': [self.JOB]}])))
         self.service.ao_room_sync(self.room)
         second = self.state()['requests']['second']
@@ -197,6 +201,7 @@ class ReportCorrectionTests(DelegateFixture):
     def test_successful_repair_allows_later_normal_engineering_correction(self):
         self.job(); self.capture(ids=[self.BAD, self.JOB]); self.correction(); self.finish_correction()
         self.service.ao_room_send(self.room, 'engineer', 'Implement a reviewed follow-up.', 'next-work', purpose='correction')
+        self.note_native_turn('next-work')  # This later direct completion needs its own native rows too.
         self.assertNotIn('report_correction_admission', self.state()['requests']['next-work']['carried'])
         (self.repo / 'followup.txt').write_text('authorized ordinary engineering')
         self.fake.finish('engineer', json.dumps(self.report(routing_log=[{'delegate_job_ids': [self.JOB]}])))

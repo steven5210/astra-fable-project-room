@@ -1,6 +1,6 @@
 # Efficient review and diagnosed continuation
 
-Fable remains the MAX engineering orchestrator. A request for Fable's personal
+Fable remains the default MAX engineering orchestrator; a room that explicitly adopted another qualified engineering model is owned by that model for subsequent engineering work, while every judgment keeps the attribution recorded with it. A request for Fable's personal
 review assigns the judgment and final verdict to Fable; it does not implicitly
 assign document assembly, evidence indexing, tests or every supporting task to
 Fable. Delegate those tasks when the full quality bar is met. Preserve explicit
@@ -126,9 +126,11 @@ status never falls back to an older all-clear. Previews are not complete task in
 scope decisions or live candidate verification.
 
 `delegate.routing.worker_recovery` distinguishes verified current guard capability
-from unverified, historical or unconfigured routing. Only matching current v2
-guard bytes establish the reported protection for the root engineer managing its
-children. Null capability values mean unknown, never permission. Unconfigured
+from unverified, historical or unconfigured routing. Only configured or verified routing with
+preparation routing version 2 or 3 and an effective guard digest matching the
+current guard bytes establishes the reported protection for the root engineer
+managing its children; that is static guard capability, not a live recovery
+attestation or dispatch authorization. Null capability values mean unknown, never permission. Unconfigured
 or unverified routing offers the operator path, not a native dispatch. Under the
 bounded contract, child context resume, `SendMessage` and root `ListAgents` remain
 unsupported; this does not claim every child tool is denied by historical guards.
@@ -179,10 +181,10 @@ the operator should inspect the evidence instead of retrying through another tie
 For a retained v2 engineer, the CLI-only `ao_routing_refresh.py` operation installs
 the reviewed definitions and guard through an immutable routing journal. Supply
 `--home`, `--room-id`, an unused `--request-id`, `--database-path`,
-`--native-session-id`, `--authorization` and `--diagnosis`. It requires the exact
-stopped Fable MAX owner, settled requests and delegates, complete native history,
-unchanged candidate and provider attachment, and the existing ignored runtime
-paths. Stop only after independently checking native quiescence; an AO idle label
+`--native-session-id`, `--authorization` and `--diagnosis`. It requires the bound
+engineering orchestrator at its current effective model and MAX, stopped, with
+settled requests and delegates, complete native history, unchanged candidate and
+provider attachment, and the existing ignored runtime paths. Stop only after independently checking native quiescence; an AO idle label
 alone is insufficient when diagnosing premature completion.
 
 The operation changes only the three ignored routing files and their
@@ -544,9 +546,10 @@ owned symlink that resolves to that exact file. The helper does not install,
 retarget, start or resume anything, and runs only a bounded `--version` probe.
 
 Repair requires a previously recorded executable that is now missing or
-changed, an idle stopped Fable MAX owner in the same native conversation and
-branch, complete settled transport history, no unsettled owned request and
-unchanged routing files and provider attachment. A separate immutable journal
+changed, an idle stopped bound engineering orchestrator at its current effective
+model and MAX in the same native conversation and branch, complete settled
+transport history, no unsettled owned request and unchanged routing files and
+provider attachment. A separate immutable journal
 records the actual replacement SHA-256, size, mtime, version and launch path.
 The original preparation, provider epochs, routing adoption, requests, quota
 holds and review limits remain unchanged. Every subsequent routing check
@@ -568,3 +571,20 @@ or routing-preparation transition is not implicitly supported by this receipt;
 it needs its own compatibility handling. The operator must also prove that AO
 uses the supplied launch path, since a valid arbitrary symlink alone is not
 evidence of the live process executable.
+
+A separate, explicitly authorized upgrade lane moves an intact recorded
+executable to a strictly newer, exactly matching qualified version instead of
+repairing loss or drift, keeping the original preparation and every earlier
+journal. Invoke the same module with the same required arguments plus
+`--upgrade-authorization` and `--expected-version X.Y.Z`; it refuses when the
+recorded executable is missing or has changed (use the repair lane above
+instead), when the replacement's actual version does not exactly match
+`--expected-version`, or when that version is not strictly newer than the
+recorded source version. It requires the same stopped-owner, idle, settled and
+unchanged-routing preconditions as repair, and runs only the same bounded
+`--version` probe — never an inference, a lifecycle action or the release of a
+quota or other hold. The journal records outcome `authorized_upgrade` together
+with the source and target versions. See
+[configured engineering model selection and transition](engineering-model-transition.md#executable-prerequisite-and-operator-sequence)
+for the room-level sequence that uses this lane before an engineering model
+transition.

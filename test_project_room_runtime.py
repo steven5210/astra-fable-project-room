@@ -243,6 +243,38 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
         self.assertEqual(self.initialize(reopened), pinned)
         self.assertEqual(self.tool(reopened, "ao_room_status", {"room_id": "ao-runtime-fixture"})["room_id"], "ao-runtime-fixture")
 
+    def test_tool_discovery_and_new_model_imports_after_source_eviction(self):
+        self.synthetic_room()
+        server = self.start_server()
+        self.initialize(server)
+        names = {tool["name"] for tool in self.request(server, "tools/list")["tools"]}
+        self.assertIn("ao_room_engineer_model_audit", names)
+        self.assertIn("ao_room_engineer_model_transition", names)
+        self.assertIn("ao_room_engineer_model_transition_abandon", names)
+        self.assertIn("ao_room_engineer_source_register", names)
+        shutil.rmtree(self.source)
+        response = self.request(server, "tools/call", {
+            "name": "ao_room_engineer_model_audit",
+            "arguments": {"room_id": "ao-runtime-fixture", "target_model": "claude-opus-5-5",
+                          "native_owner_database": "/synthetic/owner.sqlite",
+                          "native_transcript_path": "/synthetic/native.jsonl"}})
+        self.assertFalse(response["isError"], response)
+        self.assertEqual(response["content"][0]["type"], "text")
+        content = json.loads(response["content"][0]["text"])
+        self.assertEqual(response["structuredContent"], content)
+        self.assertFalse(content["eligible"])
+        self.assertEqual(content["room_id"], "ao-runtime-fixture")
+        self.assertEqual(content["target_model"], "claude-opus-5-5")
+        self.assertEqual(content["native_owner_database"], "/synthetic/owner.sqlite")
+        self.assertEqual(content["native_transcript_path"], "/synthetic/native.jsonl")
+        self.assertIsNone(content["audit_sha256"])
+        self.assertIsNone(content["evidence"])
+        self.assertFalse(content["model_dispatch"])
+        self.assertIsInstance(content["meaning"], str)
+        self.assertTrue(content["meaning"])
+        self.assertNotIn("No module named", response["content"][0]["text"])
+        self.assertNotIn("ModuleNotFoundError", response["content"][0]["text"])
+
     def test_changeset_cli_imports_after_installation_eviction(self):
         retained = runtime.retain(self.source, self.home)
         directory = Path(retained["path"])
@@ -291,6 +323,22 @@ class RuntimeRetentionTests(StdioFixture, unittest.TestCase):
                 self.assertFalse(absent.exists())
                 self.assertFalse((self.base / "absent.db").exists())
                 self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+
+    def test_newly_retained_transition_qualification_and_worker_modules_import_after_source_eviction(self):
+        retained = runtime.retain(self.source, self.home)
+        directory = Path(retained["path"])
+        expected = ("ao_engineering_transition.py", "ao_model_qualification.py", "ao_model_boundaries.py",
+                    "ao_worker_identity.py")
+        self.assertTrue(all((directory / name).is_file() for name in expected))
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        shutil.rmtree(self.source)
+        result = subprocess.run([sys.executable, "-E", "-s", "-B", "-c",
+                                 "import ao_engineering_transition, ao_model_qualification, ao_model_boundaries, ao_worker_identity;"
+                                 "print('retained-imports-ok')"],
+                                cwd=directory, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retained-imports-ok", result.stdout)
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
 
     def test_new_release_preserves_old_connection_and_identifies_both_exact_copies(self):
         self.synthetic_room()
@@ -526,6 +574,10 @@ print(json.dumps({'selected': str(selected), 'inherited': os.environ['CLAUDE_CON
                     self.assertIs(project_room_mcp.input_arguments(name, value), value)
             for name, value in (
                 ("ao_room_outcome_audit", {"ao_database_path": "../db", "native_transcript_path": "../transcript"}),
+                ("ao_room_engineer_model_audit", {"native_owner_database": "../db", "native_transcript_path": "../transcript"}),
+                ("ao_room_engineer_model_transition", {"native_owner_database": "../db", "native_transcript_path": "../transcript"}),
+                ("ao_room_engineer_model_transition_abandon", {"native_owner_database": "../db", "native_transcript_path": "../transcript"}),
+                ("ao_room_engineer_source_register", {"native_owner_database": "../db", "native_transcript_path": "../transcript"}),
                 ("ao_room_spec_review_extension_audit", {"native_owner_database": "../db"}),
                 ("ao_room_provider_transition_audit", {"target_profile": {"api_key_file": "../key"}}),
                 ("ao_room_send", {"message": "../instructions", "request_id": "../not-a-path"}),

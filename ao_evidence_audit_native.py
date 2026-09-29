@@ -28,6 +28,9 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}")
 LAUNCH_DENIED_KEYS = ("resume", "resume_from", "resumeFrom", "resumeFromId", "isolated", "isolation", "remote",
                       "remote_task", "run_in_remote", "isolationMode")
 TERMINAL_TURN_STATES = frozenset(("completed", "failed", "interrupted", "cancelled"))
+# The complete supported foreground Agent launch input, matching the pinned routing guard's own key
+# set. Any other key is an override/isolation/resume request and is never silently accepted.
+LAUNCH_INPUT_KEYS = frozenset(("description", "prompt", "subagent_type", "run_in_background"))
 ABSENT = object()
 
 COUNT_KEYS = ("read_requests", "evidence_root_requests", "outside_root_requests", "unclassified_paths",
@@ -392,10 +395,32 @@ class Collector:
             raise audit_io.SourceError("tool_id_limit")
 
 
-class ToolOccurrence:
-    __slots__ = ("number", "timestamp", "uuid", "name", "canonical", "read", "unsupported", "launch")
+class IdentityRow:
+    """One validated assistant row's opt-in identity projection; never a completion or model claim.
 
-    def __init__(self, number, timestamp, uuid, name, canonical, read, unsupported, launch):
+    The opt-in projection also retains the row-level error/synthetic markers so an API-error-only
+    or synthetic assistant row can never be read as an observed served identity.
+    """
+
+    __slots__ = ("number", "timestamp", "uuid", "model", "stop_reason", "api_error", "synthetic")
+
+    def __init__(self, number, timestamp, uuid_value, message, api_error=False, synthetic=False):
+        model = message.get("model") if isinstance(message, dict) else None
+        stop = message.get("stop_reason") if isinstance(message, dict) else None
+        self.number = number
+        self.timestamp = timestamp
+        self.uuid = uuid_value
+        self.model = model if isinstance(model, str) and model else None
+        self.stop_reason = stop if isinstance(stop, str) and stop else None
+        self.api_error = bool(api_error)
+        self.synthetic = bool(synthetic)
+
+
+class ToolOccurrence:
+    __slots__ = ("number", "timestamp", "uuid", "name", "canonical", "read", "unsupported", "launch",
+                 "identity")
+
+    def __init__(self, number, timestamp, uuid, name, canonical, read, unsupported, launch, identity=None):
         self.number = number
         self.timestamp = timestamp
         self.uuid = uuid
@@ -404,6 +429,8 @@ class ToolOccurrence:
         self.read = read
         self.unsupported = unsupported
         self.launch = launch
+        # Opt-in identity projection of one Agent/Task launch; None on the default path.
+        self.identity = identity
 
 
 class ToolEntry:
@@ -418,7 +445,7 @@ class ToolEntry:
 
 class ResultObs:
     __slots__ = ("number", "timestamp", "uuid", "canonical", "classification", "agent_id", "fingerprint",
-                 "prompt", "source_uuid")
+                 "prompt", "source_uuid", "content", "structured", "shared_projection")
 
     def __init__(self, number, timestamp, uuid, canonical, classification, source_uuid):
         self.number = number
@@ -430,6 +457,12 @@ class ResultObs:
         self.agent_id = None
         self.fingerprint = None
         self.prompt = None
+        # Opt-in identity projection: the raw text content of this block, the row-level structured
+        # projection (ABSENT when the key is absent) and whether one row-level projection would be
+        # shared by more than one result block. Never used by the default read-audit counts.
+        self.content = None
+        self.structured = ABSENT
+        self.shared_projection = False
 
 
 class HumanObs:
@@ -510,7 +543,8 @@ class ChildInterval:
 
 
 class Candidate:
-    __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids", "subagent_type")
+    __slots__ = ("agent_id", "interval", "reason", "launch_uuid", "parent_launch_uuids", "subagent_type",
+                 "tool_id", "name", "identity", "launch_number", "launch_timestamp")
 
     def __init__(self, agent_id, interval, reason, launch_uuid=None, parent_launch_uuids=(), subagent_type=None):
         self.agent_id = agent_id
@@ -519,6 +553,12 @@ class Candidate:
         self.launch_uuid = launch_uuid
         self.parent_launch_uuids = parent_launch_uuids
         self.subagent_type = subagent_type
+        # Filled by launch_inventory only; the default read-audit path leaves them None.
+        self.tool_id = None
+        self.name = None
+        self.identity = None
+        self.launch_number = None
+        self.launch_timestamp = None
 
 
 def human_candidate(record):
@@ -541,8 +581,10 @@ class RecordScanner:
     """One actor's bounded record scan: supported observations, boundaries and source notes."""
 
     def __init__(self, collector, actor_sha256, kind, agent_id, native_session_id, workspace, evidence_root,
-                 *, launch_uuid=None, parent_launch_uuids=()):
+                 *, launch_uuid=None, parent_launch_uuids=(), identity=False):
         self.collector = collector
+        self.identity = identity
+        self.stop_rows = []
         self.actor_sha256 = actor_sha256
         self.kind = kind
         self.agent_id = agent_id
@@ -700,6 +742,15 @@ class RecordScanner:
             self._human(value, number, None, uuid_value, unique, human_text)
             return
         if kind == "assistant":
+            if self.identity:
+                # No child assistant pointer requirement is introduced here. The retained native
+                # schema omits sourceToolAssistantUUID on first child rows and uses child-local user
+                # tool-result pointers instead, so absence is compatible; a child row naming a
+                # different known parent launcher is already rejected above as a foreign reference.
+                self.stop_rows.append(IdentityRow(number, timestamp, uuid_value, message,
+                                                  api_error=(value.get("isApiErrorMessage") is True
+                                                             or value.get("error") is not None),
+                                                  synthetic=(message.get("model") == "<synthetic>")))
             self._assistant(content, uuid_value, timestamp, number, message)
         else:
             self._user(value, content, uuid_value, timestamp, number, unique)
@@ -744,8 +795,16 @@ class RecordScanner:
                 classified = classify_read(input_value, self.evidence_root)
                 unsupported = classified is None
             launch = launch_input(input_value) if name in AGENT_TOOLS else None
+            projection = None
+            if self.identity and name in AGENT_TOOLS:
+                role = input_value.get("subagent_type")
+                projection = {"role": role if isinstance(role, str) and role else None,
+                              "background": input_value.get("run_in_background") is True,
+                              "flagged": bool(launch[1]) if launch is not None else False,
+                              "extra": sorted(key for key in input_value if key not in LAUNCH_INPUT_KEYS),
+                              "denied": sorted(key for key in LAUNCH_DENIED_KEYS if key in input_value)}
             entry.occurrences.append(ToolOccurrence(number, timestamp, uuid_value, name, canonical, classified,
-                                                    unsupported, launch))
+                                                    unsupported, launch, projection))
         self._usage(message, number, timestamp)
 
     def _usage(self, message, number, timestamp):
@@ -836,6 +895,13 @@ class RecordScanner:
             canonical = canonical_result_block(block)
             classification = result_classification(block) if canonical is not None else None
             observation = ResultObs(number, timestamp, uuid_value, canonical, classification, source_uuid)
+            if self.identity:
+                observation.content = block.get("content") if isinstance(block.get("content"), str) else None
+                observation.structured = structured
+                blocks = sum(1 for item in content
+                             if isinstance(item, dict) and item.get("type") == "tool_result")
+                observation.shared_projection = (structured is not ABSENT and structured is not None
+                                                 and blocks != 1)
             if structured is not ABSENT and classification == "non_error":
                 completion = completion_observation(structured, canonical, timestamp)
                 if completion is not None:
@@ -883,7 +949,38 @@ def parent_interval(scan, request, receipt, allow_terminal=True):
     return Interval("terminal", anchor.number, anchor.timestamp, None, completed_at), ()
 
 
-def launch_candidates(scan, scope):
+def _structured_identity_issue(value):
+    """Explicit agent/task identity aliases that are malformed or contradictory, else None."""
+    if not isinstance(value, dict):
+        return None
+    if "agentId" in value and structured_agent_id(value) is None:
+        return "child_attribution_ambiguous"
+    task = value.get("taskId", ABSENT)
+    alias = value.get("task_id", ABSENT)
+    for item in (task, alias):
+        if item is not ABSENT and not (isinstance(item, str) and item and bounded_text(item)):
+            return "child_attribution_ambiguous"
+    if task is not ABSENT and alias is not ABSENT and task != alias:
+        return "child_attribution_ambiguous"
+    return None
+
+
+def _strict_identity_reason(observations, launch_uuid):
+    """Positive correlation for the opt-in worker path, never used by the default read audit."""
+    for item in observations:
+        if getattr(item, "source_uuid", None) != launch_uuid:
+            return "child_attribution_ambiguous"
+        if getattr(item, "shared_projection", False):
+            return "child_attribution_ambiguous"
+        structured = getattr(item, "structured", ABSENT)
+        if structured is not ABSENT and structured is not None:
+            reason = _structured_identity_issue(structured)
+            if reason is not None:
+                return reason
+    return None
+
+
+def launch_candidates(scan, scope, strict_identity=False):
     """Resolve every Agent/Task launch inside the scope into one bounded candidate in admission order."""
     launch_uuids = set()
     for entry in scan.tool_entries.values():
@@ -915,6 +1012,11 @@ def launch_candidates(scan, scope):
             continue
         observations = [item for item in scan.results.get(entry.tool_id, ())
                         if scope.contains(item.number, item.timestamp)]
+        if strict_identity:
+            reason = _strict_identity_reason(observations, first.uuid)
+            if reason is not None:
+                candidates.append(Candidate(None, None, reason))
+                continue
         mismatched = [item for item in observations
                       if item.source_uuid is not None and item.source_uuid != first.uuid
                       and item.source_uuid in launch_uuids]
@@ -951,6 +1053,41 @@ def launch_candidates(scan, scope):
             continue
         candidates.append(Candidate(agent_id, scope.child(first.timestamp, completion.timestamp), None,
                                     first.uuid, launch_uuids, subagent_type))
+    return candidates
+
+
+def launch_inventory(scan, scope, strict_identity=False):
+    """The resolved candidates of ``launch_candidates`` annotated with their own launch identity.
+
+    ``launch_candidates`` proves the correlation; this wrapper attaches the tool-use id and the
+    opt-in launch identity projection (pinned role, declared flags, agent-model override keys) to
+    every returned candidate so a served-identity consumer can bind a launch to its pinned role and
+    its launcher message. The default read-audit path keeps calling ``launch_candidates`` and is
+    unchanged. ``None`` is returned when the two enumerations disagree: a guessed correlation would
+    be worse than an honest unknown, and no launch is silently dropped from the consumer's view.
+    """
+    candidates = launch_candidates(scan, scope, strict_identity=strict_identity)
+    ordered = sorted((entry for entry in scan.tool_entries.values() if entry.occurrences),
+                     key=lambda item: item.occurrences[0].number)
+    launches = []
+    for entry in ordered:
+        occurrences = [occurrence for occurrence in entry.occurrences
+                       if scope.contains(occurrence.number, occurrence.timestamp)]
+        if not any(occurrence.name in AGENT_TOOLS for occurrence in occurrences):
+            continue
+        launches.append((entry, occurrences))
+    if len(launches) != len(candidates):
+        return None
+    for candidate, (entry, occurrences) in zip(candidates, launches):
+        candidate.tool_id = entry.tool_id
+        candidate.name = occurrences[0].name
+        candidate.identity = getattr(occurrences[0], "identity", None)
+        # Preserve the actual launching assistant UUID for every candidate, including unresolved and
+        # typed-error candidates; otherwise a genuine terminal API error can never be correlated
+        # with its launcher and is silently lost.
+        candidate.launch_uuid = occurrences[0].uuid
+        candidate.launch_number = occurrences[0].number
+        candidate.launch_timestamp = occurrences[0].timestamp
     return candidates
 
 

@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import ao_delegates
+import ao_model_boundaries
 import ao_project_room as ao
 import ao_prompt_metrics as metrics
 import ao_workflow
@@ -198,6 +199,9 @@ class NormalSendProjectionTests(NormalProjectionFixture):
         import ao_instruction_amendments
         for amendment, _ in ao_instruction_amendments.pending(directory, state, request["session_id"]):
             sections.append(amendment)
+        for notice in (carried.get("boundary_notices") or []):
+            # Reconstruct the exact fragment from its own committed boundary; never copy the saved text.
+            sections.append(ao_model_boundaries.notice_fragment(directory, state, notice))
         sections.append(self.MESSAGE)
         return "\n".join(sections), len(sections) - 1
 
@@ -225,16 +229,31 @@ class NormalSendProjectionTests(NormalProjectionFixture):
         self.assertEqual(projection["specification_bytes"], len(section.encode()))
         self.assertTrue(projection["workflow_bytes"] > 0)
 
-    def test_implementation_continuation_carries_no_spec_or_workflow_fragment(self):
+    def test_first_delegation_delivers_the_worker_notice_once_and_later_correction_is_caller_only(self):
         self.agree()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send("implementation")
         request, projection = self.check_engineer_projection("implementation")
-        self.assertEqual(request["text"], self.MESSAGE)
+        directory, state = self.directory(), self.state()
+        notices = request["carried"]["boundary_notices"]
+        self.assertEqual([notice["kind"] for notice in notices], [ao_model_boundaries.WORKER_ROUTING])
+        fragment = ao_model_boundaries.notice_fragment(directory, state, notices[0])
+        self.assertEqual(request["text"], fragment + "\n" + self.MESSAGE)
+        self.assertEqual(request["text"].count(fragment), 1)
         self.assertEqual(projection["spec_delivery"], "none")
         self.assertEqual(projection["specification_bytes"], 0)
-        self.assertEqual(projection["workflow_bytes"], 0)
-        self.assertEqual(projection["separator_bytes"], 0)
+        self.assertEqual(projection["workflow_bytes"], len(fragment.encode()))
+        self.assertEqual(projection["caller_bytes"], len(self.MESSAGE.encode()))
+        self.assertEqual(projection["separator_bytes"], 1)
+        (self.repo / "feature.txt").write_text("implemented\n")
+        self.fake.finish("engineer", json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.send("correction")
+        correction, later = self.check_engineer_projection("correction")
+        self.assertEqual(correction["text"], self.MESSAGE)
+        self.assertNotIn("boundary_notices", correction.get("carried") or {})
+        self.assertEqual((later["workflow_bytes"], later["specification_bytes"], later["separator_bytes"]),
+                         (0, 0, 0))
 
     def test_changed_spec_delta_is_one_specification_fragment(self):
         self.agree()

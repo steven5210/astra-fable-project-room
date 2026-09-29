@@ -14,6 +14,7 @@ from unittest.mock import patch
 import ao_project_room as ao
 import ao_acceptance_extension as extension
 import ao_executable_binding
+import ao_native_outcome
 import ao_response_normalization as normalization
 import project_room
 import project_room_mcp
@@ -21,6 +22,7 @@ from test_ao_normal import Fixture
 
 
 class AcceptanceContinuationFixture(Fixture):
+    NATIVE = 'synthetic-native-engineer'
     review_count = 3
     last_review_decision = 'rejected'
     spec_review_count = 1
@@ -58,21 +60,52 @@ class AcceptanceContinuationFixture(Fixture):
             else:
                 self.send('acceptance_review', key)
             self.finish_review(key, self.last_review_decision if number == self.review_count else 'rejected')
+        self.message = 'Perform the exact authorized purpose.'
+
+    def register_native_source(self):
+        """Register the truthful two-role SQL owner before the inherited bind sends any request.
+
+        The base fixture's mocked prospective owner cannot satisfy the acceptance-review
+        audit, whose real readers validate the engineer and Codex reviewer rows against the
+        bound conversation, branch and workspaces. The engineer source goes through the
+        real pre-dispatch preflight; the reviewer row is evidence for the Codex owner
+        reader only and is not registered as a Claude transcript.
+        """
+        if getattr(self, 'native_outcome_source', None) is not None:
+            return
+        state = self.state()
+        bindings = state.get('bindings') or {}
+        if not bindings.get('engineer'):
+            return
         self.database = self.root / 'synthetic-owner.db'
+        rows = {'engineer': ('claude-code', self.native_row_workspace(), self.NATIVE),
+                'reviewer': ('codex', str(self.fake.workspaces['reviewer']), 'synthetic-native-reviewer')}
         with sqlite3.connect(self.database) as db:
             db.executescript('''CREATE TABLE sessions(id,project_id,harness,session_mode,is_terminated,
               activity_state,workspace_path,provider_conversation_id,controller_generation);
               CREATE TABLE conversations(id,current_session_id,active_branch_id);
               CREATE TABLE conversation_branches(id,conversation_id,provider_conversation_id,session_id,strategy,replay_truncated);''')
-            for role, binding in self.state()['bindings'].items():
-                native = 'synthetic-native-' + role
+            for role, binding in sorted(bindings.items()):
+                harness, workspace, native = rows[role]
                 db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
-                           (role, 'project', binding['harness'], 'chat', 0, 'idle', str(self.fake.workspaces[role]), native, 'generation'))
+                           (role, state['ao_project_id'], harness, 'chat', 0, 'idle', workspace, native, 'generation'))
                 db.execute('INSERT INTO conversations VALUES(?,?,?)',
                            (binding['conversation_id'], role, binding['branch_id']))
                 db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
                            (binding['branch_id'], binding['conversation_id'], native, role, 'native', 0))
-        self.message = 'Perform the exact authorized purpose.'
+        self.database.chmod(0o600)
+        config_root = self.native_config_root()
+        project_dir = config_root / 'projects' / str(self.repo).replace('/', '-')
+        self.transcript = project_dir / (self.NATIVE + '.jsonl')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript.write_text('')
+        self.native_events = []
+        self.native_requests = set()
+        source = {'database': str(self.database), 'transcript': str(self.transcript),
+                  'session_id': bindings['engineer']['session_id'], 'native_session_id': self.NATIVE}
+        ao_native_outcome.preflight_source(self.directory(), state, source['database'], source['transcript'])
+        ao.atomic(self.directory() / 'state.json', state)
+        self.native_outcome_source = source
 
     def finish_review(self, request_id, decision='approved'):
         request = self.state()['requests'][request_id]
@@ -82,7 +115,7 @@ class AcceptanceContinuationFixture(Fixture):
 
     def audit(self, review='fourth'):
         return self.service.ao_room_acceptance_review_audit(self.room, review, ao.digest(self.message.encode()),
-                               str(self.database), 'synthetic-native-engineer', 'synthetic-native-reviewer')
+                               str(self.database), self.NATIVE, 'synthetic-native-reviewer')
 
     def grant_inputs(self, review='fourth'):
         return dict(room_id=self.room, audit_sha256=self.audit(review)['audit_sha256'],
@@ -103,7 +136,7 @@ class AcceptanceContinuationTests(AcceptanceContinuationFixture):
             self.assertIn(name, names)
             self.assertFalse(names[name]['annotations']['readOnlyHint'])
         audit_args = dict(room_id=self.room, review_request_id='fourth', message_sha256=ao.digest(self.message.encode()),
-                          native_owner_database=str(self.database), engineer_native_session_id='synthetic-native-engineer',
+                          native_owner_database=str(self.database), engineer_native_session_id=self.NATIVE,
                           reviewer_native_session_id='synthetic-native-reviewer')
         with patch.object(ao, 'Service', return_value=self.service):
             with self.assertRaisesRegex(ao.RoomError, 'Invalid arguments'):
@@ -648,7 +681,7 @@ class CharterAndAcceptanceContinuationTests(AcceptanceContinuationFixture):
         accepted = self.service.ao_room_accept(self.room, 'prior-3')
         spec = self.spec(2)
         audit = self.service.ao_room_spec_review_extension_audit(self.room, 2, spec['sha256'],
-                    accepted['candidate_sha256'], 'synthetic-native-engineer', str(self.database))
+                    accepted['candidate_sha256'], self.NATIVE, str(self.database))
         self.service.ao_room_spec_review_extend(self.room, audit['audit_sha256'],
                     'Actual synthetic user approval of one further charter review.',
                     'The approved next charter needs its one additional review.', 'grant-fourth-charter')
@@ -772,18 +805,13 @@ class AcceptanceFreezeListProbeTests(AcceptanceContinuationFixture):
         # project_room_mcp.py) and the only non-test callers of this module (ao_acceptance_extension.py,
         # ao_review_extension.py, ao_routing.py, ao_routing_refresh.py) use _chain/_read/effective, never
         # bind. It is reachable only as a direct Python function call, which is what this probe does.
-        # Even called directly, its own guard_unused call (ao_executable_binding.py:230) is unreachable
-        # with this fixture: _inspect() (line 161) calls _source_failure(source) (line 135), which raises
-        # at line 137 whenever routing has no previously recorded successful identity. This fixture's
-        # preparation (test_ao_normal.Fixture.bind) never configures a working claude_bin, so
-        # ao_routing.claude_evidence() always yields that failing shape, identically whether or not an
-        # acceptance-review grant is unused (other suites, e.g. test_ao_routing_refresh.py, configure a
-        # working claude_bin first and do reach guard_unused, but that setup lives in a different fixture
-        # this task may not touch). This probe records the actual, non-freeze refusal in both grant states
-        # rather than bending the test to assert an unreachable gate.
+        # This fixture records a truthful compatible executable identity at preparation, so bind's own
+        # _source_failure sees the intact current identity and refuses at its unchanged-executable guard
+        # before any acceptance-review freeze check, write or POST is reached. The refusal is identical
+        # with or without an unused grant, and the recorded identity is never erased or mocked away.
         posts = len(self.fake.posts)
         state_before = (self.directory() / 'state.json').read_bytes()
-        with self.assertRaisesRegex(ao.RoomError, 'Executable repair requires a previously recorded successful identity'):
+        with self.assertRaisesRegex(ao.RoomError, 'Recorded executable is unchanged; this operation only repairs diagnosed loss or drift'):
             ao_executable_binding.bind(self.service, self.room, 'repair-attempt',
                                         str(self.root / 'synthetic-new-claude'), str(self.root / 'synthetic-launch.sh'),
                                         str(self.database), 'Synthetic authorization', 'Synthetic diagnosis')
@@ -792,7 +820,7 @@ class AcceptanceFreezeListProbeTests(AcceptanceContinuationFixture):
 
         self.grant()
         state_before = (self.directory() / 'state.json').read_bytes()
-        with self.assertRaisesRegex(ao.RoomError, 'Executable repair requires a previously recorded successful identity'):
+        with self.assertRaisesRegex(ao.RoomError, 'Recorded executable is unchanged; this operation only repairs diagnosed loss or drift'):
             ao_executable_binding.bind(self.service, self.room, 'repair-attempt',
                                         str(self.root / 'synthetic-new-claude'), str(self.root / 'synthetic-launch.sh'),
                                         str(self.database), 'Synthetic authorization', 'Synthetic diagnosis')

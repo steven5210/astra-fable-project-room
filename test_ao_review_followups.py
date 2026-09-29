@@ -247,6 +247,8 @@ class FollowupAmendmentTests(Fixture):
                     for r in before['requests'].values()}
         self.service = ao.Service(self.home, lambda url: self.fake)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'new', purpose='correction')
+        # Direct dispatch bypasses Fixture.send; record the same saved native evidence before completion.
+        self.note_native_turn('new')
         current = self.state()['requests']['new']
         self.assertEqual(current['text'], followups.INSTRUCTION + '\nContinue.')
         self.assertEqual(current['carried']['parts'], [followups.PART])

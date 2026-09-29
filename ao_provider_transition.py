@@ -388,10 +388,14 @@ def _inspect(service, directory, state, target_input, reconcile=None):
     delegate = state.get("delegate") or {}
     if delegate.get("provider") != "deepseek":
         raise RoomError("Provider transition requires a room pinned to the DeepSeek delegate provider")
+    import ao_engineering_model
     engineer, reviewer = state["bindings"].get("engineer"), state["bindings"].get("reviewer")
-    if (not engineer or engineer.get("harness") != "claude-code" or engineer.get("model") != ao_workflow.FABLE_MODEL
-            or engineer.get("reasoning_effort") != "max"):
-        raise RoomError("Provider transition requires the bound native Fable engineer at max effort")
+    # Pinned evidence keeps the immutable stored binding; eligibility reads the epoch in force.
+    effective = ao_engineering_model.effective_binding(directory, state) if engineer else None
+    if (not effective or effective.get("harness") != "claude-code"
+            or effective.get("model") != ao_engineering_model.current(directory, state)["model"]
+            or effective.get("reasoning_effort") != "max"):
+        raise RoomError("Provider transition requires the existing normal engineering orchestrator at its configured model and MAX")
     if not reviewer:
         raise RoomError("Bind the independent reviewer before a provider transition")
     agreed = ao_workflow.agreement(service, directory, state)
@@ -772,8 +776,12 @@ def dispatch_gate(service, directory, state, snapshot):
             or observed.get("worktree") != prepared["worktree"]):
         raise RoomError("Native delegate launch contradicts the active provider epoch")
     current = _native(state, engineer, snapshot, directory)
+    import ao_engineering_model
+    live = ao_engineering_model.current(directory, state)
+    pinned = ao_engineering_model.model_at_provider_epoch(directory, state)
     if (current["conversation_id"] != epoch["native"]["conversation_id"] or current["branch_id"] != epoch["native"]["branch_id"]
-            or current["model"] != epoch["native"]["model"] or current["reasoning_effort"] != epoch["native"]["reasoning_effort"]):
+            or current["model"] != live["model"] or current["reasoning_effort"] != live["reasoning_effort"]
+            or epoch["native"]["model"] != pinned["model"] or epoch["native"]["reasoning_effort"] != pinned["reasoning_effort"]):
         raise RoomError("Native conversation identity differs from the committed provider epoch")
     original = {t["turn_id"] for t in epoch["native"]["owned_turns"] + epoch["native"]["unowned_completed_turns"]}
     allowed = original | {r["turn_id"] for r in state["requests"].values()

@@ -759,7 +759,8 @@ class AcceptanceMatrixTests(MatrixFixture):
                 'Candidate changed after verification; verify and review the new candidate',
                 'Candidate changed after verification; verify and review the new candidate'),
             'reviewer_binding': (
-                'An additional acceptance review requires the bound native Fable engineer and Codex reviewer at max effort',
+                'An additional acceptance review requires the existing normal engineering orchestrator at its '
+                'configured model and MAX and the bound native Codex reviewer at max effort',
                 'The unused acceptance-review grant pins bindings; it changed, so nothing may be dispatched until it is diagnosed'),
             'room_identity': (
                 'The acceptance-review audit is stale; room, candidate, native or retained evidence changed',

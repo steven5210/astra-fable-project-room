@@ -191,7 +191,8 @@ def _consistent_reroute(reroute, request, provider_id):
         return True
     if not isinstance(reroute, dict):
         return False
-    if (reroute.get("toModel") != request.get("model")
+    import ao_engineering_model  # exact requests keep equality; family requests their frozen family rule
+    if (not ao_engineering_model.model_matches(request, reroute.get("toModel"))
             and (not reroute.get("providerTurnId") or reroute.get("providerTurnId") == provider_id)):
         return False
     return True
@@ -296,9 +297,17 @@ def _preserved_workspace(before, after):
                          and before["routing"]["claude_config_dir"] == after["routing"]["claude_config_dir"])
 
 
-def _bound_role(request, bindings):
+def _bound_role(request, bindings, root=None, state=None):
+    """The request's owner equals the frozen role binding expressed in the engineering epoch that owned it."""
     binding = bindings.get(request["role"]) if isinstance(bindings, dict) else None
     _preparation_failure(isinstance(binding, dict))
+    if state is not None:
+        import ao_engineering_model
+        try:
+            ao_engineering_model.check_request(root.path, state, request)
+            binding = ao_engineering_model.binding_for_request(root.path, state, binding, request)
+        except (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise AuditRefusal("preparation_unbound") from None
     fields = ("session_id", "harness", "model", "reasoning_effort", "conversation_id", "branch_id")
     _preparation_failure(all(isinstance(binding.get(key), str) and binding[key] == request[key] for key in fields))
 
@@ -372,7 +381,7 @@ def _transition_preparations(root, state, request):
                          and target_prepared.get("original_preparation_sha256") == source["preparation_sha256"]
                          and _same(old["routing"], target_prepared["routing"]))
     _preserved_workspace(old, target_prepared)
-    _bound_role(request, {role: epoch[role] for role in REQUEST_ROLES})
+    _bound_role(request, {role: epoch[role] for role in REQUEST_ROLES}, root, state)
     return epoch, old, target_prepared
 
 
@@ -407,7 +416,7 @@ def _adopted_preparation(root, state, request, epoch, target_prepared):
     prior_requests = before.get("requests")
     _preparation_failure(isinstance(prior_requests, dict) and all(isinstance(item, dict)
                          and "provider_epoch" not in item for item in prior_requests.values()))
-    _bound_role(request, before.get("bindings"))
+    _bound_role(request, before.get("bindings"), root, state)
     relative = "routing-adoption/v2/preparation.json"
     expected = record.get("target_preparation_sha256")
     _preparation_failure(state.get("preparation") == relative and state.get("preparation_sha256") == expected)
@@ -430,7 +439,7 @@ def _read_preparation(room_root, state, request):
             _preparation_failure("provider_epoch" not in request and state.get("routing_adoption") is None
                                  and state.get("preparation") == "preparation.json")
             if "bindings" in state:
-                _bound_role(request, state["bindings"])
+                _bound_role(request, state["bindings"], room_root, state)
             expected = state.get("preparation_sha256")
             prepared = _preparation_record(room_root, "preparation.json", expected,
                                             _digest(delegate, "preparation_unbound"), state["room_id"])

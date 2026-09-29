@@ -149,7 +149,8 @@ def _foreground(audit):
 def _foreground_sources(service, state, audit):
     if _foreground(audit):
         prepared = audit['evidence']['prepared']
-        ao_routing.contradictions(prepared['routing']['claude_config_dir'], Path(prepared['worktree']), os.environ, foreground=True)
+        ao_routing.contradictions(prepared['routing']['claude_config_dir'], Path(prepared['worktree']), os.environ, foreground=True,
+                                  agents=ao_routing.recorded_agents(prepared['routing']))
         ao_routing._foreground_project(service.client(state), state)
 
 
@@ -312,7 +313,8 @@ def _bundle(directory, audit):
         raise RoomError('Original managed hook is missing or duplicated; do not weaken other hooks')
     settings['hooks']['PreToolUse'] = [h for h in hooks if h != entry]
     command = ao_routing.hook_command(old['python'], guard)
-    settings = ao_routing.settings_document(settings, command, foreground=_foreground(audit))
+    # The v1 snapshot keeps its own recorded worker map; model restrictions are checked against it.
+    settings = ao_routing.settings_document(settings, command, foreground=_foreground(audit), agents=ao_routing.recorded_agents(old))
     runtime['.claude/settings.local.json'] = _json(settings).decode()
     new_config = copy.deepcopy(e['original_config'])
     new_config['agentRules'] += '\n\n' + INSTRUCTION

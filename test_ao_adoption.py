@@ -7,16 +7,20 @@ import json
 import os
 from pathlib import Path
 import selectors
+import sqlite3
 import subprocess
 import time
 import unittest
 from unittest.mock import patch
 
 import ao_delegates
+import ao_executable_binding
+import ao_native_outcome
 import ao_project_room as ao
 import ao_provider_transition as provider
 import ao_routing
 import ao_routing_adoption as routing
+import ao_routing_refresh as refresh
 import deepseek_adapter
 from implementation import candidate_snapshot
 from test_ao_normal import DelegateFixture
@@ -24,7 +28,115 @@ import test_ao_routing_v1_fixture as frozen
 
 
 class AdoptionFixture(DelegateFixture):
-    install_frozen_routing = frozen.FrozenV1RoutingTests.install_frozen_routing
+    def install_frozen_routing(self, service, directory, state, worktree, prepared):
+        """The frozen v1 bundle plus truthful bounded executable evidence from the fixture's fake CLI.
+
+        The generic frozen producer records ``claude_evidence(None)``, so the historically published v1
+        bytes never pin an executable. Modern continuation here runs a real qualified routing refresh
+        whose admission re-probes the recorded effective executable, so this fixture records the actual
+        compatible fake executable's bounded identity during that initial v1 construction, before the
+        preparation and its handoff are stored. The frozen guard, agent and settings templates and every
+        old published byte stay exactly as they are; nothing is invented or rewritten afterwards.
+        """
+        record = frozen.FrozenV1RoutingTests.install_frozen_routing(self, service, directory, state, worktree, prepared)
+        record['claude'] = ao_routing.claude_evidence(str(self.fake_cli))
+        return record
+
+    def make_database(self):
+        """One real synthetic AO owner database for this room's bound engineer session."""
+        self.database = self.root / 'synthetic-ao.db'
+        state = self.state()
+        binding = state['bindings']['engineer']
+        with sqlite3.connect(self.database) as db:
+            db.executescript('''CREATE TABLE sessions(id,project_id,harness,session_mode,is_terminated,
+              activity_state,workspace_path,provider_conversation_id,controller_generation);
+              CREATE TABLE conversations(id,current_session_id,active_branch_id);
+              CREATE TABLE conversation_branches(id,conversation_id,provider_conversation_id,session_id,strategy,replay_truncated);''')
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)',
+                       (binding['session_id'], state['ao_project_id'], 'claude-code', 'chat', 0, 'idle',
+                        self.native_row_workspace(), self.NATIVE, 'generation-one'))
+            db.execute('INSERT INTO conversations VALUES(?,?,?)',
+                       (binding['conversation_id'], binding['session_id'], binding['branch_id']))
+            db.execute('INSERT INTO conversation_branches VALUES(?,?,?,?,?,?)',
+                       (binding['branch_id'], binding['conversation_id'], self.NATIVE, binding['session_id'], 'native', 0))
+
+    def register_native_source(self):
+        """Register the real synthetic native owner, database and transcript before the first charter.
+
+        The inherited normal fixture fabricates an owner and patches the read-only reader. This
+        fixture registers the actual synthetic AO database through the same supported preflight a
+        qualified dispatch verifies, so owner, ledger and refresh checks observe real bytes. The
+        inherited ``note_native_turn`` helper keeps appending stop evidence to this transcript.
+        """
+        if getattr(self, 'native_outcome_source', None) is not None:
+            return
+        state = self.state()
+        binding = (state.get('bindings') or {}).get('engineer')
+        if not binding:
+            return
+        self.make_database()
+        config_root = self.native_config_root()
+        project_dir = config_root / 'projects' / str(self.repo).replace('/', '-')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript = project_dir / (self.NATIVE + '.jsonl')
+        self.transcript.write_text('')
+        self.native_events = []
+        self.native_requests = set()
+        source = {'database': str(self.database), 'transcript': str(self.transcript),
+                  'session_id': binding['session_id'], 'native_session_id': self.NATIVE}
+        ao_native_outcome.preflight_source(self.directory(), state, source['database'], source['transcript'])
+        ao.atomic(self.directory() / 'state.json', state)
+        self.native_outcome_source = source
+
+    def qualify_worker_routing(self, request_id='qualified-workers'):
+        """Real opt-in refresh of the configured adoption into source-qualified v3 worker routing.
+
+        Runs the audited ``ao_routing_refresh.refresh`` with ``agent_selection='qualified'`` against
+        the same synthetic owner database, after routing adoption is configured, while the native
+        controller is stopped and before any MCP attachment starts. Only the documented ignored
+        runtime files, the new append-only refresh journal/guard evidence and the state pointer may
+        change: the original preparation, provider epoch and adoption records, prior request receipts
+        and the candidate are asserted intact, and the committed target is the qualified exact map.
+        """
+        room = self.directory()
+        state = self.state()
+        epoch = state['provider_transition']
+        names = [epoch['original_preparation'], state['preparation'], epoch['receipt'], epoch['epoch_record'],
+                 state['routing_adoption']['receipt'], *[request['receipt'] for request in state['requests'].values()]]
+        originals = {name: (room / name).read_bytes() for name in names}
+        candidate = candidate_snapshot(self.repo)
+        result = refresh.refresh(
+            self.service, self.room, request_id, str(self.database), self.NATIVE,
+            'User authorized this exact source-qualified native worker routing refresh for the retained room.',
+            'The configured adoption is historically unqualified for new delegating execution; the retained '
+            'synthetic native owner, workspace, branch and stopped controller are unchanged.',
+            agent_selection='qualified')
+        self.assertFalse(result['idempotent'])
+        self.assertFalse(result['model_dispatch'])
+        self.assertTrue(result['original_preparation_preserved'])
+        current = self.state()
+        self.assertEqual(current['routing_refresh'], {'path': result['path'], 'sha256': result['sha256']})
+        effective = ao_routing.validate_local(ao_delegates.preparation(room, current), current, room)
+        self.assertEqual(effective['version'], 3)
+        self.assertEqual(effective['agents'], self.QUALIFIED_WORKERS)
+        self.assertEqual(effective['agent_selection'], {'pr-sonnet': {'kind': 'family', 'family': 'sonnet'},
+                                                        'pr-opus': {'kind': 'family', 'family': 'opus'}})
+        self.assertEqual(effective['agent_identity_basis'], ao_routing.QUALIFIED_IDENTITY_BASIS)
+        self.assertEqual(effective['effort'], 'max')
+        self.assertEqual(effective['worker_qualification']['snapshot']['sha256'], result['worker_qualification_sha256'])
+        for relative, expected in result['files'].items():
+            self.assertEqual(ao.digest((self.repo / relative).read_bytes()), expected)
+        self.assertEqual(current['preparation'], state['preparation'])
+        for name, raw in originals.items():
+            self.assertEqual((room / name).read_bytes(), raw)
+        for key, request in state['requests'].items():
+            current_request = current['requests'][key]
+            self.assertEqual('carried' in current_request, 'carried' in request)
+            if 'carried' in request:
+                self.assertEqual(current_request['carried'], request['carried'])
+            self.assertEqual(current_request['text_sha256'], request['text_sha256'])
+        self.assertEqual(candidate_snapshot(self.repo), candidate)
+        return result
 
     def open(self, feature='normal', provider='none'):
         if provider == 'deepseek':
@@ -140,6 +252,7 @@ class DispatchObservationTests(AdoptionFixture):
     def setUp(self):
         super().setUp()
         self.prepared = self.configure_routing()
+        self.qualify_worker_routing()  # qualify while stopped, before any MCP attachment
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.attachment = self.start_attachment(self.prepared)
         # Exercise the real ordinary normalizer over synthetic raw transport.
@@ -518,36 +631,125 @@ class RoutingAdoptionTests(AdoptionFixture):
 
     def test_real_synthetic_mcp_handshake_unlocks_one_amendment_then_only_continue(self):
         prepared = self.configure_routing()
+        self.qualify_worker_routing()
         self.fake.snapshots['engineer']['controller'] = 'ready'
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'before-handshake', purpose='implementation')
         self.start_attachment(prepared)
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'after-handshake', purpose='implementation')
+        # This direct send bypasses Fixture.send, so its synthetic native stop evidence is appended
+        # here, before the completion and sync, for the later correction to observe.
+        self.note_native_turn('after-handshake')
         sent = self.fake.posts[-1][1]['text']
         current = self.state()
         request = current['requests']['after-handshake']
         epoch = ao.read(self.directory() / current['provider_transition']['epoch_record'])
         provider_text = provider.amendment_text(epoch)
-        # Frozen baseline path: previously delivered workflow/spec, followed by
-        # exactly the provider amendment, routing amendment and caller with two LFs.
+        # The initial worker boundary travels through the same real packet assembly as the frozen
+        # provider/routing amendments. Derive its exact identity and text from the retained request
+        # and its own committed boundary; never assert a hardcoded replacement fragment.
+        from ao_model_boundaries import WORKER_ROUTING, notice_fragment
+        notices = request['carried']['boundary_notices']
+        self.assertEqual([notice['kind'] for notice in notices], [WORKER_ROUTING])
+        worker_text = notice_fragment(self.directory(), current, notices[0])
         self.assertEqual(request['carried']['parts'], [])
-        self.assertEqual(sent, provider_text + '\n' + routing.INSTRUCTION + '\nContinue.')
+        self.assertEqual(sent, provider_text + '\n' + routing.INSTRUCTION + '\n' + worker_text + '\nContinue.')
         self.assertEqual(request['prompt_projection'], {
             'version': 1, 'text_sha256': ao.digest(sent.encode()), 'total_bytes': len(sent.encode()),
             'caller_bytes': 9, 'specification_bytes': 0,
-            'workflow_bytes': len(provider_text.encode()) + len(routing.INSTRUCTION.encode()),
-            'separator_bytes': 2, 'spec_delivery': 'none'})
+            'workflow_bytes': len(provider_text.encode()) + len(routing.INSTRUCTION.encode()) + len(worker_text.encode()),
+            'separator_bytes': 3, 'spec_delivery': 'none'})
+        self.assertEqual(sent.count(worker_text), 1)
         self.assertIn(routing.INSTRUCTION, sent)
         self.assertNotIn('<specification>', sent)
         self.assertTrue(sent.endswith('Continue.'))
         self.fake.finish('engineer', json.dumps(self.report(outcome='changes_required', implementation_complete=False)))
         self.service.ao_room_sync(self.room)
+        completed = self.state()['requests']['after-handshake']
+        self.assertEqual(completed['state'], 'completed')
+        receipt = ao.read(self.directory() / completed['receipt'])
+        self.assertEqual(receipt['carried_sha256'], ao.digest(completed['carried']))
         self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'next', purpose='correction')
         self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')
-        projection = self.state()['requests']['next']['prompt_projection']
+        next_request = self.state()['requests']['next']
+        self.assertNotIn('boundary_notices', next_request.get('carried') or {})
+        self.assertNotIn(worker_text, next_request['text'])
+        self.assertNotIn(provider_text, next_request['text'])
+        self.assertNotIn(routing.INSTRUCTION, next_request['text'])
+        projection = next_request['prompt_projection']
         self.assertEqual((projection['total_bytes'], projection['caller_bytes'],
                           projection['workflow_bytes'], projection['separator_bytes']), (9, 9, 0, 0))
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_attempts'], 3)
+
+
+class HistoricalExecutableDiagnosticTests(AdoptionFixture):
+    """The actual frozen-v1 producer: an absent first identity is an unsupported diagnostic, not circular advice.
+
+    The generic frozen producer records ``claude_evidence(None)`` at initial construction and actual configured
+    adoption preserves it. A real qualified refresh then refuses the absent identity, and both actual audited
+    binding lanes refuse because neither may establish a first historical identity in place. This is a bounded
+    supported-scope correction, not a new first-binding facility: the original preparation, the adopted
+    preparation and every request/receipt stay byte-for-byte preserved, no refresh or binding journal or pointer
+    is written and no message is sent. New qualified worker execution would need a separately authorized, freshly
+    prepared room.
+    """
+
+    def install_frozen_routing(self, service, directory, state, worktree, prepared):
+        return frozen.FrozenV1RoutingTests.install_frozen_routing(self, service, directory, state, worktree, prepared)
+
+    def saved_state_evidence(self):
+        state = self.state()
+        return {'requests': copy.deepcopy(state['requests']),
+                'receipts': {request['receipt']: (self.directory() / request['receipt']).read_bytes()
+                             for request in state['requests'].values() if request.get('receipt')}}
+
+    def assert_state_evidence_preserved(self, before):
+        state = self.state()
+        for request_id, request in before['requests'].items():
+            self.assertEqual(state['requests'][request_id], request, request_id)
+        for relative, raw in before['receipts'].items():
+            self.assertEqual((self.directory() / relative).read_bytes(), raw, relative)
+
+    def test_absent_historical_identity_refuses_in_place_without_writes_or_messages(self):
+        initial = ao_delegates.preparation(self.directory(), self.state())
+        self.assertEqual(initial['routing']['version'], 1)
+        self.assertEqual(initial['routing']['claude'], ao_routing.claude_evidence(None))
+        original_preparation = (self.directory() / 'preparation.json').read_bytes()
+        before = self.saved_state_evidence()
+        prepared = self.configure_routing()
+        self.assertEqual(prepared['routing']['version'], 2)
+        self.assertEqual(prepared['routing']['claude'], initial['routing']['claude'])
+        self.assertEqual(self.state()['routing_adoption']['phase'], 'configured')
+        self.assert_state_evidence_preserved(before)
+        adopted_path = self.state()['preparation']
+        adopted_raw = (self.directory() / adopted_path).read_bytes()
+        posts = len(self.fake.posts)
+        worktree = {str(path): path.read_bytes() for path in self.repo.rglob('*') if path.is_file()}
+        with self.assertRaisesRegex(ao.RoomError, 'in-place first binding is unsupported'):
+            refresh.refresh(self.service, self.room, 'absent-identity-refresh', str(self.database), self.NATIVE,
+                            'User authorizes this bounded diagnostic refresh of the retained room.',
+                            'Diagnose the original unpinned historical preparation without modifying it.',
+                            agent_selection='qualified')
+        binding = dict(room_id=self.room, executable_path=str(self.fake_cli), launch_path=str(self.fake_cli),
+                       database_path=str(self.database),
+                       authorization='User authorizes this bounded diagnostic executable binding.',
+                       diagnosis='The original historical preparation recorded no successful identity.')
+        with self.assertRaisesRegex(ao.RoomError, 'in-place first binding is unsupported'):
+            ao_executable_binding.bind(self.service, request_id='absent-identity-repair', **binding)
+        with self.assertRaisesRegex(ao.RoomError, 'in-place first binding is unsupported'):
+            ao_executable_binding.bind(self.service, request_id='absent-identity-upgrade',
+                                       upgrade_authorization='User authorizes an explicit compatible upgrade.',
+                                       expected_version='2.1.282', **binding)
+        state = self.state()
+        self.assertIsNone(state.get('routing_refresh'))
+        self.assertIsNone(state.get('executable_binding'))
+        self.assertFalse((self.directory() / 'routing-refresh').exists())
+        self.assertFalse((self.directory() / 'executable-bindings').exists())
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual({str(path): path.read_bytes() for path in self.repo.rglob('*') if path.is_file()}, worktree)
+        self.assertEqual((self.directory() / 'preparation.json').read_bytes(), original_preparation)
+        self.assertEqual((self.directory() / adopted_path).read_bytes(), adopted_raw)
+        self.assert_state_evidence_preserved(before)
 
 
 if __name__ == '__main__':

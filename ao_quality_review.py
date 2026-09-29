@@ -296,7 +296,11 @@ def _reconciled_history(reader, state, request, receipt, latest):
 
 
 def _receipt_integrity(reader, request, binding):
-    """Immutable owned input/carried evidence, independent of history availability."""
+    """Immutable owned input/carried evidence, independent of history availability.
+
+    ``binding`` is the stored engineer binding expressed in the engineering epoch that owned this
+    request (``_owner``), so a post-transition request is never compared with the epoch-0 model.
+    """
     _require(all(isinstance(request.get(k), str) and request[k] and request[k] == binding.get(k) for k in _OWNER))
     name, pointer = request["request_id"], request.get("receipt")
     prefix = "receipts/" + name + "/"
@@ -329,6 +333,13 @@ def _receipt_integrity(reader, request, binding):
     else:
         _require("carried_sha256" not in receipt)
     return receipt
+
+
+def _owner(reader, state, binding, history, request):
+    """The ancestry owner of one retained engineer request: its exact epoch, checked and never widened."""
+    import ao_engineering_model
+    ao_engineering_model.check_request(reader.root, state, request, history)
+    return ao_engineering_model.binding_for_request(reader.root, state, binding, request, history)
 
 
 def _receipt(reader, request, binding, state, latest):
@@ -418,11 +429,14 @@ def _inspect(reader, state, session_id, *, amendment_integrity=False):
                 ordered.append(request)
     roots, root, delivered, native_turns, turns = {}, None, set(), set(), set()
     needed = _amendment_receipts(ordered, amendments) if amendment_integrity else None
+    import ao_engineering_model
+    history = ao_engineering_model.epochs(reader.root, state) if ordered else None
     for request in sorted(ordered, key=lambda r: r["created_order"]):
         if needed is not None and digest(request["request_id"].encode()) not in needed:
             continue
-        receipt = (_receipt_integrity(reader, request, binding) if amendment_integrity else
-                   _receipt(reader, request, binding, state, request is latest))
+        owner = _owner(reader, state, binding, history, request)
+        receipt = (_receipt_integrity(reader, request, owner) if amendment_integrity else
+                   _receipt(reader, request, owner, state, request is latest))
         native = receipt["turn"]["providerTurnId"]
         turn = receipt["turn"]["id"]
         _require(native not in native_turns and turn not in turns)

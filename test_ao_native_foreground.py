@@ -139,7 +139,7 @@ class ForegroundTests(unittest.TestCase):
                 self.assertIn('inherited', json.loads(result.stdout)['hookSpecificOutput']['permissionDecisionReason'])
         self.assertEqual(case.immutable_bytes(prepared), original)
         self.assertEqual(prepared['routing']['effort'], 'max')
-        self.assertEqual(prepared['routing']['agents'], ao_routing.MODELS)
+        self.assertEqual(prepared['routing']['agents'], case.QUALIFIED_WORKERS)
         self.assertEqual(case.fake.posts, [])
 
     def test_every_external_flag_zero_refuses_fresh_prepare_before_runtime_publication(self):

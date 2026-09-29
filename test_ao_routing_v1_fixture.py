@@ -105,7 +105,8 @@ class FrozenV1RoutingTests(Fixture):
         self.assertNotIn("Fable is the orchestrator: inspect evidence", actual["routing"])
         self.assertNotIn("The entire final response must be that JSON object", actual["review_contract"])
         self.assertIn("Fable owns implementation, engineering review and eligible delegation", actual["report_contract"])
-        self.service.ao_room_bind(self.room, "engineer", "engineer", ao_workflow.FABLE_MODEL, "max")
+        self.service.ao_room_bind(self.room, 'engineer', 'engineer', ao_workflow.FABLE_MODEL, 'max')
+        self.register_native_source()
         self.agree()
         request = copy.deepcopy(self.state()["requests"]["spec_review"])
         self.assertEqual(request["text"].count(actual[QUALITY_PART]), 1)
@@ -113,11 +114,40 @@ class FrozenV1RoutingTests(Fixture):
                          {name: ao.digest(value.encode()) for name, value in actual.items()})
         from ao_report_contract import PART, INSTRUCTION
         self.assertEqual(request["carried"]["part_sha256"][PART], ao.digest(INSTRUCTION.encode()))
+        delivered = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'], self.directory())
+        self.assertEqual(delivered['spec_record_sha256'], request['spec_record_sha256'])
+        self.assertEqual(delivered['completed_requests'], 1)
+        self.assertTrue(set(actual) <= set(delivered['parts']))
+        import ao_model_boundaries
+        self.assertEqual(ao_model_boundaries.read(self.directory(), self.state(), request),
+                         {'status': 'absent', 'request_id': 'spec_review',
+                          'reason': 'no_frozen_worker_expectations'})
+        posts = len(self.fake.posts)
+        rendered, carried = ao_workflow.packet(self.service, self.directory(), self.state(), 'engineer',
+                                               'spec_review', 'Continue.')
+        self.assertEqual(rendered, 'Continue.')
+        self.assertEqual(carried['parts'], [])
+        self.assertEqual(len(self.fake.posts), posts)
+        source_before = {name: data for name, data in self.frozen_bytes().items()
+                         if not name.endswith('/state.json')}
+        receipt_path = self.directory() / request['receipt']
+        receipt_bytes = receipt_path.read_bytes()
         self.service.ao_room_handoff(self.room, str(self.repo))
-        self.service.ao_room_send(self.room, "engineer", "Continue.", "continuation", purpose="implementation")
-        self.assertEqual(self.fake.posts[-1][1]["text"], "Continue.")
-        self.assertEqual(self.state()["requests"]["spec_review"], request)
-        self.assertEqual(self.state()["requests"]["continuation"]["carried"]["parts"], [])
+        before_state = self.state()
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'no source-qualified worker selection'):
+            self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'continuation', purpose='implementation')
+        after_state = self.state()
+        self.assertNotIn('continuation', after_state['requests'])
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(after_state['requests']['spec_review'], request)
+        self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+        self.assertEqual({name: data for name, data in self.frozen_bytes().items()
+                          if not name.endswith('/state.json')}, source_before)
+        self.assertEqual(after_state['bindings'], before_state['bindings'])
+        self.assertEqual(after_state['preparation'], before_state['preparation'])
+        self.assertEqual(after_state['preparation_sha256'], before_state['preparation_sha256'])
+        self.assertEqual(after_state.get('routing_refresh'), before_state.get('routing_refresh'))
 
 
 class NormalizationInterfaceTests(Fixture):
