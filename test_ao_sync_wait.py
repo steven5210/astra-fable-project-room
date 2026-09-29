@@ -169,7 +169,7 @@ class SyncWaitTests(unittest.TestCase):
         invalid_values = (44, 1801, True, "600", 600.5, [])
         for value in invalid_values:
             with self.subTest(value=value):
-                path.write_text(json.dumps(value))
+                path.write_text(json.dumps(value if isinstance(value, list) else {"sync_wait_max_seconds": value}))
                 before = self.state_path().read_bytes()
                 gets = self.fake.gets
                 with self.assertRaisesRegex(ao.RoomError, "sync_wait_max_seconds"):
