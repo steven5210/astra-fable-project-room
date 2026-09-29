@@ -84,7 +84,7 @@ All AO configuration lives in the private data directory, never in the plugin or
    {"ao_url": "http://127.0.0.1:PORT", "default_backend": "ao"}
    ```
 
-   The URL must be an explicit loopback IP and port; remote hosts, proxies, credentials in URLs and redirects are refused. The `PROJECT_ROOM_AO_URL` environment variable takes precedence over the file. `default_backend: "ao"` tells the skill to use AO for new Project Room work; the legacy tools stay callable and never migrate a room.
+   The URL must be an explicit loopback IP and port; remote hosts, proxies, credentials in URLs and redirects are refused. The `PROJECT_ROOM_AO_URL` environment variable takes precedence over the file. `default_backend: "ao"` tells the skill to use AO for new Project Room work; when it is selected and no legacy room exists, MCP omits the legacy `room_*` tools and instructions, `"legacy_tools": true` in the same config restores them after an MCP restart, while CLI tools remain callable and nothing migrates.
 
    Every new normal AO engineer preparation enables Claude's native automatic compaction with a **250,000-token window**, across projects and delegate providers. To select another window for future preparations, add `"auto_compact_window": 250000` to this same private file (an integer from 100,000 to 1,000,000). Preparation snapshots the choice in the ignored worktree settings; changing the default never rewrites an existing room. Fable stays at MAX. See [context compaction](docs/context-compaction.md) for configuration, existing sessions and validation.
 

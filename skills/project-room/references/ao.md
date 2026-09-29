@@ -82,7 +82,9 @@ in `PROJECT_ROOM_HOME/ao/config.json` (default home: `~/.project-room`). The
 Never embed local paths, live IDs or authentication in the distributed plugin.
 When the user chooses AO for new Project Room work, also record
 `"default_backend": "ao"` in that private config. The skill uses this preference;
-the low-level legacy tools remain callable and never migrate a room automatically.
+when it is set and no legacy room exists, the MCP server omits the legacy `room_*`
+tools and their instructions. Set `"legacy_tools": true` in the same config and
+restart MCP to restore them; CLI tools remain callable, and no room migrates.
 
 Every fresh normal AO engineer preparation enables native automatic compaction
 with a 250,000-token window, independent of the feature or delegate provider.

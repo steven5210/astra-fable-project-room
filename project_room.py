@@ -102,6 +102,7 @@ class Service:
         self.home = controller_home(home)
         self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._progress_cache = {}  # Parsed, stat-keyed metadata reused by read-only progress observation.
+        self.tool_inventory = None
         with self.db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS rooms(
@@ -151,6 +152,20 @@ class Service:
                 yield db
         finally:
             db.close()
+
+    def legacy_tools_visible(self):
+        if self.tool_inventory is None:
+            visible = True
+            try:
+                config = json.loads((self.home / "ao" / "config.json").read_text())
+                if (isinstance(config, dict) and config.get("default_backend") == "ao"
+                        and config.get("legacy_tools") is not True):
+                    with self.db() as db:
+                        visible = db.execute("SELECT 1 FROM rooms LIMIT 1").fetchone() is not None
+            except Exception:
+                visible = True
+            self.tool_inventory = visible
+        return self.tool_inventory
 
     def settings(self):
         try:

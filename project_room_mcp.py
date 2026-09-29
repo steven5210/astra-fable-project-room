@@ -52,11 +52,13 @@ def input_arguments(name, arguments):
 
 
 MAX_LINE = 3_000_000
-INSTRUCTIONS = (
+AO_INSTRUCTIONS = (
     "AO rooms use ao_room_*: Fable owns normal engineering/delegation; Astra owns product/spec and independent acceptance. "
     "An Astra-led exception requires actual per-task authorization. Prepare private delegates before native Fable launch, "
     "bind exact roles/models, obtain Fable acceptance of the exact spec, then hand off. Pin gates; send once, sync, verify, "
     "then accept the exact independent reviewer verdict. Usage is an attributable native subtotal, not quota. "
+)
+LEGACY_INSTRUCTIONS = (
     "The following rules apply to legacy room_* rooms, which never migrate automatically: "
     "Project Room: Astra owns grounded requirements, versioned specs, issue dispositions, and product-outcome review. "
     "Fable owns technical design, implementation planning, delegates, and engineering verdicts. "
@@ -68,8 +70,20 @@ INSTRUCTIONS = (
     "Fable's delegates follow each room's pinned provider policy: a DeepSeek room routes self-contained work to the "
     "text-only deepseek_* tools with pinned max effort and output, a legacy qwen room keeps its Qwen ladder, and a "
     "room without a provider routes among Claude tiers only; existing rooms never migrate silently. "
-    "The project-room skill supplies the workflow."
 )
+SKILL_INSTRUCTION = "The project-room skill supplies the workflow."
+INSTRUCTIONS = AO_INSTRUCTIONS + LEGACY_INSTRUCTIONS + SKILL_INSTRUCTION
+LEGACY_TOOLS_HIDDEN_ERROR = (
+    'Legacy room_* tools are not exposed: default_backend is ao and no legacy room exists. '
+    'Set "legacy_tools": true in PROJECT_ROOM_HOME/ao/config.json and restart the MCP server to use them.'
+)
+
+
+def _legacy_tools_visible(service):
+    try:
+        return service.legacy_tools_visible()
+    except AttributeError:
+        return True
 
 
 def error_response(identifier, code, message):
@@ -101,27 +115,36 @@ def handle(message, service):
         return error_response(identifier, -32602, "params must be an object")
     if method == "initialize":
         version = params.get("protocolVersion")
+        instructions = INSTRUCTIONS if _legacy_tools_visible(service) else AO_INSTRUCTIONS + SKILL_INSTRUCTION
         result = {"protocolVersion": version if version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25") else "2024-11-05",
                   "capabilities": {"tools": {"listChanged": False}},
-                  "serverInfo": {"name": "astra-fable-project-room", "version": RUNTIME["version"] if RUNTIME else "0.3.0"}, "instructions": INSTRUCTIONS}
+                  "serverInfo": {"name": "astra-fable-project-room", "version": RUNTIME["version"] if RUNTIME else "0.3.0"}, "instructions": instructions}
         if RUNTIME:
             result["_meta"] = {"project-room/runtime": RUNTIME}
     elif method == "ping":
         result = {}
     elif method == "tools/list":
+        legacy_visible = _legacy_tools_visible(service)
         readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list", "ao_room_engineer_model_audit"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
                                              "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify", "ao_room_engineer_model_audit", "ao_room_engineer_model_transition", "ao_room_engineer_model_transition_abandon")}}
-                            for name, (description, schema) in project_room.TOOL_SCHEMAS.items()]}
+                            for name, (description, schema) in project_room.TOOL_SCHEMAS.items()
+                            if legacy_visible or name.startswith("ao_")]}
     elif method == "tools/call":
-        try:
-            name = params.get("name")
-            value = service.call(name, input_arguments(name, params.get("arguments", {})))
-            result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
-                      "structuredContent": value, "isError": False}
-        except Exception as exc:
-            result = {"content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}], "isError": True}
+        name = params.get("name")
+        if (not _legacy_tools_visible(service) and isinstance(name, str)
+                and name in project_room.TOOL_SCHEMAS
+                and not name.startswith("ao_")):
+            error = {"error": LEGACY_TOOLS_HIDDEN_ERROR}
+            result = {"content": [{"type": "text", "text": json.dumps(error, ensure_ascii=False)}], "isError": True}
+        else:
+            try:
+                value = service.call(name, input_arguments(name, params.get("arguments", {})))
+                result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
+                          "structuredContent": value, "isError": False}
+            except Exception as exc:
+                result = {"content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}], "isError": True}
     else:
         return error_response(identifier, -32601, "Method not found")
     return {"jsonrpc": "2.0", "id": identifier, "result": result}
