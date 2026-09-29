@@ -57,10 +57,11 @@ unknown usage is never represented as zero.
 ## Loopback profile example
 
 The following is the single local-server example in this reference. Run the command with the selected model and
-served name, and set the profile's `model` to exactly the value supplied for `--served-model-name`:
+served name, and set the profile's `model` to exactly the value supplied for `--served-model-name`. Set
+`limits.context_tokens` to exactly the server's `--max-model-len`:
 
 ```sh
-vllm serve <model> --served-model-name <name> --host 127.0.0.1 --port 8000
+vllm serve <model> --served-model-name <name> --host 127.0.0.1 --port 8000 --max-model-len 32768
 ```
 
 For example, replace `<name>` with `local/model-name` in both the profile and command:
@@ -69,7 +70,6 @@ For example, replace `<name>` with `local/model-name` in both the profile and co
 {
   "profile_version": 1,
   "id": "local-vllm",
-  "label": "Local model",
   "transport": {
     "kind": "loopback_http",
     "host": "127.0.0.1",
@@ -78,34 +78,23 @@ For example, replace `<name>` with `local/model-name` in both the profile and co
   },
   "model": "local/model-name",
   "request_syntax": "openai_plain",
-  "ask_effort": "none",
   "auth": {"kind": "none"},
   "limits": {
-    "max_tokens": 128,
-    "context_tokens": 4096,
-    "min_tokens_per_second": 40,
-    "request_timeout_seconds": 64,
-    "context_basis": "TOKEN",
-    "ask_max_tokens": 64,
-    "max_input_bytes": 3968,
-    "connect_margin_seconds": 60,
-    "read_idle_seconds": 30,
-    "max_concurrent_per_room": 1,
-    "max_concurrent_per_host": 1,
-    "max_context_files": 16,
-    "max_context_file_bytes": 3968,
-    "max_content_bytes": 1024,
-    "max_reasoning_bytes": 1024,
-    "max_wire_bytes": 2097152,
-    "max_wire_tail_bytes": 4096,
-    "max_metadata_bytes": 131072,
-    "max_sse_line_bytes": 1048576,
-    "max_retained_bytes": 1048576,
-    "max_jobs": 10000
+    "max_tokens": 8192,
+    "context_tokens": 32768,
+    "ask_max_tokens": 1024,
+    "min_tokens_per_second": 20,
+    "request_timeout_seconds": 470,
+    "context_basis": "vllm_max_model_len",
+    "max_input_bytes": 24576,
+    "max_context_file_bytes": 24576
   }
 }
 ```
 
 The command line's `--served-model-name` value in this example must be `local/model-name`, matching the profile's
-`model`. Plain syntax sends no reasoning or thinking parameters and requests streamed usage. If the endpoint does
-not return usage, the delegate reports it as missing and unknown, not zero.
+`model`. `request_timeout_seconds` is the smallest value accepted by the sizing rule with the default
+`connect_margin_seconds` of 60: `ceil(8192 / 20) + 60 = 470`. `max_input_bytes` leaves exactly the context budget
+remaining after `max_tokens`, and `max_context_file_bytes` does not exceed it. Plain syntax sends no reasoning or
+thinking parameters and requests streamed usage. If the endpoint does not return usage, the delegate reports it as
+missing and unknown, not zero.

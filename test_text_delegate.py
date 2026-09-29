@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import ssl
 import sys
@@ -143,6 +144,15 @@ class ProfileValidationTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn('"code": "config_invalid"', stderr.getvalue())
 
+    def test_vllm_documented_profile_passes_validation(self):
+        reference = Path(__file__).resolve().parent / "docs" / "reference" / "text-delegate.md"
+        blocks = re.findall(r"```json\n(.*?)\n```", reference.read_text(encoding="utf-8"), re.DOTALL)
+        self.assertTrue(blocks)
+        profile = json.loads(blocks[-1])
+        config = delegate.validate_config(profile, self.home)
+        self.assertEqual(config["context_tokens"], 32768)
+        self.assertEqual(config["request_timeout_seconds"], 470)
+
 
 class RequestBodyTests(unittest.TestCase):
     def setUp(self):
@@ -197,7 +207,23 @@ class TransportAndWorkerTests(unittest.TestCase):
         self.addCleanup(self.fake.close)
         self.profile_path = self.base / "profile.json"
         self.write_loopback_profile()
-        self.adapter = delegate.Adapter(self.home, "worker-room", self.profile_path)
+        self.export_dir = self.base / "granted-exports"
+        self.export_dir.mkdir(mode=0o700)
+        self.room_root = self.base / "room-root"
+        self.room_root.mkdir(mode=0o700)
+        adapter_path = Path(delegate.__file__).resolve()
+        inventory = {
+            "provider": "text_delegate",
+            "profile_id": "fixture",
+            "room_id": "worker-room",
+            "files": {
+                str(adapter_path): delegate.sha(adapter_path.read_bytes()),
+                str(self.profile_path.resolve()): delegate.sha(self.profile_path.read_bytes()),
+            },
+            "export_dir": str(self.export_dir),
+        }
+        (self.room_root / "settings.json").write_text(json.dumps({"provider_inventory": inventory}), encoding="utf-8")
+        self.adapter = delegate.Adapter(self.home, "worker-room", self.profile_path, room_root=self.room_root)
 
     def write_loopback_profile(self):
         profile = make_profile("openai_plain", "loopback_http", "127.0.0.1", self.fake.port, {"kind": "none"})
@@ -220,6 +246,8 @@ class TransportAndWorkerTests(unittest.TestCase):
         self.assertEqual(only_usage["usage_source"], "usage_only_chunk")
         self.assertEqual(only_usage["usage"], USAGE)
         first_result = self.adapter.result(only_usage["job_id"])
+        self.assertEqual(self.adapter.export_dir, self.export_dir)
+        self.assertEqual(Path(first_result["content_path"]).parent, self.export_dir)
         self.assertNotIn("PRIVATE_REASONING", first_result["text"])
         job_dir = self.home / "delegates" / "fixture" / "jobs" / only_usage["job_id"]
         self.assertIn(b"PRIVATE_REASONING", (job_dir / "reasoning").read_bytes())
@@ -245,7 +273,7 @@ class TransportAndWorkerTests(unittest.TestCase):
         self.assertTrue((root / "ledger.sqlite3").is_file())
         self.assertTrue((root / "jobs").is_dir())
         self.assertTrue((root / "probes").is_dir())
-        self.assertTrue((root / "exports" / "worker-room").is_dir())
+        self.assertTrue(self.export_dir.is_dir())
         self.assertFalse((self.home / "deepseek").exists())
         health = self.adapter.health()
         self.assertEqual(health["provider"], "text_delegate")
@@ -255,11 +283,35 @@ class TransportAndWorkerTests(unittest.TestCase):
         self.assertEqual(health["request_syntax"], "openai_plain")
         self.assertEqual(health["auth_kind"], "none")
 
+    def test_default_export_dir_is_selected_without_creating_it(self):
+        fallback_home = self.base / "fallback-home"
+        fallback_home.mkdir(mode=0o700)
+        adapter = delegate.Adapter(fallback_home, "fallback-room", self.profile_path)
+        expected = fallback_home / "delegates" / "fixture" / "exports" / "fallback-room"
+        self.assertEqual(adapter.export_dir, expected)
+        self.assertFalse(expected.exists())
+
     def test_loopback_redirect_is_refused_after_send(self):
         value = self.run_to_terminal("redirect", {"kind": "redirect"})
         self.assertEqual((value["state"], value["error_code"]), ("failed_after_send", "redirect_refused"))
         self.assertEqual(len(self.fake.requests), 1)
         self.assertNotIn("Authorization", self.fake.requests[0]["headers"])
+
+    def test_resolve_job_persists_resolution_and_unblocks_room(self):
+        failed = self.run_to_terminal("resolve", {"kind": "redirect"})
+        self.assertEqual(failed["state"], "failed_after_send")
+
+        resolution = delegate.resolve_job(
+            self.home, self.profile_path, "worker-room", failed["job_id"], "accept the uncertain outcome", interactive=True)
+        self.assertTrue(resolution["resolved"])
+        receipt = self.home / "delegates" / "fixture" / "jobs" / failed["job_id"] / "resolution.json"
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["note"], "accept the uncertain outcome")
+
+        self.fake.scenario = {"kind": "ok", "model": legacy.DEFAULT_MODEL}
+        submitted = self.adapter.submit("New task after resolution", "after-resolution")
+        completed = self.adapter.status(submitted["job_id"], wait=True, timeout_s=12)
+        self.assertEqual(completed["state"], "completed")
 
 
 class HttpsAndSurfaceTests(unittest.TestCase):

@@ -1606,7 +1606,7 @@ class Adapter:
         ensure_private_directory(self.profile_root)
         self.room_root = Path(room_root) if room_root else None
         self.integrity = self._verify_inventory()
-        self.export_dir = ensure_private_directory(self.profile_root / "exports" / self.room_id)
+        self.export_dir = Path(self.integrity["export_dir"]) if self.integrity["export_dir"] else self.profile_root / "exports" / self.room_id
         self.ledger = Ledger(self.profile_root)
         self.jobs_dir = ensure_private_directory(self.profile_root / "jobs")
         self.probes_dir = ensure_private_directory(self.profile_root / "probes")
@@ -2340,7 +2340,7 @@ def resolve_job(home, config_path, room_id, job_id, note, interactive=None):
                            "bytes (control characters, quotes and backslashes expand under JSON escaping)", record_bytes=encoded)
     config = load_config(config_path, home)[0]
     profile_root = Path(home) / "delegates" / config["profile_id"]
-    ledger = Ledger(profile_root, initialize=False)
+    ledger = Ledger(profile_root)
     row = ledger.job(job_id, room_id)
     if row["state"] not in STOP_STATES:
         raise AdapterError("resolve_not_eligible", "Only an unknown_delivery or failed_after_send job in this room can be resolved; this job is " + row["state"], state=row["state"])
