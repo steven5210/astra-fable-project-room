@@ -556,11 +556,11 @@ def _bind(home, room, request_id, database, evidence_root):
         raise
     return {"room_root": room_root, "preparation_sha256": preparation_sha256, "home": home, "room": room, "request_id": request_id, "database": database,
             "evidence_root": evidence_root, "request": request, "receipt": receipt, "prepared": prepared,
-            "owner": owner, "owner_sha256": owner_sha256, "request_sha256": request_sha256,
+            "state": state, "owner": owner, "owner_sha256": owner_sha256, "request_sha256": request_sha256,
             "native_session_id": owner["provider_conversation_id"],
             "workspace": prepared["worktree"],
             "config_root": prepared["routing"]["claude_config_dir"],
-            "evidence_norm": os.path.normpath(evidence_root),
+            "evidence_norm": None if evidence_root is None else os.path.normpath(evidence_root),
             "database_identity": database_identity,
             "source_active": owner["activity_state"] != "idle"}
 
@@ -653,6 +653,10 @@ def _descends_from(index, ancestor, admitted):
 
 
 def _collect(binding):
+    return _render_sources(binding, _gather(binding))
+
+
+def _gather(binding):
     notes = set()
     limits = _limits()
     collector = native.Collector(limits, notes)
@@ -660,14 +664,20 @@ def _collect(binding):
         config_root = audit_io.Root(binding["config_root"], "source_missing", "source_unsafe")
     except audit_io.SourceError as exc:
         notes.add(exc.reason)
-        return _unavailable(binding, exc.reason, notes)
+        return _gather_unavailable(exc.reason, notes)
     try:
-        return _collect_sources(binding, collector, limits, notes, config_root)
+        return _gather_sources(binding, collector, limits, notes, config_root)
     finally:
         config_root.close()
 
 
-def _collect_sources(binding, collector, limits, notes, config_root):
+def _gather_unavailable(reason, notes):
+    return {"parent_scan": None, "parent_result": None, "interval": None, "admitted": [],
+            "child_problems": set(), "notes": set(notes) | {reason}, "sources": [],
+            "parent_unavailable": True, "parent_unavailable_reason": reason}
+
+
+def _gather_sources(binding, collector, limits, notes, config_root):
     parent_actor = native.actor_digest(binding["owner_sha256"], "parent", None)
     native_id = binding["native_session_id"]
     try:
@@ -675,20 +685,20 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                                                                  "source_missing", "source_unsafe")
     except audit_io.SourceError as exc:
         notes.add(exc.reason)
-        return _unavailable(binding, exc.reason, notes)
+        return _gather_unavailable(exc.reason, notes)
     if overflow:
         notes.add("directory_entry_limit")
     try:
         matches = config_root.find_exact(names, native_id + ".jsonl")
     except audit_io.SourceError as exc:
         notes.add(exc.reason)
-        return _unavailable(binding, exc.reason, notes)
+        return _gather_unavailable(exc.reason, notes)
     if not matches:
         notes.add("source_missing")
-        return _unavailable(binding, "source_missing", notes)
+        return _gather_unavailable("source_missing", notes)
     if len(matches) > 1:
         notes.add("identity_conflict")
-        return _unavailable(binding, "identity_conflict", notes)
+        return _gather_unavailable("identity_conflict", notes)
     project_dir = matches[0]
     required_listings = [{"parts": ("projects",), "present": True, "identity": listing_identity, "names": names,
                           "overflow": overflow}]
@@ -699,7 +709,7 @@ def _collect_sources(binding, collector, limits, notes, config_root):
     parent_parts = ("projects", project_dir, native_id + ".jsonl")
     parent_result = _scan(collector, config_root, parent_parts, parent_scan, limits)
     if parent_result is None:
-        return _unavailable(binding, parent_scan.failure or "source_missing", notes)
+        return _gather_unavailable(parent_scan.failure or "source_missing", notes)
     scanned = [{"root": config_root, "parts": parent_parts, "result": parent_result, "scan": parent_scan}]
     interval, interval_reasons = native.parent_interval(parent_scan, binding["request"], binding["receipt"],
                                                         allow_terminal=not binding["source_active"])
@@ -750,7 +760,8 @@ def _collect_sources(binding, collector, limits, notes, config_root):
                 index = len(admitted)
                 by_agent[candidate.agent_id] = index
                 entry = {"actor_sha256": native.actor_digest(binding["owner_sha256"], "child", candidate.agent_id),
-                         "agent_id": candidate.agent_id, "interval": candidate.interval, "scan": None,
+                         "agent_id": candidate.agent_id, "configured_agent": candidate.subagent_type,
+                         "interval": candidate.interval, "scan": None,
                          "result": None, "ambiguous": False, "parent": parent_index, "reason": candidate.reason}
                 admitted.append(entry)
                 if candidate.interval is None:
@@ -844,6 +855,24 @@ def _collect_sources(binding, collector, limits, notes, config_root):
         config_root.recheck_identity("source_changed")
     except audit_io.SourceError:
         _note_scanners(collector, scanned, "source_changed")
+    sources = [{"source_sha256": parent_result.digest, "actor_sha256": parent_actor}]
+    child_sources = [{"source_sha256": entry["result"].digest, "actor_sha256": entry["actor_sha256"]}
+                     for entry in admitted if entry["result"] is not None]
+    child_sources.sort(key=lambda item: item["actor_sha256"])
+    sources.extend(child_sources)
+    return {"parent_scan": parent_scan, "parent_result": parent_result, "interval": interval,
+            "admitted": admitted, "child_problems": child_problems, "notes": notes, "sources": sources,
+            "parent_actor": parent_actor, "parent_unavailable": False, "parent_unavailable_reason": None}
+
+
+def _render_sources(binding, gathered):
+    notes = gathered["notes"]
+    if gathered["parent_unavailable"]:
+        return _unavailable(binding, gathered["parent_unavailable_reason"], notes)
+    parent_scan = gathered["parent_scan"]
+    interval = gathered["interval"]
+    admitted = gathered["admitted"]
+    child_problems = gathered["child_problems"]
     parent_group = native.group_report(parent_scan, interval)
     public_children = []
     child_labels = []
@@ -861,15 +890,10 @@ def _collect_sources(binding, collector, limits, notes, config_root):
         child_coverage = "incomplete"
     else:
         child_coverage = "complete"
-    sources = [{"source_sha256": parent_result.digest, "actor_sha256": parent_actor}]
-    child_sources = [{"source_sha256": entry["result"].digest, "actor_sha256": entry["actor_sha256"]}
-                     for entry in admitted if entry["result"] is not None]
-    child_sources.sort(key=lambda item: item["actor_sha256"])
-    sources.extend(child_sources)
     reasons = sorted(notes)
     coverage = ("complete" if parent_group["coverage"] == "complete" and child_coverage == "complete"
                 and not reasons else "incomplete")
-    return _report(coverage, binding["request_sha256"], binding["owner_sha256"], sources, parent_group,
+    return _report(coverage, binding["request_sha256"], binding["owner_sha256"], gathered["sources"], parent_group,
                    public_children, child_coverage, notes)
 
 

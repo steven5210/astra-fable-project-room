@@ -1818,6 +1818,12 @@ def main(argv=None):
     evidence.add_argument("--request", required=True)
     evidence.add_argument("--ao-database", required=True)
     evidence.add_argument("--evidence-root", required=True)
+    usage_audit = commands.add_parser("ao-native-usage-audit",
+                                      help="read-only native and delegate usage for one owned request; no model or network")
+    usage_audit.add_argument("--home", default=argparse.SUPPRESS, help="controller home; also accepted before the subcommand")
+    usage_audit.add_argument("--room", required=True)
+    usage_audit.add_argument("--request", required=True)
+    usage_audit.add_argument("--ao-database", required=True)
     call = commands.add_parser("call")
     call.add_argument("tool", choices=sorted(TOOL_SCHEMAS))
     call.add_argument("--args", default="{}", help="JSON argument object")
@@ -1860,6 +1866,25 @@ def main(argv=None):
                 return 2
             except Exception:
                 print(json.dumps({"error": "ao_evidence_read_audit_failed"}), file=sys.stderr)
+                return 2
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0 if result["coverage"] == "complete" else 1
+        if args.command == "ao-native-usage-audit":
+            try:
+                import ao_usage_audit
+            except Exception:
+                print(json.dumps({"error": "ao_native_usage_audit_failed"}), file=sys.stderr)
+                return 2
+            try:
+                audit_home = Path(args.home or os.environ.get("PROJECT_ROOM_HOME") or Path.home() / ".project-room").expanduser()
+                if not audit_home.is_absolute():
+                    audit_home = Path.cwd() / audit_home
+                result = ao_usage_audit.audit(audit_home, args.room, args.request, args.ao_database)
+            except ao_usage_audit.AuditError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                return 2
+            except Exception:
+                print(json.dumps({"error": "ao_native_usage_audit_failed"}), file=sys.stderr)
                 return 2
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0 if result["coverage"] == "complete" else 1

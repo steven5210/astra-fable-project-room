@@ -25,7 +25,7 @@ RUNTIME_FILES = (
     "ao_provider_transition.py", "ao_quality_review.py", "ao_report_contract.py", "ao_response_normalization.py",
     "ao_review_extension.py", "ao_review_followups.py", "ao_reviewer_recovery.py", "ao_routing.py", "ao_routing_adoption.py", "ao_routing_guard.py",
     "ao_routing_refresh.py",
-    "ao_workflow.py", "changeset_core.py", "changeset_faults.py", "changeset_fs.py",
+    "ao_usage_audit.py", "ao_workflow.py", "changeset_core.py", "changeset_faults.py", "changeset_fs.py",
     "changeset_journal.py", "changeset_ops.py", "changeset_plan.py", "changeset_receipts.py", "changeset_tool.py",
     "deepseek_adapter.py", "handoff_status.py", "heartbeat.py",
     "implementation.py", "progress.py", "project_room.py", "project_room_mcp.py",
