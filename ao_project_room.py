@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -37,6 +38,7 @@ TERMINAL = {"completed", "failed", "cancelled", "interrupted", "settled_failure"
 NATIVE_TERMINAL = TERMINAL | {"recovered"}
 COUNTERS = ("inputTokens", "outputTokens", "cachedTokens", "totalTokens")
 MAX_REVIEW_ATTEMPTS = 3
+AO_SYNC_WAIT_POLL_SECONDS = 5
 
 
 def digest(value):
@@ -714,7 +716,37 @@ class Service:
             self.save(directory, state)
             return self.request_summary(request)
 
-    def ao_room_sync(self, room_id):
+    def ao_room_sync(self, room_id, wait_seconds=0):
+        try:
+            invalid = (isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float))
+                       or not math.isfinite(wait_seconds) or not 0 <= wait_seconds <= 45)
+        except (OverflowError, TypeError, ValueError):
+            invalid = True
+        if invalid:
+            raise RoomError("wait_seconds must be finite and between 0 and 45")
+        if wait_seconds == 0:
+            return self._sync_once(room_id)[0]
+        deadline = time.monotonic() + wait_seconds
+        summary, initial = self._sync_once(room_id)
+        states = initial
+        while True:
+            active = [request_id for request_id, state in states.items() if state in ("submitted", "running")]
+            if not active:
+                reason = "no_active_request"
+                break
+            if states != initial:
+                reason = "state_changed"
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = "timeout"
+                break
+            time.sleep(min(AO_SYNC_WAIT_POLL_SECONDS, remaining))
+            summary, states = self._sync_once(room_id)
+        summary["wait"] = {"requested_seconds": wait_seconds, "reason": reason, "settled": reason != "timeout"}
+        return summary
+
+    def _sync_once(self, room_id):
         with self.locked(room_id) as (directory, state):
             self._routing_refresh_gate(state)  # Sync also persists observations and changes the pending intent's state.
             from ao_review_extension import validate as review_extension_validate
@@ -817,7 +849,9 @@ class Service:
             self.save(directory, state)
             if ao_workflow.normal(state):
                 ao_routing.observe_on_sync(self, directory, state)  # bounded GET; never refuses the sync
-            return self.summary(directory, state)
+            summary = self.summary(directory, state)
+            states = {request_id: request["state"] for request_id, request in state["requests"].items()}
+            return summary, states
 
     def ao_room_outcome_audit(self, room_id, role='engineer', ao_database_path=None, native_transcript_path=None):
         import ao_outcomes
@@ -1070,7 +1104,7 @@ TOOL_SCHEMAS = {
     "ao_room_routing_adoption_activate": ("Activate only the identical staged routing-adoption request after the exact new project configuration, managed files and unchanged stopped native identity/history are observed. Pin the new preparation without changing provider snapshots, handoff or review budgets. No AO POST or inference; native MCP startup remains a separate dispatch gate.", schema({**R, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
-    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven.", schema(R)),
+    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (<=45) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running or any request state changes; repeat bounded waits instead of polling each turn.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
     "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
