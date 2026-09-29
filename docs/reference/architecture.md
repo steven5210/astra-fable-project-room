@@ -12,7 +12,7 @@ dispatch or acceptance. See
 
 The package separates the agent workflow from durable execution:
 
-- `skills/project-room/SKILL.md` supplies Astra's roles, review loop, handoff, and product acceptance workflow.
+- `skills/project-room/SKILL.md` supplies Astra's roles and backend selection. AO rooms work from `references/ao-card.md`, a per-phase operator card that names the section of `references/ao.md` to open for each exception. Legacy rooms follow `references/legacy.md`.
 - `project_room_mcp.py` exposes local stdio tools. The plugin manifest starts it from the installed plugin root.
 - `project_room.py` provides setup, diagnostics, a project/feature room registry, and the CLI equivalent of the MCP operations.
 - `ao_acceptance_extension.py` audits and grants one exact additional independent acceptance review after the ordinary AO allowance. Its append-only grant/consumption journal preserves native ownership, prior evidence and single-use dispatch semantics; see [acceptance-review continuation](../guides/acceptance-review-continuation.md).
