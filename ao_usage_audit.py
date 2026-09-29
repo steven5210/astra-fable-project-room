@@ -39,7 +39,11 @@ def _sum_counters(values):
 
 
 def _marker_in_interval(interval, number, timestamp):
-    return interval.contains(number, timestamp) if timestamp is not None else interval.contains_number(number)
+    if timestamp is not None:
+        return interval.contains(number, timestamp)
+    # Record numbers are actor-local: only a parent Interval can place a marker by number. A child
+    # interval is bounded by timestamps alone, so a marker without one cannot be excluded (fail closed).
+    return interval.contains_number(number) if isinstance(interval, native.Interval) else True
 
 
 def _actor_unavailable(configured_model, reasons):
