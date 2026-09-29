@@ -15,7 +15,7 @@ The `deepseek` tool family supports two deliberately selected backends. Its shar
 | Context / evidence basis | 1,048,576 / provisional V4 family assumption | 1,048,576 / advertised public model metadata |
 | Default request timeout | 9,891 seconds | 3,337 seconds |
 | Default private key | `<home>/secrets/deepseek-api-key` | `<home>/secrets/deepinfra-api-key` |
-| Complete key-free example | [Official](../examples/deepseek-provider.example.json) | [DeepInfra](../examples/deepinfra-provider.example.json) |
+| Complete key-free example | [Official](../../examples/deepseek-provider.example.json) | [DeepInfra](../../examples/deepinfra-provider.example.json) |
 
 The [DeepInfra model API guide](https://deepinfra.com/deepseek-ai/DeepSeek-V4.1-Flash/api) names the hosted model and endpoint; its [public metadata](https://api.deepinfra.com/models/deepseek-ai/DeepSeek-V4.1-Flash) advertises the output and context limits above. These are provider claims, not measurements by this adapter. The [Chat Completions schema](https://docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions) includes `reasoning_effort: "max"`. A successful tiny live probe establishes acceptance of that request, not how the hosted model applies effort, maximum-length generation, model equivalence or quality. A rejected pinned setting fails explicitly without lowering it or changing hosts/models.
 
@@ -53,7 +53,7 @@ The key is read at exactly two moments: inside the detached worker when a job's 
 
 ## Provider configuration and its validator
 
-The [official example](../examples/deepseek-provider.example.json) and [DeepInfra example](../examples/deepinfra-provider.example.json) show each complete profile. The following table preserves official compatibility defaults; DeepInfra replaces the backend, URL, model, key filename, output cap, context evidence basis and request timeout as listed above. All other defaults and validation bounds are shared. The key-free rule is a schema rule: unknown fields are refused, any field whose name contains `key` other than `api_key_file` is refused, and `api_key_file` must be an absolute path, so the configuration has no field in which a credential value belongs and the adapter never writes one into it. The validator does not scan the remaining string values for secrets; the file is expected to stay private under the controller home, and its exact bytes are pinned by digest into every room that snapshots it.
+The [official example](../../examples/deepseek-provider.example.json) and [DeepInfra example](../../examples/deepinfra-provider.example.json) show each complete profile. The following table preserves official compatibility defaults; DeepInfra replaces the backend, URL, model, key filename, output cap, context evidence basis and request timeout as listed above. All other defaults and validation bounds are shared. The key-free rule is a schema rule: unknown fields are refused, any field whose name contains `key` other than `api_key_file` is refused, and `api_key_file` must be an absolute path, so the configuration has no field in which a credential value belongs and the adapter never writes one into it. The validator does not scan the remaining string values for secrets; the file is expected to stay private under the controller home, and its exact bytes are pinned by digest into every room that snapshots it.
 
 | Field | Default | Notes |
 | --- | --- | --- |

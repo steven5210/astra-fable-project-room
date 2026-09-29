@@ -1,9 +1,10 @@
 """Check the documentation link graph after the docs reorganization: every
-relative link ending in .md (optionally with a #anchor) in every Markdown file of
-the repository must resolve to an existing file, and a link carrying an
-anchor must find a heading in the target file whose GitHub-style slug equals
-that anchor; a second test requires docs/README.md to link to every Markdown
-document under docs/ except itself.
+relative link (optionally with a #anchor) in every Markdown file of the
+repository must resolve to an existing file or directory, a link into a
+Markdown file carrying an anchor must find a heading whose GitHub-style slug
+equals that anchor, docs/README.md must link to every Markdown document under
+docs/ except itself, and README.md must keep every heading it had before the
+reorganization so external anchors keep working.
 """
 import re
 import unittest
@@ -12,6 +13,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 HEADING = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
+PRE_REORGANIZATION_README_HEADINGS = (
+    "Project Room", "What each participant owns", "Prerequisites", "Install and authenticate",
+    "Configure the private AO backend", "Roles, agreement and delegation", "Normal workflow on AO", "CLI fallback",
+    "Operate: status, sync, usage and version checks", "Verification and acceptance versus publication",
+    "Current validation limits", "DeepSeek delegate", "Legacy controller", "Qwen delegation (legacy)",
+    "Deterministic change-set application", "Private state", "Development and testing")
 
 
 def heading_slugs(path):
@@ -31,22 +38,25 @@ def markdown_files():
 
 
 class DocsLinkTests(unittest.TestCase):
-    def test_relative_markdown_links_and_anchors_resolve(self):
+    def test_relative_links_and_anchors_resolve(self):
         problems = []
         for source in markdown_files():
             for target in LINK.findall(source.read_text(encoding="utf-8")):
                 if "://" in target or target.startswith("mailto:"):
                     continue
                 name, _, anchor = target.partition("#")
-                if name and not name.endswith(".md"):
-                    continue
                 dest = (source.parent / name).resolve() if name else source
-                if not dest.is_file():
-                    problems.append(f"{source.relative_to(ROOT)}: {target} (missing file)")
+                if not dest.exists():
+                    problems.append(f"{source.relative_to(ROOT)}: {target} (missing target)")
                     continue
-                if anchor and anchor not in heading_slugs(dest):
+                if anchor and dest.suffix == ".md" and anchor not in heading_slugs(dest):
                     problems.append(f"{source.relative_to(ROOT)}: {target} (missing anchor)")
         self.assertEqual(problems, [])
+
+    def test_readme_keeps_every_pre_reorganization_heading(self):
+        headings = HEADING.findall((ROOT / "README.md").read_text(encoding="utf-8"))
+        for title in PRE_REORGANIZATION_README_HEADINGS:
+            self.assertIn(title, headings)
 
     def test_docs_index_lists_every_document(self):
         index = (ROOT / "docs" / "README.md").resolve()

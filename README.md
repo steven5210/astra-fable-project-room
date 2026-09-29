@@ -63,6 +63,10 @@ See [Roles, agreement and delegation](docs/guides/roles-and-delegation.md).
 
 See [AO backend setup and normal workflow](docs/guides/ao-setup.md).
 
+### CLI fallback
+
+See [AO backend setup and normal workflow](docs/guides/ao-setup.md#cli-fallback).
+
 ## Operate: status, sync, usage and version checks
 
 - `ao_room_status` reads saved facts offline: bindings, the agreement, request states, verification and acceptance records, the primary usage subtotal, the configured model and any contradictory native reroute, delegate attachment, the bounded delegate job ledger and the routing state. `ao_room_list` returns at most 50 room records with explicit truncation. Historical acceptance in status does not attest current filesystem bytes.
@@ -85,6 +89,10 @@ See [DeepSeek delegate quick reference](docs/reference/deepseek-quickstart.md).
 ## Legacy controller
 
 See [Legacy controller](docs/reference/legacy-controller.md).
+
+### Qwen delegation (legacy)
+
+See [Legacy controller](docs/reference/legacy-controller.md#qwen-delegation-legacy).
 
 ## Deterministic change-set application
 
