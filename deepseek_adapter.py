@@ -929,8 +929,8 @@ def _availability(status):
 
 def _bounded_tail(data, config, key):
     """The last max_wire_tail_bytes of `data` AFTER the configured key is redacted from the whole window, so replacement
-    can never grow the stored tail past its bound. A key cut by the window's front edge cannot be matched whole; any
-    leading bytes that form a proper suffix of the key are dropped so that no fragment of it is retained either."""
+    can never grow the stored tail past its bound. Proper key fragments at either edge of the retained window are
+    dropped: a leading proper suffix and a trailing proper prefix."""
     limit = config["max_wire_tail_bytes"]
     tail = redact(bytes(data), key)[-limit:] if data else b""
     if key:
@@ -938,6 +938,10 @@ def _bounded_tail(data, config, key):
         for length in range(min(len(secret) - 1, len(tail)), 0, -1):
             if tail.startswith(secret[-length:]):
                 tail = tail[length:]
+                break
+        for length in range(min(len(secret) - 1, len(tail)), 0, -1):
+            if tail.endswith(secret[:length]):
+                tail = tail[:-length]
                 break
     return tail
 
