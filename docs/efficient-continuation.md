@@ -244,6 +244,8 @@ still apply. It verifies every well-formed provider claim first, regardless of
 where malformed strings occur; unknown or foreign IDs, wrong provider identities,
 damaged results and unresolved jobs remain refusals. A rejected string is not
 thereby verified as a native worker ID.
+In a room without a delegate provider, this repair applies only when every named
+ID is malformed; any provider-shaped ID remains refused.
 
 The successor intent carries controller-authored `report_correction_admission`
 evidence binding the rejected report, original candidate and verified provider
