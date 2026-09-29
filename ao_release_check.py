@@ -1,5 +1,6 @@
 """Read-only comparison of the running AO daemon with its latest stable release."""
 
+import fcntl
 import http.client
 import json
 import os
@@ -23,6 +24,7 @@ GITHUB_RELEASE_PREFIX = "https://github.com/Untrivial-ai/agent-orchestrator/rele
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_PLIST_BYTES = 1_000_000
 MAX_STATE_BYTES = 1_000_000
+_LEGACY_EVIDENCE_NOT_PRESERVED = object()
 VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 TAG_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 PS_TIME_FORMAT = "%a %b %d %H:%M:%S %Y"
@@ -204,13 +206,20 @@ def _existing_record(path):
         value = None
     if isinstance(value, dict) and value.get("schema") == SCHEMA:
         return value
-    legacy = path.with_name("version-check.legacy.json")
-    if not os.path.lexists(legacy):
+    for suffix in range(1, 101):
+        name = "version-check.legacy.json" if suffix == 1 else f"version-check.legacy-{suffix}.json"
         try:
-            os.replace(path, legacy)
+            os.link(path, path.with_name(name))
+        except FileExistsError:
+            continue
         except OSError:
-            pass
-    return None
+            return _LEGACY_EVIDENCE_NOT_PRESERVED
+        try:
+            os.unlink(path)
+        except OSError:
+            return _LEGACY_EVIDENCE_NOT_PRESERVED
+        return None
+    return _LEGACY_EVIDENCE_NOT_PRESERVED
 
 
 def _timestamp(value):
@@ -284,35 +293,48 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
         reasons.add("running_newer_than_latest_stable")
         outcome = "unknown"
 
-    checked_at = _timestamp(now())
     record_path = Path(root) / "version-check.json"
-    previous = _existing_record(record_path)
-    record = {
-        "schema": SCHEMA,
-        "checked_at": checked_at,
-        "outcome": outcome,
-        "reasons": sorted(reasons),
-        "latest": ({key: latest[key] for key in ("tag_name", "html_url", "published_at")}
-                   if latest is not None else None),
-        "installed_version": installed_version,
-        "running_version": running_version,
-        "daemon": daemon,
-    }
-    if outcome != "unknown":
-        record["last_successful"] = dict(record)
-    else:
-        record["last_successful"] = previous.get("last_successful") if previous is not None else None
-    ao_project_room.atomic(record_path, record)
-    last_successful = record["last_successful"]
-    return {
-        "outcome": outcome,
-        "reasons": sorted(reasons),
-        "latest_version": latest["tag_name"] if latest is not None else None,
-        "installed_version": installed_version,
-        "running_version": running_version,
-        "release_url": latest["html_url"] if latest is not None else None,
-        "checked_at": checked_at,
-        "last_successful_checked_at": (
-            last_successful.get("checked_at") if isinstance(last_successful, dict) else None
-        ),
-    }
+    lock_path = record_path.with_name(".version-check.lock")
+    record_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        checked_at = _timestamp(now())
+        previous = _existing_record(record_path)
+        evidence_saved = previous is not _LEGACY_EVIDENCE_NOT_PRESERVED
+        if not evidence_saved:
+            reasons.add("evidence_not_saved")
+            previous = None
+        record = {
+            "schema": SCHEMA,
+            "checked_at": checked_at,
+            "outcome": outcome,
+            "reasons": sorted(reasons),
+            "latest": ({key: latest[key] for key in ("tag_name", "html_url", "published_at")}
+                       if latest is not None else None),
+            "installed_version": installed_version,
+            "running_version": running_version,
+            "daemon": daemon,
+        }
+        if outcome != "unknown":
+            record["last_successful"] = dict(record)
+        else:
+            record["last_successful"] = previous.get("last_successful") if previous is not None else None
+        if evidence_saved:
+            ao_project_room.atomic(record_path, record)
+        last_successful = record["last_successful"]
+        result = {
+            "outcome": outcome,
+            "reasons": sorted(reasons),
+            "latest_version": latest["tag_name"] if latest is not None else None,
+            "installed_version": installed_version,
+            "running_version": running_version,
+            "release_url": latest["html_url"] if latest is not None else None,
+            "checked_at": checked_at,
+            "last_successful_checked_at": (
+                last_successful.get("checked_at") if isinstance(last_successful, dict) else None
+            ),
+        }
+    finally:
+        os.close(lock_fd)
+    return result

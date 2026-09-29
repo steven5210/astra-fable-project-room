@@ -276,9 +276,11 @@ class ReleaseCheckTests(unittest.TestCase):
 
         sentinel = b"preserve existing legacy evidence\n"
         legacy.write_bytes(sentinel)
-        path.write_text("Astra hand-written release record", encoding="utf-8")
+        hand_written = b"Astra hand-written release record"
+        path.write_bytes(hand_written)
         self.check()
         self.assertEqual(legacy.read_bytes(), sentinel)
+        self.assertEqual((self.root / "version-check.legacy-2.json").read_bytes(), hand_written)
         self.assertEqual(json.loads(path.read_bytes())["schema"], ao_release_check.SCHEMA)
 
         malformed_root = self.base / "malformed"
@@ -290,22 +292,47 @@ class ReleaseCheckTests(unittest.TestCase):
 
     def test_legacy_migration_replace_failure_does_not_abort_the_check(self):
         path = self.root / "version-check.json"
-        path.write_text("invalid legacy record", encoding="utf-8")
-        original_replace = os.replace
-        replacements = 0
+        old_bytes = b"invalid legacy record"
+        path.write_bytes(old_bytes)
+        with patch.object(ao_release_check.os, "link", side_effect=OSError("synthetic legacy migration failure")):
+            with patch.object(ao_release_check.ao_project_room, "atomic") as atomic:
+                result = self.check()
+        self.assertEqual(result["outcome"], "up_to_date")
+        self.assertIn("evidence_not_saved", result["reasons"])
+        self.assertEqual(path.read_bytes(), old_bytes)
+        self.assertFalse((self.root / "version-check.legacy.json").exists())
+        atomic.assert_not_called()
 
-        def fail_migration_then_replace(source, destination):
-            nonlocal replacements
-            replacements += 1
-            if replacements == 1:
-                raise OSError("synthetic legacy migration failure")
-            return original_replace(source, destination)
+    def test_legacy_migration_uses_unique_free_name_when_default_exists(self):
+        path = self.root / "version-check.json"
+        old_bytes = b"old-format release evidence"
+        path.write_bytes(old_bytes)
+        legacy = self.root / "version-check.legacy.json"
+        occupied_bytes = b"existing legacy evidence"
+        legacy.write_bytes(occupied_bytes)
+        result = self.check()
+        self.assertEqual(result["outcome"], "up_to_date")
+        self.assertEqual(legacy.read_bytes(), occupied_bytes)
+        self.assertEqual((self.root / "version-check.legacy-2.json").read_bytes(), old_bytes)
+        self.assertEqual(json.loads(path.read_bytes())["schema"], ao_release_check.SCHEMA)
 
-        with patch.object(ao_release_check.os, "replace", side_effect=fail_migration_then_replace):
+    def test_previous_record_is_read_while_version_check_lock_is_held(self):
+        lock_path = self.root / ".version-check.lock"
+        existing_record = ao_release_check._existing_record
+
+        def assert_locked(path):
+            fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            return existing_record(path)
+
+        with patch.object(ao_release_check, "_existing_record", side_effect=assert_locked):
             result = self.check()
         self.assertEqual(result["outcome"], "up_to_date")
-        self.assertFalse((self.root / "version-check.legacy.json").exists())
-        self.assertEqual(json.loads(path.read_bytes())["schema"], ao_release_check.SCHEMA)
+        self.assertTrue(lock_path.exists())
 
     def test_public_result_has_no_executable_path_pid_or_root(self):
         result = self.check()
