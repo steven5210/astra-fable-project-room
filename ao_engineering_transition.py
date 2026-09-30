@@ -455,6 +455,11 @@ def _structured_result_identity(value):
 FAILED_LAUNCH_STATUS = frozenset(('failed', 'cancelled', 'stopped', 'error'))
 AGENT_API_ERROR_PREFIX = 'Agent terminated early due to an API error: '
 AGENT_API_ERROR_RESULT_PREFIX = 'Error: '
+GUARD_DENIAL_PREFIX = 'Project Room routing guard: '
+GUARD_INTERNAL_ERROR_PREFIX = 'Project Room routing guard error: '
+HOOK_ERROR_PREFIX_TEMPLATE = 'PreToolUse:{tool} hook error: ['
+HOOK_ERROR = re.compile(r'^PreToolUse:(?P<tool>Agent|Task) hook error: \[(?P<command>.*?)\]: '
+                        r'(?P<stderr>.+)$', re.DOTALL)
 
 
 def _failed_launch_projection(value, launch):
@@ -500,7 +505,67 @@ def _terminal_api_error(item, launch):
             'error_text_sha256': ao.digest(content.encode()), 'detail_sha256': ao.digest(detail.encode())}
 
 
-def _launch_projection(item, launch):
+def _guard_denial(item, launch):
+    """The routing guard's own pre-execution denial of this launch, or None.
+
+    A denied launch creates no child: the correlated result is classified error, is not a shared
+    projection, block.content carries the pinned guard prefix with a non-empty reason, and the
+    row-level toolUseResult is exactly the Error-prefixed form of that same content. The internal
+    'Project Room routing guard error: ' form does not match the prefix and stays unknown. A denied
+    launch counts whether it was foreground or background; it never ran, so no terminal notification
+    is owed.
+    """
+    if item['classification'] != 'error' or item['shared_projection']:
+        return None
+    if item['source_uuid'] != launch['row_uuid']:
+        return None
+    content, structured = item['result_content'], item['tool_use_result']
+    if not isinstance(content, str) or not isinstance(structured, str):
+        return None
+    if not content.startswith(GUARD_DENIAL_PREFIX):
+        return None
+    if not content[len(GUARD_DENIAL_PREFIX):].strip():
+        return None
+    if structured != AGENT_API_ERROR_RESULT_PREFIX + content:
+        return None
+    return {'kind': 'guard_denied', 'reason_sha256': ao.digest(content[len(GUARD_DENIAL_PREFIX):].encode()),
+            'text_sha256': ao.digest(content.encode())}
+
+
+def _hook_blocked(item, launch, guard_sha256):
+    """A PreToolUse hook that exited nonzero running this room's pinned guard, or None.
+
+    The block proves no child was created: the correlated result is classified error, is not a
+    shared projection, and the row-level toolUseResult is exactly the Error-prefixed form of the
+    same content. The content must carry Claude Code's PreToolUse hook-error shape for the launch's
+    own tool, whose bracketed command contains the room's pinned guard sha256 and whose stderr
+    names the guard's own denial or internal-error prefix with a non-empty remainder. Without the
+    pinned guard sha256, or for any other hook or stderr, the row stays unknown.
+    """
+    if not isinstance(guard_sha256, str) or re.fullmatch(r'[0-9a-f]{64}', guard_sha256) is None:
+        return None
+    if item['classification'] != 'error' or item['shared_projection']:
+        return None
+    if item['source_uuid'] != launch['row_uuid']:
+        return None
+    content, structured = item['result_content'], item['tool_use_result']
+    if not isinstance(content, str) or not isinstance(structured, str):
+        return None
+    if structured != AGENT_API_ERROR_RESULT_PREFIX + content:
+        return None
+    match = HOOK_ERROR.match(content)
+    if match is None or match['tool'] != launch['name'] or guard_sha256 not in match['command']:
+        return None
+    stderr = match['stderr']
+    for prefix in (GUARD_INTERNAL_ERROR_PREFIX, GUARD_DENIAL_PREFIX):
+        if stderr.startswith(prefix) and stderr[len(prefix):].strip():
+            return {'kind': 'hook_blocked', 'guard_sha256': guard_sha256,
+                    'stderr_sha256': ao.digest(stderr.encode()),
+                    'text_sha256': ao.digest(content.encode())}
+    return None
+
+
+def _launch_projection(item, launch, guard_sha256=None):
     """The complete supported lifecycle projection of one result observed for a proven launch."""
     value = item['tool_use_result']
     completion = ao_evidence_audit_native.completion_observation(value, item['canonical'], item['timestamp'])
@@ -511,10 +576,12 @@ def _launch_projection(item, launch):
             'status': status,
             'completion': None if completion is None else {'agent_id': completion[0], 'fingerprint': completion[1],
                                                            'prompt': completion[2]},
-            'failed': failed, 'api_error': _terminal_api_error(item, launch)}
+            'failed': failed, 'api_error': _terminal_api_error(item, launch),
+            'guard_denial': _guard_denial(item, launch),
+            'hook_blocked': _hook_blocked(item, launch, guard_sha256)}
 
 
-def child_evidence(raw, native_session_id, workspace):
+def child_evidence(raw, native_session_id, workspace, guard_sha256=None):
     """Independently prove the parent Agent/Task launches and background notifications of the plain transcript.
 
     Every parent row must prove the retained session and worktree. Child-internal rows are never claimed. A launch
@@ -640,6 +707,8 @@ def child_evidence(raw, native_session_id, workspace):
         else:
             raise RoomError('A parent transcript row has an unsupported type; child evidence is unknown')
     terminal_api_errors = 0
+    guard_denied = 0
+    hook_blocked = 0
     identity_owners = {}
     for tool_id, launch in launches.items():
         observations = results.get(tool_id, [])
@@ -656,7 +725,7 @@ def child_evidence(raw, native_session_id, workspace):
                             'authorize an Agent/Task launch; child evidence is unknown')
         projections = {}
         for item in observations:
-            projection = _launch_projection(item, launch)
+            projection = _launch_projection(item, launch, guard_sha256)
             authorities = [value for value in (projection['completion'], projection['failed'],
                                                projection['api_error']) if value is not None]
             if len(authorities) > 1:
@@ -682,6 +751,20 @@ def child_evidence(raw, native_session_id, workspace):
                                 'child evidence is unknown')
             identity_owners[(kind, value)] = tool_id
         notification = notifications.get(tool_id)
+        if projection['guard_denial'] is not None:
+            # A denied launch never ran: it is terminal with no child and owes no notification.
+            if notification:
+                raise RoomError('A task notification names a guard-denied launch; child evidence is '
+                                'unknown')
+            guard_denied += 1
+            continue
+        if projection['hook_blocked'] is not None:
+            # A hook-blocked launch never ran: it is terminal with no child and owes no notification.
+            if notification:
+                raise RoomError('A task notification names a hook-blocked launch; child evidence is '
+                                'unknown')
+            hook_blocked += 1
+            continue
         if launch['background']:
             if not notification:
                 raise RoomError('A parent background Agent/Task launch has no terminal task notification; an '
@@ -728,6 +811,7 @@ def child_evidence(raw, native_session_id, workspace):
             'background_launches': sum(1 for item in launches.values() if item['background']),
             'correlated_results': len(set(launches) & set(results)),
             'terminal_notifications': len(notifications), 'terminal_api_errors': terminal_api_errors,
+            'guard_denied_launches': guard_denied, 'hook_blocked_launches': hook_blocked,
             'launches_sha256': ao.digest([{'id': tool_id,
                                            **{key: launches[tool_id][key] for key in ('name', 'background', 'row_uuid')}}
                                           for tool_id in sorted(launches)]),
@@ -897,7 +981,8 @@ def _require_known_outcomes(directory, state, session_id):
                         + '); audit it before the transition')
 
 
-def _observe(service, directory, state, binding, expected, owner_database, transcript_path, worktree):
+def _observe(service, directory, state, binding, expected, owner_database, transcript_path, worktree,
+             guard_sha256=None):
     """One read-only observation: AO identity, complete history, the retained owner and the plain transcript."""
     snapshot = _ReadOnlyIdentity(service).identity(service.client(state), state, binding, expected=expected)
     if snapshot.get('history_truncated') is not False:
@@ -914,7 +999,7 @@ def _observe(service, directory, state, binding, expected, owner_database, trans
     if owner['ao_conversation_id'] != binding['conversation_id'] or owner['active_branch_id'] != binding['branch_id']:
         raise RoomError('The retained native owner evidence conversation or branch differs from the bound engineer')
     raw = _read_transcript(transcript_path, owner['provider_conversation_id'])
-    children = child_evidence(raw, owner['provider_conversation_id'], worktree)
+    children = child_evidence(raw, owner['provider_conversation_id'], worktree, guard_sha256=guard_sha256)
     return ({'settings': copy.deepcopy(snapshot.get('settings') or {}), 'controller': snapshot.get('controller'),
              'history_sha256': history['history_sha256'], 'transcript_sha256': ao.digest(raw),
              'native_owner': copy.deepcopy(owner)},
@@ -1010,7 +1095,7 @@ def _inspect(service, directory, state, target_model, owner_database, transcript
     observation, extras = _observe(
         service, directory, state, engineer,
         {'model': target['configured_model'], 'reasoning_effort': em.EFFORT} if expect_target else None,
-        owner_database, transcript_path, prepared['worktree'])
+        owner_database, transcript_path, prepared['worktree'], guard_sha256=routing.get('guard_sha256'))
     if observation['controller'] != 'ready' and not (allow_stopped_controller and observation['controller'] == 'stopped'):
         raise RoomError('Installed AO changes conversation settings only for a live idle controller; the retained '
                         'engineer controller reports ' + str(observation['controller']))
@@ -1300,7 +1385,8 @@ def _settle(service, directory, state, request_id, intent, patch_result, owner_d
                           'reasoningEffort': em.EFFORT})
     try:
         after, _ = _observe(service, directory, state, intent['evidence']['engineer'], expectation, owner_database,
-                            transcript_path, intent['evidence']['preparation']['worktree'])
+                            transcript_path, intent['evidence']['preparation']['worktree'],
+                            guard_sha256=(intent['evidence'].get('routing') or {}).get('guard_sha256'))
     except RoomError as exc:
         return None, ('The attempt stays pending: the fresh native observation did not equal the recorded target ('
                       + str(exc)[:300] + ')')

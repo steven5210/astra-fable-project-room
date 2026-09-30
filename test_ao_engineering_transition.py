@@ -363,21 +363,33 @@ class TransitionCase(unittest.TestCase):
                        semantic_outcome_sha256=value, semantic_status=record['outcome'])
         ao.atomic(self.directory / 'state.json', state)
 
-    def agent_launch(self, background=False):
-        return {'uuid': 'a-2', 'type': 'assistant', 'sessionId': NATIVE, 'cwd': str(self.repo),
+    def agent_launch(self, background=False, uuid='a-2', tool_id='toolu_1'):
+        return {'uuid': uuid, 'type': 'assistant', 'sessionId': NATIVE, 'cwd': str(self.repo),
                 'message': {'role': 'assistant', 'content': [
-                    {'type': 'tool_use', 'id': 'toolu_1', 'name': 'Agent',
+                    {'type': 'tool_use', 'id': tool_id, 'name': 'Agent',
                      'input': {'subagent_type': 'pr-opus', 'prompt': 'Review the exact synthetic fragment.',
                                'run_in_background': background}}]}}
 
-    def tool_result(self, tool_use_id='toolu_1', tool_use_result=None):
-        row = {'uuid': 'h-2', 'type': 'user', 'sessionId': NATIVE, 'cwd': str(self.repo),
-               'sourceToolAssistantUUID': 'a-2',
-               'message': {'role': 'user', 'content': [
-                   {'type': 'tool_result', 'tool_use_id': tool_use_id, 'content': 'launched'}]}}
+    def tool_result(self, tool_use_id='toolu_1', tool_use_result=None, source_uuid='a-2',
+                    content='launched', is_error=None, row_uuid='h-2'):
+        block = {'type': 'tool_result', 'tool_use_id': tool_use_id, 'content': content}
+        if is_error is not None:
+            block['is_error'] = is_error
+        row = {'uuid': row_uuid, 'type': 'user', 'sessionId': NATIVE, 'cwd': str(self.repo),
+               'sourceToolAssistantUUID': source_uuid,
+               'message': {'role': 'user', 'content': [block]}}
         if tool_use_result is not None:
             row['toolUseResult'] = tool_use_result
         return row
+
+    DENIAL_TEXT = ('Project Room routing guard: Agent parameters model are refused (no model '
+                   'override, isolation, resume or team routing)')
+
+    def denial_result(self, content=None, structured=None, **kwargs):
+        content = self.DENIAL_TEXT if content is None else content
+        if structured is None:
+            structured = 'Error: ' + content
+        return self.tool_result(content=content, is_error=True, tool_use_result=structured, **kwargs)
 
     def notification_row(self, text, row_uuid='h-3'):
         return {'uuid': row_uuid, 'type': 'user', 'sessionId': NATIVE, 'cwd': str(self.repo),
@@ -529,6 +541,142 @@ class AuditTests(TransitionCase):
         self.assertEqual(result['children']['agent_launches'], 1)
         self.assertEqual(result['children']['background_launches'], 1)
         self.assertEqual(result['children']['terminal_notifications'], 1)
+
+    def test_audit_accepts_a_guard_denied_foreground_launch(self):
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.denial_result()))
+        result = self.audit()
+        self.assertTrue(result['eligible'], result.get('reason'))
+        self.assertEqual(result['children']['agent_launches'], 1)
+        self.assertEqual(result['children']['guard_denied_launches'], 1)
+        self.assertEqual(result['children']['terminal_api_errors'], 0)
+
+    def test_audit_accepts_a_guard_denial_before_a_completed_launch(self):
+        self.reset()
+        self.write_transcript((
+            self.agent_launch(), self.denial_result(),
+            self.agent_launch(uuid='a-3', tool_id='toolu_2'),
+            self.tool_result(tool_use_id='toolu_2', source_uuid='a-3', row_uuid='h-4',
+                             tool_use_result={
+                                 'status': 'completed', 'agentId': 'agent-1',
+                                 'prompt': 'Review the exact synthetic fragment.',
+                                 'content': [{'type': 'text', 'text': 'Finished.'}],
+                                 'totalToolUseCount': 1, 'totalDurationMs': 1, 'totalTokens': 0,
+                                 'usage': {'input_tokens': 0, 'output_tokens': 0,
+                                           'cache_creation_input_tokens': None,
+                                           'cache_read_input_tokens': None, 'server_tool_use': None,
+                                           'service_tier': None, 'cache_creation': None}})))
+        result = self.audit()
+        self.assertTrue(result['eligible'], result.get('reason'))
+        self.assertEqual(result['children']['agent_launches'], 2)
+        self.assertEqual(result['children']['guard_denied_launches'], 1)
+
+    def test_audit_refuses_lookalike_denial_results(self):
+        for name, result_row, expected in (
+                ('plain-error', self.tool_result(content='something else', is_error=True,
+                                                 tool_use_result='Error: something else'),
+                 'no validated terminal result'),
+                ('internal-error-form',
+                 self.denial_result(content='Project Room routing guard error: boom'),
+                 'no validated terminal result'),
+                ('structured-mismatch', self.denial_result(structured='Error: something else'),
+                 'no validated terminal result')):
+            with self.subTest(case=name):
+                self.reset()
+                self.write_transcript((self.agent_launch(), result_row))
+                result = self.audit()
+                self.assertFalse(result['eligible'])
+                self.assertIn(expected, result['reason'])
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.denial_result(),
+                               self.notification_row(NOTIFICATION)))
+        result = self.audit()
+        self.assertFalse(result['eligible'])
+        self.assertIn('guard-denied launch', result['reason'])
+
+    GUARD_SHA = '0' * 64
+    HOOK_STDERR = ('Project Room routing guard error: a caller record combines an origin.kind=human '
+                   'identity with a different turnOrigin; the identity is contradictory')
+
+    def hook_result(self, content=None, structured=None, stderr=None, command_sha=None, **kwargs):
+        sha = self.GUARD_SHA if command_sha is None else command_sha
+        stderr = self.HOOK_STDERR if stderr is None else stderr
+        if content is None:
+            content = ('PreToolUse:Agent hook error: [/opt/python3 /room/launchers/' + sha +
+                       '.py; s=$?; [ "$s" -eq 0 ] || exit 2]: ' + stderr + '\n')
+        if structured is None:
+            structured = 'Error: ' + content
+        return self.tool_result(content=content, is_error=True, tool_use_result=structured, **kwargs)
+
+    def completed_result(self, **kwargs):
+        return self.tool_result(tool_use_result={
+            'status': 'completed', 'agentId': 'agent-1',
+            'prompt': 'Review the exact synthetic fragment.',
+            'content': [{'type': 'text', 'text': 'Finished.'}],
+            'totalToolUseCount': 1, 'totalDurationMs': 1, 'totalTokens': 0,
+            'usage': {'input_tokens': 0, 'output_tokens': 0, 'cache_creation_input_tokens': None,
+                      'cache_read_input_tokens': None, 'server_tool_use': None, 'service_tier': None,
+                      'cache_creation': None}}, **kwargs)
+
+    def test_audit_accepts_a_hook_blocked_launch_of_the_pinned_guard(self):
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.hook_result()))
+        result = self.audit()
+        self.assertTrue(result['eligible'], result.get('reason'))
+        self.assertEqual(result['children']['agent_launches'], 1)
+        self.assertEqual(result['children']['hook_blocked_launches'], 1)
+        self.assertEqual(result['children']['guard_denied_launches'], 0)
+
+    def test_audit_refuses_lookalike_hook_blocked_results(self):
+        cases = (
+            ('other-guard-sha',
+             {'command_sha': '1' * 64}, 'no validated terminal result'),
+            ('foreign-stderr',
+             {'stderr': 'Traceback (most recent call last): boom'}, 'no validated terminal result'),
+            ('structured-mismatch',
+             {'structured': 'Error: something else'}, 'no validated terminal result'),
+            ('wrong-tool-name',
+             {'content': 'PreToolUse:Task hook error: [/opt/python3 /room/launchers/' + self.GUARD_SHA +
+                         '.py; s=$?; [ "$s" -eq 0 ] || exit 2]: ' + self.HOOK_STDERR},
+             'no validated terminal result'))
+        for name, kwargs, expected in cases:
+            with self.subTest(case=name):
+                self.reset()
+                self.write_transcript((self.agent_launch(), self.hook_result(**kwargs)))
+                result = self.audit()
+                self.assertFalse(result['eligible'])
+                self.assertIn(expected, result['reason'])
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.hook_result()))
+        with self.assertRaisesRegex(RoomError, 'no validated terminal result'):
+            et.child_evidence(self.transcript.read_bytes(), NATIVE, str(self.repo),
+                              guard_sha256=None)
+        self.write_transcript((self.agent_launch(), self.hook_result(),
+                               self.notification_row(NOTIFICATION)))
+        result = self.audit()
+        self.assertFalse(result['eligible'])
+        self.assertIn('hook-blocked launch', result['reason'])
+
+    def test_audit_accepts_denied_and_hook_blocked_launches_before_a_completed_launch(self):
+        self.reset()
+        rows = [
+            self.agent_launch(), self.denial_result(),
+            self.agent_launch(uuid='a-3', tool_id='toolu_2'),
+            self.denial_result(tool_use_id='toolu_2', source_uuid='a-3', row_uuid='h-4'),
+            self.agent_launch(uuid='a-4', tool_id='toolu_3'),
+            self.hook_result(tool_use_id='toolu_3', source_uuid='a-4', row_uuid='h-6'),
+            self.agent_launch(uuid='a-5', tool_id='toolu_4'),
+            self.hook_result(tool_use_id='toolu_4', source_uuid='a-5', row_uuid='h-8'),
+            self.agent_launch(uuid='a-6', tool_id='toolu_5'),
+            self.hook_result(tool_use_id='toolu_5', source_uuid='a-6', row_uuid='h-10'),
+            self.agent_launch(uuid='a-7', tool_id='toolu_6'),
+            self.completed_result(tool_use_id='toolu_6', source_uuid='a-7', row_uuid='h-12')]
+        self.write_transcript(tuple(rows))
+        result = self.audit()
+        self.assertTrue(result['eligible'], result.get('reason'))
+        self.assertEqual(result['children']['agent_launches'], 6)
+        self.assertEqual(result['children']['guard_denied_launches'], 2)
+        self.assertEqual(result['children']['hook_blocked_launches'], 3)
 
     def test_audit_refuses_an_active_delegate_ledger(self):
         self.reset()
