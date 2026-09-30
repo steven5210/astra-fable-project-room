@@ -6,7 +6,7 @@ import re
 from room import RoomError
 
 QUOTA_KINDS = {'rate_limit', 'quota_limit', 'quota_exhausted', 'usage_limit', 'budget_exhausted'}
-RESUMABLE = {'quota_limit', 'provider_error', 'output_truncated'}
+RESUMABLE = {'quota_limit', 'provider_error', 'output_truncated', 'model_mismatch'}
 
 
 def activity_failures(snapshot, turn_id):
@@ -94,6 +94,17 @@ def classify(receipt, native=None, require_structured=True):
         return {'kind': 'unknown', 'hold': True,
                 'reason': 'Qualified native identity was not observed on the owned turn; missing evidence is not '
                           'qualified success'}
+    mismatch = native.get('model_mismatch') if native else None
+    if isinstance(mismatch, dict):
+        observed = mismatch.get('observed_models')
+        if not isinstance(observed, list) or not isinstance(mismatch.get('expected_model'), str):
+            return {'kind': 'unknown', 'hold': True, 'reason': 'Malformed model mismatch evidence'}
+        return {'kind': 'model_mismatch', 'hold': True,
+                'reason': 'Native response model ' + ', '.join(map(str, observed))
+                          + ' contradicts the qualified expected model ' + mismatch['expected_model']
+                          + '; the completed result is retained and cannot become qualified success. Record the '
+                            'continuation with ao_room_outcome_resume, pin the exact identifier with '
+                            'ao_room_engineer_model_transition, then send the reserved successor.'}
     if 'max_tokens' in stops:
         return {'kind': 'output_truncated', 'hold': True, 'reason': 'Native output was truncated; inspect partial work before continuation'}
     finals = [m for m in messages if m.get('role') == 'assistant' and not m.get('streaming') and m.get('text', '').strip()]

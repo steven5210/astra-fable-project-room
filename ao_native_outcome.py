@@ -721,12 +721,28 @@ def inspect(directory, state, request, source, snapshot):
     result = {**result, 'source': source, 'source_sha256': digest(raw),
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
     if result.get('model_contradiction') is not None:
-        # The existing unknown/hold path applies, with the observed identities, the expected
-        # qualification digest and the exact source digest retained.
-        result = {**result, 'model_contradiction': {**result['model_contradiction'],
-                                                   'source_sha256': result['source_sha256']},
-                  'unknown': 'Native response model contradicts the qualified expected model for this '
-                                        'family; the observed identities and their source evidence are retained'}
+        # The observed identities, the expected qualification digest and the exact source digest are
+        # always retained. With otherwise complete evidence — the owned turn ended, no unsettled
+        # errors, every attributable stop is end_turn, and every observed identity is an exact
+        # identifier of the expected model's family — the contradiction is a settled diagnosed
+        # model_mismatch rather than unknown. Anything else keeps the existing unknown/hold path.
+        contradiction = {**result['model_contradiction'], 'source_sha256': result['source_sha256']}
+        expected = contradiction['expected_model']
+        match = re.fullmatch(r'claude-([a-z]+)(?:-[0-9]+)+', expected) if isinstance(expected, str) else None
+        observed = contradiction['observed_models']
+        import ao_engineering_model
+        complete = (match is not None and result['errors'] == [] and bool(result['stop_reasons'])
+                    and all(stop == 'end_turn' for stop in result['stop_reasons'])
+                    and bool(observed)
+                    and all(ao_engineering_model.family_member(match.group(1), model)
+                            for model in observed))
+        if complete:
+            result = {**result, 'model_contradiction': contradiction,
+                      'model_mismatch': dict(contradiction)}
+        else:
+            result = {**result, 'model_contradiction': contradiction,
+                      'unknown': 'Native response model contradicts the qualified expected model for this '
+                                            'family; the observed identities and their source evidence are retained'}
     if (role == 'engineer' and state.get('workflow') == 'fable_engineering'
             and snapshot.get('sessionId') == source['session_id'] == request['session_id']):
         notifications = task_notification_imports(events, source['native_session_id'], snapshot, workspace)

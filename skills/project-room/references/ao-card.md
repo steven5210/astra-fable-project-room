@@ -132,6 +132,8 @@ acceptance, and remaining blockers.
 ## Situations outside the card
 
 - Engineer model change → [engineering model selection and transition](ao.md#engineering-model-selection-and-transition).
+- `model_mismatch` hold → record the continuation with `ao_room_outcome_resume`, pin the exact model
+  by transition, then send the reserved successor.
 - Provider amendment → [provider transition](../../../docs/operations/provider-transition.md).
 - `astra_led` exception or pilot rooms → [explicit Astra exception](ao.md#explicit-astra-exception-and-historical-pilot-rooms).
 - Uncertain, failed or recovered turns → the second paragraph of
