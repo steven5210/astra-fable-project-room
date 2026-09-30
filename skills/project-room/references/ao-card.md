@@ -41,7 +41,8 @@ Resume the recorded backend and state before anything new.
 After a context compaction, or when resuming a room in a new thread, reload only
 this card, then call the room's `ao_room_status`. Do not re-read `SKILL.md`:
 Codex re-injects its own skill index, and this card carries every AO rule. Do
-not open `ao.md` unless a **Stop** line below matches the status you see. Status
+not open `ao.md` unless a **Stop** line or an entry under "Situations outside the
+card" matches the status you see. Status
 gives the phase, requests, holds, verification and acceptance, but it only names
 the saved spec file and previews the latest reports: before acting on either,
 read the saved spec and the full saved response of the latest report. Keep one Astra thread per
