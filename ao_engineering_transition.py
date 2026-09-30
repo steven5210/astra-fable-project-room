@@ -606,6 +606,7 @@ def child_evidence(raw, native_session_id, workspace, guard_sha256s=None):
     a background launch without its exact terminal SDK notification, a notification naming no recorded parent
     launch, and any ambiguous, torn or conflicting duplicate all refuse instead of being assumed successful.
     """
+    guard_sha256s = _guard_digests(guard_sha256s)  # normalised once: a one-shot iterable must serve every result
     if not isinstance(raw, bytes):
         raise RoomError('The retained native transcript is unreadable')
     if not isinstance(native_session_id, str) or not native_session_id:
@@ -742,7 +743,7 @@ def child_evidence(raw, native_session_id, workspace, guard_sha256s=None):
                             'authorize an Agent/Task launch; child evidence is unknown')
         projections = {}
         for item in observations:
-            projection = _launch_projection(item, launch, _guard_digests(guard_sha256s))
+            projection = _launch_projection(item, launch, guard_sha256s)
             authorities = [value for value in (projection['completion'], projection['failed'],
                                                projection['api_error']) if value is not None]
             if len(authorities) > 1:

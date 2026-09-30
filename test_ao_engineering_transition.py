@@ -671,6 +671,15 @@ class AuditTests(TransitionCase):
                                     guard_sha256s={'f' * 64, self.GUARD_SHA})
         self.assertEqual(summary['hook_blocked_launches'], 1)
 
+    def test_a_one_shot_guard_digest_iterable_serves_every_hook_blocked_result(self):
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.hook_result(),
+                               self.agent_launch(uuid='a-3', tool_id='toolu_2'),
+                               self.hook_result(tool_use_id='toolu_2', source_uuid='a-3', row_uuid='h-3')))
+        raw = self.transcript.read_bytes()
+        summary = et.child_evidence(raw, NATIVE, str(self.repo), guard_sha256s=(sha for sha in (self.GUARD_SHA,)))
+        self.assertEqual(summary['hook_blocked_launches'], 2)
+
     def test_audit_accepts_denied_and_hook_blocked_launches_before_a_completed_launch(self):
         self.reset()
         rows = [
