@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,9 @@ _LEGACY_EVIDENCE_NOT_PRESERVED = object()
 VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 TAG_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 MODEL_ID_PATTERN = re.compile(r"claude-(fable|opus|sonnet)-\d+(?:-\d+)*")
+QUALIFICATION_SOURCE_HOSTS = frozenset(
+    {"code.claude.com", "docs.claude.com", "docs.anthropic.com", "platform.claude.com",
+     "www.anthropic.com"})
 PS_TIME_FORMAT = "%a %b %d %H:%M:%S %Y"
 APP_CONTENTS = ("Contents", "Resources", "daemon", "ao")
 
@@ -83,11 +87,34 @@ def _fetch_claude_latest():
     return _fetch_github_latest(CLAUDE_GITHUB_PATH)
 
 
+def _source_uri_allowed(uri):
+    """https on a first-party Claude documentation host only: no userinfo, no non-443 port, no IP."""
+    if not isinstance(uri, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = parsed.hostname
+    if (parsed.scheme != "https" or host is None or host not in QUALIFICATION_SOURCE_HOSTS
+            or parsed.username is not None or parsed.password is not None
+            or (port is not None and port != 443)):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
 def _fetch_source(uri):
     """One bounded https GET of a qualification source URI; no credentials, no redirects."""
     parsed = urllib.parse.urlsplit(uri) if isinstance(uri, str) else None
     if parsed is None or parsed.scheme != "https" or not parsed.hostname:
         raise _FetchFailure("source_not_https")
+    if not _source_uri_allowed(uri):
+        raise _FetchFailure("source_host_not_allowed")
     connection = http.client.HTTPSConnection(
         parsed.hostname, parsed.port or 443,
         context=deepseek_adapter.tls_context(), timeout=15,
@@ -103,9 +130,9 @@ def _fetch_source(uri):
         response = connection.getresponse()
         if response.status != 200:
             raise _FetchFailure("source_fetch_failed")
-        body = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(body) > MAX_RESPONSE_BYTES:
-            raise _FetchFailure("source_fetch_failed")
+        body = response.read(ao_model_qualification.MAX_EVIDENCE_BYTES + 1)
+        if len(body) > ao_model_qualification.MAX_EVIDENCE_BYTES:
+            raise _FetchFailure("source_too_large")
         return body
     finally:
         connection.close()
@@ -357,18 +384,17 @@ def _claude_code(root, run, home, fetch_claude_latest):
                 else:
                     configured["version"] = _version_string(configured_tuple)
 
-    floors = [entry.get("minimum_claude_code_version")
-              for entry in ao_engineering_model.BUNDLED_FAMILIES.values()]
-    floors += [entry.get("minimum_claude_code_version")
-               for entry in ao_engineering_model.BUNDLED_MODELS.values()]
+    floors_incomplete = False
     try:
-        artifact = _qualification_artifact(root)
+        policy, _ = ao_engineering_model.effective_policy(root)
+        floor_entries = list(policy["families"].values()) + list(policy["models"].values())
     except Exception:
-        artifact = None
-        reasons.add("qualification_floors_unread")
-    if isinstance(artifact, dict) and isinstance(artifact.get("families"), dict):
-        floors += [entry.get("minimum_claude_code_version")
-                   for entry in artifact["families"].values() if isinstance(entry, dict)]
+        floors_incomplete = True
+        reasons.add("floors_incomplete")
+        floor_entries = (list(ao_engineering_model.BUNDLED_FAMILIES.values())
+                         + list(ao_engineering_model.BUNDLED_MODELS.values()))
+    floors = [entry.get("minimum_claude_code_version") for entry in floor_entries
+              if isinstance(entry, dict)]
     floor = ao_engineering_model._newer_floor(*floors)
     floor_tuple = _version_tuple(floor) if floor is not None else None
 
@@ -388,23 +414,28 @@ def _claude_code(root, run, home, fetch_claude_latest):
         except OSError:
             continue
         if stat.S_ISREG(details.st_mode) and os.access(executable, os.X_OK):
-            candidates.append((tuple(int(part) for part in match.groups()), str(entry)))
+            candidates.append((tuple(int(part) for part in match.groups()), str(executable), True))
     located = shutil.which("claude")
     if located is not None:
         try:
             resolved = str(Path(located).resolve())
         except OSError:
             resolved = None
-        if resolved is not None and resolved not in {path for _, path in candidates}:
+        if resolved is not None and resolved not in {path for _, path, _ in candidates}:
             located_tuple = _claude_version(run, resolved)
             if located_tuple is not None:
-                candidates.append((located_tuple, resolved))
-    if candidates:
-        newest_tuple, newest_path = max(candidates, key=lambda candidate: candidate[0])
-        newest_installed = {"version": _version_string(newest_tuple), "path": newest_path}
-    else:
-        newest_tuple = None
-        newest_installed = None
+                candidates.append((located_tuple, resolved, False))
+    newest_installed = None
+    newest_tuple = None
+    for name_tuple, path, needs_probe in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+        probed = _claude_version(run, path) if needs_probe else name_tuple
+        if probed is None or probed != name_tuple:
+            reasons.add("installed_version_mismatch")
+            continue
+        newest_tuple = probed
+        newest_installed = {"version": _version_string(probed), "path": path}
+        break
+    if newest_installed is None:
         reasons.add("no_installed_claude_found")
 
     latest_published = None
@@ -424,25 +455,34 @@ def _claude_code(root, run, home, fetch_claude_latest):
                                 "tag_name": released["tag_name"], "html_url": released["html_url"],
                                 "published_at": released["published_at"]}
 
-    if (configured_tuple is not None and floor_tuple is not None
-            and configured_tuple < floor_tuple):
+    floor_satisfied = (configured_tuple >= floor_tuple
+                       if configured_tuple is not None and floor_tuple is not None else None)
+    if floors_incomplete and floor_satisfied is True:
+        floor_satisfied = None  # the lower bound can assert below_floor but never satisfaction
+    if floor_satisfied is False:
         outcome = "below_floor"
     elif configured_tuple is not None and (
             (newest_tuple is not None and newest_tuple > configured_tuple)
             or (published_tuple is not None and published_tuple > configured_tuple)):
         outcome = "update_available"
-    elif (configured_tuple is not None and published_tuple is not None
+    elif (floor_satisfied is True and published_tuple is not None
           and configured_tuple >= published_tuple
           and (newest_tuple is None or newest_tuple <= configured_tuple)):
         outcome = "up_to_date"
     else:
         outcome = "unknown"
     action = None
-    if (outcome in ("below_floor", "update_available") and newest_installed is not None
-            and (floor_tuple is None or newest_tuple >= floor_tuple)):
+    qualifies = (newest_installed is not None and configured_tuple is not None
+                 and newest_tuple > configured_tuple
+                 and (floor_tuple is None or newest_tuple >= floor_tuple))
+    if outcome in ("below_floor", "update_available") and qualifies and floors_incomplete:
+        # The bundled lower bound can prove the configured executable insufficient, but it cannot
+        # certify a replacement against the unread configured or qualified floors.
+        reasons.add("action_withheld_floors_incomplete")
+    elif outcome in ("below_floor", "update_available") and qualifies:
         action = "python3 project_room.py setup --claude-bin " + newest_installed["path"]
-    floor_satisfied = (configured_tuple >= floor_tuple
-                       if configured_tuple is not None and floor_tuple is not None else None)
+    elif outcome == "below_floor":
+        reasons.add("no_installed_candidate_satisfies_floor")
     return {"configured": configured, "highest_family_floor": floor,
             "floor_satisfied": floor_satisfied, "newest_installed": newest_installed,
             "latest_published": latest_published, "outcome": outcome,
@@ -471,6 +511,11 @@ def _qualification_sources(root, fetch_source):
         entry = {"id": descriptor.get("id"), "outcome": "unreachable",
                  "bytes_match": None, "identifiers_not_in_capture": {},
                  "identifiers_only_in_capture": {}}
+        if not _source_uri_allowed(descriptor.get("uri")):
+            reasons.add("source_host_not_allowed")
+            doubtful = True
+            entries.append(entry)
+            continue
         try:
             body = fetch_source(descriptor.get("uri"))
         except _FetchFailure as exc:
@@ -480,37 +525,44 @@ def _qualification_sources(root, fetch_source):
             reasons.add("source_fetch_failed")
             doubtful = True
         else:
-            entry["bytes_match"] = (
-                hashlib.sha256(body).hexdigest() == descriptor.get("sha256"))
             try:
                 captured = ao_model_qualification._private_bytes(
                     descriptor.get("evidence_file"), ao_model_qualification.MAX_EVIDENCE_BYTES,
                     "Source evidence")
             except Exception:
-                captured = b""
+                entry["outcome"] = "evidence_unreadable"
                 reasons.add("evidence_unreadable")
                 doubtful = True
-            captured_ids = {identifier for _, identifier in _model_ids(captured)}
-            fresh_pairs = _model_ids(body)
-            fresh_ids = {identifier for _, identifier in fresh_pairs}
-            not_in_capture = {}
-            for family, identifier in fresh_pairs:
-                if identifier not in captured_ids:
-                    not_in_capture.setdefault(family, []).append(identifier)
-            only_in_capture = {}
-            for family, identifier in _model_ids(captured):
-                if identifier not in fresh_ids:
-                    only_in_capture.setdefault(family, []).append(identifier)
-            entry["identifiers_not_in_capture"] = not_in_capture
-            entry["identifiers_only_in_capture"] = only_in_capture
-            if not_in_capture or only_in_capture:
-                entry["outcome"] = "identifiers_differ"
-                identifiers_differ = True
-            elif entry["bytes_match"]:
-                entry["outcome"] = "unchanged"
             else:
-                entry["outcome"] = "bytes_differ"
-                bytes_differ = True
+                if hashlib.sha256(captured).hexdigest() != descriptor.get("sha256"):
+                    entry["outcome"] = "evidence_digest_mismatch"
+                    reasons.add("evidence_digest_mismatch")
+                    doubtful = True
+                    entries.append(entry)
+                    continue
+                entry["bytes_match"] = (
+                    hashlib.sha256(body).hexdigest() == descriptor.get("sha256"))
+                captured_ids = {identifier for _, identifier in _model_ids(captured)}
+                fresh_pairs = _model_ids(body)
+                fresh_ids = {identifier for _, identifier in fresh_pairs}
+                not_in_capture = {}
+                for family, identifier in fresh_pairs:
+                    if identifier not in captured_ids:
+                        not_in_capture.setdefault(family, []).append(identifier)
+                only_in_capture = {}
+                for family, identifier in _model_ids(captured):
+                    if identifier not in fresh_ids:
+                        only_in_capture.setdefault(family, []).append(identifier)
+                entry["identifiers_not_in_capture"] = not_in_capture
+                entry["identifiers_only_in_capture"] = only_in_capture
+                if not_in_capture or only_in_capture:
+                    entry["outcome"] = "identifiers_differ"
+                    identifiers_differ = True
+                elif entry["bytes_match"]:
+                    entry["outcome"] = "unchanged"
+                else:
+                    entry["outcome"] = "bytes_differ"
+                    bytes_differ = True
         entries.append(entry)
     if identifiers_differ:
         outcome = "identifiers_differ"
