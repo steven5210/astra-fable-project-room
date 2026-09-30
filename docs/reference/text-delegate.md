@@ -47,7 +47,8 @@ authentication.
 `context_basis` (a short `TOKEN`-pattern value). Every other `INTEGER_FIELDS` value is optional and uses the
 delegate's current default; `max_concurrent_per_host` defaults to 1 for loopback HTTP and 2 for HTTPS. Every
 numeric value is a positive integer, and the existing context, output, timeout, streaming, metadata and retention
-consistency checks apply.
+consistency checks apply. The host limit counts only this profile's jobs; because each profile has its own ledger,
+profiles that share one server count separately.
 
 Delegate state is private and profile-scoped at `<home>/delegates/<id>/`: `ledger.sqlite3`, `jobs/`, `probes/`
 and `exports/<room_id>/`. Usage is requested for streaming responses when the selected syntax supports the

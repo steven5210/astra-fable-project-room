@@ -1139,14 +1139,13 @@ class _Stream:
                 self.fail(FAILED_AFTER_SEND, "unsupported_tool_calls")
                 return
             text = delta.get("content")
-            reasoning_parts = [delta.get("reasoning_content")]
-            if self.openai_reasoning:
-                reasoning_parts.append(delta.get("reasoning"))
+            reasoning = delta.get("reasoning_content")
+            if reasoning is None and self.openai_reasoning:
+                reasoning = delta.get("reasoning")
             if (text is not None and not isinstance(text, str)
-                    or any(part is not None and not isinstance(part, str) for part in reasoning_parts)):
+                    or reasoning is not None and not isinstance(reasoning, str)):
                 self.fail(FAILED_AFTER_SEND, "malformed_stream")
                 return
-            reasoning = "".join(part for part in reasoning_parts if part)
             if self.finished and (text or reasoning):
                 self.fail(FAILED_AFTER_SEND, "content_after_finish")
                 return
@@ -1665,28 +1664,28 @@ class Adapter:
 
     def _export_bytes(self, job_id, room_id):
         """Size of an export artifact carrying this job's name in the export directory of the room that owns the job
-        (every room's directory is a sibling below the same exports root), reached through owned descriptors. It is
-        counted whenever a job is relabelled without its worker, from whichever room's adapter observes it: a durable
+        reached through owned descriptors. Use this adapter's selected export directory for its own room, and the
+        sibling lookup for another room. It is counted whenever a job is relabelled without its worker: a durable
         export written before the worker died is still that job's evidence. Accounted, never adopted (#31 stays out)."""
         if not isinstance(room_id, str) or not ROOM_ID.fullmatch(room_id):
             return 0
+        exports_fd = room_fd = None
         try:
-            exports_fd = open_directory(self.export_dir.parent, "export_unsafe")
-        except AdapterError:
-            return 0
-        try:
-            try:
+            if room_id == self.room_id:
+                room_fd = open_directory(self.export_dir, "export_unsafe")
+            else:
+                exports_fd = open_directory(self.export_dir.parent, "export_unsafe")
                 room_fd = directory_below(exports_fd, (room_id,), "export_unsafe")
-            except AdapterError:
-                return 0
-            try:
-                metadata = os.stat(job_id + ".md", dir_fd=room_fd, follow_symlinks=False)
-            except OSError:
-                return 0
-            finally:
-                os.close(room_fd)
+            metadata = os.stat(job_id + ".md", dir_fd=room_fd, follow_symlinks=False)
+        except (AdapterError, OSError):
+            return 0
         finally:
-            os.close(exports_fd)
+            if room_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(room_fd)
+            if exports_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(exports_fd)
         return metadata.st_size if stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid() else 0
 
     def _heartbeat_at(self, job_id):
@@ -2104,6 +2103,9 @@ class Adapter:
             beat(True)
             if exists_below(job_fd, "cancel.json"):
                 self._finish(job_id, job_fd, _unsent("cancelled_before_send"), execution_id)
+                return 0
+            if row["profile_sha256"] != self.profile_sha256:
+                self._finish(job_id, job_fd, _unsent("profile_changed"), execution_id)
                 return 0
             if self.room_root is not None and not self.integrity["verified"]:
                 self._finish(job_id, job_fd, _unsent("provider_inventory_mismatch"), execution_id)

@@ -195,6 +195,22 @@ class RequestBodyTests(unittest.TestCase):
             self.assertEqual(parameters["thinking"], "not_requested")
             self.assertIsNone(parameters["reasoning_effort"])
 
+    def test_reasoning_aliases_are_not_concatenated(self):
+        config = delegate.validate_config(make_profile(), self.home)
+        artifacts_fd = os.open(self.temp.name, os.O_RDONLY | os.O_DIRECTORY)
+        stream = delegate._Stream(config, artifacts_fd, None, {})
+        reasoning = "é"
+        delta = {"reasoning_content": reasoning, "reasoning": reasoning}
+        try:
+            stream.line(b"data: " + json.dumps({"choices": [{"delta": delta}]}).encode("utf-8"))
+            self.assertEqual(stream.reasoning_bytes, len(reasoning.encode("utf-8")))
+        finally:
+            try:
+                stream.close()
+            finally:
+                os.close(artifacts_fd)
+        self.assertEqual((Path(self.temp.name) / "reasoning").read_bytes(), reasoning.encode("utf-8"))
+
 
 class TransportAndWorkerTests(unittest.TestCase):
     def setUp(self):
@@ -248,6 +264,9 @@ class TransportAndWorkerTests(unittest.TestCase):
         first_result = self.adapter.result(only_usage["job_id"])
         self.assertEqual(self.adapter.export_dir, self.export_dir)
         self.assertEqual(Path(first_result["content_path"]).parent, self.export_dir)
+        self.assertNotEqual(self.export_dir.name, self.adapter.room_id)
+        self.assertEqual(self.adapter._export_bytes(only_usage["job_id"], self.adapter.room_id),
+                         Path(first_result["content_path"]).stat().st_size)
         self.assertNotIn("PRIVATE_REASONING", first_result["text"])
         job_dir = self.home / "delegates" / "fixture" / "jobs" / only_usage["job_id"]
         self.assertIn(b"PRIVATE_REASONING", (job_dir / "reasoning").read_bytes())
@@ -290,6 +309,27 @@ class TransportAndWorkerTests(unittest.TestCase):
         expected = fallback_home / "delegates" / "fixture" / "exports" / "fallback-room"
         self.assertEqual(adapter.export_dir, expected)
         self.assertFalse(expected.exists())
+
+    def test_worker_refuses_queued_job_when_profile_changes(self):
+        with mock.patch.object(self.adapter, "_spawn_worker", lambda job_id, job_fd, lease_fd: None):
+            submitted = self.adapter.submit("Do not send with a changed profile", "profile-change")
+
+        profile = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        profile["model"] = "fixture/changed-model"
+        write_profile(self.profile_path, profile)
+        changed_adapter = delegate.Adapter(self.home, "worker-room", self.profile_path, room_root=self.room_root)
+        job_fd = changed_adapter._job_fd(submitted["job_id"])
+        lease_fd = os.open("worker.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=job_fd)
+        try:
+            changed_adapter.run_worker(submitted["job_id"], lease_fd)
+        finally:
+            os.close(lease_fd)
+            os.close(job_fd)
+
+        row = changed_adapter.ledger.job(submitted["job_id"], "worker-room")
+        self.assertEqual((row["state"], row["remote_outcome"], row["error_code"], row["possibly_billed"]),
+                         (delegate.NOT_STARTED, "not_sent", "profile_changed", 0))
+        self.assertEqual(self.fake.requests, [])
 
     def test_loopback_redirect_is_refused_after_send(self):
         value = self.run_to_terminal("redirect", {"kind": "redirect"})
