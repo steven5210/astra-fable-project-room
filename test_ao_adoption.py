@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import sqlite3
 import subprocess
@@ -15,6 +16,7 @@ from unittest.mock import patch
 
 import ao_delegates
 import ao_executable_binding
+import ao_mcp_attachment
 import ao_native_outcome
 import ao_project_room as ao
 import ao_provider_transition as provider
@@ -605,6 +607,40 @@ class RoutingAdoptionTests(AdoptionFixture):
             capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(decision.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
         self.assertEqual(len(self.fake.posts), self.posts_before)
+
+    def test_manifest_expects_the_pinned_adapter_catalog_not_the_controller_constant(self):
+        # Adoption retains the room's original adapter snapshot; a room pinned before the catalog grew
+        # must get a manifest naming its own six tools, or its witness would reject every handshake.
+        legacy = sorted(ao_mcp_attachment.LEGACY_TOOLS)
+        with patch.object(routing, 'pinned_adapter_tools', return_value=list(legacy)) as pinned:
+            self.stage_routing()
+        self.assertTrue(pinned.call_args_list)
+        for called in pinned.call_args_list:
+            self.assertEqual(called.args, (self.state()['delegate']['inventory'],))
+        manifest = ao.read(self.directory() / routing.REL / 'mcp-attachment.json')
+        self.assertEqual(manifest['expected_tools'], legacy)
+        self.assertNotEqual(sorted(manifest['expected_tools']), sorted(routing.TOOLS))
+
+    def test_pinned_adapter_tools_reads_the_digest_verified_snapshot_only(self):
+        inventory = copy.deepcopy(self.state()['delegate']['inventory'])
+        adapter = [Path(p) for p in inventory['files'] if Path(p).name == 'deepseek_adapter.py'][0]
+        self.assertEqual(routing.pinned_adapter_tools(inventory), sorted(routing.TOOLS))
+        source = adapter.read_text()
+        legacy = re.sub(r'\n    "deepseek_context_check": \(.*?\n(?=    "|\})', '\n', source, flags=re.S)
+        self.assertNotIn('"deepseek_context_check": (', legacy)
+        adapter.write_text(legacy)
+        with self.assertRaisesRegex(ao.RoomError, 'differs from its recorded digest'):
+            routing.pinned_adapter_tools(inventory)
+        inventory['files'][str(adapter)] = ao.digest(legacy.encode())
+        self.assertEqual(routing.pinned_adapter_tools(inventory), sorted(ao_mcp_attachment.LEGACY_TOOLS))
+        unknown = legacy.replace('"deepseek_health": (', '"deepseek_invented": (')
+        adapter.write_text(unknown)
+        inventory['files'][str(adapter)] = ao.digest(unknown.encode())
+        with self.assertRaisesRegex(ao.RoomError, 'unknown tool catalog'):
+            routing.pinned_adapter_tools(inventory)
+        adapter.write_text(source)
+        with self.assertRaisesRegex(ao.RoomError, 'does not identify one adapter snapshot'):
+            routing.pinned_adapter_tools({'files': {}})
 
     def test_runtime_drift_and_new_native_activity_refuse_activation(self):
         result = self.stage_routing()
