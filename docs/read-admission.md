@@ -128,10 +128,12 @@ size and a fixed 64 KiB anchor digest ending at that size.
 ## External SDK caller compatibility
 
 Quota inspection and stale-Read checks recognize the original plain-text root
-user record with an explicit human origin. They also recognize the observed
-external SDK CLI record without an origin field when all its identifying fields
-are present: promptSource and turnOrigin are sdk, userType is external,
-entrypoint is sdk-cli, and promptId is a valid UUID. Missing origin alone does
+user record with an explicit human origin: older rows carry no turnOrigin, and
+the 2.1.28x rows written by AO's ACP driver carry turnOrigin human under the
+sdk-ts entrypoint. They also recognize the observed external SDK record without
+an origin field when all its identifying fields are present: promptSource and
+turnOrigin are sdk, userType is external, entrypoint is sdk-cli or sdk-ts, and
+promptId is a valid UUID. Missing origin alone does
 not establish caller identity. Explicit-null, malformed or contradictory caller
 identity is refused; task notifications, compact summaries, internal messages,
 tool results, meta records and nested workers never establish a fresh caller.

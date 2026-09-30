@@ -65,6 +65,16 @@ class SdkCallerAndReadinessTests(unittest.TestCase):
                            entrypoint="sdk-cli", promptId=prompt_id, version="2.1.282",
                            permissionMode="auto", **fields)
 
+    def sdk_ts_human_caller(self, prompt_id, identity="caller-sdk-ts",
+                            text="Apply the authorized correction.", **fields):
+        # Observed 2.1.28x human-origin caller dialect written by AO 0.13.1's ACP
+        # driver: origin.kind=human, turnOrigin=human, promptSource=sdk,
+        # userType=external, entrypoint=sdk-ts and a promptId UUID.
+        return self.record("user", identity, [{"type": "text", "text": text}],
+                           origin={"kind": "human"}, promptSource="sdk", turnOrigin="human",
+                           userType="external", entrypoint="sdk-ts", promptId=prompt_id,
+                           version="2.1.282", permissionMode="auto", **fields)
+
     def notification_row(self, prompt_id, identity="task-notification"):
         # A harness notification in an SDK session can carry the same turn fields; the
         # synthetic envelope text is what excludes it from caller identity.
@@ -142,6 +152,65 @@ class SdkCallerAndReadinessTests(unittest.TestCase):
         # is positively certified, but its prompt binding cannot be enforced.
         self.assertIsNone(guard.decide(self.agent_event()))
 
+    def test_sdk_ts_human_origin_caller_is_recognized_and_clears_its_turn(self):
+        row = self.sdk_ts_human_caller(self.PROMPT_ONE)
+        self.assertEqual(guard._caller_kind(row), "human")
+        self.write_transcript([self.legacy_caller(), self.quota_error(), row])
+        proof = guard.inspect_quota(self.agent_event())
+        self.assertEqual(proof, {"status": "clear_current_turn", "caller_uuid": "caller-sdk-ts",
+                                 "error_uuids": []})
+        self.assertIsNone(guard.decide(self.agent_event(prompt_id=self.PROMPT_ONE)))
+
+    def test_human_origin_with_a_nonhuman_turn_origin_still_refuses(self):
+        for value in ("agent", "system"):
+            with self.subTest(turnOrigin=value):
+                row = self.sdk_ts_human_caller(self.PROMPT_ONE, identity="conflicted-" + value)
+                row["turnOrigin"] = value
+                with self.assertRaises(guard._CallerIdentityError):
+                    guard._caller_kind(row)
+                self.write_transcript([self.legacy_caller(), row])
+                with self.assertRaises(ValueError):
+                    guard.inspect_quota(self.agent_event(prompt_id=self.PROMPT_ONE))
+
+    def test_sdk_dialect_accepts_sdk_ts_and_refuses_other_entrypoints(self):
+        row = self.sdk_caller(self.PROMPT_ONE)
+        row["entrypoint"] = "sdk-ts"
+        self.assertEqual(guard._caller_kind(row), "sdk")
+        self.write_transcript([row])
+        proof = guard.inspect_quota(self.agent_event(prompt_id=self.PROMPT_ONE))
+        self.assertEqual(proof["caller_uuid"], "caller-sdk")
+        bad = self.sdk_caller(self.PROMPT_ONE)
+        bad["entrypoint"] = "sdk-py"
+        with self.assertRaisesRegex(guard._CallerIdentityError, "not the complete dialect"):
+            guard._caller_kind(bad)
+
+    def test_envelope_and_summary_rows_with_sdk_ts_fields_stay_non_callers(self):
+        summary = self.sdk_ts_human_caller(self.PROMPT_ONE, identity="summary")
+        summary["isCompactSummary"] = True
+        summary.pop("origin", None)
+        envelopes = [
+            self.record("user", "envelope-" + name,
+                        [{"type": "text", "text": text}],
+                        promptSource="sdk", userType="external", entrypoint="sdk-ts",
+                        promptId=self.PROMPT_ONE)
+            for name, text in (("caveat", "<local-command-caveat>metadata</local-command-caveat>"),
+                               ("name", "<command-name>/clear</command-name>"),
+                               ("stdout", "<local-command-stdout>done</local-command-stdout>"))]
+        for label, row in (("summary", summary), *[(r["uuid"], r) for r in envelopes]):
+            with self.subTest(shape=label):
+                self.assertIsNone(guard._caller_kind(row))
+                self.write_transcript([self.legacy_caller(), self.quota_error(), row])
+                proof = guard.inspect_quota(self.agent_event())
+                self.assertEqual(proof["caller_uuid"], "caller-legacy")
+                self.assertEqual(proof["status"], "quota_in_current_turn")
+
+    def test_agent_launch_through_the_hook_accepts_the_sdk_ts_human_caller(self):
+        self.write_transcript([self.sdk_ts_human_caller(self.PROMPT_ONE)])
+        event = self.agent_event(tool_input={"subagent_type": "pr-sonnet",
+                                             "prompt": "Complete the bounded task.",
+                                             "description": "Synthetic task"})
+        self.assertIsNone(guard.decide(event))
+
     def test_sdk_caller_after_quota_opens_a_new_window_and_mismatch_refuses(self):
         self.write_transcript([self.sdk_caller(self.PROMPT_ONE), self.quota_error(),
                                self.sdk_caller(self.PROMPT_TWO, identity="caller-sdk-two")])
@@ -195,7 +264,7 @@ class SdkCallerAndReadinessTests(unittest.TestCase):
 
     def test_incomplete_or_conflicting_caller_identity_refuses_instead_of_falling_back(self):
         partial = self.sdk_caller(self.PROMPT_TWO, identity="partial-dialect")
-        partial["entrypoint"] = "sdk-ts"
+        partial["entrypoint"] = "sdk-py"
         missing = self.sdk_caller(self.PROMPT_TWO, identity="missing-prompt")
         missing.pop("promptId")
         malformed = self.sdk_caller("not-a-uuid", identity="malformed-prompt")
@@ -250,7 +319,7 @@ class SdkCallerAndReadinessTests(unittest.TestCase):
     def test_conflicting_caller_record_after_the_read_refuses_instead_of_admitting(self):
         params = {"file_path": str(self.source("conflict-after.txt", 100))}
         broken = self.sdk_caller(self.PROMPT_TWO, identity="broken-dialect")
-        broken["entrypoint"] = "sdk-ts"
+        broken["entrypoint"] = "sdk-py"
         self.write_transcript([self.legacy_caller(),
                                self.message("msg-conflict-after",
                                             [("toolu_conflict_after", params)]),
