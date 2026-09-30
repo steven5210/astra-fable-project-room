@@ -281,7 +281,13 @@ selector, only through the audited transition tools
 session, conversation, branch, worktree, specification, counters, prior
 reviews and independent holds. `ao_room_engineer_model_audit` is read-only;
 the transition and abandon tools are mutations, and the core owns their lock,
-idempotency and exact retry semantics.
+idempotency and exact retry semantics. Its child-evidence check treats a
+parent `Agent`/`Task` launch the routing guard denied before execution as
+terminal with no child; so does a launch whose PreToolUse hook exited nonzero
+running one of the room's verified guard launchers, original or refreshed
+(a recorded `guard_sha256` in the bracketed command, the guard's own denial or
+internal error in stderr). A plain error, a foreign
+hook, a start acknowledgement or a missing result still refuses.
 
 A configured-model change sends exactly one guarded
 `PATCH /sessions/{id}/conversation/settings`; a same-selector

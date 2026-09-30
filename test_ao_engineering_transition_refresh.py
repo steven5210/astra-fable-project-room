@@ -174,6 +174,47 @@ class TransitionAfterRealRefreshTests(Fixture):
                 'authorization': 'The user authorized this exact engineering model transition',
                 'reason': 'The qualified engineering orchestrator replaces the original for this room'}
 
+    def hook_pair(self, guard_sha256, tool_id, launch_uuid, result_uuid):
+        """One Agent launch plus the hook-error result a nonzero pinned-guard exit records."""
+        content = ('PreToolUse:Agent hook error: [/opt/python3 /ao/launchers/' + guard_sha256 +
+                   '.py; s=$?; [ "$s" -eq 0 ] || exit 2]: Project Room routing guard error: '
+                   'synthetic guard failure\n')
+        return ({'uuid': launch_uuid, 'type': 'assistant', 'sessionId': self.native_session,
+                 'cwd': self.native_row_workspace(),
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': tool_id, 'name': 'Agent',
+                      'input': {'subagent_type': 'pr-opus', 'prompt': 'Synthetic fragment.'}}]}},
+                {'uuid': result_uuid, 'type': 'user', 'sessionId': self.native_session,
+                 'cwd': self.native_row_workspace(), 'sourceToolAssistantUUID': launch_uuid,
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': tool_id, 'content': content,
+                      'is_error': True}]},
+                 'toolUseResult': 'Error: ' + content})
+
+    def append_native(self, *rows):
+        with self.transcript.open('a') as stream:
+            for row in rows:
+                stream.write(json.dumps(row, sort_keys=True) + '\n')
+
+    def test_audit_accepts_hook_blocks_from_the_whole_verified_guard_history(self):
+        prepared = ao_delegates.preparation(self.directory(), self.state())
+        original = prepared['routing']['guard_sha256']
+        effective = refresh.effective(self.directory(), self.state(), prepared)['guard_sha256']
+        self.assertNotEqual(original, effective)
+        rows = self.hook_pair(original, 'toolu_old', 'a-10', 'h-10')
+        rows += self.hook_pair(effective, 'toolu_new', 'a-11', 'h-11')
+        self.append_native(*rows)
+        result = et.audit(self.service, self.room, OPUS, str(self.database), str(self.transcript))
+        self.assertTrue(result['eligible'], result.get('reason'))
+        self.assertEqual(result['children']['agent_launches'], 2)
+        self.assertEqual(result['children']['hook_blocked_launches'], 2)
+
+    def test_audit_refuses_a_hook_block_of_a_sha_outside_the_verified_history(self):
+        self.append_native(*self.hook_pair('2' * 64, 'toolu_foreign', 'a-10', 'h-10'))
+        result = et.audit(self.service, self.room, OPUS, str(self.database), str(self.transcript))
+        self.assertFalse(result['eligible'])
+        self.assertIn('no validated terminal result', result['reason'])
+
     def test_audit_binds_the_current_refresh_record_guard_settings_and_executable(self):
         self.assertTrue(self.result['eligible'], self.result.get('reason'))
         prepared = ao_delegates.preparation(self.directory(), self.state())
