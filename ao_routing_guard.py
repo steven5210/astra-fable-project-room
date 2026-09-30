@@ -98,14 +98,16 @@ READ_CONTAINER_MAGIC = ((b"%PDF-", "PDF document"), (b"\x89PNG\r\n\x1a\n", "PNG 
                         (b"GIF89a", "GIF image"), (b"II*\x00", "TIFF image"),
                         (b"MM\x00*", "TIFF image"), (b"PK\x03\x04", "ZIP or office container"),
                         (b"\x1f\x8b", "gzip archive"))
-# Positively identified external SDK caller dialect (Claude Code 2.1.282). A missing
-# origin alone is never human evidence: the dialect is certified only by its complete
-# identity, and the older origin.kind=human shape stays deliberately supported. See
-# docs/read-admission.md for the limits that remain in both dialects.
+# Positively identified external SDK caller dialects (Claude Code 2.1.28x). A missing
+# origin alone is never human evidence: a dialect is certified only by its complete
+# identity, and the origin.kind=human shapes (no turnOrigin on 2.1.268, turnOrigin=human
+# on the 2.1.28x sdk-ts rows) stay deliberately supported. See docs/read-admission.md
+# for the limits that remain in every dialect.
 SDK_CALLER_PROMPT_SOURCE = "sdk"
 SDK_CALLER_TURN_ORIGIN = "sdk"
 SDK_CALLER_USER_TYPE = "external"
-SDK_CALLER_ENTRYPOINT = "sdk-cli"
+SDK_CALLER_ENTRYPOINTS = ("sdk-cli", "sdk-ts")
+HUMAN_CALLER_TURN_ORIGIN = "human"
 SDK_CALLER_IDENTITY_KEYS = ("turnOrigin", "promptId")
 SDK_CALLER_ENVELOPE_PREFIXES = ("<task-notification", "<system-reminder", "<local-command",
                                 "<command-name", "<command-message")
@@ -321,9 +323,10 @@ def _prompt_mismatch_error():
 def _certify_sdk_caller(row, prompt_id):
     """Certify the complete external SDK caller dialect; refuse anything incomplete."""
     missing = [name for name, expected in (("promptSource", SDK_CALLER_PROMPT_SOURCE),
-                                           ("userType", SDK_CALLER_USER_TYPE),
-                                           ("entrypoint", SDK_CALLER_ENTRYPOINT))
+                                           ("userType", SDK_CALLER_USER_TYPE))
                if row.get(name) != expected]
+    if row.get("entrypoint") not in SDK_CALLER_ENTRYPOINTS:
+        missing.append("entrypoint")
     if missing:
         raise _CallerIdentityError(
             "a root user record presents external SDK caller identity keys but not the complete "
@@ -338,10 +341,12 @@ def _certify_sdk_caller(row, prompt_id):
 def _caller_kind(row, prompt_id=None):
     """Classify one root-session record as 'human', 'sdk' or None when it is not a caller.
 
-    'human' is the older origin.kind=human dialect and stays deliberately supported.
-    'sdk' is the positively identified external SDK caller dialect observed on Claude
-    Code 2.1.282: plain text content, no origin field, promptSource=sdk,
-    turnOrigin=sdk, userType=external, entrypoint=sdk-cli and a promptId UUID.
+    'human' is the origin.kind=human dialect: Claude Code 2.1.268 wrote it with no
+    turnOrigin and 2.1.282 writes it with turnOrigin=human under the sdk-ts
+    entrypoint; both stay deliberately supported. 'sdk' is the positively
+    identified external SDK caller dialect with no origin field: plain text
+    content, promptSource=sdk, turnOrigin=sdk, userType=external, entrypoint
+    sdk-cli or sdk-ts and a promptId UUID.
     ``prompt_id`` is the hook's own prompt_id when it supplied one; it is then
     enforced against the record's promptId.
 
@@ -386,7 +391,7 @@ def _caller_kind(row, prompt_id=None):
             "rather than inferred from an older record")
     turn_origin = row.get("turnOrigin")
     if _human_caller(row):
-        if turn_origin not in (None, SDK_CALLER_TURN_ORIGIN):
+        if turn_origin not in (None, SDK_CALLER_TURN_ORIGIN, HUMAN_CALLER_TURN_ORIGIN):
             raise _CallerIdentityError(
                 "a caller record combines an origin.kind=human identity with a different turnOrigin; "
                 "the identity is contradictory and is refused rather than inferred from an older "
