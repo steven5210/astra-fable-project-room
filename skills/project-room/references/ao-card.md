@@ -16,7 +16,10 @@ Rules for every phase:
   `failed`, `interrupted`, `cancelled`, `recovered` or a lost acknowledgement.
 - While an owned turn is submitted or running, wait only with `ao_room_sync`,
   setting `wait_seconds` to the maximum its schema lists (45 unless the operator
-  raised `sync_wait_max_seconds`), and repeat. Never poll room files, receipts,
+  raised `sync_wait_max_seconds`), and repeat. When you call it from a code
+  cell, give that cell a `yield_time_ms` longer than the wait (for example
+  `(wait_seconds + 30) * 1000`); if the cell still comes back pending, wait on
+  it with the same long yield, never short ones. Never poll room files, receipts,
   transcripts or the CLI with shell or Python watchers, `sleep` loops or short
   repeated calls: every check is a full Astra model turn. Between waits, give
   at most a one-line update, and only when something changed. A `timeout` or
