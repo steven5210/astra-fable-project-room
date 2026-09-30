@@ -788,14 +788,59 @@ def worktree_root():
     return Path(value)
 
 
-def context_files(paths, config, root):
-    """Read explicitly named files lexically beneath the worktree root through descriptor-relative no-symlink opens."""
+def context_paths(paths, config):
+    """Normalize the context_path argument to a nonempty bounded list of path strings."""
     if isinstance(paths, str):
         paths = [paths]
     if not isinstance(paths, list) or not paths or not all(isinstance(item, str) and item for item in paths):
-        raise AdapterError("context_path_invalid", "context_path must name one or more absolute files")
+        raise AdapterError("context_path_invalid", "context_path must name one or more absolute or worktree-relative files")
     if len(paths) > config["max_context_files"]:
         raise AdapterError("context_files_limit", f"context_path may name at most {config['max_context_files']} files")
+    return paths
+
+
+def resolve_context_entry(item, root):
+    """Resolve one context_path entry to its path relative to the verified worktree root. An entry is either an
+    absolute normalized path lexically beneath the root or an already-normalized worktree-relative path."""
+    normalized_error = "context_path entries must be normalized absolute or worktree-relative paths"
+    if "\0" in item:
+        raise AdapterError("context_path_invalid", normalized_error)
+    if os.path.isabs(item):
+        if os.path.normpath(item) != item or item.endswith("/"):
+            raise AdapterError("context_path_invalid", normalized_error)
+        resolved = Path(item)
+    else:
+        if os.path.normpath(item) != item or item.endswith("/") or ".." in item.split("/"):
+            raise AdapterError("context_path_invalid", normalized_error)
+        resolved = Path(root, item)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise AdapterError("context_path_outside_worktree", "context_path must lie beneath the verified worktree root") from exc
+    parts = relative.parts
+    if not parts or len(parts) > 32 or any(part.startswith(".") for part in parts):
+        raise AdapterError("context_path_invalid", "context_path may not name dotfiles, hidden directories or overlong paths")
+    name = parts[-1]
+    if CREDENTIAL_NAMES.fullmatch(name):
+        raise AdapterError("context_path_credential", "context_path refuses credential-looking files")
+    if Path(name).suffix.lower() not in CONTEXT_SUFFIXES and name not in CONTEXT_BARE_NAMES:
+        raise AdapterError("context_path_suffix", "context_path allows common source, documentation and build files only")
+    return relative
+
+
+def read_context_entry(root_fd, relative, config):
+    """Read one resolved context path beneath the worktree through descriptor-relative no-symlink opens."""
+    data = read_below(root_fd, relative.parts, config["max_context_file_bytes"], "context_unsafe")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AdapterError("context_not_utf8", "context files must be UTF-8 text") from exc
+    return {"path": str(relative), "bytes": len(data), "sha256": sha(data), "text": text}
+
+
+def context_files(paths, config, root):
+    """Read explicitly named absolute or worktree-relative files beneath the worktree root through descriptor-relative no-symlink opens."""
+    paths = context_paths(paths, config)
     if root is None:
         raise AdapterError("worktree_root_unavailable", "context_path requires PROJECT_ROOM_WORKTREE from the controller")
     root_fd = open_directory(root, "worktree_unsafe")
@@ -803,42 +848,30 @@ def context_files(paths, config, root):
     try:
         identity = os.fstat(root_fd)
         for item in paths:
-            if "\0" in item or not os.path.isabs(item) or os.path.normpath(item) != item or item.endswith("/"):
-                raise AdapterError("context_path_invalid", "context_path entries must be normalized absolute paths")
-            try:
-                relative = Path(item).relative_to(root)
-            except ValueError as exc:
-                raise AdapterError("context_path_outside_worktree", "context_path must lie beneath the verified worktree root") from exc
-            parts = relative.parts
-            if not parts or len(parts) > 32 or any(part.startswith(".") for part in parts):
-                raise AdapterError("context_path_invalid", "context_path may not name dotfiles, hidden directories or overlong paths")
-            name = parts[-1]
-            suffix = Path(name).suffix.lower()
-            if CREDENTIAL_NAMES.fullmatch(name):
-                raise AdapterError("context_path_credential", "context_path refuses credential-looking files")
-            if suffix not in CONTEXT_SUFFIXES and name not in CONTEXT_BARE_NAMES:
-                raise AdapterError("context_path_suffix", "context_path allows common source, documentation and build files only")
-            if item in seen:
+            relative = resolve_context_entry(item, root)
+            if str(relative) in seen:
                 raise AdapterError("context_path_invalid", "context_path lists a file twice")
-            seen.add(item)
-            data = read_below(root_fd, parts, config["max_context_file_bytes"], "context_unsafe")
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise AdapterError("context_not_utf8", "context files must be UTF-8 text") from exc
-            files.append({"path": str(relative), "bytes": len(data), "sha256": sha(data), "text": text})
+            seen.add(str(relative))
+            files.append(read_context_entry(root_fd, relative, config))
         return files, {"path": str(root), "identity": [identity.st_dev, identity.st_ino]}
     finally:
         os.close(root_fd)
+
+
+SEPARATOR = "\n\n-----\n\n"
+
+
+def file_section(entry):
+    """The exact framed FILE block assemble() emits for one context file."""
+    return f"FILE {entry['path']} ({entry['bytes']} bytes, sha256 {entry['sha256']}):\n" + entry["text"]
 
 
 def assemble(task, context, files):
     parts = ["TASK:\n" + task]
     if context:
         parts.append("CONTEXT (inline):\n" + context)
-    for entry in files:
-        parts.append(f"FILE {entry['path']} ({entry['bytes']} bytes, sha256 {entry['sha256']}):\n" + entry["text"])
-    return "\n\n-----\n\n".join(parts)
+    parts.extend(file_section(entry) for entry in files)
+    return SEPARATOR.join(parts)
 
 
 def lane_parameters(config, lane, effort=None):
@@ -1893,6 +1926,48 @@ class Adapter:
 
     # -- observation tools -------------------------------------------------------------------------------------
 
+    def context_check(self, paths):
+        """Validate context_path entries against exactly the deepseek_submit rules and report every entry in input
+        order. No job, no ledger row, no storage and no request is created; a later submit revalidates the files."""
+        paths = context_paths(paths, self.config)
+        root = worktree_root()
+        if root is None:
+            raise AdapterError("worktree_root_unavailable", "context_path requires PROJECT_ROOM_WORKTREE from the controller")
+        root_fd = open_directory(root, "worktree_unsafe")
+        rows, seen, accepted = [], set(), []
+        try:
+            identity = os.fstat(root_fd)
+            for item in paths:
+                row = {"path": item, "relative": None, "bytes": None, "sha256": None, "error": None}
+                try:
+                    relative = resolve_context_entry(item, root)
+                    row["relative"] = str(relative)
+                    if str(relative) in seen:
+                        raise AdapterError("context_path_invalid", "context_path lists a file twice")
+                    seen.add(str(relative))
+                    entry = read_context_entry(root_fd, relative, self.config)
+                    row["bytes"], row["sha256"] = entry["bytes"], entry["sha256"]
+                    accepted.append(entry)
+                except AdapterError as exc:
+                    row["error"] = exc.code
+                rows.append(row)
+        finally:
+            os.close(root_fd)
+        file_input_bytes = sum(len(SEPARATOR.encode("utf-8")) + len(file_section(entry).encode("utf-8")) for entry in accepted)
+        fixed_input_bytes = len(FRAMING.encode("utf-8")) + len("TASK:\n".encode("utf-8"))
+        return {"ok": all(row["error"] is None for row in rows),
+                "worktree": {"path": str(root), "identity": [identity.st_dev, identity.st_ino]},
+                "files": rows, "accepted": len(accepted), "rejected": len(rows) - len(accepted),
+                "file_input_bytes": file_input_bytes, "fixed_input_bytes": fixed_input_bytes,
+                "inline_context_header_bytes": len(SEPARATOR.encode("utf-8")) + len("CONTEXT (inline):\n".encode("utf-8")),
+                "max_input_bytes": self.config["max_input_bytes"],
+                "remaining_task_and_context_bytes": self.config["max_input_bytes"] - fixed_input_bytes - file_input_bytes,
+                "limits": {"max_context_files": self.config["max_context_files"],
+                           "max_context_file_bytes": self.config["max_context_file_bytes"]},
+                "meaning": ("validation only: nothing is queued, stored or sent; deepseek_submit with the same "
+                            "context_path attaches these bytes. remaining_task_and_context_bytes excludes the "
+                            "inline context header, which is charged only when context is supplied")}
+
     def status(self, job_id, wait=True, timeout_s=DEFAULT_WAIT_SECONDS):
         if wait is not True:
             raise AdapterError("wait_required", "deepseek_status requires wait=true; chain bounded waits instead of polling")
@@ -2301,7 +2376,9 @@ TOOLS = {
                         "DeepSeek API or DeepInfra, named by deepseek_health) with the pinned deep settings "
                         "(thinking enabled, configured reasoning_effort, pinned max_tokens; none can be lowered here). Returns a durable "
                         "job_id; identical request_id/payload reuses the job and an identical payload under a new request_id is refused, so "
-                        "never resubmit to poll. context_path names explicit files beneath the verified worktree only. Text only: nothing "
+                        "never resubmit to poll. context_path names explicit files beneath the verified worktree only; entries may be "
+                        "absolute or worktree-relative, validate them with deepseek_context_check first when unsure, then submit once. "
+                        "Text only: nothing "
                         "returned is executed. diagnosis is required only to resubmit a payload that was definitively rejected before generation.",
                        {"type": "object", "additionalProperties": False, "required": ["task", "request_id"],
                         "properties": {"task": S, "context": S, "context_path": {"type": ["string", "array"], "items": S, "maxItems": DEFAULTS["max_context_files"]},
@@ -2327,6 +2404,14 @@ TOOLS = {
     "deepseek_health": ("Read the pinned backend and endpoint, configuration, integrity, key-file metadata (never contents), export directory, storage, admission counts, room "
                         "stop state with the user-run resolve syntax, and the latest probe facts. No network, no model call.",
                        {"type": "object", "additionalProperties": False, "properties": {}}),
+    "deepseek_context_check": ("Validate context_path before composing a task. Resolves absolute or worktree-relative entries beneath the "
+                               "verified worktree and applies exactly the deepseek_submit rules (dotfiles, credential names, suffixes, "
+                               "size, UTF-8, duplicates, file count). Reports every entry, the bytes the accepted files add to the framed "
+                               "input and the bytes left for task and inline context. No job, no storage, no model call; run it once, "
+                               "then submit once.",
+                              {"type": "object", "additionalProperties": False, "required": ["context_path"],
+                               "properties": {"context_path": {"type": ["string", "array"], "items": S,
+                                                               "maxItems": DEFAULTS["max_context_files"]}}}),
 }
 INSTRUCTIONS = ("DeepSeek-model text delegate for Fable on this room's one pinned backend (official DeepSeek API or DeepInfra; deepseek_health names "
                 "it). Submit self-contained tasks with a stable request_id, keep the returned job_id, wait with "
@@ -2364,6 +2449,8 @@ def call_tool(adapter, name, arguments):
         return adapter.result(arguments["job_id"], arguments.get("offset", 0), arguments.get("max_chars", MAX_RESULT_CHARS))
     if name == "deepseek_cancel":
         return adapter.cancel(arguments["job_id"])
+    if name == "deepseek_context_check":
+        return adapter.context_check(arguments["context_path"])
     return adapter.health()
 
 
@@ -2385,7 +2472,7 @@ def handle(message, adapter):
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        readonly = {"deepseek_status", "deepseek_result", "deepseek_health"}
+        readonly = {"deepseek_status", "deepseek_result", "deepseek_health", "deepseek_context_check"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": schema,
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
                                              "openWorldHint": name in ("deepseek_submit", "deepseek_ask")}}

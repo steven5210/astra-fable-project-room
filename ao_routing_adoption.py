@@ -34,7 +34,8 @@ INSTRUCTION = (
     'No inherited Fable workers, extra native delegation layer or more than two concurrent native workers. '
     'Do not replay earlier provider jobs or resend the unchanged specification or policies on continuation.'
 )
-TOOLS = ['deepseek_submit', 'deepseek_ask', 'deepseek_status', 'deepseek_result', 'deepseek_cancel', 'deepseek_health']
+TOOLS = ['deepseek_submit', 'deepseek_ask', 'deepseek_status', 'deepseek_result', 'deepseek_cancel', 'deepseek_health',
+         'deepseek_context_check']
 MAX_EVIDENCE = 96_000_000
 LEGACY_LAUNCH_LIMIT = 4_000_000
 

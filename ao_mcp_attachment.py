@@ -26,7 +26,11 @@ import time
 import uuid
 
 
-TOOLS = ("deepseek_ask", "deepseek_cancel", "deepseek_health", "deepseek_result", "deepseek_status", "deepseek_submit")
+TOOLS = ("deepseek_ask", "deepseek_cancel", "deepseek_context_check", "deepseek_health", "deepseek_result",
+         "deepseek_status", "deepseek_submit")
+LEGACY_TOOLS = ("deepseek_ask", "deepseek_cancel", "deepseek_health", "deepseek_result", "deepseek_status",
+                "deepseek_submit")
+TOOL_SETS = (list(TOOLS), list(LEGACY_TOOLS))
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 MEANING = "Native client initialization and server tool enumeration observed; no inference proof."
 LIMITATION = ("A held local attachment lease is observed, not a portable process-start or AO-controller "
@@ -150,7 +154,7 @@ def _validate_manifest(path, state=None, prepared=None, runtime=False):
     _inside(str(path), directory)
     for key in ("room_id", "session_id", "attachment_id"):
         _identifier(manifest[key])
-    if not isinstance(manifest["expected_tools"], list) or sorted(manifest["expected_tools"]) != list(TOOLS):
+    if not isinstance(manifest["expected_tools"], list) or sorted(manifest["expected_tools"]) not in TOOL_SETS:
         raise ValueError("Attachment must enumerate the exact DeepSeek tools")
     disk_state = _load(directory / "state.json")
     if state is None:
@@ -260,7 +264,7 @@ def _basis(manifest, prepared):
             "session_id": manifest["session_id"], "worktree": manifest["worktree"],
             "manifest_sha256": digest(manifest), "preparation_sha256": digest(prepared),
             "child_server_sha256": digest(manifest["child_server"]), "provider_files": manifest["provider_files"],
-            "wrapper_sha256": manifest["wrapper_sha256"], "expected_tools": list(TOOLS)}
+            "wrapper_sha256": manifest["wrapper_sha256"], "expected_tools": sorted(manifest["expected_tools"])}
 
 
 def _ledger_before_launch(manifest, state):
@@ -373,8 +377,9 @@ def validate_attachment(directory, state, prepared):
 class Witness:
     """Observe only handshake metadata. Never retain ordinary tool payloads."""
 
-    def __init__(self, ready, invalid):
+    def __init__(self, ready, invalid, expected=None):
         self.ready, self.invalid = ready, invalid
+        self.expected = list(TOOLS) if expected is None else expected
         self.lock = threading.Lock()
         self.initialize_id = None
         self.tools_id = None
@@ -441,7 +446,7 @@ class Witness:
                         tools = result.get("tools") if isinstance(result, dict) else None
                         if (self.tools_ok or "error" in value or not isinstance(tools, list)
                                 or any(not isinstance(tool, dict) or not isinstance(tool.get("name"), str) for tool in tools)
-                                or sorted(tool["name"] for tool in tools) != list(TOOLS) or result.get("nextCursor")):
+                                or sorted(tool["name"] for tool in tools) != self.expected or result.get("nextCursor")):
                             self.reject()
                         else:
                             self.tools_ok = True
@@ -544,7 +549,7 @@ def run(manifest_path):
             _immutable(receipts / (name + ".invalid.json"), {"connection": connection,
                         "reason": "handshake_not_proven", "observed_at_ns": time.time_ns(), "limitation": LIMITATION})
 
-        witness = Witness(ready, invalid)
+        witness = Witness(ready, invalid, sorted(manifest["expected_tools"]))
 
         def pump(source, destination, client):
             lines = Lines(lambda line: witness.observe(line, client))
