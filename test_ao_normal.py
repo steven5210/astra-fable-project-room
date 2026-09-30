@@ -49,11 +49,59 @@ class NativeFake(FakeAO):
             turn['completedAt'] = datetime.now(timezone.utc).isoformat()
 
 
+UNITTEST_INTERNALS = set(vars(unittest.TestCase('runTest'))) | {
+    '_testMethodName', '_outcome', '_cleanups', '_subtest', '_type_equality_funcs', '_testMethodDoc'}
+
+
 class Fixture(unittest.TestCase):
+    TEMPLATE_SETUP = False
+    TEMPLATE_ATTRS = ('repo', 'home', 'claude_env', 'fixture_claude', 'gates', 'transcript',
+                      'native_events', 'native_requests', 'owner', 'native_outcome_source', 'database')
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
+        if not self.TEMPLATE_SETUP:
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.root = Path(self.temp.name).resolve()
+            self._populate_root()
+            self._activate()
+            return
+        template = type(self).__dict__.get('_template')
+        if template is None:
+            temp = tempfile.TemporaryDirectory()
+            self.addClassCleanup(temp.cleanup)
+            self.temp = temp
+            self.root = Path(temp.name).resolve() / 'root'
+            self.root.mkdir()
+            self._populate_root()
+            self._activate()
+            self.build_template()
+            pristine = shutil.copytree(self.root, Path(temp.name) / 'pristine', symlinks=True)
+            state = {'fake': copy.deepcopy({name: value for name, value in vars(self.fake).items()
+                                            if not callable(value)}),
+                     'attrs': copy.deepcopy({name: getattr(self, name) for name in self.TEMPLATE_ATTRS
+                                             if hasattr(self, name)})}
+            unexpected = (set(vars(self)) - UNITTEST_INTERNALS
+                          - {'temp', 'root', 'fake', 'service'} - set(self.TEMPLATE_ATTRS))
+            assert not unexpected, \
+                f'template snapshot does not cover fixture attributes: {sorted(unexpected)}'
+            setattr(type(self), '_template',
+                    {'temp': temp, 'root': self.root, 'pristine': pristine, 'state': state})
+        else:
+            self.temp = template['temp']
+            self.root = template['root']
+            shutil.rmtree(self.root)
+            shutil.copytree(template['pristine'], self.root, symlinks=True)
+            for name in ('repo', 'home', 'claude_env', 'fixture_claude'):
+                setattr(self, name, template['state']['attrs'][name])
+            self._activate()
+            vars(self.fake).update(copy.deepcopy(template['state']['fake']))
+            for name, value in template['state']['attrs'].items():
+                setattr(self, name, copy.deepcopy(value))
+            self.after_restore()
+
+    def _populate_root(self):
+        """Write every file under self.root once: the candidate repository and the private home."""
         self.repo = self.root / 'repo'; self.repo.mkdir()
         for args in (('init',), ('config', 'user.name', 'Test'), ('config', 'user.email', 'fixture@example.invalid')):
             subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
@@ -70,6 +118,15 @@ class Fixture(unittest.TestCase):
         self.fixture_claude.write_text('#!' + sys.executable + '\nimport sys\n'
                                        'print("2.1.282 (Claude Code)" if sys.argv[1:] == ["--version"] else "unexpected")\n')
         self.fixture_claude.chmod(0o700)
+        self.home.mkdir(parents=True, exist_ok=True)
+        controller = self.home / 'config.json'
+        value = ao.read(controller) if controller.exists() else {}
+        value.setdefault('claude_bin', str(self.fixture_claude))
+        value.setdefault('claude_config_dir', str(self.claude_env))
+        ao.atomic(controller, value)
+
+    def _activate(self):
+        """Install the process-level knobs and live objects every test gets fresh."""
         patcher = patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.claude_env)}); patcher.start(); self.addCleanup(patcher.stop)
         for key in list(os.environ):
             if (key in ao_routing.RECORDED_ENV or key in ao_routing.FOREGROUND_ENV
@@ -77,15 +134,20 @@ class Fixture(unittest.TestCase):
                 del os.environ[key]
         self.fake = NativeFake(self.repo)
         self.service = ao.Service(self.home, lambda url: self.fake)
-        self.home.mkdir(parents=True, exist_ok=True)
-        controller = self.home / 'config.json'
-        value = ao.read(controller) if controller.exists() else {}
-        value.setdefault('claude_bin', str(self.fixture_claude))
-        value.setdefault('claude_config_dir', str(self.claude_env))
-        ao.atomic(controller, value)
         for name in ('native_outcome_source', 'native_events', 'native_requests', 'transcript', 'database', 'owner'):
             self.__dict__.pop(name, None)
         self.gates = [[sys.executable, '-c', "from pathlib import Path; assert Path('feature.txt').read_text() == 'implemented\\n'"]]
+
+    def build_template(self):
+        """One-time fixture work a TEMPLATE_SETUP subclass snapshots; the base fixture adds none.
+
+        Cooperative just like setUp: a mixin whose state must exist before the room workflow runs
+        calls super().build_template() first and then does its own setup."""
+
+    def after_restore(self):
+        """Re-bind what a deepcopy cannot carry after a template restore: the mocked owner reader."""
+        if getattr(self, 'owner', None) is not None:
+            self._patch_owner_reader()
 
     QUALIFIED_MODEL = 'claude-fable-5-1'
     QUALIFIED_WORKERS = {'pr-sonnet': 'claude-sonnet-5-5', 'pr-opus': 'claude-opus-5-5'}
@@ -193,6 +255,11 @@ class Fixture(unittest.TestCase):
                 return worktree
         return str(self.repo)
 
+    def _patch_owner_reader(self):
+        patcher = patch('ao_native_identity.read_owner', side_effect=lambda *a: copy.deepcopy(self.owner))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def register_native_source(self):
         """Register the prospective native outcome source a qualified dispatch verifies before send.
 
@@ -222,9 +289,7 @@ class Fixture(unittest.TestCase):
                       'ao_conversation_id': binding['conversation_id'], 'active_branch_id': binding['branch_id'],
                       'branch_provider_conversation_id': self.NATIVE, 'branch_session_id': binding['session_id'],
                       'strategy': 'native', 'replay_truncated': 0}
-        patcher = patch('ao_native_identity.read_owner', side_effect=lambda *a: copy.deepcopy(self.owner))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self._patch_owner_reader()
         source = {'database': str(self.root / 'owner.db'), 'transcript': str(self.transcript),
                   'session_id': binding['session_id'], 'native_session_id': self.NATIVE}
         ao_native_outcome.preflight_source(self.directory(), state, source['database'], source['transcript'])
@@ -499,8 +564,18 @@ class NormalWorkflowTests(Fixture):
 
 
 class DelegateFixture(Fixture):
+    TEMPLATE_ATTRS = Fixture.TEMPLATE_ATTRS + ('claude_config', 'fake_cli')
+
     def setUp(self):
         super().setUp()
+        if not self.TEMPLATE_SETUP:
+            self._delegate_setup()
+
+    def build_template(self):
+        super().build_template()
+        self._delegate_setup()
+
+    def _delegate_setup(self):
         self.claude_config = self.root / 'claude-config'; self.claude_config.mkdir()
         self.claude_env = self.claude_config
         value = ao.read(self.home / 'config.json')
