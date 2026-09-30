@@ -32,7 +32,10 @@ Rules for every phase:
 ## 0. Session start or resume
 
 `ao_release_check` once, before the first new model dispatch. Continue on any
-outcome; only `up_to_date` counts as current. Then `ao_room_list` (plus legacy
+outcome; only `up_to_date` counts as current. It also reports `claude_code`
+staleness and `qualification_sources` drift — report-only: `identifiers_differ`
+means prepare a qualification revision; `bytes_differ` is informational.
+Then `ao_room_list` (plus legacy
 `room_list` if it is listed), `ao_room_status`, and `ao_room_sync` for active work.
 Resume the recorded backend and state before anything new.
 After a context compaction, or when resuming a room in a new thread, reload only

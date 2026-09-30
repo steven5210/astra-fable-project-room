@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+import ao_model_qualification
 import ao_project_room
 import ao_release_check
 import project_room
@@ -84,6 +86,26 @@ class ReleaseCheckTests(unittest.TestCase):
         self.fetch_latest = Mock(return_value=self.latest)
         self.fetch_health = Mock(return_value=self.health)
         self.run = Mock(return_value=self.process_result(self.process_start))
+        # The claude_code and qualification_sources sections: hermetic defaults so every existing
+        # test stays offline — no controller claude_bin, no qualification pointer, an empty home,
+        # and a failing guard on the real fetch defaults in case a test forgets to inject.
+        self.claude_home = self.base / "claude-home"
+        self.claude_home.mkdir()
+        self.claude_latest = {
+            "draft": False, "prerelease": False, "tag_name": "v2.1.285",
+            "html_url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.285",
+            "published_at": "2026-09-20T00:00:00Z",
+        }
+        self.fetch_claude_latest = Mock(return_value=self.claude_latest)
+        self.fetch_source = Mock(return_value=b"")
+        for name, guard in (("_fetch_claude_latest", AssertionError("tests must inject fetch_claude_latest")),
+                            ("_fetch_source", AssertionError("tests must inject fetch_source"))):
+            patcher = patch.object(ao_release_check, name, side_effect=guard)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        which_patch = patch.object(ao_release_check.shutil, "which", return_value=None)
+        which_patch.start()
+        self.addCleanup(which_patch.stop)
 
     def process_result(self, start, returncode=0, stdout=None):
         output = time.strftime(ao_release_check.PS_TIME_FORMAT, time.localtime(start)) if stdout is None else stdout
@@ -106,9 +128,76 @@ class ReleaseCheckTests(unittest.TestCase):
             "fetch_health": self.fetch_health,
             "run": self.run,
             "now": lambda: self.checked_time,
+            "fetch_claude_latest": self.fetch_claude_latest,
+            "fetch_source": self.fetch_source,
+            "home": self.claude_home,
         }
         arguments.update(overrides)
         return ao_release_check.check(self.root if root is None else root, self.ao_url, **arguments)
+
+    def write_qualification(self, evidence=b"Synthetic source capture naming claude-opus-5-5.\n",
+                            extra_sources=()):
+        """A digest-pinned synthetic family_qualification artifact plus private evidence files.
+
+        extra_sources is a list of (source_id, uri, evidence_bytes) triples appended after the
+        default "docs-src" descriptor."""
+        source_ids = ["docs-src"]
+
+        def descriptor(source_id, uri, evidence, evidence_name):
+            evidence_file = (self.base / evidence_name).resolve()
+            evidence_file.write_bytes(evidence)
+            evidence_file.chmod(0o600)
+            return {"id": source_id, "uri": uri, "captured_at": "2026-06-01T00:00:00Z",
+                    "sha256": hashlib.sha256(evidence).hexdigest(),
+                    "evidence_file": str(evidence_file)}
+
+        sources = [descriptor("docs-src", "https://docs.invalid.example/claude",
+                              evidence, "evidence.bin")]
+        for index, (source_id, uri, extra_evidence) in enumerate(extra_sources):
+            source_ids.append(source_id)
+            sources.append(descriptor(source_id, uri, extra_evidence, f"evidence-{index}.bin"))
+        artifact = {
+            "format": "ao-model-qualification/v1", "revision": 1,
+            "families": {
+                "fable": {"expected_model": "claude-fable-5-1", "source_ids": source_ids},
+                "opus": {"expected_model": "claude-opus-5-5", "source_ids": source_ids,
+                         "minimum_claude_code_version": "2.1.280"},
+                "sonnet": {"expected_model": "claude-sonnet-5-5", "source_ids": source_ids,
+                           "minimum_claude_code_version": "2.1.197"},
+            },
+            "sources": sources,
+        }
+        artifact_path = (self.base / "qualification.json").resolve()
+        artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True))
+        artifact_path.chmod(0o600)
+        (self.root / "config.json").write_text(json.dumps(
+            {"family_qualification": {"path": str(artifact_path),
+                                      "sha256": ao_model_qualification.digest(artifact)}}))
+        return artifact
+
+    def claude_layout(self, configured="2.1.268", installed="2.1.285"):
+        """A controller claude_bin plus a native-installer versions entry; returns a run dispatcher."""
+        self.claude_bin = self.base / "configured-claude"
+        self.claude_bin.write_text("#!/bin/sh\nexit 0\n")
+        self.claude_bin.chmod(0o700)
+        (self.base / "config.json").write_text(json.dumps({"claude_bin": str(self.claude_bin)}))
+        versions = {str(self.claude_bin): configured}
+        if installed is not None:
+            entry = self.claude_home / ".local" / "share" / "claude" / "versions" / installed
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text("#!/bin/sh\nexit 0\n")
+            entry.chmod(0o700)
+            versions[str(entry)] = installed
+
+        def run(argv, **kwargs):
+            if argv[0] == "ps":
+                return self.process_result(self.process_start)
+            if argv[1:] == ["--version"] and argv[0] in versions:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=versions[argv[0]] + " (Claude Code)\n", stderr="")
+            raise AssertionError("unexpected run argv " + repr(argv))
+
+        return run
 
     def test_matching_latest_and_bundle_is_up_to_date_and_saves_success(self):
         result = self.check()
@@ -366,7 +455,8 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertEqual(
             set(result),
             {"outcome", "reasons", "latest_version", "installed_version", "running_version",
-             "release_url", "checked_at", "last_successful_checked_at"},
+             "release_url", "checked_at", "last_successful_checked_at",
+             "claude_code", "qualification_sources"},
         )
 
     def test_release_metadata_is_sanitized(self):
@@ -431,11 +521,164 @@ class ReleaseCheckTests(unittest.TestCase):
         with patch.object(ao_project_room.urllib.request, "build_opener") as build_opener:
             result = ao_release_check.check(
                 self.root, "http://example.com:1234",
-                fetch_latest=self.fetch_latest, run=self.run, now=lambda: self.checked_time
+                fetch_latest=self.fetch_latest, run=self.run, now=lambda: self.checked_time,
+                fetch_claude_latest=self.fetch_claude_latest, fetch_source=self.fetch_source,
+                home=self.claude_home,
             )
         self.assertEqual(result["outcome"], "unknown")
         self.assertIn("daemon_url_invalid", result["reasons"])
         build_opener.assert_not_called()
+
+    def test_configured_below_family_floor_reports_below_floor_with_action(self):
+        run = self.claude_layout(configured="2.1.268", installed="2.1.285")
+        self.write_qualification()
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["configured"]["version"], "2.1.268")
+        self.assertEqual(section["highest_family_floor"], "2.1.280")
+        self.assertIs(section["floor_satisfied"], False)
+        self.assertEqual(section["newest_installed"]["version"], "2.1.285")
+        self.assertEqual(section["latest_published"]["version"], "2.1.285")
+        self.assertEqual(section["outcome"], "below_floor")
+        expected_path = str(self.claude_home / ".local" / "share" / "claude" / "versions" / "2.1.285")
+        self.assertEqual(section["action"], "python3 project_room.py setup --claude-bin " + expected_path)
+
+    def test_configured_installed_and_published_equal_is_up_to_date(self):
+        run = self.claude_layout(configured="2.1.285", installed="2.1.285")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["outcome"], "up_to_date")
+        self.assertIsNone(section["action"])
+        self.assertIs(section["floor_satisfied"], True)
+        self.assertEqual(result["outcome"], "up_to_date")
+
+    def test_newer_installed_than_configured_is_update_available(self):
+        run = self.claude_layout(configured="2.1.280", installed="2.1.285")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["outcome"], "update_available")
+        self.assertTrue(section["action"].endswith(
+            str(Path(".local") / "share" / "claude" / "versions" / "2.1.285")))
+
+    def test_claude_latest_fetch_failure_reports_reason_and_never_up_to_date(self):
+        run = self.claude_layout(configured="2.1.285", installed="2.1.285")
+        result = self.check(run=run,
+                            fetch_claude_latest=Mock(side_effect=OSError("synthetic fetch failure")))
+        section = result["claude_code"]
+        self.assertIn("claude_latest_fetch_failed", section["reasons"])
+        self.assertIsNone(section["latest_published"])
+        self.assertNotEqual(section["outcome"], "up_to_date")
+
+    def test_missing_claude_bin_key_is_unconfigured_and_unknown(self):
+        (self.base / "config.json").write_text("{}")
+        result = self.check()
+        section = result["claude_code"]
+        self.assertEqual(section["configured"]["reasons"], ["claude_bin_unconfigured"])
+        self.assertIsNone(section["configured"]["version"])
+        self.assertEqual(section["outcome"], "unknown")
+
+    def test_qualification_source_unchanged_and_identifiers_differ(self):
+        evidence = b"Synthetic source capture naming claude-opus-5-5.\n"
+        self.write_qualification(evidence=evidence)
+        result = self.check(fetch_source=Mock(return_value=evidence))
+        section = result["qualification_sources"]
+        self.assertTrue(section["artifact_present"])
+        self.assertEqual(section["revision"], 1)
+        self.assertEqual(section["outcome"], "unchanged")
+        self.assertEqual(section["sources"],
+                         [{"id": "docs-src", "outcome": "unchanged", "bytes_match": True,
+                           "identifiers_not_in_capture": {}, "identifiers_only_in_capture": {}}])
+
+        drifted = b"Synthetic source now announcing claude-opus-6 beside claude-opus-5-5.\n"
+        result = self.check(fetch_source=Mock(return_value=drifted))
+        section = result["qualification_sources"]
+        self.assertEqual(section["outcome"], "identifiers_differ")
+        self.assertEqual(section["sources"][0]["outcome"], "identifiers_differ")
+        self.assertFalse(section["sources"][0]["bytes_match"])
+        self.assertEqual(section["sources"][0]["identifiers_not_in_capture"],
+                         {"opus": ["claude-opus-6"]})
+        self.assertEqual(section["sources"][0]["identifiers_only_in_capture"], {})
+
+        result = self.check(fetch_source=Mock(side_effect=OSError("synthetic source failure")))
+        section = result["qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "unreachable")
+        self.assertIsNone(section["sources"][0]["bytes_match"])
+        self.assertEqual(section["sources"][0]["identifiers_not_in_capture"], {})
+        self.assertEqual(section["outcome"], "unknown")
+
+    def test_qualification_source_bytes_differ_without_identifier_drift(self):
+        evidence = b"Synthetic source capture naming claude-opus-5-5.\n"
+        self.write_qualification(evidence=evidence)
+        result = self.check(fetch_source=Mock(return_value=evidence + b"\n"))
+        section = result["qualification_sources"]
+        self.assertEqual(section["outcome"], "bytes_differ")
+        self.assertEqual(section["sources"][0]["outcome"], "bytes_differ")
+        self.assertFalse(section["sources"][0]["bytes_match"])
+        self.assertEqual(section["sources"][0]["identifiers_not_in_capture"], {})
+        self.assertEqual(section["sources"][0]["identifiers_only_in_capture"], {})
+
+    def test_qualification_source_identifier_dropped_from_fresh_bytes(self):
+        evidence = b"Synthetic source capture naming claude-opus-5-5 and claude-opus-9.\n"
+        self.write_qualification(evidence=evidence)
+        fresh = b"Synthetic source now naming only claude-opus-5-5.\n"
+        result = self.check(fetch_source=Mock(return_value=fresh))
+        section = result["qualification_sources"]
+        self.assertEqual(section["outcome"], "identifiers_differ")
+        self.assertEqual(section["sources"][0]["identifiers_not_in_capture"], {})
+        self.assertEqual(section["sources"][0]["identifiers_only_in_capture"],
+                         {"opus": ["claude-opus-9"]})
+
+    def test_qualification_sources_outcome_precedence(self):
+        captured = b"Captured page naming claude-sonnet-5-5.\n"
+        self.write_qualification(
+            evidence=captured,
+            extra_sources=[("second-src", "https://docs.invalid.example/second",
+                            b"Second capture.\n")])
+        # One bytes-only drift plus one unreachable source -> bytes_differ overall.
+        def fetch(uri):
+            if uri == "https://docs.invalid.example/claude":
+                return captured + b"trailing whitespace\n"
+            raise OSError("synthetic source failure")
+
+        section = self.check(fetch_source=fetch)["qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "bytes_differ")
+        self.assertEqual(section["sources"][1]["outcome"], "unreachable")
+        self.assertEqual(section["outcome"], "bytes_differ")
+        self.assertIn("source_fetch_failed", section["reasons"])
+
+        # A single unreachable source with no differing source -> unknown.
+        section = self.check(
+            fetch_source=Mock(side_effect=OSError("synthetic source failure"))
+        )["qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "unreachable")
+        self.assertEqual(section["sources"][1]["outcome"], "unreachable")
+        self.assertEqual(section["outcome"], "unknown")
+
+    def test_no_qualification_pointer_reports_no_qualification(self):
+        result = self.check()
+        self.assertEqual(result["qualification_sources"],
+                         {"artifact_present": False, "revision": None, "outcome": "no_qualification",
+                          "reasons": [], "sources": []})
+        self.fetch_source.assert_not_called()
+
+    def test_saved_record_carries_both_sections_and_old_records_still_read(self):
+        run = self.claude_layout()
+        self.write_qualification()
+        self.check(run=run)
+        record = json.loads((self.root / "version-check.json").read_bytes())
+        self.assertIn("claude_code", record)
+        self.assertIn("qualification_sources", record)
+        self.assertEqual(record["claude_code"]["outcome"], "below_floor")
+        self.assertEqual(record["last_successful"]["claude_code"], record["claude_code"])
+
+        old_shape = self.base / "old-shape"
+        old_shape.mkdir()
+        previous = {"schema": ao_release_check.SCHEMA, "outcome": "up_to_date",
+                    "checked_at": "2026-01-01T00:00:00Z", "reasons": [],
+                    "latest": None, "installed_version": "0.13.2", "running_version": "0.13.2",
+                    "daemon": None, "last_successful": None}
+        (old_shape / "version-check.json").write_text(json.dumps(previous))
+        self.assertEqual(ao_release_check._existing_record(old_shape / "version-check.json"), previous)
 
     def test_health_fetch_uses_healthz_and_reads_only_one_megabyte_plus_one_byte(self):
         body = json.dumps(self.health).encode()

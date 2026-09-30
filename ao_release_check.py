@@ -1,18 +1,23 @@
 """Read-only comparison of the running AO daemon with its latest stable release."""
 
 import fcntl
+import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import time
 from datetime import datetime, timezone
+import urllib.parse
 import urllib.request
 
+import ao_engineering_model
+import ao_model_qualification
 import ao_project_room
 import deepseek_adapter
 
@@ -21,12 +26,15 @@ SCHEMA = "ao-release-check/v1"
 GITHUB_HOST = "api.github.com"
 GITHUB_PATH = "/repos/Untrivial-ai/agent-orchestrator/releases/latest"
 GITHUB_RELEASE_PREFIX = "https://github.com/Untrivial-ai/agent-orchestrator/releases/"
+CLAUDE_GITHUB_PATH = "/repos/anthropics/claude-code/releases/latest"
+CLAUDE_RELEASE_PREFIX = "https://github.com/anthropics/claude-code/releases/"
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_PLIST_BYTES = 1_000_000
 MAX_STATE_BYTES = 1_000_000
 _LEGACY_EVIDENCE_NOT_PRESERVED = object()
 VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 TAG_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+MODEL_ID_PATTERN = re.compile(r"claude-(fable|opus|sonnet)-\d+(?:-\d+)*")
 PS_TIME_FORMAT = "%a %b %d %H:%M:%S %Y"
 APP_CONTENTS = ("Contents", "Resources", "daemon", "ao")
 
@@ -37,14 +45,14 @@ class _FetchFailure(Exception):
         self.reason = reason
 
 
-def _fetch_latest():
+def _fetch_github_latest(path):
     connection = http.client.HTTPSConnection(
         GITHUB_HOST, 443, context=deepseek_adapter.tls_context(), timeout=10
     )
     try:
         connection.request(
             "GET",
-            GITHUB_PATH,
+            path,
             headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "astra-fable-project-room",
@@ -63,6 +71,42 @@ def _fetch_latest():
             return json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             raise _FetchFailure("latest_fetch_failed") from exc
+    finally:
+        connection.close()
+
+
+def _fetch_latest():
+    return _fetch_github_latest(GITHUB_PATH)
+
+
+def _fetch_claude_latest():
+    return _fetch_github_latest(CLAUDE_GITHUB_PATH)
+
+
+def _fetch_source(uri):
+    """One bounded https GET of a qualification source URI; no credentials, no redirects."""
+    parsed = urllib.parse.urlsplit(uri) if isinstance(uri, str) else None
+    if parsed is None or parsed.scheme != "https" or not parsed.hostname:
+        raise _FetchFailure("source_not_https")
+    connection = http.client.HTTPSConnection(
+        parsed.hostname, parsed.port or 443,
+        context=deepseek_adapter.tls_context(), timeout=15,
+    )
+    try:
+        target = parsed.path or "/"
+        if parsed.query:
+            target += "?" + parsed.query
+        connection.request(
+            "GET", target,
+            headers={"Accept": "*/*", "User-Agent": "astra-fable-project-room"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            raise _FetchFailure("source_fetch_failed")
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise _FetchFailure("source_fetch_failed")
+        return body
     finally:
         connection.close()
 
@@ -100,7 +144,7 @@ def _read_bounded_regular(path, maximum):
     return body
 
 
-def _release(raw):
+def _release(raw, prefix=GITHUB_RELEASE_PREFIX):
     if (not isinstance(raw, dict) or raw.get("draft") is not False
             or raw.get("prerelease") is not False):
         return None
@@ -109,7 +153,7 @@ def _release(raw):
     if match is None:
         return None
     url = raw.get("html_url")
-    if not isinstance(url, str) or not url.startswith(GITHUB_RELEASE_PREFIX):
+    if not isinstance(url, str) or not url.startswith(prefix):
         url = None
     published_at = raw.get("published_at")
     if not isinstance(published_at, str) or len(published_at) > 64:
@@ -226,7 +270,271 @@ def _timestamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run, now=time.time):
+def _version_tuple(text):
+    match = VERSION_PATTERN.search(text) if isinstance(text, str) else None
+    return tuple(int(part) for part in match.groups()) if match is not None else None
+
+
+def _version_string(value):
+    return ".".join(str(part) for part in value) if value is not None else None
+
+
+def _qualification_artifact(root):
+    """The configured family_qualification artifact verified against its pointer digest, or None.
+
+    Raises on a configured pointer whose artifact is unreadable or digest-mismatched; a missing or
+    unreadable AO config, or an absent pointer, returns None."""
+    try:
+        config = json.loads(_read_bounded_regular(Path(root) / "config.json", MAX_STATE_BYTES))
+    except (OSError, ValueError, TypeError, RecursionError):
+        config = None
+    if not isinstance(config, dict):
+        return None
+    pointer = config.get(ao_engineering_model.QUALIFICATION_KEY)
+    if not isinstance(pointer, dict):
+        return None
+    raw = ao_model_qualification._private_bytes(
+        pointer.get("path"), ao_model_qualification.MAX_ARTIFACT_BYTES,
+        "Family qualification artifact")
+    artifact = json.loads(raw)
+    if (not isinstance(artifact, dict)
+            or ao_model_qualification.digest(artifact) != pointer.get("sha256")):
+        raise ValueError("Family qualification artifact does not match its configured digest")
+    return artifact
+
+
+def _model_ids(data):
+    """Ordered unique (family, identifier) pairs of claude-<family>-<digits> matches in raw bytes."""
+    text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else ""
+    seen = set()
+    pairs = []
+    for match in MODEL_ID_PATTERN.finditer(text):
+        if match.group(0) not in seen:
+            seen.add(match.group(0))
+            pairs.append((match.group(1), match.group(0)))
+    return pairs
+
+
+def _claude_version(run, path):
+    try:
+        completed = run([path, "--version"], capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    output = completed.stdout if completed.returncode == 0 else None
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return _version_tuple(output)
+
+
+def _claude_code(root, run, home, fetch_claude_latest):
+    """Report-only staleness view of the configured claude_bin: floors, installs and latest release."""
+    reasons = set()
+    configured = {"version": None, "reasons": []}
+    configured_tuple = None
+    try:
+        parsed = json.loads(
+            _read_bounded_regular(Path(root).parent / "config.json", MAX_STATE_BYTES))
+        controller = parsed if isinstance(parsed, dict) else None
+    except (OSError, ValueError, TypeError, RecursionError):
+        controller = None
+    if controller is None:
+        configured["reasons"].append("controller_config_unreadable")
+    else:
+        claude_bin = controller.get("claude_bin")
+        if not isinstance(claude_bin, str) or not claude_bin:
+            configured["reasons"].append("claude_bin_unconfigured")
+        else:
+            try:
+                details = os.stat(claude_bin)
+                if not stat.S_ISREG(details.st_mode) or not os.access(claude_bin, os.X_OK):
+                    raise OSError("claude_bin is not an executable regular file")
+            except OSError:
+                configured["reasons"].append("claude_bin_missing")
+            else:
+                configured_tuple = _claude_version(run, claude_bin)
+                if configured_tuple is None:
+                    configured["reasons"].append("claude_bin_version_unavailable")
+                else:
+                    configured["version"] = _version_string(configured_tuple)
+
+    floors = [entry.get("minimum_claude_code_version")
+              for entry in ao_engineering_model.BUNDLED_FAMILIES.values()]
+    floors += [entry.get("minimum_claude_code_version")
+               for entry in ao_engineering_model.BUNDLED_MODELS.values()]
+    try:
+        artifact = _qualification_artifact(root)
+    except Exception:
+        artifact = None
+        reasons.add("qualification_floors_unread")
+    if isinstance(artifact, dict) and isinstance(artifact.get("families"), dict):
+        floors += [entry.get("minimum_claude_code_version")
+                   for entry in artifact["families"].values() if isinstance(entry, dict)]
+    floor = ao_engineering_model._newer_floor(*floors)
+    floor_tuple = _version_tuple(floor) if floor is not None else None
+
+    candidates = []
+    versions_dir = Path(home) / ".local" / "share" / "claude" / "versions"
+    try:
+        entries = list(versions_dir.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        match = VERSION_PATTERN.fullmatch(entry.name)
+        if match is None:
+            continue
+        executable = entry if entry.is_file() else entry / "claude"
+        try:
+            details = executable.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(details.st_mode) and os.access(executable, os.X_OK):
+            candidates.append((tuple(int(part) for part in match.groups()), str(entry)))
+    located = shutil.which("claude")
+    if located is not None:
+        try:
+            resolved = str(Path(located).resolve())
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved not in {path for _, path in candidates}:
+            located_tuple = _claude_version(run, resolved)
+            if located_tuple is not None:
+                candidates.append((located_tuple, resolved))
+    if candidates:
+        newest_tuple, newest_path = max(candidates, key=lambda candidate: candidate[0])
+        newest_installed = {"version": _version_string(newest_tuple), "path": newest_path}
+    else:
+        newest_tuple = None
+        newest_installed = None
+        reasons.add("no_installed_claude_found")
+
+    latest_published = None
+    published_tuple = None
+    try:
+        released = _release(fetch_claude_latest(), prefix=CLAUDE_RELEASE_PREFIX)
+    except _FetchFailure as exc:
+        reasons.add(exc.reason)
+    except Exception:
+        reasons.add("claude_latest_fetch_failed")
+    else:
+        if released is None:
+            reasons.add("claude_latest_invalid")
+        else:
+            published_tuple = released["version"]
+            latest_published = {"version": _version_string(published_tuple),
+                                "tag_name": released["tag_name"], "html_url": released["html_url"],
+                                "published_at": released["published_at"]}
+
+    if (configured_tuple is not None and floor_tuple is not None
+            and configured_tuple < floor_tuple):
+        outcome = "below_floor"
+    elif configured_tuple is not None and (
+            (newest_tuple is not None and newest_tuple > configured_tuple)
+            or (published_tuple is not None and published_tuple > configured_tuple)):
+        outcome = "update_available"
+    elif (configured_tuple is not None and published_tuple is not None
+          and configured_tuple >= published_tuple
+          and (newest_tuple is None or newest_tuple <= configured_tuple)):
+        outcome = "up_to_date"
+    else:
+        outcome = "unknown"
+    action = None
+    if (outcome in ("below_floor", "update_available") and newest_installed is not None
+            and (floor_tuple is None or newest_tuple >= floor_tuple)):
+        action = "python3 project_room.py setup --claude-bin " + newest_installed["path"]
+    floor_satisfied = (configured_tuple >= floor_tuple
+                       if configured_tuple is not None and floor_tuple is not None else None)
+    return {"configured": configured, "highest_family_floor": floor,
+            "floor_satisfied": floor_satisfied, "newest_installed": newest_installed,
+            "latest_published": latest_published, "outcome": outcome,
+            "reasons": sorted(reasons), "action": action}
+
+
+def _qualification_sources(root, fetch_source):
+    """Report-only drift view: whether each qualification source still serves the captured bytes."""
+    try:
+        artifact = _qualification_artifact(root)
+    except Exception:
+        return {"artifact_present": False, "revision": None, "outcome": "unknown",
+                "reasons": ["qualification_artifact_unreadable"], "sources": []}
+    if artifact is None:
+        return {"artifact_present": False, "revision": None, "outcome": "no_qualification",
+                "reasons": [], "sources": []}
+    reasons = set()
+    entries = []
+    identifiers_differ = False
+    bytes_differ = False
+    doubtful = False
+    sources = artifact.get("sources")
+    for descriptor in sources if isinstance(sources, list) else []:
+        if not isinstance(descriptor, dict):
+            continue
+        entry = {"id": descriptor.get("id"), "outcome": "unreachable",
+                 "bytes_match": None, "identifiers_not_in_capture": {},
+                 "identifiers_only_in_capture": {}}
+        try:
+            body = fetch_source(descriptor.get("uri"))
+        except _FetchFailure as exc:
+            reasons.add(exc.reason)
+            doubtful = True
+        except Exception:
+            reasons.add("source_fetch_failed")
+            doubtful = True
+        else:
+            entry["bytes_match"] = (
+                hashlib.sha256(body).hexdigest() == descriptor.get("sha256"))
+            try:
+                captured = ao_model_qualification._private_bytes(
+                    descriptor.get("evidence_file"), ao_model_qualification.MAX_EVIDENCE_BYTES,
+                    "Source evidence")
+            except Exception:
+                captured = b""
+                reasons.add("evidence_unreadable")
+                doubtful = True
+            captured_ids = {identifier for _, identifier in _model_ids(captured)}
+            fresh_pairs = _model_ids(body)
+            fresh_ids = {identifier for _, identifier in fresh_pairs}
+            not_in_capture = {}
+            for family, identifier in fresh_pairs:
+                if identifier not in captured_ids:
+                    not_in_capture.setdefault(family, []).append(identifier)
+            only_in_capture = {}
+            for family, identifier in _model_ids(captured):
+                if identifier not in fresh_ids:
+                    only_in_capture.setdefault(family, []).append(identifier)
+            entry["identifiers_not_in_capture"] = not_in_capture
+            entry["identifiers_only_in_capture"] = only_in_capture
+            if not_in_capture or only_in_capture:
+                entry["outcome"] = "identifiers_differ"
+                identifiers_differ = True
+            elif entry["bytes_match"]:
+                entry["outcome"] = "unchanged"
+            else:
+                entry["outcome"] = "bytes_differ"
+                bytes_differ = True
+        entries.append(entry)
+    if identifiers_differ:
+        outcome = "identifiers_differ"
+    elif bytes_differ:
+        outcome = "bytes_differ"
+    elif doubtful:
+        outcome = "unknown"
+    else:
+        outcome = "unchanged"
+    revision = artifact.get("revision")
+    return {"artifact_present": True,
+            "revision": revision if isinstance(revision, int) and not isinstance(revision, bool)
+            else None,
+            "outcome": outcome, "reasons": sorted(reasons), "sources": entries}
+
+
+def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run, now=time.time,
+          fetch_claude_latest=None, fetch_source=None, home=None):
+    home = Path.home() if home is None else Path(home)
+    claude_code = _claude_code(root, run, home,
+        _fetch_claude_latest if fetch_claude_latest is None else fetch_claude_latest)
+    qualification_sources = _qualification_sources(
+        root, _fetch_source if fetch_source is None else fetch_source)
+
     latest = None
     latest_version = None
     reasons = set()
@@ -315,6 +623,8 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
             "installed_version": installed_version,
             "running_version": running_version,
             "daemon": daemon,
+            "claude_code": claude_code,
+            "qualification_sources": qualification_sources,
         }
         if outcome != "unknown" and latest is not None:
             record["last_successful"] = dict(record)
@@ -334,6 +644,8 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
             "last_successful_checked_at": (
                 last_successful.get("checked_at") if isinstance(last_successful, dict) else None
             ),
+            "claude_code": claude_code,
+            "qualification_sources": qualification_sources,
         }
     finally:
         os.close(lock_fd)

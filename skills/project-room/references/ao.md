@@ -50,6 +50,26 @@ release and arrange an update between jobs as below. For `mismatch`, restart AO
 between jobs and recheck. For `unknown`, warn with the reported reasons, never
 treat it as up to date, and do not block status, sync or recovery.
 
+The same call carries two report-only sections. `claude_code` compares the
+configured `claude_bin` version with the highest bundled or qualified family
+floor, the newest Claude Code installed under `~/.local/share/claude/versions`,
+and the latest published `vX.Y.Z` release. `below_floor` means the configured
+executable cannot run a qualified family: run the reported
+`python3 project_room.py setup --claude-bin` command before any new dispatch.
+`update_available` means a newer install or release exists: arrange the update
+between jobs. `unknown` is not up to date. `qualification_sources` re-fetches
+each captured engineering-model qualification source and reports per-source `unchanged`,
+`bytes_differ`, `identifiers_differ` or `unreachable`, with overall
+`unchanged`, `bytes_differ`, `identifiers_differ`, `unknown` or
+`no_qualification`. `identifiers_differ` means the source now lists
+`claude-<family>` identifiers that are not in the retained capture, or no
+longer lists some that are: prepare a new qualification revision for the
+operator's approval. `bytes_differ` means the page changed but its
+`claude-<family>` identifiers did not: informational, no action required. The
+section reports differences between the fresh bytes and the retained capture;
+it does not decide which identifier is newer, and neither section ever
+switches executables or models automatically.
+
 For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
 from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's
 version and installation provenance; a configured version string alone does not
