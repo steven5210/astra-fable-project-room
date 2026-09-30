@@ -39,11 +39,12 @@ Then `ao_room_list` (plus legacy
 `room_list` if it is listed), `ao_room_status`, and `ao_room_sync` for active work.
 Resume the recorded backend and state before anything new.
 After a context compaction, or when resuming a room in a new thread, reload only
-this card and the room's `ao_room_status`. Status gives the phase, requests,
-holds, verification and acceptance, but it only names the saved spec file and
-previews the latest reports: before acting on either, read the saved spec and the
-full saved response of the latest report. Open a full-guide section only when a
-**Stop** line or an uncovered situation calls for it. Keep one Astra thread per
+this card, then call the room's `ao_room_status`. Do not re-read `SKILL.md`:
+Codex re-injects its own skill index, and this card carries every AO rule. Do
+not open `ao.md` unless a **Stop** line below matches the status you see. Status
+gives the phase, requests, holds, verification and acceptance, but it only names
+the saved spec file and previews the latest reports: before acting on either,
+read the saved spec and the full saved response of the latest report. Keep one Astra thread per
 room: start a new thread when you move to a different room, never partway through
 one. Before switching, check that the user's product decisions for the room you
 are leaving are recorded in its saved spec; if one is not, tell the user first.
