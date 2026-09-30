@@ -632,7 +632,18 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
             native = {**native, 'unknown': 'A later native human packet follows this owned request; reconcile it first'}
     restored_observation = None
     prior_record = _owned_outcome_record(directory, request)
-    restoration_retained = isinstance(prior_record, dict) and 'restored_compaction_observation' in prior_record
+    # The authenticated release names this request's own retained restoration obligation even when
+    # its selected current outcome pointer is missing, malformed, foreign, names other evidence, or
+    # the live rows no longer differ from the saved receipt. Enforce it here, in the shared
+    # observation path before any outcome, state or pointer write, so lost or foreign selected
+    # current proof fails closed instead of minting an unannotated replacement outcome. The release
+    # only detects the obligation; it never substitutes for missing, malformed or foreign selected
+    # evidence. A legitimate pre-restoration record still supplies the prior evidence for the
+    # explicit-audit-only authorization below, and an unrelated outcome keeps its existing path.
+    retained_record = _retained_restored_compaction_record(directory, request)
+    if isinstance(retained_record, dict):
+        prior_record = retained_record
+    restoration_retained = isinstance(retained_record, dict)
     if live_messages != saved.get('messages') or restoration_retained:
         # The narrow restoration contract positively requires known complete history. The ordinary
         # legacy path below keeps its existing truthy check for unrelated outcomes.

@@ -653,6 +653,143 @@ class RestoredCompactionTests(CompactionServiceFixture):
                       ao.read(f.directory() / pointer['semantic_outcome']))
         self.assertEqual(self.files('outcomes'), outcomes_before)
 
+    # --- compound selected-current-proof loss ---------------------------------------
+    def fresh_compound_fixture(self):
+        """One fresh supported restoration fixture per independent public entrypoint.
+
+        The real fixture is instantiated directly, exactly as the adoption probe did, so public
+        audit, resume, gate and send each start from their own untouched valid
+        restore/authorize/renew/refresh state. The outer cleanup also tears the fixture down when a
+        check fails before its explicit teardown.
+        """
+        helper = RestoredCompactionTests('runTest')
+        self.addCleanup(helper.doCleanups)
+        helper.setUp()
+        return helper
+
+    def compound_state(self, variant, live_state):
+        """Valid restoration, then the exact compound state with every retained byte preserved.
+
+        The live restored row is removed back to the saved receipt rows, the live turn status becomes
+        ``live_state``, and the request's selected current outcome pointer is either removed entirely
+        (missing) or made non-owned while its real file and SHA bytes stay (malformed). Receipts,
+        outcomes, the release, the native source and the candidate stay byte-identical.
+        """
+        f = self.fixture
+        restored = self.restore()
+        audit = self.authorize()
+        self.renew(audit)
+        result = f.do_refresh()
+        self.assertFalse(result['model_dispatch'])
+        request = self.request()
+        self.assertEqual(request['state'], 'settled_failure')
+        record = self.record()
+        self.assertIn('restored_compaction_observation', record)
+        self.assertEqual(record['restored_compaction_observation']['added_message'], restored)
+        pointer = {key: request.get(key) for key in ('semantic_outcome', 'semantic_outcome_sha256')}
+        release = ao.read(f.directory() / request['outcome_resume'])
+        self.assertEqual(release['outcome_sha256'], pointer['semantic_outcome_sha256'])
+        self.assertIn('restored_compaction_observation', ao.read(
+            f.directory() / ('outcomes/' + self.request_id + '/' + release['outcome_sha256'] + '.json')))
+        saved_state = f.state()
+        row = saved_state['requests'][self.request_id]
+        if variant == 'missing':
+            row.pop('semantic_outcome', None)
+            row.pop('semantic_outcome_sha256', None)
+        else:
+            self.assertEqual(variant, 'malformed')
+            # Keep the real selected file and SHA bytes; only the state path becomes non-owned.
+            row['semantic_outcome'] = ('outcomes/foreign-request/' + pointer['semantic_outcome_sha256']
+                                       + '.json')
+        ao.atomic(f.directory() / 'state.json', saved_state)
+        snapshot = f.fake.snapshots['engineer']
+        self.assertIn(restored, snapshot['messages'])
+        snapshot['messages'].remove(restored)
+        turns = [turn for turn in snapshot['turns'] if turn.get('id') == request['turn_id']]
+        self.assertEqual(len(turns), 1)
+        turns[0]['state'] = live_state
+        self.assertEqual(self.turn_rows(), outcomes.receipt(f.directory(), self.request())['messages'])
+        return {'audit': audit, 'pointer': pointer, 'record': record, 'release': release}
+
+    def compound_operation(self, name, audit):
+        """The exact public entrypoints the adoption probe exercised, one per independent check."""
+        f = self.fixture
+        if name == 'public_audit':
+            return self.audit
+        if name == 'public_resume':
+            return lambda: self.renew(audit)
+        if name == 'gate':
+            return lambda: outcomes.gate(f.service, f.directory(), f.state(), 'engineer', 'resume',
+                                         f.fake.conversation('engineer'))
+        if name == 'public_send':
+            return lambda: f.service.ao_room_send(f.room, 'engineer', 'Continue.', 'resume',
+                                                  purpose='correction')
+        raise AssertionError('Unexpected compound operation')
+
+    def assert_refuses_before_any_write(self, operation):
+        """One entrypoint refuses with every room file byte-identical, no native change and no POST."""
+        f = self.fixture
+        native = (self.transcript.read_bytes(), f.database.read_bytes())
+
+        def snapshot():
+            return {str(path.relative_to(f.directory())): path.read_bytes()
+                    for path in sorted(f.directory().rglob('*')) if path.is_file()}
+
+        before = snapshot()
+        posts = self.posts()
+        with self.assertRaises(ao.RoomError):
+            operation()
+        self.assertEqual(snapshot(), before)
+        self.assertEqual((self.transcript.read_bytes(), f.database.read_bytes()), native)
+        self.assert_no_posts(posts)
+
+    def assert_retained_observation_intact(self, path):
+        """The retained restored outcome stays readable at its real selected path."""
+        self.assertIn('restored_compaction_observation', ao.read(self.fixture.directory() / path))
+
+    def test_compound_pointer_loss_refuses_public_operations_before_writes(self):
+        """Missing-both and malformed selected pointers refuse before any write on every public entrypoint.
+
+        Each case starts from its own fresh valid restore -> explicit audit -> renewal -> routing
+        refresh fixture and keeps every retained byte. The live restored row is reverted to the saved
+        receipt rows, so row equality cannot hide the obligation; the live turn status is covered as
+        failed and completed to show the obligation does not depend on it. Public audit, resume, gate
+        and send each refuse with no outcome, pointer, state or POST write.
+        """
+        for live_state in ('failed', 'completed'):
+            for variant in ('missing', 'malformed'):
+                for operation in ('public_audit', 'public_resume', 'gate', 'public_send'):
+                    with self.subTest(live_state=live_state, variant=variant, operation=operation):
+                        helper = self.fresh_compound_fixture()
+                        state = helper.compound_state(variant, live_state)
+                        helper.assert_refuses_before_any_write(
+                            helper.compound_operation(operation, state['audit']))
+                        helper.assert_retained_observation_intact(state['pointer']['semantic_outcome'])
+                        helper.doCleanups()
+
+    def test_compound_pointer_loss_cannot_start_the_audit_renew_gate_send_chain(self):
+        """The former audit -> renew -> gate -> send exploit never starts without an eligible audit.
+
+        Only the public audit's own returned evidence may feed that chain, and no digest is fabricated
+        here. Because the compound public audit refuses before writing anything, the request keeps its
+        retained evidence, the retained real audit digest renews nothing, and the gate and public send
+        keep the same refusal, the same untouched files and the same POST count.
+        """
+        for live_state in ('failed', 'completed'):
+            for variant in ('missing', 'malformed'):
+                with self.subTest(live_state=live_state, variant=variant):
+                    helper = self.fresh_compound_fixture()
+                    state = helper.compound_state(variant, live_state)
+                    helper.assert_refuses_before_any_write(helper.audit)
+                    helper.assert_refuses_before_any_write(lambda: helper.renew(state['audit']))
+                    helper.assert_refuses_before_any_write(lambda: outcomes.gate(
+                        helper.fixture.service, helper.fixture.directory(), helper.fixture.state(),
+                        'engineer', 'resume', helper.fixture.fake.conversation('engineer')))
+                    helper.assert_refuses_before_any_write(lambda: helper.fixture.service.ao_room_send(
+                        helper.fixture.room, 'engineer', 'Continue.', 'resume', purpose='correction'))
+                    helper.assert_retained_observation_intact(state['pointer']['semantic_outcome'])
+                    helper.doCleanups()
+
     def test_explicit_audit_requires_positive_complete_history_at_internal_boundary(self):
         """Narrow boundary check for the restoration lane.
 
