@@ -19,12 +19,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4]
+        exclude:
+          - os: macos-latest
+            python: "3.12"
     runs-on: ${{ matrix.os }}
-    # The offline suite (about 1,800 tests and growing) runs as four module-level shards
-    # per interpreter (tests/run_test_shards.py); a shard is expected to take 10-25 minutes
-    # on a macOS runner. The budget covers setup, recovery timeout probes and cleanup.
-    # This is a CI budget, not a Fable, model or gate deadline.
+    # The offline suite (about 2,200 tests) runs as five module-level shards balanced by
+    # measured duration (tests/shard_weights.json). Measured on the #142 main run:
+    # unbalanced four-way shards took 12-20 minutes on macOS and 5-12 on Linux; balanced
+    # five-way shards are estimated at about 11 minutes on macOS and 6 on Linux. macOS
+    # runs Python 3.11 only because the account runs about five macOS jobs at a time and
+    # 3.11 is the production interpreter. This is a CI budget, not a Fable, model or gate
+    # deadline.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +42,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run macOS tests with fake model and MCP backends
         if: runner.os == 'macOS'
-        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 4 -v
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 -v
       - name: Run Linux tests in an isolated process namespace
         if: runner.os == 'Linux'
         env:
@@ -57,7 +66,7 @@ jobs:
             --mount "type=bind,source=$project_room_candidate,target=/candidate,readonly" \
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
-            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 4 -v
+            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 -v
 
   lint:
     runs-on: ubuntu-latest

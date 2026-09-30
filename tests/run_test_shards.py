@@ -1,12 +1,16 @@
 """Shard the Project Room offline suite deterministically by module: the module
 set is the sorted stems of every top-level test*.py file, identical to what
-`python -m unittest discover` finds, and module i runs in shard i % shards. CI
-runs one shard per job with `--shard I --shards N`; `--jobs J` runs all J
-shards concurrently on a developer machine and writes each shard's combined
-output to its own log file.
+`python -m unittest discover` finds. Modules are partitioned across shards by
+longest-processing-time greedy assignment over the measured per-module seconds
+in tests/shard_weights.json; a module missing from the file takes the median
+weight, and every module weighs 1.0 when the file is absent. CI runs one shard
+per job with `--shard I --shards N`; `--jobs J` runs all J shards concurrently
+on a developer machine and writes each shard's combined output to a log file.
 """
 import argparse
+import json
 import re
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -19,6 +23,27 @@ RESULT_RE = re.compile(r"^(OK|FAILED)(?: \(.*\))?$")
 
 def test_modules():
     return sorted(path.stem for path in ROOT.glob("test*.py") if path.is_file())
+
+
+def load_weights():
+    weights_file = ROOT / "tests" / "shard_weights.json"
+    if not weights_file.is_file():
+        return {}
+    return dict(json.loads(weights_file.read_text())["weights"])
+
+
+def assign(modules, shards, weights):
+    default = statistics.median(weights.values()) if weights else 1.0
+    weight = lambda module: float(weights.get(module, default))
+    groups = [[] for _ in range(shards)]
+    loads = [0.0] * shards
+    for module in sorted(modules, key=lambda m: (-weight(m), m)):
+        target = min(range(shards), key=lambda i: (loads[i], i))
+        groups[target].append(module)
+        loads[target] += weight(module)
+    for group in groups:
+        group.sort()
+    return groups, loads
 
 
 def unittest_cmd(modules, verbose):
@@ -100,12 +125,13 @@ def main(argv=None):
     if shards < 1:
         print(f"error: shard count must be >= 1 (got {shards})", file=sys.stderr)
         return 2
-    groups = [modules[i::shards] for i in range(shards)]
+    groups, loads = assign(modules, shards, load_weights())
     assert sorted(m for group in groups for m in group) == modules, \
         "shard assignment must cover every module exactly once"
     if args.list:
         for i, group in enumerate(groups):
-            print(f"shard {i}/{shards} ({len(group)} modules): {' '.join(group)}")
+            print(f"shard {i}/{shards} ({len(group)} modules, "
+                  f"~{loads[i] / 60:.1f} min): {' '.join(group)}")
         print(f"total: {len(modules)} modules")
         return 0
     if args.shard is not None:
