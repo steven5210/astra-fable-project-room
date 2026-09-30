@@ -56,8 +56,8 @@ def unittest_cmd(modules, verbose):
 def parse_args(argv):
     parser = argparse.ArgumentParser(prog="run_test_shards.py")
     parser.add_argument("--shard", type=int, metavar="I", help="run shard index I")
-    parser.add_argument("--shards", type=int, default=4, metavar="N",
-                        help="split the modules into N shards (default: 4)")
+    parser.add_argument("--shards", type=int, default=5, metavar="N",
+                        help="split the modules into N shards (default: 5)")
     parser.add_argument("--jobs", type=int, metavar="J",
                         help="run all J shards concurrently")
     parser.add_argument("--log-dir", metavar="DIR",

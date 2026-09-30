@@ -1,7 +1,7 @@
 {
  "_meta": {
   "regenerate": "python3 tests/run_test_shards.py --list shows the estimated minutes per shard; refresh this file from a recent macOS job log when shards drift apart",
-  "source": "GitHub Actions run 36647433937 (main 8af4e80, 2026-09-29): per-module seconds averaged over the macos-latest 3.11 and 3.12 jobs, measured from the timestamps of consecutive test lines in the job logs",
+  "source": "GitHub Actions run 36647433937 (main 8af4e80, 2026-09-29): per-module seconds averaged over the macos-latest 3.11 and 3.12 jobs, measured from the timestamps of consecutive test lines in the job logs; test_text_delegate (43.1 s) and test_run_test_shards (0.0 s) were added from the macos-latest 3.11 jobs of run 36658856547 (PR #147), the first run that contained them",
   "unit": "seconds",
   "unknown_module_weight": "median of the listed weights"
  },
@@ -118,7 +118,9 @@
   "test_recovery_safe_open": 1.9,
   "test_review_decisions": 13.0,
   "test_room": 25.8,
+  "test_run_test_shards": 0.0,
   "test_supervisor_lease": 8.1,
+  "test_text_delegate": 43.1,
   "test_transcript_audit": 12.8,
   "test_verification": 60.0,
   "test_verification_matrix": 69.4
