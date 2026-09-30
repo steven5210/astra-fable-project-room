@@ -68,7 +68,13 @@ operator's approval. `bytes_differ` means the page changed but its
 `claude-<family>` identifiers did not: informational, no action required. The
 section reports differences between the fresh bytes and the retained capture;
 it does not decide which identifier is newer, and neither section ever
-switches executables or models automatically.
+switches executables or models automatically. Sources are fetched only from
+first-party Claude documentation hosts; `evidence_unreadable` or
+`evidence_digest_mismatch` means the retained capture cannot be trusted and the
+section is `unknown`. `floors_incomplete` means the private engineering_models
+or family_qualification configuration is malformed: fix it before trusting
+`up_to_date`. The reported setup command is suggested only for an installed
+executable newer than the configured one, never for a remote release alone.
 
 For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
 from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's

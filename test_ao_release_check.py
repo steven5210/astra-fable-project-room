@@ -98,6 +98,7 @@ class ReleaseCheckTests(unittest.TestCase):
         }
         self.fetch_claude_latest = Mock(return_value=self.claude_latest)
         self.fetch_source = Mock(return_value=b"")
+        self.real_fetch_source = ao_release_check._fetch_source
         for name, guard in (("_fetch_claude_latest", AssertionError("tests must inject fetch_claude_latest")),
                             ("_fetch_source", AssertionError("tests must inject fetch_source"))):
             patcher = patch.object(ao_release_check, name, side_effect=guard)
@@ -151,7 +152,7 @@ class ReleaseCheckTests(unittest.TestCase):
                     "sha256": hashlib.sha256(evidence).hexdigest(),
                     "evidence_file": str(evidence_file)}
 
-        sources = [descriptor("docs-src", "https://docs.invalid.example/claude",
+        sources = [descriptor("docs-src", "https://docs.claude.com/claude",
                               evidence, "evidence.bin")]
         for index, (source_id, uri, extra_evidence) in enumerate(extra_sources):
             source_ids.append(source_id)
@@ -175,19 +176,31 @@ class ReleaseCheckTests(unittest.TestCase):
                                       "sha256": ao_model_qualification.digest(artifact)}}))
         return artifact
 
-    def claude_layout(self, configured="2.1.268", installed="2.1.285"):
-        """A controller claude_bin plus a native-installer versions entry; returns a run dispatcher."""
+    def claude_layout(self, configured="2.1.268", installed="2.1.285", dir_layout=False):
+        """A controller claude_bin plus native-installer versions entries; returns a run dispatcher.
+
+        installed may be a version string or an {entry_name: reported_version} map; the reported
+        version is what '<path> --version' prints, which may differ from the entry name."""
         self.claude_bin = self.base / "configured-claude"
         self.claude_bin.write_text("#!/bin/sh\nexit 0\n")
         self.claude_bin.chmod(0o700)
         (self.base / "config.json").write_text(json.dumps({"claude_bin": str(self.claude_bin)}))
         versions = {str(self.claude_bin): configured}
         if installed is not None:
-            entry = self.claude_home / ".local" / "share" / "claude" / "versions" / installed
-            entry.parent.mkdir(parents=True, exist_ok=True)
-            entry.write_text("#!/bin/sh\nexit 0\n")
-            entry.chmod(0o700)
-            versions[str(entry)] = installed
+            if isinstance(installed, str):
+                installed = {installed: installed}
+            versions_dir = self.claude_home / ".local" / "share" / "claude" / "versions"
+            for name, reported in installed.items():
+                entry = versions_dir / name
+                if dir_layout:
+                    entry.mkdir(parents=True, exist_ok=True)
+                    executable = entry / "claude"
+                else:
+                    executable = entry
+                    executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o700)
+                versions[str(executable)] = reported
 
         def run(argv, **kwargs):
             if argv[0] == "ps":
@@ -350,7 +363,9 @@ class ReleaseCheckTests(unittest.TestCase):
         run = Mock(side_effect=AssertionError("unconfigured URL must not inspect processes"))
         result = ao_release_check.check(
             self.base / "unconfigured", None, fetch_latest=self.fetch_latest, fetch_health=fetch_health,
-            run=run, now=lambda: self.checked_time
+            run=run, now=lambda: self.checked_time,
+            fetch_claude_latest=self.fetch_claude_latest, fetch_source=self.fetch_source,
+            home=self.claude_home,
         )
         self.assertEqual(result["outcome"], "unknown")
         self.assertIn("daemon_url_unconfigured", result["reasons"])
@@ -632,11 +647,11 @@ class ReleaseCheckTests(unittest.TestCase):
         captured = b"Captured page naming claude-sonnet-5-5.\n"
         self.write_qualification(
             evidence=captured,
-            extra_sources=[("second-src", "https://docs.invalid.example/second",
+            extra_sources=[("second-src", "https://code.claude.com/second",
                             b"Second capture.\n")])
         # One bytes-only drift plus one unreachable source -> bytes_differ overall.
         def fetch(uri):
-            if uri == "https://docs.invalid.example/claude":
+            if uri == "https://docs.claude.com/claude":
                 return captured + b"trailing whitespace\n"
             raise OSError("synthetic source failure")
 
@@ -679,6 +694,155 @@ class ReleaseCheckTests(unittest.TestCase):
                     "daemon": None, "last_successful": None}
         (old_shape / "version-check.json").write_text(json.dumps(previous))
         self.assertEqual(ao_release_check._existing_record(old_shape / "version-check.json"), previous)
+
+    def test_newer_published_without_newer_install_offers_no_action(self):
+        run = self.claude_layout(configured="2.1.285", installed="2.1.280")
+        published = dict(self.claude_latest, tag_name="v2.1.290",
+                         html_url="https://github.com/anthropics/claude-code/releases/tag/v2.1.290")
+        result = self.check(run=run, fetch_claude_latest=Mock(return_value=published))
+        section = result["claude_code"]
+        self.assertEqual(section["outcome"], "update_available")
+        self.assertEqual(section["newest_installed"]["version"], "2.1.280")
+        self.assertIsNone(section["action"])
+
+    def test_below_floor_without_a_qualifying_install_names_no_action(self):
+        run = self.claude_layout(configured="2.1.268", installed="2.1.270")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["outcome"], "below_floor")
+        self.assertIsNone(section["action"])
+        self.assertIn("no_installed_candidate_satisfies_floor", section["reasons"])
+
+    def test_directory_layout_records_the_executable_not_the_directory(self):
+        run = self.claude_layout(configured="2.1.285", installed="2.1.285", dir_layout=True)
+        result = self.check(run=run)
+        path = result["claude_code"]["newest_installed"]["path"]
+        self.assertTrue(path.endswith("/claude"))
+        self.assertTrue(os.access(path, os.X_OK))
+        self.assertEqual(result["claude_code"]["outcome"], "up_to_date")
+
+    def test_engineering_models_floor_is_part_of_the_effective_policy(self):
+        (self.root / "config.json").write_text(json.dumps({"engineering_models": {
+            "claude-opus-9-9": {"harness": "claude-code", "reasoning_effort": "max",
+                                "minimum_claude_code_version": "2.1.300"}}}))
+        run = self.claude_layout(configured="2.1.285", installed="2.1.285")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["highest_family_floor"], "2.1.300")
+        self.assertEqual(section["outcome"], "below_floor")
+
+    def test_malformed_engineering_models_marks_floors_incomplete_and_unknown(self):
+        (self.root / "config.json").write_text(json.dumps({"engineering_models": ["not-a-dict"]}))
+        run = self.claude_layout(configured="2.1.285", installed="2.1.285")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertIn("floors_incomplete", section["reasons"])
+        self.assertIsNone(section["floor_satisfied"])
+        self.assertEqual(section["outcome"], "unknown")
+
+    def test_newest_install_is_probed_and_name_mismatch_is_dropped(self):
+        run = self.claude_layout(configured="2.1.268",
+                                 installed={"2.1.290": "2.1.280", "2.1.285": "2.1.285"})
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["newest_installed"]["version"], "2.1.285")
+        self.assertIn("installed_version_mismatch", section["reasons"])
+
+        run = self.claude_layout(configured="2.1.268", installed={"2.1.290": "2.1.280"})
+        section = self.check(run=run)["claude_code"]
+        self.assertIsNone(section["newest_installed"])
+        self.assertIn("installed_version_mismatch", section["reasons"])
+
+    def test_unreadable_or_mismatched_evidence_excludes_the_source_from_drift(self):
+        evidence_bytes = b"Synthetic source capture naming claude-opus-5-5.\n"
+        self.write_qualification(evidence=evidence_bytes)
+        section = self.check(fetch_source=Mock(return_value=evidence_bytes))[
+            "qualification_sources"]
+        self.assertEqual(section["outcome"], "unchanged")
+
+        # Deleting the retained capture means the source cannot be drift-evaluated at all.
+        evidence = (self.base / "evidence.bin").resolve()
+        evidence.unlink()
+        section = self.check(fetch_source=Mock(return_value=b"fresh claude-opus-5-5\n"))[
+            "qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "evidence_unreadable")
+        self.assertIsNone(section["sources"][0]["bytes_match"])
+        self.assertEqual(section["sources"][0]["identifiers_not_in_capture"], {})
+        self.assertEqual(section["outcome"], "unknown")
+        self.assertIn("evidence_unreadable", section["reasons"])
+
+        # A tampered capture is the same exclusion with a digest-mismatch outcome.
+        self.write_qualification()
+        evidence.write_bytes(b"tampered bytes\n")
+        evidence.chmod(0o600)
+        section = self.check(fetch_source=Mock(return_value=b"fresh claude-opus-5-5\n"))[
+            "qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "evidence_digest_mismatch")
+        self.assertEqual(section["outcome"], "unknown")
+        self.assertIn("evidence_digest_mismatch", section["reasons"])
+
+        # Tampered evidence beside a second source with real identifier drift -> identifiers_differ.
+        self.write_qualification(
+            evidence=b"First capture.\n",
+            extra_sources=[("second-src", "https://code.claude.com/second",
+                            b"Captured claude-sonnet-5-5.\n")])
+        evidence = (self.base / "evidence.bin").resolve()
+        evidence.write_bytes(b"tampered first capture\n")
+        evidence.chmod(0o600)
+
+        def fetch(uri):
+            if uri == "https://code.claude.com/second":
+                return b"Now listing claude-sonnet-5-5 and claude-sonnet-7.\n"
+            return b"anything\n"
+
+        section = self.check(fetch_source=fetch)["qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "evidence_digest_mismatch")
+        self.assertEqual(section["sources"][1]["outcome"], "identifiers_differ")
+        self.assertEqual(section["outcome"], "identifiers_differ")
+
+    def test_fetch_source_bound_rejects_oversized_source_bodies(self):
+        oversized = b"x" * (ao_model_qualification.MAX_EVIDENCE_BYTES + 1)
+        response = Mock()
+        response.status = 200
+        response.read.return_value = oversized
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(ao_release_check.http.client, "HTTPSConnection",
+                          return_value=connection):
+            with self.assertRaises(ao_release_check._FetchFailure) as raised:
+                self.real_fetch_source("https://docs.claude.com/page")
+        self.assertEqual(raised.exception.reason, "source_too_large")
+        self.assertEqual(response.read.call_args.args[0],
+                         ao_model_qualification.MAX_EVIDENCE_BYTES + 1)
+
+    def test_oversized_but_identical_capture_bytes_classify_unchanged(self):
+        evidence = b"captured " + b"x" * 1_500_000 + b" claude-opus-5-5\n"
+        self.write_qualification(evidence=evidence)
+        section = self.check(fetch_source=Mock(return_value=evidence))["qualification_sources"]
+        self.assertEqual(section["sources"][0]["outcome"], "unchanged")
+        self.assertEqual(section["outcome"], "unchanged")
+
+    def test_source_uris_are_limited_to_first_party_claude_hosts(self):
+        blocked = ["https://127.0.0.1/x", "https://example.com/x",
+                   "https://code.claude.com:8443/x", "https://user@code.claude.com/x"]
+        self.write_qualification(
+            evidence=b"captured\n",
+            extra_sources=[("allowed-src", "https://CODE.claude.com/x", b"allowed capture\n")]
+            + [("blocked-%d" % index, uri, b"blocked\n") for index, uri in enumerate(blocked)])
+        fetcher = Mock(side_effect=lambda uri: {
+            "https://docs.claude.com/claude": b"captured\n",
+            "https://CODE.claude.com/x": b"allowed capture\n"}[uri])
+        section = self.check(fetch_source=fetcher)["qualification_sources"]
+        outcomes = {source["id"]: source["outcome"] for source in section["sources"]}
+        self.assertEqual(outcomes["docs-src"], "unchanged")
+        self.assertEqual(outcomes["allowed-src"], "unchanged")
+        for index in range(len(blocked)):
+            self.assertEqual(outcomes["blocked-%d" % index], "unreachable")
+        self.assertEqual(section["outcome"], "unknown")
+        self.assertEqual(section["reasons"], ["source_host_not_allowed"])
+        fetched = [call.args[0] for call in fetcher.call_args_list]
+        self.assertEqual(sorted(fetched),
+                         ["https://CODE.claude.com/x", "https://docs.claude.com/claude"])
 
     def test_health_fetch_uses_healthz_and_reads_only_one_megabyte_plus_one_byte(self):
         body = json.dumps(self.health).encode()
