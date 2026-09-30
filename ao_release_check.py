@@ -475,7 +475,11 @@ def _claude_code(root, run, home, fetch_claude_latest):
     qualifies = (newest_installed is not None and configured_tuple is not None
                  and newest_tuple > configured_tuple
                  and (floor_tuple is None or newest_tuple >= floor_tuple))
-    if outcome in ("below_floor", "update_available") and qualifies:
+    if outcome in ("below_floor", "update_available") and qualifies and floors_incomplete:
+        # The bundled lower bound can prove the configured executable insufficient, but it cannot
+        # certify a replacement against the unread configured or qualified floors.
+        reasons.add("action_withheld_floors_incomplete")
+    elif outcome in ("below_floor", "update_available") and qualifies:
         action = "python3 project_room.py setup --claude-bin " + newest_installed["path"]
     elif outcome == "below_floor":
         reasons.add("no_installed_candidate_satisfies_floor")

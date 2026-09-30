@@ -70,11 +70,17 @@ section reports differences between the fresh bytes and the retained capture;
 it does not decide which identifier is newer, and neither section ever
 switches executables or models automatically. Sources are fetched only from
 first-party Claude documentation hosts; `evidence_unreadable` or
-`evidence_digest_mismatch` means the retained capture cannot be trusted and the
-section is `unknown`. `floors_incomplete` means the private engineering_models
-or family_qualification configuration is malformed: fix it before trusting
-`up_to_date`. The reported setup command is suggested only for an installed
-executable newer than the configured one, never for a remote release alone.
+`evidence_digest_mismatch` means the retained capture cannot be trusted: that
+source is left out of the comparison and the section is `unknown` unless another
+source shows drift. `floors_incomplete` means the private engineering_models or
+family_qualification configuration is malformed or its evidence is unreadable:
+fix it before trusting `up_to_date`; while it is set, `below_floor` is still
+reported from the bundled floors but no setup command is suggested. The setup
+command is suggested only for an installed executable newer than the configured
+one that meets the complete floor, never for a remote release alone. When
+`below_floor` comes without a command, install a Claude Code release at or above
+`highest_family_floor` first, then run `python3 project_room.py setup --claude-bin`
+with that executable.
 
 For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
 from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's

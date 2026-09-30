@@ -1,3 +1,4 @@
+import copy
 import fcntl
 import hashlib
 import json
@@ -158,7 +159,8 @@ class ReleaseCheckTests(unittest.TestCase):
             source_ids.append(source_id)
             sources.append(descriptor(source_id, uri, extra_evidence, f"evidence-{index}.bin"))
         artifact = {
-            "format": "ao-model-qualification/v1", "revision": 1,
+            "format": ao_model_qualification.FORMAT, "revision": 1, "qualified_at": "2026-06-02T00:00:00Z",
+            "scope": copy.deepcopy(ao_model_qualification.SCOPE),
             "families": {
                 "fable": {"expected_model": "claude-fable-5-1", "source_ids": source_ids},
                 "opus": {"expected_model": "claude-opus-5-5", "source_ids": source_ids,
@@ -739,6 +741,16 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIn("floors_incomplete", section["reasons"])
         self.assertIsNone(section["floor_satisfied"])
         self.assertEqual(section["outcome"], "unknown")
+
+    def test_incomplete_floors_withhold_the_setup_action(self):
+        (self.root / "config.json").write_text(json.dumps({"engineering_models": ["not-a-dict"]}))
+        run = self.claude_layout(configured="2.1.268", installed="2.1.285")
+        result = self.check(run=run)
+        section = result["claude_code"]
+        self.assertEqual(section["outcome"], "below_floor")
+        self.assertIn("floors_incomplete", section["reasons"])
+        self.assertIn("action_withheld_floors_incomplete", section["reasons"])
+        self.assertIsNone(section["action"])
 
     def test_newest_install_is_probed_and_name_mismatch_is_dropped(self):
         run = self.claude_layout(configured="2.1.268",
