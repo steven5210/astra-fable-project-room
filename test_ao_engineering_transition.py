@@ -650,12 +650,26 @@ class AuditTests(TransitionCase):
         self.write_transcript((self.agent_launch(), self.hook_result()))
         with self.assertRaisesRegex(RoomError, 'no validated terminal result'):
             et.child_evidence(self.transcript.read_bytes(), NATIVE, str(self.repo),
-                              guard_sha256=None)
+                              guard_sha256s=None)
         self.write_transcript((self.agent_launch(), self.hook_result(),
                                self.notification_row(NOTIFICATION)))
         result = self.audit()
         self.assertFalse(result['eligible'])
         self.assertIn('hook-blocked launch', result['reason'])
+
+    def test_child_evidence_normalises_and_fails_closed_on_empty_guard_digests(self):
+        self.reset()
+        self.write_transcript((self.agent_launch(), self.hook_result()))
+        raw = self.transcript.read_bytes()
+        for value in (None, set(), 'not-a-digest'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RoomError, 'no validated terminal result'):
+                    et.child_evidence(raw, NATIVE, str(self.repo), guard_sha256s=value)
+        summary = et.child_evidence(raw, NATIVE, str(self.repo), guard_sha256s=self.GUARD_SHA)
+        self.assertEqual(summary['hook_blocked_launches'], 1)
+        summary = et.child_evidence(raw, NATIVE, str(self.repo),
+                                    guard_sha256s={'f' * 64, self.GUARD_SHA})
+        self.assertEqual(summary['hook_blocked_launches'], 1)
 
     def test_audit_accepts_denied_and_hook_blocked_launches_before_a_completed_launch(self):
         self.reset()

@@ -284,8 +284,9 @@ the transition and abandon tools are mutations, and the core owns their lock,
 idempotency and exact retry semantics. Its child-evidence check treats a
 parent `Agent`/`Task` launch the routing guard denied before execution as
 terminal with no child; so does a launch whose PreToolUse hook exited nonzero
-running the room's pinned guard (`guard_sha256` in the bracketed command, the
-guard's own denial or internal error in stderr). A plain error, a foreign
+running one of the room's verified guard launchers, original or refreshed
+(a recorded `guard_sha256` in the bracketed command, the guard's own denial or
+internal error in stderr). A plain error, a foreign
 hook, a start acknowledgement or a missing result still refuses.
 
 A configured-model change sends exactly one guarded
