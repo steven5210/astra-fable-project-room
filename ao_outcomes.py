@@ -986,16 +986,14 @@ def gate(service, directory, state, role, new_request_id, snapshot):
             raise RoomError('AO-completed autocompact-thrashing evidence is not eligible for recovery; only an exact failed AO transport turn can settle this native failure')
         _require_compaction_mitigation(service, directory, state, request, release, diagnosed)
         if value['outcome']['kind'] == 'model_mismatch':
-            # The reserved successor repeats the contradiction under the same family alias unless the
-            # audited transition has already committed the exact expected identifier.
+            # The reserved successor would repeat the contradiction under a family alias, which AO may
+            # resolve to another member. Any audited transition to an exact identifier of the effective
+            # policy avoids that: the next turn's expectation is then the pinned identifier itself.
             import ao_engineering_model
-            mismatch = (value.get('native') or {}).get('model_mismatch') or {}
-            expected = mismatch.get('expected_model')
             selector = (ao_engineering_model.current(directory, state) or {}).get('selector') or {}
-            if (not isinstance(expected, str) or selector.get('kind') != 'exact'
-                    or selector.get('model') != expected):
-                raise RoomError('model_mismatch continuation requires a committed transition to the '
-                                'exact expected identifier before the reserved successor is sent')
+            if selector.get('kind') != 'exact' or not isinstance(selector.get('model'), str):
+                raise RoomError('model_mismatch continuation requires a committed transition to an exact '
+                                'identifier before the reserved successor is sent')
         return
     raise RoomError('Native semantic hold: ' + value['outcome']['kind'] + '. Inspect ao_room_outcome_audit; no automatic retry or replay.')
 
