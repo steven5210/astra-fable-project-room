@@ -1,4 +1,5 @@
 """Durable semantic holds, separate from AO transport and immutable receipts."""
+import copy
 import json
 import re
 
@@ -255,6 +256,283 @@ def native_failure_kind(record):
     return None
 
 
+RESTORED_COMPACTION_KIND = 'restored_compaction_message'
+RESTORED_COMPACTION_FIELDS = frozenset((
+    'version', 'kind', 'room_id', 'request_id', 'session_id', 'conversation_id', 'branch_id', 'turn_id',
+    'provider_turn_id', 'receipt_sha256', 'prior_outcome_sha256', 'native_source', 'native_source_sha256',
+    'native_compaction_failure', 'added_message', 'added_message_sha256', 'live_messages_sha256'))
+RESTORED_MESSAGE_ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}')
+RESTORED_CONTRADICTORY_KEYS = ('error', 'errorMessage', 'failure', 'apiError', 'apiErrorStatus',
+                               'rateLimitType', 'quota', 'quotaLimits', 'refusal', 'safety',
+                               'stopReason', 'stop_reason', 'httpStatus', 'http_status')
+
+
+def _restored_metadata_absent(value):
+    """Whether one restored-row contradictory-metadata key carries exact legitimate absence.
+
+    Only ``None``, ``False``, ``''``, ``[]`` and ``{}`` are absent. Identity and exact type
+    checks keep ``False`` admissible deliberately while rejecting falsy numerics: ``0`` and
+    ``0.0`` compare equal to ``False`` in Python, but they are malformed metadata, not absence.
+    This is a pure predicate; it never authorizes anything.
+    """
+    if value is None or value is False:
+        return True
+    if isinstance(value, str):
+        return value == ''
+    if isinstance(value, (list, dict)):
+        return not value
+    return False
+
+
+def _restored_compaction_extra(saved, live_messages):
+    """The exact single AO restoration row of the retained synthetic thrashing error, or None.
+
+    Pure structure only: the unchanged saved turn messages must be the exact prefix and exactly one
+    provider-origin, nonstreaming assistant row with the exact public error text, one well-formed
+    unique message identity and no contradictory metadata may follow. This never authorizes anything.
+    """
+    from ao_native_outcome import COMPACTION_THRASHING_TEXT
+    if not isinstance(saved, dict) or not isinstance(live_messages, list) or not live_messages:
+        return None
+    messages = saved.get('messages')
+    if (not isinstance(messages, list) or not messages
+            or any(not isinstance(item, dict) for item in messages + live_messages)
+            or len(live_messages) != len(messages) + 1):
+        return None
+    if live_messages[:len(messages)] != messages:
+        return None
+    extra = live_messages[-1]
+    if (extra.get('role') != 'assistant' or extra.get('origin') != 'provider'
+            or extra.get('streaming') is not False):
+        return None
+    if extra.get('text') != COMPACTION_THRASHING_TEXT:
+        return None
+    if 'kind' in extra and extra.get('kind') != 'message':
+        return None
+    if any(not _restored_metadata_absent(extra.get(key)) for key in RESTORED_CONTRADICTORY_KEYS):
+        return None
+    identity = extra.get('id')
+    if not isinstance(identity, str) or RESTORED_MESSAGE_ID.fullmatch(identity) is None:
+        return None
+    identities = [message.get('id') for message in live_messages]
+    if any(not isinstance(value, str) or not value for value in identities):
+        return None
+    if len(set(identities)) != len(identities) or identities.count(identity) != 1:
+        return None
+    return extra
+
+
+def _restored_compaction_candidate(request, saved, live_messages, turn):
+    """Cheap eligibility preconditions before the native inspection; this never authorizes."""
+    if (not isinstance(request, dict) or request.get('role') != 'engineer'
+            or request.get('state') not in ('uncertain', 'settled_failure')
+            or saved.get('history_truncated') is not False
+            or not isinstance(request.get('turn_id'), str) or not request['turn_id']
+            or not isinstance(request.get('provider_turn_id'), str) or not request['provider_turn_id']
+            or not isinstance(turn, dict) or turn.get('state') != 'failed'
+            or turn.get('providerTurnId') != request.get('provider_turn_id')):
+        return None
+    return _restored_compaction_extra(saved, live_messages)
+
+
+def _outcome_record_by_sha(directory, request, sha):
+    """The exact owned content-addressed outcome record for one SHA, or None. Read-only."""
+    from ao_project_room import digest, read
+    if (not isinstance(request, dict) or not isinstance(sha, str)
+            or re.fullmatch(r'[0-9a-f]{64}', sha) is None):
+        return None
+    try:
+        record = read(directory / ('outcomes/' + str(request.get('request_id')) + '/' + sha + '.json'))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if (not isinstance(record, dict) or digest(record) != sha
+            or record.get('version') != 1 or record.get('room_id') != directory.name
+            or record.get('request_id') != request.get('request_id')
+            or record.get('receipt_sha256') != request.get('receipt_sha256')
+            or record.get('text_sha256') != request.get('text_sha256')
+            or record.get('turn_id') != request.get('turn_id')
+            or record.get('provider_turn_id') != request.get('provider_turn_id')):
+        return None
+    return record
+
+
+def _owned_outcome_record(directory, request):
+    """The record this request currently names at its exact owned path, or None. Read-only."""
+    path = request.get('semantic_outcome') if isinstance(request, dict) else None
+    sha = request.get('semantic_outcome_sha256') if isinstance(request, dict) else None
+    if (not isinstance(path, str) or not isinstance(sha, str)
+            or path != 'outcomes/' + str(request.get('request_id')) + '/' + sha + '.json'):
+        return None
+    return _outcome_record_by_sha(directory, request, sha)
+
+
+def _verified_restored_observation(directory, request, record, saved, live_messages, native=None,
+                                   require_fresh_native=False):
+    """Verify one retained restored-compaction observation against the exact current AO rows.
+
+    Read-only. ``native``, when supplied, is the fresh native inspection that must still positively
+    reproduce the bound compaction failure. ``require_fresh_native`` makes that fresh proof mandatory
+    for a current restoration recheck: an absent native inspection is not evidence of restoration and
+    must refuse before any write. A missing, corrupt, stale or contradictory observation returns None;
+    the caller refuses and never modifies existing evidence.
+    """
+    from ao_project_room import digest
+    observation = record.get('restored_compaction_observation') if isinstance(record, dict) else None
+    if (not isinstance(observation, dict) or set(observation) != RESTORED_COMPACTION_FIELDS
+            or observation.get('version') != 1 or observation.get('kind') != RESTORED_COMPACTION_KIND):
+        return None
+    if (request.get('role') != 'engineer' or request.get('state') not in ('uncertain', 'settled_failure')
+            or not isinstance(request.get('provider_turn_id'), str) or not request['provider_turn_id']
+            or not isinstance(request.get('baseline'), dict)):
+        return None
+    baseline = request['baseline']
+    if (observation.get('room_id') != directory.name
+            or observation.get('request_id') != request.get('request_id')
+            or observation.get('session_id') != request.get('session_id')
+            or observation.get('conversation_id') != baseline.get('conversation_id')
+            or observation.get('branch_id') != baseline.get('branch_id')
+            or observation.get('turn_id') != request.get('turn_id')
+            or observation.get('provider_turn_id') != request.get('provider_turn_id')
+            or observation.get('receipt_sha256') != request.get('receipt_sha256')
+            or not isinstance(observation.get('native_source'), dict)
+            or not isinstance(observation.get('native_source_sha256'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', observation['native_source_sha256']) is None
+            or not isinstance(observation.get('native_compaction_failure'), dict)):
+        return None
+    extra = _restored_compaction_extra(saved, live_messages)
+    if extra is None or observation.get('added_message') != extra:
+        return None
+    if (observation.get('added_message_sha256') != digest(extra)
+            or observation.get('live_messages_sha256') != digest(live_messages)):
+        return None
+    retained = record.get('native') if isinstance(record.get('native'), dict) else {}
+    if (not isinstance(record.get('outcome'), dict) or record['outcome'].get('kind') != 'provider_error'
+            or observation.get('native_source') != retained.get('source')
+            or observation.get('native_source_sha256') != retained.get('source_sha256')
+            or observation.get('native_compaction_failure') != retained.get('compaction_failure')
+            or not native_compaction_failure(record)):
+        return None
+    prior = _outcome_record_by_sha(directory, request, observation.get('prior_outcome_sha256'))
+    if (prior is None or 'restored_compaction_observation' in prior
+            or not isinstance(prior.get('outcome'), dict)
+            or native_failure_kind(prior) != 'compaction_thrashing'):
+        return None
+    prior_native = prior.get('native') if isinstance(prior.get('native'), dict) else {}
+    if (prior_native.get('source') != observation.get('native_source')
+            or prior_native.get('source_sha256') != observation.get('native_source_sha256')
+            or prior_native.get('compaction_failure') != observation.get('native_compaction_failure')):
+        return None
+    if require_fresh_native and not isinstance(native, dict):
+        return None
+    if native is not None:
+        if (not isinstance(native, dict) or native.get('unknown')
+                or native.get('next_human_uuid') is not None
+                or native.get('source') != observation.get('native_source')
+                or native.get('source_sha256') != observation.get('native_source_sha256')
+                or native.get('compaction_failure') != observation.get('native_compaction_failure')
+                or native_failure_kind({**record, 'native': native}) != 'compaction_thrashing'):
+            return None
+    return observation
+
+
+def _retained_restored_compaction_record(directory, request):
+    """The selected current outcome record that retains this request's restored-compaction observation.
+
+    Read-only. Only the request's own selected current outcome pointer is returned, and only when its
+    record is coherent, valid and non-foreign and itself retains the observation. Whenever the request
+    carries an authenticated outcome-resume release, that release's own named record is read only to
+    detect the restoration obligation: the authenticated release, never the mutable request status
+    tag, is the authority that establishes it, so an externally changed ``state`` cannot erase the
+    obligation. Detecting it never replaces missing, malformed, foreign or lost selected evidence. A
+    detected obligation whose selected current outcome is unusable, or names other evidence, fails
+    closed here. A request without a release, or whose release names no retained restoration, returns
+    None and keeps its own strict comparison.
+    """
+    record = _owned_outcome_record(directory, request)
+    if isinstance(record, dict) and 'restored_compaction_observation' in record:
+        return record
+    obligation = False
+    # The authenticated release pointer, not the mutable request status tag, is the authority: a
+    # release that still names a retained restored-compaction record keeps proving the obligation
+    # even after ``state`` is externally changed, so the release is consulted whenever it exists.
+    if isinstance(request, dict) and request.get('outcome_resume'):
+        release = release_record(directory, {'room_id': directory.name}, request)
+        if isinstance(release, dict) and isinstance(release.get('outcome_sha256'), str):
+            retained = _outcome_record_by_sha(directory, request, release['outcome_sha256'])
+            obligation = isinstance(retained, dict) and 'restored_compaction_observation' in retained
+    if obligation:
+        # The authenticated release proves this consumed turn was settled under a retained
+        # restored-compaction observation, independently of the saved status tag, so the selected
+        # current outcome must itself be exactly that evidence.
+        raise RoomError('The retained restored compaction-error observation no longer matches the exact AO evidence; re-audit before continuing')
+    return None
+
+
+def _verified_restored_compaction_rows(directory, request, saved, live_messages):
+    """The verified restored-compaction observation for the exact current rows, or None.
+
+    None means this request retains no restored-compaction observation and the caller keeps its own
+    strict comparison. A retained observation that no longer matches the exact current rows raises:
+    a stale proof refuses and is never re-minted by a read-only consumer.
+    """
+    record = _retained_restored_compaction_record(directory, request)
+    if not isinstance(record, dict):
+        return None
+    observation = _verified_restored_observation(directory, request, record, saved, live_messages)
+    if observation is None:
+        raise RoomError('The retained restored compaction-error observation no longer matches the exact AO evidence; re-audit before continuing')
+    return observation
+
+
+def _authorize_restored_compaction(directory, request, saved, live_messages, extra, observed, native, prior):
+    """Create the immutable restored-compaction observation. Explicit outcome audit only."""
+    from ao_project_room import digest
+    turn = observed.get('turn') if isinstance(observed, dict) else None
+    if (request.get('role') != 'engineer' or request.get('state') not in ('uncertain', 'settled_failure')
+            or not isinstance(request.get('turn_id'), str) or not request['turn_id']
+            or not isinstance(request.get('provider_turn_id'), str) or not request['provider_turn_id']
+            or saved.get('history_truncated') is not False
+            or not isinstance(saved.get('turn'), dict) or saved['turn'].get('state') != 'failed'
+            or not isinstance(turn, dict) or turn.get('state') != 'failed'
+            or turn.get('providerTurnId') != request.get('provider_turn_id')
+            or extra is None or _restored_compaction_extra(saved, live_messages) != extra):
+        raise RoomError('A restored compaction-error observation requires one exact failed engineer turn and its unchanged saved failure')
+    if (not isinstance(prior, dict) or 'restored_compaction_observation' in prior
+            or not isinstance(prior.get('outcome'), dict)
+            or native_failure_kind(prior) != 'compaction_thrashing'):
+        raise RoomError('A restored compaction-error observation requires the prior retained diagnosed native compaction outcome; audit the unchanged native failure first')
+    source = native.get('source') if isinstance(native, dict) else None
+    if (not isinstance(native, dict) or native.get('unknown') or native.get('next_human_uuid') is not None
+            or not isinstance(source, dict)
+            or set(source) != {'database', 'transcript', 'session_id', 'native_session_id'}
+            or any(not isinstance(value, str) or not value for value in source.values())
+            or source.get('session_id') != request.get('session_id')
+            or not isinstance(native.get('source_sha256'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', native['source_sha256']) is None
+            or not isinstance(native.get('compaction_failure'), dict)
+            or native_failure_kind({'outcome': prior['outcome'], 'native': native, 'ao_terminal': turn,
+                                    'session_failures': observed.get('sessionFailures'),
+                                    'provider_failures': observed.get('provider_failures')}) != 'compaction_thrashing'):
+        raise RoomError('A restored compaction-error observation requires the same positively typed native compaction failure from a fresh owner/source inspection')
+    retained = prior.get('native') if isinstance(prior.get('native'), dict) else {}
+    if (source != retained.get('source')
+            or native.get('source_sha256') != retained.get('source_sha256')
+            or native.get('compaction_failure') != retained.get('compaction_failure')
+            or native.get('anchor_uuid') != retained.get('anchor_uuid')
+            or native.get('errors') != retained.get('errors')):
+        raise RoomError('A restored compaction-error observation requires the exact native error identity, source paths and complete transcript hash already retained')
+    return {'version': 1, 'kind': RESTORED_COMPACTION_KIND, 'room_id': directory.name,
+            'request_id': request.get('request_id'), 'session_id': request.get('session_id'),
+            'conversation_id': (request.get('baseline') or {}).get('conversation_id'),
+            'branch_id': (request.get('baseline') or {}).get('branch_id'),
+            'turn_id': request.get('turn_id'), 'provider_turn_id': request.get('provider_turn_id'),
+            'receipt_sha256': request.get('receipt_sha256'), 'prior_outcome_sha256': digest(prior),
+            'native_source': copy.deepcopy(source), 'native_source_sha256': native['source_sha256'],
+            'native_compaction_failure': copy.deepcopy(native['compaction_failure']),
+            'added_message': copy.deepcopy(extra), 'added_message_sha256': digest(extra),
+            'live_messages_sha256': digest(live_messages)}
+
+
 def validate_settlement(directory, request):
     from ao_project_room import digest, read
     release = release_record(directory, {'room_id': directory.name}, request)
@@ -305,9 +583,11 @@ def latest_for_role(state, role):
     return max(rows, key=lambda r: r['created_order']) if rows else None
 
 
-def observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None):
+def observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None,
+            restored_compaction=False):
     try:
-        return _observe(service, directory, state, request, snapshot, allow_unknown_clear, source_verification)
+        return _observe(service, directory, state, request, snapshot, allow_unknown_clear, source_verification,
+                        restored_compaction)
     except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
         from ao_history_reconciliation import invalidate
         if request.get('history_reconciliation_sha256'):
@@ -315,7 +595,8 @@ def observe(service, directory, state, request, snapshot, allow_unknown_clear=Fa
         raise
 
 
-def _observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None):
+def _observe(service, directory, state, request, snapshot, allow_unknown_clear=False, source_verification=None,
+             restored_compaction=False):
     from ao_project_room import atomic, digest, read, sent_message, turn_ids
     from ao_project_room import native_turn_identity
     identity = native_turn_identity(request)
@@ -324,8 +605,15 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
     saved = receipt(directory, request)
     live_messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == request.get('turn_id')]
     turns = [t for t in snapshot.get('turns', []) if t.get('id') == request.get('turn_id')]
+    # The exact single-message AO restoration of the retained synthetic thrashing error is only
+    # structurally admissible here so an explicit audit can authorize it or a retained authorization
+    # can be verified below; this guard alone never authorizes the exception and every other strict
+    # comparison is unchanged.
+    restored_candidate = None
+    if live_messages != saved.get('messages') and len(turns) == 1:
+        restored_candidate = _restored_compaction_candidate(request, saved, live_messages, turns[0])
     if (snapshot.get('history_truncated') or not sent_message(request, snapshot) or len(turns) != 1
-            or live_messages != saved.get('messages')
+            or (live_messages != saved.get('messages') and restored_candidate is None)
             or turns[0].get('state') not in ('completed', 'failed')
             or {t['id'] for t in snapshot.get('turns', []) if t.get('state') != 'recovered'} - set(request['baseline']['turn_ids']) != {request.get('turn_id')}
             or turns[0].get('providerTurnId') != request.get('provider_turn_id')
@@ -348,6 +636,39 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
             native = {'unknown': str(exc)[:500]}
         if native and native.get('next_human_uuid'):
             native = {**native, 'unknown': 'A later native human packet follows this owned request; reconcile it first'}
+    restored_observation = None
+    prior_record = _owned_outcome_record(directory, request)
+    # The authenticated release names this request's own retained restoration obligation even when
+    # its selected current outcome pointer is missing, malformed, foreign, names other evidence, or
+    # the live rows no longer differ from the saved receipt. Enforce it here, in the shared
+    # observation path before any outcome, state or pointer write, so lost or foreign selected
+    # current proof fails closed instead of minting an unannotated replacement outcome. The release
+    # only detects the obligation; it never substitutes for missing, malformed or foreign selected
+    # evidence. A legitimate pre-restoration record still supplies the prior evidence for the
+    # explicit-audit-only authorization below, and an unrelated outcome keeps its existing path.
+    retained_record = _retained_restored_compaction_record(directory, request)
+    if isinstance(retained_record, dict):
+        prior_record = retained_record
+    restoration_retained = isinstance(retained_record, dict)
+    if live_messages != saved.get('messages') or restoration_retained:
+        # The narrow restoration contract positively requires known complete history. The ordinary
+        # legacy path below keeps its existing truthy check for unrelated outcomes.
+        if snapshot.get('history_truncated') is not False:
+            raise RoomError('Restored compaction-error evidence requires positively complete native history')
+    if live_messages != saved.get('messages'):
+        if restoration_retained:
+            restored_observation = _verified_restored_observation(directory, request, prior_record, saved,
+                                                                  live_messages, native=native,
+                                                                  require_fresh_native=True)
+            if restored_observation is None:
+                raise RoomError('The retained restored compaction-error observation no longer matches the exact AO evidence; re-audit before continuing')
+        elif restored_compaction:
+            restored_observation = _authorize_restored_compaction(directory, request, saved, live_messages,
+                                                                  restored_candidate, observed, native, prior_record)
+        else:
+            raise RoomError('Cannot attribute semantic outcome to an unchanged completed native result')
+    elif restoration_retained:
+        raise RoomError('The retained restored compaction-error observation no longer matches the exact AO evidence; re-audit before continuing')
     extra_turns = turn_ids(snapshot) - set(request['baseline']['turn_ids']) - {request['turn_id']}
     if state['workflow'] == 'fable_engineering':
         proven_imports = _unowned_context_turns(state, {
@@ -365,6 +686,8 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
              'ao_terminal': turns[0], 'session_failures': observed['sessionFailures'], 'provider_failures': activities,
              'native': native, 'outcome': classify(observed, native,
                 require_structured=state['workflow'] == 'fable_engineering' or request['role'] == 'reviewer')}
+    if restored_observation is not None:
+        value['restored_compaction_observation'] = restored_observation
     # W3: this request's own frozen worker expectation is a separate proof. The reviewed W2 consumer
     # runs before any legacy absent-field path, a worker identity gap is recorded as its own
     # structured evidence, and only qualified final availability is withheld: the parent native
@@ -553,24 +876,32 @@ def _require_compaction_mitigation(service, directory, state, request, release, 
         raise RoomError('Compaction-thrashing continuation requires the reviewed read-admission routing guard; the effective guard does not match the settled mitigation')
 
 
-def _fresh_failed_turn_evidence(directory, request, snapshot):
+def _fresh_failed_turn_evidence(directory, request, snapshot, record):
     """Read-only reconstruction of the exact current AO evidence a fresh audit uses.
 
     A changed current receipt, provider turn, activity or session-failure record
     must refuse an unused compaction refresh before it can carry a stale proof
-    forward. This never writes an outcome, saves state or dispatches a model.
+    forward. When the retained record carries an authorized restored-compaction
+    observation, the current rows must still be exactly the ones that record
+    observed; this function verifies that authority and never creates one. It
+    never writes an outcome, saves state or dispatches a model.
     """
     from ao_project_room import sent_message
     saved = receipt(directory, request)
     turns = [t for t in snapshot.get('turns', []) if t.get('id') == request.get('turn_id')]
     messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == request.get('turn_id')]
     baseline = request.get('baseline') or {}
-    if (snapshot.get('history_truncated') or not sent_message(request, snapshot) or len(turns) != 1
-            or not isinstance(turns[0], dict) or messages != saved.get('messages')
+    if (snapshot.get('history_truncated') is not False or not sent_message(request, snapshot) or len(turns) != 1
+            or not isinstance(turns[0], dict)
             or turns[0].get('state') != 'failed'
             or turns[0].get('providerTurnId') != request.get('provider_turn_id')
             or snapshot.get('conversationId') != baseline.get('conversation_id')
             or snapshot.get('activeBranchId') != baseline.get('branch_id')):
+        raise RoomError('Unused compaction continuation AO evidence changed; re-audit before continuing')
+    if isinstance(record, dict) and record.get('restored_compaction_observation') is not None:
+        if _verified_restored_observation(directory, request, record, saved, messages) is None:
+            raise RoomError('Unused compaction continuation AO evidence changed; re-audit before continuing')
+    elif messages != saved.get('messages'):
         raise RoomError('Unused compaction continuation AO evidence changed; re-audit before continuing')
     return {**saved, 'turn': turns[0], 'sessionFailures': snapshot.get('sessionFailures', []),
             'provider_failures': activity_failures(snapshot, request['turn_id'])}
@@ -618,7 +949,7 @@ def verify_unused_compaction_source(directory, state, request, snapshot):
             or current.get('source_sha256') != native['source_sha256']
             or current.get('compaction_failure') != native['compaction_failure']):
         raise RoomError('Unused compaction continuation source changed; re-audit before continuing')
-    observed = _fresh_failed_turn_evidence(directory, request, snapshot)
+    observed = _fresh_failed_turn_evidence(directory, request, snapshot, record)
     fresh = {**record, 'ao_terminal': observed['turn'], 'session_failures': observed['sessionFailures'],
              'provider_failures': observed['provider_failures'], 'native': current,
              'outcome': classify(observed, current, require_structured=(
@@ -675,7 +1006,7 @@ def audit(service, directory, state, role='engineer', ao_database_path=None, nat
         state[source_keys(role)[0]] = source
     snapshot = service.identity(service.client(state), state, request)
     value = observe(service, directory, state, request, snapshot, allow_unknown_clear=True,
-                    source_verification=source_verification)
+                    source_verification=source_verification, restored_compaction=True)
     diagnosed = native_failure_kind(value)
     completed_compaction = request['state'] == 'completed' and diagnosed == 'compaction_thrashing'
     settlement = diagnosed if request['state'] != 'completed' else None
