@@ -38,7 +38,7 @@ Report each fact separately and keep the underlying receipts private.
 
 ## Stable-release check
 
-For diagnosed provider limits, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/guides/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
+For diagnosed provider limits, a settled served-model mismatch, missing/truncated output, compact engineering reports, or a new operating instruction that must wait while a room is paused, use [efficient continuation](../../../docs/guides/efficient-continuation.md). Shared semantic holds are separate from AO transport state. The guide also documents the explicit, hash-pinned workaround for the affected AO 0.13 Claude bridge; do not carry local vendor changes blindly across releases.
 
 At the start of each new or resumed AO work session, call `ao_release_check` once
 before the first new model dispatch. It compares the running macOS bundled daemon
@@ -300,6 +300,19 @@ replaced. See
 [configured engineering model selection and transition](../../../docs/guides/engineering-model-transition.md)
 for the qualification artifact, eligibility, the write-ahead/reconciliation
 contract, abandonment, the conditional PATCH and the full operator sequence.
+
+A qualified family request whose retained native rows all `end_turn` without
+unsettled errors but report other members of the same qualified family settles
+as `model_mismatch`, not `unknown`: AO's resolver can map a bare family alias to
+an older member, so the completed result is retained and held but never counts
+as qualified success. Recover it in order: record the continuation with
+`ao_room_outcome_resume`, pin the exact identifier with
+`ao_room_engineer_model_transition`, then send the reserved successor through
+ordinary `ao_room_send`; the reserved successor is admitted only after that
+transition commits the exact expected identifier, and any other send still
+fails the hold. A contradiction with an unsettled error, a stop row other than
+`tool_use`/`end_turn` or a served model outside the qualified family stays
+`unknown` and cannot be resumed.
 
 ## Recovery of a reviewer that has never been used
 

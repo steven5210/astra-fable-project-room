@@ -326,12 +326,16 @@ class QualificationMismatchTests(QualificationFixture):
                           'source_sha256': native['source_sha256']})
         self.assertEqual(native['source'], self.source)
         self.assertEqual(native['source_sha256'], ao.digest(self.transcript.read_bytes()))
-        self.assertIn('contradicts the qualified expected model', native['unknown'])
-        self.assertEqual(outcome['outcome']['kind'], 'unknown')
+        # Complete end_turn evidence with no errors settles the contradiction as model_mismatch:
+        # the result stays held and retained, never silently resolved or fallen back from.
+        self.assertEqual(native['model_mismatch'],
+                         {**native['model_contradiction'], 'source_sha256': native['source_sha256']})
+        self.assertNotIn('unknown', native)
+        self.assertEqual(outcome['outcome']['kind'], 'model_mismatch')
         self.assertEqual(em.current(self.directory(), self.state())['expected_model'], OPUS)
         self.assertIsNone(self.resolutions())
         before = files_under(self.directory())
-        with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: unknown'):
+        with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: model_mismatch'):
             self.send('correction', 'fix-1')
         self.assertNotIn('fix-1', self.state()['requests'])
         after = files_under(self.directory())
@@ -345,7 +349,8 @@ class QualificationMismatchTests(QualificationFixture):
         self.assertEqual(native['observed_models'], [OPUS, 'claude-opus-5-6'])
         self.assertEqual(native['stop_row_ids'], ['spec_review-reply-0', 'spec_review-reply-1'])
         self.assertEqual(native['model_contradiction']['observed_models'], [OPUS, 'claude-opus-5-6'])
-        self.assertEqual(self.outcome('spec_review')['outcome']['kind'], 'unknown')
+        self.assertEqual(native['model_mismatch']['observed_models'], [OPUS, 'claude-opus-5-6'])
+        self.assertEqual(self.outcome('spec_review')['outcome']['kind'], 'model_mismatch')
 
 
 class QualificationPinTests(QualificationFixture):

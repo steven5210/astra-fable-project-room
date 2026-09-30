@@ -330,6 +330,7 @@ def events_outcome(events, request, session_id, workspace=None):
         result['expected_model'] = expected
         result['qualification_sha256'] = qualification_sha256
         result['stop_row_ids'] = sorted(row['uuid'] for row in stop_rows)
+        result['stop_row_reasons'] = sorted(set(row['stop_reason'] for row in stop_rows))
         if sorted(observed) and sorted(observed) != [expected]:
             # A qualified family must observe exactly its pre-inference expected model. The
             # contradiction retains every attributable actual identity; it never falls back, and a
@@ -721,12 +722,30 @@ def inspect(directory, state, request, source, snapshot):
     result = {**result, 'source': source, 'source_sha256': digest(raw),
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
     if result.get('model_contradiction') is not None:
-        # The existing unknown/hold path applies, with the observed identities, the expected
-        # qualification digest and the exact source digest retained.
-        result = {**result, 'model_contradiction': {**result['model_contradiction'],
-                                                   'source_sha256': result['source_sha256']},
-                  'unknown': 'Native response model contradicts the qualified expected model for this '
-                                        'family; the observed identities and their source evidence are retained'}
+        # The observed identities, the expected qualification digest and the exact source digest are
+        # always retained. With otherwise complete evidence — no unsettled errors, the owned turn
+        # ended at end_turn, every attributable stop row is tool_use or end_turn (a hidden earlier
+        # refusal or any other stop settles nothing), and every observed identity is an exact
+        # identifier of the expected model's family — the contradiction is a settled diagnosed
+        # model_mismatch rather than unknown. Anything else keeps the existing unknown/hold path.
+        contradiction = {**result['model_contradiction'], 'source_sha256': result['source_sha256']}
+        expected = contradiction['expected_model']
+        match = re.fullmatch(r'claude-([a-z]+)(?:-[0-9]+)+', expected) if isinstance(expected, str) else None
+        observed = contradiction['observed_models']
+        import ao_engineering_model
+        complete = (match is not None and result['errors'] == []
+                    and result['stop_reasons'] == ['end_turn']
+                    and all(reason in ('tool_use', 'end_turn') for reason in result['stop_row_reasons'])
+                    and bool(observed)
+                    and all(ao_engineering_model.family_member(match.group(1), model)
+                            for model in observed))
+        if complete:
+            result = {**result, 'model_contradiction': contradiction,
+                      'model_mismatch': dict(contradiction)}
+        else:
+            result = {**result, 'model_contradiction': contradiction,
+                      'unknown': 'Native response model contradicts the qualified expected model for this '
+                                            'family; the observed identities and their source evidence are retained'}
     if (role == 'engineer' and state.get('workflow') == 'fable_engineering'
             and snapshot.get('sessionId') == source['session_id'] == request['session_id']):
         notifications = task_notification_imports(events, source['native_session_id'], snapshot, workspace)
