@@ -330,6 +330,7 @@ def events_outcome(events, request, session_id, workspace=None):
         result['expected_model'] = expected
         result['qualification_sha256'] = qualification_sha256
         result['stop_row_ids'] = sorted(row['uuid'] for row in stop_rows)
+        result['stop_row_reasons'] = sorted(set(row['stop_reason'] for row in stop_rows))
         if sorted(observed) and sorted(observed) != [expected]:
             # A qualified family must observe exactly its pre-inference expected model. The
             # contradiction retains every attributable actual identity; it never falls back, and a
@@ -722,8 +723,9 @@ def inspect(directory, state, request, source, snapshot):
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
     if result.get('model_contradiction') is not None:
         # The observed identities, the expected qualification digest and the exact source digest are
-        # always retained. With otherwise complete evidence — the owned turn ended, no unsettled
-        # errors, every attributable stop is end_turn, and every observed identity is an exact
+        # always retained. With otherwise complete evidence — no unsettled errors, the owned turn
+        # ended at end_turn, every attributable stop row is tool_use or end_turn (a hidden earlier
+        # refusal or any other stop settles nothing), and every observed identity is an exact
         # identifier of the expected model's family — the contradiction is a settled diagnosed
         # model_mismatch rather than unknown. Anything else keeps the existing unknown/hold path.
         contradiction = {**result['model_contradiction'], 'source_sha256': result['source_sha256']}
@@ -731,8 +733,9 @@ def inspect(directory, state, request, source, snapshot):
         match = re.fullmatch(r'claude-([a-z]+)(?:-[0-9]+)+', expected) if isinstance(expected, str) else None
         observed = contradiction['observed_models']
         import ao_engineering_model
-        complete = (match is not None and result['errors'] == [] and bool(result['stop_reasons'])
-                    and all(stop == 'end_turn' for stop in result['stop_reasons'])
+        complete = (match is not None and result['errors'] == []
+                    and result['stop_reasons'] == ['end_turn']
+                    and all(reason in ('tool_use', 'end_turn') for reason in result['stop_row_reasons'])
                     and bool(observed)
                     and all(ao_engineering_model.family_member(match.group(1), model)
                             for model in observed))

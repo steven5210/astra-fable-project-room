@@ -94,6 +94,11 @@ def classify(receipt, native=None, require_structured=True):
         return {'kind': 'unknown', 'hold': True,
                 'reason': 'Qualified native identity was not observed on the owned turn; missing evidence is not '
                           'qualified success'}
+    if 'max_tokens' in stops:
+        return {'kind': 'output_truncated', 'hold': True, 'reason': 'Native output was truncated; inspect partial work before continuation'}
+    finals = [m for m in messages if m.get('role') == 'assistant' and not m.get('streaming') and m.get('text', '').strip()]
+    if not finals:
+        return {'kind': 'unknown', 'hold': True, 'reason': 'Native result has no final response; absence is not successful completion or a quota diagnosis'}
     mismatch = native.get('model_mismatch') if native else None
     if isinstance(mismatch, dict):
         observed = mismatch.get('observed_models')
@@ -105,11 +110,6 @@ def classify(receipt, native=None, require_structured=True):
                           + '; the completed result is retained and cannot become qualified success. Record the '
                             'continuation with ao_room_outcome_resume, pin the exact identifier with '
                             'ao_room_engineer_model_transition, then send the reserved successor.'}
-    if 'max_tokens' in stops:
-        return {'kind': 'output_truncated', 'hold': True, 'reason': 'Native output was truncated; inspect partial work before continuation'}
-    finals = [m for m in messages if m.get('role') == 'assistant' and not m.get('streaming') and m.get('text', '').strip()]
-    if not finals:
-        return {'kind': 'unknown', 'hold': True, 'reason': 'Native result has no final response; absence is not successful completion or a quota diagnosis'}
     from ao_response_normalization import strict_object, ResponseFormatError
     try:
         strict_object(finals[-1]['text'])
@@ -985,6 +985,17 @@ def gate(service, directory, state, role, new_request_id, snapshot):
         if diagnosed and request.get('state') == 'completed':
             raise RoomError('AO-completed autocompact-thrashing evidence is not eligible for recovery; only an exact failed AO transport turn can settle this native failure')
         _require_compaction_mitigation(service, directory, state, request, release, diagnosed)
+        if value['outcome']['kind'] == 'model_mismatch':
+            # The reserved successor repeats the contradiction under the same family alias unless the
+            # audited transition has already committed the exact expected identifier.
+            import ao_engineering_model
+            mismatch = (value.get('native') or {}).get('model_mismatch') or {}
+            expected = mismatch.get('expected_model')
+            selector = (ao_engineering_model.current(directory, state) or {}).get('selector') or {}
+            if (not isinstance(expected, str) or selector.get('kind') != 'exact'
+                    or selector.get('model') != expected):
+                raise RoomError('model_mismatch continuation requires a committed transition to the '
+                                'exact expected identifier before the reserved successor is sent')
         return
     raise RoomError('Native semantic hold: ' + value['outcome']['kind'] + '. Inspect ao_room_outcome_audit; no automatic retry or replay.')
 

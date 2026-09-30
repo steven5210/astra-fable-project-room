@@ -10,6 +10,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import ao_engineering_model as em
 import ao_engineering_transition as et
 import ao_model_qualification as qmod
 import ao_project_room as ao
@@ -92,6 +93,39 @@ class ModelMismatchLaneTests(QualificationFixture):
         self.assertEqual(outcome['outcome']['kind'], 'unknown')
         self.assertNotIn('model_mismatch', outcome['native'])
 
+    def test_an_earlier_refusal_stop_row_is_not_hidden_by_the_later_end_turn(self):
+        self.qualified_room('served-opus-hidden-refusal')
+        self.send('spec_review')
+        self.native_turn('spec_review', OLDER_OPUS, OLDER_OPUS)
+        # The first served row refused; the later end_turn resets the condensed stop map, so
+        # completeness is judged from every attributable stop row, not the condensed map alone.
+        self.events[1]['message']['stop_reason'] = 'refusal'
+        self.write_native()
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+        outcome = self.outcome('spec_review')
+        self.assertEqual(outcome['native']['stop_row_reasons'], ['end_turn', 'refusal'])
+        self.assertEqual(outcome['outcome']['kind'], 'unknown')
+        self.assertNotIn('model_mismatch', outcome['native'])
+
+    def test_tool_use_stop_rows_do_not_block_the_settled_mismatch(self):
+        self.qualified_room('served-opus-tools')
+        self.turn('spec_review', 'spec_review', self.verdict(), OLDER_OPUS, OLDER_OPUS, OLDER_OPUS)
+        outcome = self.outcome('spec_review')
+        self.assertEqual(outcome['native']['stop_row_reasons'], ['end_turn', 'tool_use'])
+        self.assertEqual(outcome['outcome']['kind'], 'model_mismatch')
+
+    def test_no_final_response_stays_unknown_and_cannot_be_resumed(self):
+        self.qualified_room('served-opus-nofinal')
+        self.send('spec_review')
+        self.native_turn('spec_review', OLDER_OPUS)
+        self.fake.finish('engineer', '')
+        self.service.ao_room_sync(self.room)
+        outcome = self.outcome('spec_review')
+        self.assertEqual(outcome['outcome']['kind'], 'unknown')
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.assertFalse(audit['resume_eligible'])
+
     def test_resume_records_the_continuation_and_a_different_successor_is_refused(self):
         self.qualified_room('served-opus-resume')
         self.turn('spec_review', 'spec_review', self.verdict(), OLDER_OPUS)
@@ -110,6 +144,37 @@ class ModelMismatchLaneTests(QualificationFixture):
             self.service.ao_room_outcome_resume(
                 self.room, 'spec_review', audit['outcome_sha256'], 'resume-2',
                 'same diagnosis', 'The user authorized this continuation')
+
+    def test_successor_is_refused_until_the_exact_identifier_is_committed(self):
+        self.qualified_room('served-opus-gate')
+        self.turn('spec_review', 'spec_review', self.verdict(), OLDER_OPUS)
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.service.ao_room_outcome_resume(
+            self.room, 'spec_review', audit['outcome_sha256'], 'resume-1',
+            'AO resolved the bare opus alias to claude-opus-5; pin claude-opus-5-5',
+            'The user authorized this continuation')
+        with self.assertRaisesRegex(ao.RoomError, 'committed transition to the exact expected '
+                                                'identifier'):
+            self.send('spec_review', 'resume-1')
+        self.assertNotIn('resume-1', self.state()['requests'])
+
+    def test_a_different_exact_identifier_does_not_satisfy_the_gate(self):
+        self.qualified_room('served-opus-wrong-target')
+        self.turn('spec_review', 'spec_review', self.verdict(), OLDER_OPUS)
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.service.ao_room_outcome_resume(
+            self.room, 'spec_review', audit['outcome_sha256'], 'resume-1',
+            'AO resolved the bare opus alias to claude-opus-5; pin claude-opus-5-5',
+            'The user authorized this continuation')
+        # Simulate the epoch after a transition that committed the observed member rather than the
+        # qualified expected identifier; the gate reads only the current epoch selector.
+        epoch = em.current(self.directory(), self.state())
+        with patch.object(em, 'current', return_value={**epoch, 'selector': {'kind': 'exact',
+                                                                             'model': OLDER_OPUS}}):
+            with self.assertRaisesRegex(ao.RoomError, 'committed transition to the exact expected '
+                                                    'identifier'):
+                self.send('spec_review', 'resume-1')
+        self.assertNotIn('resume-1', self.state()['requests'])
 
     def test_exact_identifier_transition_releases_the_reserved_successor(self):
         self.qualified_room('served-opus-recovery')
