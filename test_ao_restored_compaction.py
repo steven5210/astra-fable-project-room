@@ -726,6 +726,42 @@ class RestoredCompactionTests(CompactionServiceFixture):
                                                   purpose='correction')
         raise AssertionError('Unexpected compound operation')
 
+    def uncertain_compound_state(self, variant, live_state):
+        """``compound_state`` with only the saved request status tag externally changed.
+
+        ``compound_state`` leaves an authenticated outcome-resume release naming the intact retained
+        restored-compaction outcome record, a missing or malformed selected current pointer, reverted
+        live rows and a failed or completed live turn. Flipping only the mutable ``state`` tag to
+        ``uncertain`` must not erase that release obligation: the release pointer stays intact, the
+        saved receipt still establishes the exact failed owned turn, and every other retained byte is
+        untouched.
+        """
+        state = self.compound_state(variant, live_state)
+        f = self.fixture
+        saved_state = f.state()
+        request = saved_state['requests'][self.request_id]
+        self.assertEqual(request['state'], 'settled_failure')
+        pointer = request.get('outcome_resume')
+        self.assertTrue(pointer)
+        request['state'] = 'uncertain'
+        ao.atomic(f.directory() / 'state.json', saved_state)
+        current = self.request()
+        self.assertEqual(current['state'], 'uncertain')
+        self.assertEqual(current.get('outcome_resume'), pointer)
+        if variant == 'missing':
+            self.assertNotIn('semantic_outcome', current)
+            self.assertNotIn('semantic_outcome_sha256', current)
+        else:
+            self.assertEqual(current.get('semantic_outcome'),
+                             'outcomes/foreign-request/'
+                             + state['pointer']['semantic_outcome_sha256'] + '.json')
+        self.assertEqual(outcomes.receipt(f.directory(), current)['turn']['state'], 'failed')
+        release = ao.read(f.directory() / pointer)
+        self.assertEqual(release, state['release'])
+        self.assertIn('restored_compaction_observation', ao.read(
+            f.directory() / ('outcomes/' + self.request_id + '/' + release['outcome_sha256'] + '.json')))
+        return state
+
     def assert_refuses_before_any_write(self, operation):
         """One entrypoint refuses with every room file byte-identical, no native change and no POST."""
         f = self.fixture
@@ -789,6 +825,29 @@ class RestoredCompactionTests(CompactionServiceFixture):
                         helper.fixture.room, 'engineer', 'Continue.', 'resume', purpose='correction'))
                     helper.assert_retained_observation_intact(state['pointer']['semantic_outcome'])
                     helper.doCleanups()
+
+    def test_uncertain_status_tag_cannot_erase_the_authenticated_release_obligation(self):
+        """An externally changed status tag must not hide the release's retained-restoration obligation.
+
+        With missing or malformed selected pointers, reverted live rows and failed or completed live
+        turns the public audit, resume, gate and send already refuse while the release-named status
+        tag says ``settled_failure``. Changing only that saved tag to ``uncertain`` must not let the
+        missing-pointer public audit mint an unannotated eligible outcome and must not let its real
+        returned digest start the renewal -> gate -> send chain with one POST. Each independent
+        entrypoint starts from its own fresh fixture and refuses before any outcome, pointer, state or
+        POST write; every retained byte, including the retained observation at its real selected path,
+        stays unchanged. No fixture, digest or release is fabricated here.
+        """
+        for live_state in ('failed', 'completed'):
+            for variant in ('missing', 'malformed'):
+                for operation in ('public_audit', 'public_resume', 'gate', 'public_send'):
+                    with self.subTest(live_state=live_state, variant=variant, operation=operation):
+                        helper = self.fresh_compound_fixture()
+                        state = helper.uncertain_compound_state(variant, live_state)
+                        helper.assert_refuses_before_any_write(
+                            helper.compound_operation(operation, state['audit']))
+                        helper.assert_retained_observation_intact(state['pointer']['semantic_outcome'])
+                        helper.doCleanups()
 
     def test_explicit_audit_requires_positive_complete_history_at_internal_boundary(self):
         """Narrow boundary check for the restoration lane.

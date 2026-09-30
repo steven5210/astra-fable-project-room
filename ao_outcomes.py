@@ -439,25 +439,31 @@ def _retained_restored_compaction_record(directory, request):
     """The selected current outcome record that retains this request's restored-compaction observation.
 
     Read-only. Only the request's own selected current outcome pointer is returned, and only when its
-    record is coherent, valid and non-foreign and itself retains the observation. The authenticated
-    release-named settlement record is read only to detect that a settled failed turn carries this
-    restoration obligation; it never replaces missing, malformed, foreign or lost selected evidence.
-    A detected obligation whose selected current outcome is unusable, or names other evidence, fails
-    closed here. A request with no restoration obligation returns None and keeps its own strict
-    comparison.
+    record is coherent, valid and non-foreign and itself retains the observation. Whenever the request
+    carries an authenticated outcome-resume release, that release's own named record is read only to
+    detect the restoration obligation: the authenticated release, never the mutable request status
+    tag, is the authority that establishes it, so an externally changed ``state`` cannot erase the
+    obligation. Detecting it never replaces missing, malformed, foreign or lost selected evidence. A
+    detected obligation whose selected current outcome is unusable, or names other evidence, fails
+    closed here. A request without a release, or whose release names no retained restoration, returns
+    None and keeps its own strict comparison.
     """
     record = _owned_outcome_record(directory, request)
     if isinstance(record, dict) and 'restored_compaction_observation' in record:
         return record
     obligation = False
-    if isinstance(request, dict) and request.get('state') == 'settled_failure':
+    # The authenticated release pointer, not the mutable request status tag, is the authority: a
+    # release that still names a retained restored-compaction record keeps proving the obligation
+    # even after ``state`` is externally changed, so the release is consulted whenever it exists.
+    if isinstance(request, dict) and request.get('outcome_resume'):
         release = release_record(directory, {'room_id': directory.name}, request)
         if isinstance(release, dict) and isinstance(release.get('outcome_sha256'), str):
             retained = _outcome_record_by_sha(directory, request, release['outcome_sha256'])
             obligation = isinstance(retained, dict) and 'restored_compaction_observation' in retained
     if obligation:
-        # The release proves this consumed turn was settled under a retained restored-compaction
-        # observation, so the selected current outcome must itself be exactly that evidence.
+        # The authenticated release proves this consumed turn was settled under a retained
+        # restored-compaction observation, independently of the saved status tag, so the selected
+        # current outcome must itself be exactly that evidence.
         raise RoomError('The retained restored compaction-error observation no longer matches the exact AO evidence; re-audit before continuing')
     return None
 
