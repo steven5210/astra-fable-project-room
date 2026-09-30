@@ -825,9 +825,15 @@ def _native_history(directory, state, binding, snapshot):
         live_turn = next((item for item in turns if item.get('id') == turn_id), None)
         if live_turn is None or _turn_projection(live_turn) != _turn_projection(turn):
             raise RoomError('The observed native turn differs from the immutable receipt for this owned request')
-        if (_message_projection_set([item for item in messages if item.get('turnId') == turn_id])
-                != _message_projection_set([item for item in (receipt.get('messages') or [])
-                                            if item.get('turnId') == turn_id])):
+        live_rows = [item for item in messages if item.get('turnId') == turn_id]
+        receipt_rows = [item for item in (receipt.get('messages') or []) if item.get('turnId') == turn_id]
+        # A retained restored-compaction observation is authoritative regardless of whether the
+        # current rows still differ from the receipt: a removed or reverted extra row is a stale
+        # proof, never a genuine no-restoration. The helper returns None only when this request
+        # genuinely retains no observation, in which case the ordinary exact comparison applies.
+        from ao_outcomes import _verified_restored_compaction_rows
+        observation = _verified_restored_compaction_rows(directory, request, receipt, live_rows)
+        if observation is None and _message_projection_set(live_rows) != _message_projection_set(receipt_rows):
             raise RoomError('Observed native messages differ from the immutable receipt for this owned request')
     if set(owned) - set(ids):
         raise RoomError('Owned native turns are missing from the observed history')
