@@ -27,17 +27,23 @@ class AcceptanceContinuationFixture(Fixture):
     last_review_decision = 'rejected'
     spec_review_count = 1
     prior_review_default_purpose = False
+    TEMPLATE_SETUP = True
+    TEMPLATE_ATTRS = Fixture.TEMPLATE_ATTRS + ('room', 'review_repo', 'message')
 
-    def setUp(self):
-        super().setUp()
-        original_request = self.fake.request
+    def _install_complete_history(self):
+        """Bind the closed-over request closure to the CURRENT fake; a deepcopy cannot carry it."""
+        original = type(self.fake).request.__get__(self.fake, type(self.fake))
 
         def complete_history(method, path, payload=None):
             if method == 'GET' and '/conversation?' in path:
                 return {**self.fake.conversation(path.split('/')[2]), 'hasMoreBefore': False}
-            return original_request(method, path, payload)
+            return original(method, path, payload)
 
         self.fake.request = complete_history
+
+    def build_template(self):
+        super().build_template()
+        self._install_complete_history()
         for session in self.fake.sessions.values():
             session['isTerminated'] = False
         for snapshot in self.fake.snapshots.values():
@@ -61,6 +67,10 @@ class AcceptanceContinuationFixture(Fixture):
                 self.send('acceptance_review', key)
             self.finish_review(key, self.last_review_decision if number == self.review_count else 'rejected')
         self.message = 'Perform the exact authorized purpose.'
+
+    def after_restore(self):
+        super().after_restore()
+        self._install_complete_history()
 
     def register_native_source(self):
         """Register the truthful two-role SQL owner before the inherited bind sends any request.

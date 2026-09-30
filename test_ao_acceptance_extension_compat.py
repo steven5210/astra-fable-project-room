@@ -57,6 +57,10 @@ class DelegateAcceptanceContinuationFixture(AcceptanceContinuationFixture, Deleg
     implement() sends that report and syncs it.
     """
 
+    TEMPLATE_ATTRS = AcceptanceContinuationFixture.TEMPLATE_ATTRS + (
+        'claude_config', 'fake_cli', 'ledger', 'delegate_model', 'delegate_profile',
+        'delegate_content', 'delegate_job_id')
+
     def open(self, feature='normal', provider='none'):
         return super().open(feature, 'deepseek')
 
@@ -635,8 +639,18 @@ class ExecutableRepairClaudeFixture(Fixture):
     (test_ao_executable_binding.py:16-23) -- not its TestCase, so its own tests are not re-collected here.
     """
 
+    TEMPLATE_ATTRS = Fixture.TEMPLATE_ATTRS + ('original_claude',)
+
     def setUp(self):
         super().setUp()
+        if not self.TEMPLATE_SETUP:
+            self._executable_setup()
+
+    def build_template(self):
+        super().build_template()
+        self._executable_setup()
+
+    def _executable_setup(self):
         self.original_claude = self.root / 'original-claude'
         self.original_claude.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.original_claude.chmod(0o700)
@@ -666,6 +680,8 @@ class ExecutableRepairUnusedGrantFixture(AcceptanceContinuationFixture, Executab
     ao_executable_binding._inspect's own read_owner check (ao_executable_binding.py:186-189) passes without
     any additional setup.
     """
+
+    TEMPLATE_ATTRS = AcceptanceContinuationFixture.TEMPLATE_ATTRS + ('original_claude',)
 
     def setUp(self):
         super().setUp()
@@ -731,8 +747,18 @@ class HistoricalRoutingFixture(Fixture):
     above.
     """
 
+    TEMPLATE_ATTRS = Fixture.TEMPLATE_ATTRS + ('native_cli',)
+
     def setUp(self):
         super().setUp()
+        if not self.TEMPLATE_SETUP:
+            self._routing_setup()
+
+    def build_template(self):
+        super().build_template()
+        self._routing_setup()
+
+    def _routing_setup(self):
         self.native_cli = self.root / 'native-claude-version'
         self.native_cli.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.native_cli.chmod(0o700)
@@ -768,6 +794,8 @@ class RoutingRefreshUnusedGrantFixture(AcceptanceContinuationFixture, Historical
     refresh()'s database_path/native_session_id: ao_routing_refresh._inspect's own owner check
     (ao_routing_refresh.py:293-297) passes against the unchanged engineer row.
     """
+
+    TEMPLATE_ATTRS = AcceptanceContinuationFixture.TEMPLATE_ATTRS + ('native_cli',)
 
     def setUp(self):
         super().setUp()
