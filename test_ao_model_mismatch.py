@@ -153,12 +153,11 @@ class ModelMismatchLaneTests(QualificationFixture):
             self.room, 'spec_review', audit['outcome_sha256'], 'resume-1',
             'AO resolved the bare opus alias to claude-opus-5; pin claude-opus-5-5',
             'The user authorized this continuation')
-        with self.assertRaisesRegex(ao.RoomError, 'committed transition to the exact expected '
-                                                'identifier'):
+        with self.assertRaisesRegex(ao.RoomError, 'committed transition to an exact identifier'):
             self.send('spec_review', 'resume-1')
         self.assertNotIn('resume-1', self.state()['requests'])
 
-    def test_a_different_exact_identifier_does_not_satisfy_the_gate(self):
+    def test_any_exact_identifier_selector_admits_the_successor(self):
         self.qualified_room('served-opus-wrong-target')
         self.turn('spec_review', 'spec_review', self.verdict(), OLDER_OPUS)
         audit = self.service.ao_room_outcome_audit(self.room)
@@ -166,15 +165,18 @@ class ModelMismatchLaneTests(QualificationFixture):
             self.room, 'spec_review', audit['outcome_sha256'], 'resume-1',
             'AO resolved the bare opus alias to claude-opus-5; pin claude-opus-5-5',
             'The user authorized this continuation')
-        # Simulate the epoch after a transition that committed the observed member rather than the
-        # qualified expected identifier; the gate reads only the current epoch selector.
+        # The gate reads only the current epoch selector: any exact identifier admits the successor
+        # (an alias could be mis-resolved again; an exact identifier cannot), a family alias refuses.
         epoch = em.current(self.directory(), self.state())
-        with patch.object(em, 'current', return_value={**epoch, 'selector': {'kind': 'exact',
-                                                                             'model': OLDER_OPUS}}):
-            with self.assertRaisesRegex(ao.RoomError, 'committed transition to the exact expected '
-                                                    'identifier'):
+        with patch.object(em, 'current', return_value={**epoch, 'selector': {'kind': 'family',
+                                                                             'family': 'fable'}}):
+            with self.assertRaisesRegex(ao.RoomError, 'committed transition to an exact identifier'):
                 self.send('spec_review', 'resume-1')
         self.assertNotIn('resume-1', self.state()['requests'])
+        with patch.object(em, 'current', return_value={**epoch, 'selector': {'kind': 'exact',
+                                                                             'model': 'claude-fable-5-1'}}):
+            self.send('spec_review', 'resume-1')
+        self.assertIn('resume-1', self.state()['requests'])
 
     def test_exact_identifier_transition_releases_the_reserved_successor(self):
         self.qualified_room('served-opus-recovery')

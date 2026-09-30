@@ -312,11 +312,13 @@ unsettled errors but report other members of the same qualified family settles
 as `model_mismatch`, not `unknown`: AO's resolver can map a bare family alias to
 an older member, so the completed result is retained and held but never counts
 as qualified success. Recover it in order: record the continuation with
-`ao_room_outcome_resume`, pin the exact identifier with
-`ao_room_engineer_model_transition`, then send the reserved successor through
-ordinary `ao_room_send`; the reserved successor is admitted only after that
-transition commits the exact expected identifier, and any other send still
-fails the hold. A contradiction with an unsettled error, a stop row other than
+`ao_room_outcome_resume`, pin an exact identifier with
+`ao_room_engineer_model_transition` (the qualified expected model, or another
+qualified exact identifier such as the room's earlier engineering model; never a
+family alias, which AO may resolve to another member again), then send the
+reserved successor through ordinary `ao_room_send`; the reserved successor is
+admitted only after that transition commits an exact identifier, and any other
+send still fails the hold. A contradiction with an unsettled error, a stop row other than
 `tool_use`/`end_turn` or a served model outside the qualified family stays
 `unknown` and cannot be resumed.
 
