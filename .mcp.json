@@ -5,7 +5,8 @@
       "args": [
         "./project_room_mcp.py"
       ],
-      "cwd": "."
+      "cwd": ".",
+      "tool_timeout_sec": 1860
     }
   }
 }
