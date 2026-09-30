@@ -230,11 +230,12 @@ class ModelMismatchLaneTests(QualificationFixture):
     def test_exact_identifier_transition_releases_the_reserved_successor(self):
         self.recover_through(OPUS, 'served-opus-recovery')
 
-    def test_returning_to_the_earlier_exact_engineering_model_releases_the_reserved_successor(self):
-        # The operator may pin a different qualified exact identifier (here the room's original
-        # Fable model) instead of the mismatched family's expected member; the successor then
-        # completes under that identifier and audits as final.
-        done = self.recover_through(FABLE, 'served-opus-back-to-fable')
+    def test_another_qualified_exact_identifier_releases_the_reserved_successor(self):
+        # The operator may pin any qualified exact identifier (here Fable 5.1, a different family)
+        # instead of the mismatched family's expected member; the successor then completes under
+        # that identifier and audits as final. The gate reads the current selector only, so a room
+        # whose earlier epochs ran that identifier behaves the same way.
+        done = self.recover_through(FABLE, 'served-opus-to-fable')
         # An exact request keeps its historical result shape: no family observation, no contradiction.
         self.assertNotIn('model_contradiction', done['native'])
         self.assertNotIn('model_mismatch', done['native'])
