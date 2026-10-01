@@ -228,10 +228,16 @@ class NativeQuotaGuardTests(unittest.TestCase):
     def test_reads_results_cancellation_and_worker_execution_do_not_read_quota_transcript(self):
         tools = ("Glob", "Grep", "ToolSearch", "TaskOutput", "AskUserQuestion",
                  "mcp__deepseek__deepseek_health", "mcp__deepseek__deepseek_status",
-                 "mcp__deepseek__deepseek_result", "mcp__deepseek__deepseek_cancel")
+                 "mcp__deepseek__deepseek_result", "mcp__deepseek__deepseek_cancel",
+                 "mcp__deepseek__deepseek_context_check")
         with mock.patch.object(guard, "_transcript_tail", side_effect=AssertionError("unexpected evidence read")):
             for tool in tools:
                 self.assertIsNone(guard.decide(self.event(tool, transcript_path="unsafe")))
+            # The validation tool is root-only like the rest of the pinned provider
+            # family: inside a pr-sonnet worker it is denied as submission work.
+            denied = guard.decide(self.event("mcp__deepseek__deepseek_context_check", transcript_path="unsafe",
+                                             agent_type="pr-sonnet", agent_id="native-child"))
+            self.assertIn("native workers cannot submit delegate or room work", denied)
             # Root Read now has its own admission path and still never consults native
             # quota evidence. An unsupported Read shape is refused before any transcript
             # inspection, so this quota-transcript mock must not be reached at all.

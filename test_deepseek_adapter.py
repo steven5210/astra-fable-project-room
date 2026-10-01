@@ -779,7 +779,7 @@ class TransportContractTests(AdapterFixture):
                  ("credential", str(self.worktree / "server.key"), "context_path_credential"),
                  ("suffix", str(self.worktree / "notes.bin"), "context_path_suffix"), ("symlink", str(self.worktree / "link.py"), "context_unsafe"),
                  ("oversized", str(self.worktree / "large.py"), "context_oversized"), ("traversal", str(self.worktree / "sub" / ".." / "module.py"), "context_path_invalid"),
-                 ("relative", "module.py", "context_path_invalid"), ("missing", str(self.worktree / "absent.py"), "context_missing"),
+                 ("unnormalized-relative", "./module.py", "context_path_invalid"), ("missing", str(self.worktree / "absent.py"), "context_missing"),
                  ("too-many", [good] * 17, "context_files_limit"), ("duplicate", [good, good], "context_path_invalid")]
         for name, value, code in cases:
             with self.subTest(case=name), self.assertRaises(adapter.AdapterError) as refused:
@@ -798,6 +798,95 @@ class TransportContractTests(AdapterFixture):
         second = self.submit("Read it", "ctx-changed", context_path=good)
         self.assertNotEqual(second["job_id"], first["job_id"], "changed file bytes are a different payload")
         self.wait(second["job_id"])
+
+    def test_context_path_accepts_worktree_relative_entries(self):
+        absolute, worktree = str(self.worktree / "module.py"), self.worktree
+        files_absolute, root_absolute = adapter.context_files(absolute, self.adapter.config, worktree)
+        files_relative, root_relative = adapter.context_files("module.py", self.adapter.config, worktree)
+        self.assertEqual(files_relative, files_absolute)
+        self.assertEqual(files_relative[0]["path"], "module.py")
+        self.assertEqual(files_relative[0]["sha256"], files_absolute[0]["sha256"])
+        self.assertEqual(root_relative, root_absolute)
+        self.assertEqual(adapter.assemble("Read it", None, files_relative), adapter.assemble("Read it", None, files_absolute))
+
+    def test_context_path_refuses_unnormalized_or_escaping_relative_forms(self):
+        for value in ("../module.py", "sub/../module.py", "./module.py", "module.py/", ".claude/settings.json"):
+            with self.subTest(value=value), self.assertRaises(adapter.AdapterError) as refused:
+                adapter.context_files(value, self.adapter.config, self.worktree)
+            self.assertEqual(refused.exception.code, "context_path_invalid", value)
+
+    def test_context_path_duplicate_across_absolute_and_relative_forms(self):
+        with self.assertRaises(adapter.AdapterError) as refused:
+            adapter.context_files([str(self.worktree / "module.py"), "module.py"], self.adapter.config, self.worktree)
+        self.assertEqual(refused.exception.code, "context_path_invalid")
+
+    def test_assemble_layout_is_unchanged(self):
+        files = [{"path": "sub/module.py", "bytes": 4, "sha256": "ab" * 32, "text": "code"}]
+        expected = ("TASK:\nDo it." + "\n\n-----\n\n" + "CONTEXT (inline):\ninline" + "\n\n-----\n\n"
+                    + "FILE sub/module.py (4 bytes, sha256 " + "ab" * 32 + "):\ncode")
+        self.assertEqual(adapter.assemble("Do it.", "inline", files), expected)
+
+    def test_context_check_reports_every_entry_and_exact_byte_accounting(self):
+        (self.worktree / "guide.md").write_text("# Guide\n")
+        (self.worktree / ".hidden").mkdir()
+        (self.worktree / ".hidden" / "x.md").write_text("hidden")
+        (self.worktree / "notutf8.txt").write_bytes(b"\xff\xfe")
+        (self.worktree / "archive.zip").write_bytes(b"PK\x03\x04")
+        entries = ["module.py", "guide.md", ".hidden/x.md", "missing.md", "notutf8.txt", "archive.zip"]
+        check = self.adapter.context_check(entries)
+        self.assertFalse(check["ok"])
+        self.assertEqual((check["accepted"], check["rejected"]), (2, 4))
+        self.assertEqual([row["path"] for row in check["files"]], entries)
+        self.assertEqual([row["error"] for row in check["files"]],
+                         [None, None, "context_path_invalid", "context_missing", "context_not_utf8", "context_path_suffix"])
+        self.assertEqual(check["files"][0]["relative"], "module.py")
+        self.assertIsNone(check["files"][2]["relative"])
+        self.assertEqual(check["files"][3]["relative"], "missing.md")
+        self.assertIsNone(check["files"][3]["bytes"])
+        expected_bytes = 0
+        for relative in ("module.py", "guide.md"):
+            data = (self.worktree / relative).read_bytes()
+            entry = {"path": relative, "bytes": len(data), "sha256": adapter.sha(data), "text": data.decode("utf-8")}
+            expected_bytes += len(adapter.SEPARATOR.encode("utf-8")) + len(adapter.file_section(entry).encode("utf-8"))
+        self.assertEqual(check["file_input_bytes"], expected_bytes)
+        self.assertEqual(check["fixed_input_bytes"], len(adapter.FRAMING.encode("utf-8")) + len("TASK:\n".encode("utf-8")))
+        self.assertEqual(check["inline_context_header_bytes"],
+                         len(adapter.SEPARATOR.encode("utf-8")) + len("CONTEXT (inline):\n".encode("utf-8")))
+        self.assertEqual(check["remaining_task_and_context_bytes"],
+                         check["max_input_bytes"] - check["fixed_input_bytes"] - check["file_input_bytes"])
+        self.assertEqual(check["limits"], {"max_context_files": self.adapter.config["max_context_files"],
+                                           "max_context_file_bytes": self.adapter.config["max_context_file_bytes"]})
+        self.assertNotIn("text", check["files"][0])
+
+    def test_context_check_then_submit_accounts_exact_input_bytes(self):
+        (self.worktree / "guide.md").write_text("# Guide\n")
+        check = self.adapter.context_check(["module.py", "guide.md"])
+        self.assertTrue(check["ok"], check)
+        self.fake.scenario = {"kind": "ok"}
+        submitted = self.submit("task text", "check-then-submit", context_path=["module.py", "guide.md"])
+        self.assertEqual(submitted["input_bytes"],
+                         check["fixed_input_bytes"] + len("task text".encode("utf-8")) + check["file_input_bytes"])
+        self.assertEqual(self.wait(submitted["job_id"])["state"], "completed")
+
+    def test_context_check_writes_no_job_or_ledger_row(self):
+        jobs_before = self.adapter.ledger.storage()["jobs"]
+        check = self.adapter.context_check("module.py")
+        self.assertTrue(check["ok"], check)
+        self.assertEqual(self.adapter.ledger.storage()["jobs"], jobs_before)
+        self.assertEqual(list(self.adapter.jobs_dir.iterdir()), [])
+        self.assertEqual(self.fake.requests, [])
+
+    def test_context_check_schema_dispatch_and_limits(self):
+        listed = adapter.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, self.adapter)["result"]["tools"]
+        tool = next(entry for entry in listed if entry["name"] == "deepseek_context_check")
+        self.assertTrue(tool["annotations"]["readOnlyHint"])
+        self.assertFalse(tool["annotations"]["openWorldHint"])
+        with self.assertRaises(adapter.AdapterError) as invalid:
+            adapter.call_tool(self.adapter, "deepseek_context_check", {"context_path": "module.py", "extra": "x"})
+        self.assertEqual(invalid.exception.code, "arguments_invalid")
+        with self.assertRaises(adapter.AdapterError) as limited:
+            adapter.call_tool(self.adapter, "deepseek_context_check", {"context_path": ["module.py"] * 17})
+        self.assertEqual(limited.exception.code, "context_files_limit")
 
     def test_ask_lane_uses_small_budget_and_optional_thinking(self):
         self.fake.scenario = {"kind": "ok", "answer": "Forty-two"}
@@ -1441,7 +1530,7 @@ class McpTransportTests(AdapterFixture):
         self.assertEqual(initialized["result"]["serverInfo"], {"name": "deepseek-delegate", "version": "0.3.0"})
         self.assertEqual(initialized["result"]["protocolVersion"], "2025-06-18")
         listed = self.request(server, "tools/list")["result"]["tools"]
-        self.assertEqual({tool["name"] for tool in listed}, {"deepseek_submit", "deepseek_ask", "deepseek_status", "deepseek_result", "deepseek_cancel", "deepseek_health"})
+        self.assertEqual({tool["name"] for tool in listed}, {"deepseek_submit", "deepseek_ask", "deepseek_status", "deepseek_result", "deepseek_cancel", "deepseek_health", "deepseek_context_check"})
         self.assertTrue(all(tool["inputSchema"]["additionalProperties"] is False for tool in listed))
         submit_schema = next(tool for tool in listed if tool["name"] == "deepseek_submit")["inputSchema"]
         self.assertNotIn("max_tokens", submit_schema["properties"])
@@ -1450,6 +1539,10 @@ class McpTransportTests(AdapterFixture):
         error, health = self.tool(server, "deepseek_health")
         self.assertFalse(error)
         self.assertEqual(health["model"], adapter.DEFAULT_MODEL)
+        error, checked = self.tool(server, "deepseek_context_check", {"context_path": "module.py"})
+        self.assertFalse(error, checked)
+        self.assertTrue(checked["ok"], checked)
+        self.assertEqual((checked["accepted"], checked["rejected"], checked["files"][0]["relative"]), (1, 0, "module.py"))
         error, refused = self.tool(server, "deepseek_submit", {"task": "x", "request_id": "m1", "max_tokens": 5})
         self.assertTrue(error)
         self.assertEqual(refused["code"], "arguments_invalid")

@@ -13,6 +13,7 @@ import uuid
 
 import ao_project_room as ao
 import ao_delegates
+import ao_mcp_attachment
 import ao_routing
 import ao_workflow
 from ao_delegate_launcher import owned_bytes
@@ -34,7 +35,9 @@ INSTRUCTION = (
     'No inherited Fable workers, extra native delegation layer or more than two concurrent native workers. '
     'Do not replay earlier provider jobs or resend the unchanged specification or policies on continuation.'
 )
-TOOLS = ['deepseek_submit', 'deepseek_ask', 'deepseek_status', 'deepseek_result', 'deepseek_cancel', 'deepseek_health']
+TOOLS = ['deepseek_submit', 'deepseek_ask', 'deepseek_status', 'deepseek_result', 'deepseek_cancel', 'deepseek_health',
+         'deepseek_context_check']
+TOOL_KEY = re.compile(r'^    "(deepseek_[a-z_]+)": \(', re.MULTILINE)
 MAX_EVIDENCE = 96_000_000
 LEGACY_LAUNCH_LIMIT = 4_000_000
 
@@ -283,6 +286,29 @@ def _inspect(service, directory, state):
             'wrapper_sha256': ao.digest(owned_bytes(Path(__file__).with_name('ao_mcp_attachment.py')))}
 
 
+def pinned_adapter_tools(inventory):
+    """The tool names the room's own pinned adapter snapshot enumerates, read from the digest-verified copy.
+
+    Adoption keeps the original provider snapshot, so the manifest must expect exactly the catalog that
+    snapshot serves; the controller's current adapter may enumerate more. Only a known catalog is accepted."""
+    files = (inventory or {}).get('files', {})
+    adapters = [(path, recorded) for path, recorded in files.items() if Path(str(path)).name == 'deepseek_adapter.py']
+    if len(adapters) != 1 or not isinstance(adapters[0][1], str):
+        raise RoomError('Pinned provider inventory does not identify one adapter snapshot')
+    data = owned_bytes(Path(adapters[0][0]))
+    if ao.digest(data) != adapters[0][1]:
+        raise RoomError('Pinned adapter snapshot differs from its recorded digest')
+    text = data.decode('utf-8')
+    start = text.find('\nTOOLS = {')
+    end = text.find('\n}\n', start)
+    if start < 0 or end < 0:
+        raise RoomError('Pinned adapter snapshot does not declare its tool catalog')
+    tools = sorted(set(TOOL_KEY.findall(text[start:end])))
+    if tools not in ao_mcp_attachment.TOOL_SETS:
+        raise RoomError('Pinned adapter snapshot enumerates an unknown tool catalog')
+    return tools
+
+
 def audit(service, room_id):
     with service.locked(room_id) as (directory, state):
         evidence = _inspect(service, directory, state)
@@ -332,7 +358,8 @@ def _bundle(directory, audit):
         'room_id': e['room_id'], 'session_id': e['state']['bindings']['engineer']['session_id'],
         'worktree': prepared['worktree'], 'child_server': copy.deepcopy(prepared['server']),
         'provider_files': {**delegate['files'], **delegate['inventory']['files']}, 'profile_path': profiles[0],
-        'wrapper_path': str(wrapper), 'wrapper_sha256': e['wrapper_sha256'], 'expected_tools': TOOLS,
+        'wrapper_path': str(wrapper), 'wrapper_sha256': e['wrapper_sha256'],
+        'expected_tools': pinned_adapter_tools(delegate['inventory']),
         'receipt_directory': str(directory / BASE / 'connections' / audit['attachment_id'])}
     prepared['mcp_attachment'] = {'version': 1, 'attachment_id': audit['attachment_id'],
         'manifest_path': str(manifest_path), 'manifest_sha256': ao.digest(manifest)}

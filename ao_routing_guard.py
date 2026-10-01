@@ -38,7 +38,7 @@ ROOT_TOOLS = frozenset({"Read", "Glob", "Grep", "ToolSearch", "TaskOutput", "Tod
                         "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "AskUserQuestion"})
 DEEPSEEK_TOOLS = frozenset("mcp__deepseek__" + name for name in
                          ("deepseek_health", "deepseek_submit", "deepseek_ask", "deepseek_status",
-                          "deepseek_result", "deepseek_cancel"))
+                          "deepseek_result", "deepseek_cancel", "deepseek_context_check"))
 MAX_EVENT_BYTES = 1_000_000
 # Limit work per submission, while requiring the complete current human turn.
 # An older transcript can exceed this bound; a turn without its caller in the

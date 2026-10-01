@@ -18,7 +18,9 @@ import ao_mcp_attachment as attachment
 
 FAKE = r'''
 import json, os, subprocess, sys
-TOOLS = ["deepseek_ask", "deepseek_cancel", "deepseek_health", "deepseek_result", "deepseek_status", "deepseek_submit"]
+TOOLS = ["deepseek_ask", "deepseek_cancel", "deepseek_context_check", "deepseek_health", "deepseek_result",
+         "deepseek_status", "deepseek_submit"]
+LEGACY = [name for name in TOOLS if name != "deepseek_context_check"]
 MODE = __MODE__
 for line in sys.stdin.buffer:
     value = json.loads(line)
@@ -38,6 +40,7 @@ for line in sys.stdin.buffer:
         result = {"protocolVersion":"2025-03-26", "capabilities":{"tools":{}}, "serverInfo":{"name":"fake", "version":"1"}}
     elif method == "tools/list":
         names = TOOLS[:-1] if MODE == "missing_tools" else TOOLS
+        if MODE == "legacy_tools": names = LEGACY
         if MODE == "duplicate_tool": names = TOOLS + [TOOLS[0]]
         result = {"tools":[{"name":name} for name in names]}
         if MODE == "large_tools": result["padding"] = "x" * 1_000_000
@@ -357,6 +360,42 @@ class AttachmentTests(unittest.TestCase):
                 proc = self.start()
                 self.assertEqual(proc.wait(timeout=5), 1)
                 self.assertFalse((self.receipts / "connection.lock").exists())
+
+    def test_legacy_six_tool_manifest_remains_valid(self):
+        # Rooms adopted before deepseek_context_check carry a manifest naming the
+        # legacy six; the controller must keep validating them.
+        self.manifest["expected_tools"] = list(attachment.LEGACY_TOOLS)
+        self.save()
+        manifest, _, _, _ = attachment._validate_manifest(self.manifest_path)
+        self.assertEqual(sorted(manifest["expected_tools"]), list(attachment.LEGACY_TOOLS))
+        self.configure("legacy_tools")  # rebuilds the fixture manifest, so set the six again
+        self.manifest["expected_tools"] = list(attachment.LEGACY_TOOLS)
+        self.save()
+        proc = self.start()
+        receipt = self.handshake(proc)
+        self.assertEqual(receipt["basis"]["expected_tools"], list(attachment.LEGACY_TOOLS))
+        self.assertEqual(attachment.validate_attachment(self.room, self.state, self.prepared), receipt)
+
+    def test_tool_lists_other_than_the_two_pinned_sets_refuse(self):
+        renamed = [name if name != "deepseek_health" else "deepseek_invented" for name in attachment.LEGACY_TOOLS]
+        for tools in (list(attachment.LEGACY_TOOLS[:-1]), renamed):
+            with self.subTest(tools=tools):
+                self.manifest["expected_tools"] = tools
+                self.save()
+                with self.assertRaisesRegex(ValueError, "enumerate the exact DeepSeek tools"):
+                    attachment._validate_manifest(self.manifest_path)
+
+    def test_observer_requires_the_manifests_own_tool_list(self):
+        # A legacy manifest plus a server enumerating the new seven is as much a
+        # mismatch as the reverse: the witness compares to the manifest, not a
+        # controller constant.
+        self.manifest["expected_tools"] = list(attachment.LEGACY_TOOLS)
+        self.save()
+        proc = self.start()
+        self.initialize(proc)
+        self.enumerate(proc)
+        self.wait_for(self.invalid_receipt)
+        self.assertIsNone(self.ready_receipt())
 
     def test_manifest_file_digest_and_saved_preparation_tamper_refuse(self):
         self.manifest["attachment_id"] = "changed"
