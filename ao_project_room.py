@@ -663,6 +663,10 @@ class Service:
         return abandon(self, room_id, request_id, native_owner_database, native_transcript_path,
                        authorization, diagnosis)
 
+    def ao_room_engineer_model_policy(self, room_id, action, authorization, family=None):
+        import ao_engineering_policy
+        return ao_engineering_policy.record(self, room_id, action, authorization, family=family)
+
     def ao_room_engineer_source_register(self, room_id, native_owner_database, native_transcript_path):
         """Register the bound engineer's prospective native outcome source before its first response.
 
@@ -749,6 +753,12 @@ class Service:
     def ao_room_send(self, room_id, role, message, request_id, purpose=None):
         identifier(request_id)
         nonempty(message, "message", 6000)
+        standing = None
+        if role == "engineer":
+            # The standing family-member policy runs its own short lock windows at this dispatch
+            # boundary, never nested inside the send lock; a deferral never blocks this send.
+            import ao_engineering_policy
+            standing = ao_engineering_policy.apply(self, room_id, purpose, request_id)
         with self.locked(room_id) as (directory, state):
             payload = {"role": role, "message": message, "request_id": request_id}
             if purpose is not None:
@@ -857,6 +867,8 @@ class Service:
                                     "branch_id": snapshot.get("activeBranchId"), "usage": snapshot.get("usage") or {}}}
             if frozen is not None:
                 request["engineering_resolution"] = frozen
+            if standing is not None:
+                request["standing_policy"] = standing
             if worker_expectations is not None:
                 request["native_worker_expectations"] = worker_expectations
             if ao_workflow.normal(state):
@@ -1185,7 +1197,8 @@ class Service:
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
                   "response_normalization", "response_normalization_sha256")
-        fields += ('semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'outcome_resume', 'outcome_resume_sha256')
+        fields += ('semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'outcome_resume', 'outcome_resume_sha256',
+                   "standing_policy")
         result = {k: request[k] for k in fields if k in request}
         if isinstance(request.get("observed_turn"), dict):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -1227,8 +1240,10 @@ class Service:
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
                 agreed = {"agreed": False, "reason": str(exc)}
             delegate = ao_delegates.status(self.root.parent, directory, state)
+            import ao_engineering_policy
             extra.update(agreement=agreed, handoff=state.get("handoff"), delegate=delegate,
                          engineering_model=ao_engineering_model.summary(directory, state),
+                         engineering_model_policy=ao_engineering_policy.summary(state),
                          provider_transition=ao_provider_transition.summary(self, directory, state, delegate),
                          spec_review_extension=ao_review_extension.summary(self, state),
                          acceptance_review_extension=ao_acceptance_extension.summary(self, state),
@@ -1296,6 +1311,7 @@ TOOL_SCHEMAS = {
     "ao_room_provider_transition": ("With the exact audit digest, actual user switch authorization, concrete diagnosis, durable request_id and the operator's performed AO exit-agent record, commit immutable provider epoch 2 while the engineer is positively stopped. Preserve sessions, history, original evidence and review limits; archive the old launch evidence. No AO POST, registration change or model dispatch. Identical requests read or reconcile the same verified receipt. Native launch alone does not qualify MCP initialization or open dispatch.", schema({**R, "audit_sha256": S, "diagnosis": S, "authorization": S, "request_id": S, "native_stop_record": S})),
     "ao_room_engineer_model_audit": ("Read-only eligibility and complete bound evidence for one engineering-model transition. Performs bounded AO GETs and local reads only; writes no room file, journal pointer or state. Returns the exact audit digest a transition must name. Qualification is not provider availability.", schema({**R, "target_model": S, "native_owner_database": S, "native_transcript_path": S})),
     "ao_room_engineer_model_transition": ("Apply or reconcile exactly one audited engineering-model transition. Reobserves the exact frozen evidence under the room lock and writes one create-once intent; a configured-model change then sends exactly one guarded AO conversation settings PATCH before it can commit, while a same-selector qualification-only refresh sends zero PATCH. Requires the exact audit digests, source and target values, explicit native owner database/transcript paths, actual user authorization and reason. The core owns its lock and idempotency; no wrapper lock, precheck or result reinterpretation is applied.", schema({**R, "request_id": S, "source_model": S, "target_model": S, "audit_sha256": S, "spec_record_sha256": S, "candidate_sha256": S, "native_history_sha256": S, "native_owner_database": S, "native_transcript_path": S, "authorization": S, "reason": S})),
+    "ao_room_engineer_model_policy": ("Record or revoke this room's standing engineering-model decision follow_newest_qualified_family_member: while active, every engineer ao_room_send first applies the audited transition to the configured qualification's newest exact family member at a stopped boundary, and reports standing_policy on the request and in ao_room_status; any refusal defers and the send continues on the current pinned model. Requires a committed exact-identifier epoch of the same family (never an alias, never cross-family) and the operator's actual authorization text; records are append-only and digest-chained. No model dispatch by this call itself.", schema({**R, "action": {"type": "string", "enum": ["set", "revoke"]}, "authorization": S, "family": S}, ["room_id", "action", "authorization"])),
     "ao_room_engineer_model_transition_abandon": ("Close only the exact pending engineering-model transition request after a fresh full unchanged-source read-only observation. Sends no PATCH and makes no claim about an earlier attempt. Requires the exact request identity, explicit native owner database/transcript paths, actual user authorization and diagnosis.", schema({**R, "request_id": S, "native_owner_database": S, "native_transcript_path": S, "authorization": S, "diagnosis": S})),
     "ao_room_engineer_source_register": ("Register one prospective native outcome source for the bound engineer before its first response. Engineer-only, normal rooms. Requires the explicit verified AO owner database and the exact prospective or existing owned transcript path; the workspace is derived from the retained preparation and is never a caller input. Refuses held, pending or foreign sources without replacing a registered source. Local registration only: not provider availability, quota, execution or permission to send.", schema({**R, "native_owner_database": S, "native_transcript_path": S})),
     "ao_room_routing_adoption_audit": ("Audit a stopped existing native engineer for one v1-to-v2 routing and operating-rules adoption after provider epoch 2, before any epoch 2 native request. Verify the original preparation, provider, native history, candidate, routing files and project rules. Save private audit evidence; bounded AO GETs only, no model or lifecycle mutation.", schema(R)),

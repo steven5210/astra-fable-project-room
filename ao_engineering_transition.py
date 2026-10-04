@@ -1639,7 +1639,14 @@ def _terminal_result(state, attempt):
 
 def _transition_locked(service, directory, state, request_id, source_model, target_model, audit_sha256,
                        spec_record_sha256, candidate_sha256, native_history_sha256, native_owner_database,
-                       native_transcript_path, authorization, reason, inputs):
+                       native_transcript_path, authorization, reason, inputs, precondition=None):
+    if precondition is not None:
+        # A caller's revalidation runs before any claim, only while this request_id still has no
+        # journal attempt: an existing attempt may already have sent its PATCH and is reconciled
+        # exactly as before, never second-guessed by a later caller condition.
+        chain = em.journal(directory, state, allow_pending=True)
+        if all(item['request_id'] != request_id for item in chain['attempts']):
+            precondition(directory, state)
     state = _claim(service, directory, state, request_id, inputs)
     chain = em.journal(directory, state, allow_pending=True)
     if chain.get('pending_resolution') is not None:
@@ -1667,8 +1674,14 @@ def _transition_locked(service, directory, state, request_id, source_model, targ
 
 def transition(service, room_id, request_id, source_model, target_model, audit_sha256, spec_record_sha256,
                candidate_sha256, native_history_sha256, native_owner_database, native_transcript_path,
-               authorization, reason):
-    """Apply or reconcile exactly one audited engineering model transition."""
+               authorization, reason, precondition=None):
+    """Apply or reconcile exactly one audited engineering model transition.
+
+    ``precondition`` is an optional callable ``(directory, state) -> None`` evaluated under this
+    lock before any claim, and only while no journal attempt exists for ``request_id``; its
+    RoomError is a no-write refusal that propagates to the caller. A reconciled attempt never
+    consults it.
+    """
     ao.identifier(room_id)
     ao.identifier(request_id)
     ao.nonempty(authorization, 'authorization: the actual user decision for this exact change', 6000)
@@ -1696,7 +1709,7 @@ def transition(service, room_id, request_id, source_model, target_model, audit_s
             return _transition_locked(service, directory, state, request_id, source_model, target_model,
                                       audit_sha256, spec_record_sha256, candidate_sha256,
                                       native_history_sha256, native_owner_database, native_transcript_path,
-                                      authorization, reason, inputs)
+                                      authorization, reason, inputs, precondition)
         except _NoWriteRefusal as exc:
             deferred = exc
     raise deferred
