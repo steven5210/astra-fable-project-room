@@ -460,6 +460,42 @@ for the next turn; actual native use is established only by the next owned
 response's native model identity, and observed effective effort stays
 unevidenced.
 
+## Standing policy
+
+A room can hold one standing decision instead of a per-release approval.
+`ao_room_engineer_model_policy` records `follow_newest_qualified_family_member`
+for the engineer role with the operator's authorization text, as an append-only
+digest-chained record under `engineering-model/policy/records/`. `set` requires
+a normal room whose current committed epoch pins an exact identifier of the
+same family — a room pinned to a family alias, or a requested `family` that is
+not the current model's family, is refused; the cross-family choice stays a
+manual transition. A pending transition epoch also refuses. A second record
+with `action` `revoke` ends the policy.
+
+While a policy is active, every engineer `ao_room_send` applies it first,
+before the send takes the room lock (the room lock is never nested). At that
+boundary the controller compares the configured family qualification's
+`expected_model` for the recorded family with the room's pinned exact model and
+follows the newest qualified member only when the engineer is stopped with no
+open request, no semantic hold and no pending epoch, the qualified member is
+strictly newer (never a downgrade), and the registered native source — or the
+most recent committed transition's retained native paths — is present. It then
+runs the unchanged `audit` and `transition` pair in-process with the standing
+record's authorization, under a request id derived from the policy record and
+the qualification revision, and the send proceeds under the new committed
+epoch.
+
+Every check that does not pass produces `deferred` with a reason
+(`engineer_active`, `semantic_hold`, `transition_pending`, `family_mismatch`,
+`qualified_not_newer`, `no_registered_source`, `audit:<reason>` or
+`transition:<outcome>`), the send continues on the current pinned model, and
+one immutable application record is appended under
+`engineering-model/policy/applications/`; `ao_room_status` reports the compact
+`engineering_model_policy` summary and each send result and request record
+carries `standing_policy`. An outcome of `no_change` means the pinned model is
+already the qualified member. The policy never changes a model mid-turn, never
+crosses families, never trusts an alias and never releases a hold.
+
 ## One-time notice and continuations
 
 The current effective undelivered committed root boundary is reported once,

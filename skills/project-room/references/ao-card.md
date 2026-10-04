@@ -145,3 +145,7 @@ acceptance, and remaining blockers.
   Diagnose them without resending.
 - Quota stop, semantic hold, or an instruction staged while paused →
   [efficient continuation](../../../docs/guides/efficient-continuation.md).
+- Standing policy `follow_newest_qualified_family_member` → set or revoke it with
+  `ao_room_engineer_model_policy` (the user's recorded decision, same family only);
+  each later `ao_room_send` reports `standing_policy` (`transitioned`, `deferred`
+  with a reason, or `no_change`) — a deferral never blocks the send.

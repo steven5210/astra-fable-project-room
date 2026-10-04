@@ -351,6 +351,26 @@ send still fails the hold. A contradiction with an unsettled error, a stop row o
 `tool_use`/`end_turn` or a served model outside the qualified family stays
 `unknown` and cannot be resumed.
 
+A room can hold one standing decision instead of a per-release approval:
+`ao_room_engineer_model_policy` records `follow_newest_qualified_family_member`
+for the engineer role with the user's authorization text, only for a normal room
+whose committed epoch pins an exact identifier of that same family (a
+cross-family change stays a manual transition); a second record revokes it.
+While it is active, every engineer `ao_room_send` first checks, before taking
+the room lock, whether the configured qualification's expected model for that
+family is strictly newer than the room's pinned exact model; if the engineer is
+stopped with no open request, no semantic hold and no pending epoch, and the
+registered native source is present, the controller runs the ordinary audit and
+transition with the standing record as authorization, under a request id
+derived from the record and the qualification revision, and the send then
+proceeds under the new committed epoch. Any refusal — an active request, a hold,
+a pending epoch, a missing source, an ineligible audit, a non-committed
+transition, a family mismatch or a qualified model that is not newer — defers:
+the send continues on the current pinned model, and the result and
+`ao_room_status` carry `standing_policy` with the reason and an append-only
+application record. The policy never changes model mid-turn, never crosses
+families, never trusts an alias and never releases a hold.
+
 ## Recovery of a reviewer that has never been used
 
 A Codex Chat session can receive a thread UUID before its first message creates
