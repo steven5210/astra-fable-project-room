@@ -214,14 +214,10 @@ class ProgressViewTests(Fixture):
         view = self.view(request_id='spec_review')
         self.assertEqual(view['request']['request_id'], 'spec_review')
         self.assertTrue(view['turn']['anchor_found'])
-        spec_caller = next(row for row in self.native_events if row.get('uuid') == 'spec_review-caller')
-        todo_result = next(row for row in self.native_events
-                           if row.get('uuid', '').startswith('impl-1-todo-write-result'))
-        # The spec turn now anchors on its own caller row and ends at the impl-1 human row.
-        self.assertEqual(turn_timestamps(view['turn']), (spec_caller['timestamp'], todo_result['timestamp']))
-        self.assertEqual(view['turn']['assistant_rows'], 2)
-        self.assertEqual(view['turn']['served_models'], {MODEL: 2})
-        self.assertEqual(view['turn']['tool_calls'], {'TodoWrite': 1})
+        # spec_review's text appears twice (its caller and the trailing echo); a single request in
+        # the same-text group aligns to the LAST visible match — a text delivered twice anchors late.
+        self.assertEqual(turn_timestamps(view['turn']), (self.trailing['timestamp'], self.trailing['timestamp']))
+        self.assertEqual(view['turn']['assistant_rows'], 0)
         self.assertEqual(view['launches'], [])
         self.assertEqual(self.view(request_id='impl-1')['request']['request_id'], 'impl-1')
         with self.assertRaises(ao.RoomError):
@@ -423,7 +419,7 @@ class ProgressViewTests(Fixture):
                                          created_order=first['created_order'] + 1,
                                          created_at=first['created_at'] + 0.5)
         ao.atomic(self.directory() / 'state.json', state)
-        # With only one matching human row the second request falls back to the last match.
+        # With one visible row the second same-text request tail-aligns onto it.
         self.assertEqual(self.view(request_id='impl-2')['turn']['started_at'], self.anchor['timestamp'])
         stamp = _iso(self.request['created_at'] + 4.5)
         second = [
@@ -446,6 +442,55 @@ class ProgressViewTests(Fixture):
         self.assertEqual(second_view['turn']['assistant_rows'], 1)
         self.assertEqual([launch['description'] for launch in second_view['launches']],
                          ['Second turn launch'])
+
+    def test_suffix_alignment_maps_same_text_requests_to_the_visible_tail(self):
+        state = self.state()
+        first = state['requests']['impl-1']
+        for name, order, at in (('impl-2', first['created_order'] + 1, first['created_at'] + 0.5),
+                                ('impl-3', first['created_order'] + 2, first['created_at'] + 1.0)):
+            state['requests'][name] = dict(first, request_id=name, created_order=order,
+                                           created_at=at)
+        ao.atomic(self.directory() / 'state.json', state)
+        stamp = _iso(self.request['created_at'] + 4.5)
+        tail = [
+            {'type': 'user', 'uuid': 'impl-2-caller', 'sessionId': self.NATIVE, 'timestamp': stamp,
+             'cwd': self.workspace, 'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': self.request['text']}},
+            self._assistant('second-agent', _iso(self.request['created_at'] + 4.6),
+                            [self._use('tu-sa', 'Agent', {'subagent_type': 'Explore',
+                                                        'description': 'Second turn launch'})]),
+            {'type': 'user', 'uuid': 'impl-3-caller', 'sessionId': self.NATIVE,
+             'timestamp': _iso(self.request['created_at'] + 4.7),
+             'cwd': self.workspace, 'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': self.request['text']}},
+            self._assistant('third-agent', _iso(self.request['created_at'] + 4.8),
+                            [self._use('tu-ta', 'Agent', {'subagent_type': 'Plan',
+                                                        'description': 'Third turn launch'})]),
+        ]
+        # Three requests share the text but only the last two anchors remain visible in the tail.
+        self.native_events = [row for row in self.native_events
+                              if row.get('uuid') != self.anchor.get('uuid')]
+        self.native_events[self.native_events.index(self.trailing):0] = tail
+        self._write_transcript()
+        second = self.view(request_id='impl-2')
+        self.assertEqual(second['turn']['started_at'], stamp)
+        self.assertEqual([launch['description'] for launch in second['launches']],
+                         ['Second turn launch'])
+        third = self.view(request_id='impl-3')
+        self.assertEqual(third['turn']['started_at'], _iso(self.request['created_at'] + 4.7))
+        self.assertEqual([launch['description'] for launch in third['launches']],
+                         ['Third turn launch'])
+        oldest = self.view(request_id='impl-1')
+        self.assertEqual(oldest['turn'], {'anchor_found': False})
+        self.assertEqual(oldest['launches'], [])
+
+    def test_redact_keeps_urls_and_relative_paths(self):
+        self.assertEqual(ao_progress._redact('Inspect https://example.com/issue/42'),
+                         'Inspect https://example.com/issue/42')
+        self.assertEqual(ao_progress._redact('Fix /Users/x/secret.json and src/a.ts'),
+                         'Fix <path> and src/a.ts')
+        self.assertEqual(ao_progress._redact('see (/tmp/x) "/etc/y"'), 'see (<path> "<path>"')
+        self.assertEqual(ao_progress._redact('path/with/slashes'), 'path/with/slashes')
 
     def test_any_human_row_ends_the_turn_window(self):
         stamp = _iso(self.request['created_at'] + 4.0)
@@ -510,9 +555,10 @@ class ProgressViewTests(Fixture):
         self._write_transcript()
         tool_calls = self.view()['turn']['tool_calls']
         named = {key: count for key, count in tool_calls.items() if key != 'other'}
-        self.assertEqual(len(named), 32)
+        self.assertEqual(len(named), 31)
         self.assertEqual(named[long_name[:64]], 1)
-        self.assertEqual(tool_calls['other'], 13)
+        self.assertEqual(tool_calls['other'], 14)
+        self.assertLessEqual(len(tool_calls), 32)
 
 
 def agent_stamp(events, label):

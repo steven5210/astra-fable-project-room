@@ -250,8 +250,13 @@ def _fold_plan(rows, uses, results):
     return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts}
 
 
-def _turn_window(rows, request, rank):
-    """The request's rank-th anchor row and the turn rows after it, up to the next human row."""
+def _turn_window(rows, request, rank, group_size):
+    """The request's anchor row and the turn rows after it, up to the next human row.
+
+    The transcript is append-only and the window is its tail, so the visible matching rows belong
+    to the LAST ``len(matches)`` requests of the same-text group; a request whose aligned row
+    scrolled out of the window reports no anchor rather than borrowing a later request's row.
+    """
     wanted = request.get("text_sha256")
     matches = []
     if isinstance(wanted, str):
@@ -259,9 +264,10 @@ def _turn_window(rows, request, rank):
             text = ao_native_outcome.human_text(row)
             if text and hashlib.sha256(text.encode()).hexdigest() == wanted:
                 matches.append(index)
-    if not matches:
+    index = rank - (group_size - len(matches))
+    if not matches or not 0 <= index < len(matches):
         return None, None
-    anchor = matches[rank] if rank < len(matches) else matches[-1]
+    anchor = matches[index]
     window = []
     for row in rows[anchor + 1:]:
         if ao_native_outcome.human_text(row):
@@ -298,11 +304,11 @@ def _launches(uses, results):
 
 
 def _bump(histogram, key):
-    """One bounded histogram entry; keys past 32 distinct fold into other."""
+    """One bounded histogram entry; named keys stop at MAX_HISTOGRAM_KEYS - 1, the rest fold into other."""
     if not isinstance(key, str):
         return
     key = key[:MAX_KEY_CHARS]
-    if key not in histogram and len(histogram) >= MAX_HISTOGRAM_KEYS:
+    if key not in histogram and len(histogram) - ("other" in histogram) >= MAX_HISTOGRAM_KEYS - 1:
         key = "other"
     histogram[key] = histogram.get(key, 0) + 1
 
@@ -399,7 +405,7 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     uses, results = _tools(rows)
     view["source"] = {"available": True}
     view["malformed_rows"] = malformed
-    anchor_row, turn_rows = _turn_window(rows, request, rank)
+    anchor_row, turn_rows = _turn_window(rows, request, rank, len(same))
     view["turn"] = {"anchor_found": False} if anchor_row is None else _turn(anchor_row, turn_rows)
     if anchor_row is not None:
         # Launches belong to the request's own turn; without an anchor nothing is attributable.
