@@ -33,8 +33,10 @@ Rules for every phase:
 
 `ao_release_check` once, before the first new model dispatch. Continue on any
 outcome; only `up_to_date` counts as current. It also reports `claude_code`
-staleness and `qualification_sources` drift — report-only: `identifiers_differ`
-means prepare a qualification revision; `bytes_differ` is informational.
+staleness, `qualification_sources` drift (`bytes_differ` is informational) and
+`qualification_draft`: `drafted` → tell the user the proposal (from → to, floor)
+and the `action` adopt command, nothing switches by itself; `adopted` → report
+the new revision; rooms still transition separately, between jobs.
 Then `ao_room_list` (plus legacy
 `room_list` if it is listed), `ao_room_status`, and `ao_room_sync` for active work.
 Resume the recorded backend and state before anything new.

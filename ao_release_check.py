@@ -353,17 +353,26 @@ def _claude_version(run, path):
     return _version_tuple(output)
 
 
-def _claude_code(root, run, home, fetch_claude_latest):
+def _controller_config(root):
+    """The controller configuration beside the AO root, or None when it is unreadable."""
+    try:
+        parsed = json.loads(
+            _read_bounded_regular(Path(root).parent / "config.json", MAX_STATE_BYTES))
+    except (OSError, ValueError, TypeError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+_UNREAD = object()
+
+
+def _claude_code(root, run, home, fetch_claude_latest, controller=_UNREAD):
     """Report-only staleness view of the configured claude_bin: floors, installs and latest release."""
     reasons = set()
     configured = {"version": None, "reasons": []}
     configured_tuple = None
-    try:
-        parsed = json.loads(
-            _read_bounded_regular(Path(root).parent / "config.json", MAX_STATE_BYTES))
-        controller = parsed if isinstance(parsed, dict) else None
-    except (OSError, ValueError, TypeError, RecursionError):
-        controller = None
+    if controller is _UNREAD:
+        controller = _controller_config(root)
     if controller is None:
         configured["reasons"].append("controller_config_unreadable")
     else:
@@ -490,15 +499,19 @@ def _claude_code(root, run, home, fetch_claude_latest):
 
 
 def _qualification_sources(root, fetch_source):
-    """Report-only drift view: whether each qualification source still serves the captured bytes."""
+    """Report-only drift view: whether each qualification source still serves the captured bytes.
+
+    Also returns {source id: freshly fetched body or None} for the qualification-draft pass;
+    the reported section itself is unchanged."""
+    bodies = {}
     try:
         artifact = _qualification_artifact(root)
     except Exception:
-        return {"artifact_present": False, "revision": None, "outcome": "unknown",
-                "reasons": ["qualification_artifact_unreadable"], "sources": []}
+        return ({"artifact_present": False, "revision": None, "outcome": "unknown",
+                 "reasons": ["qualification_artifact_unreadable"], "sources": []}, bodies)
     if artifact is None:
-        return {"artifact_present": False, "revision": None, "outcome": "no_qualification",
-                "reasons": [], "sources": []}
+        return ({"artifact_present": False, "revision": None, "outcome": "no_qualification",
+                 "reasons": [], "sources": []}, bodies)
     reasons = set()
     entries = []
     identifiers_differ = False
@@ -511,6 +524,7 @@ def _qualification_sources(root, fetch_source):
         entry = {"id": descriptor.get("id"), "outcome": "unreachable",
                  "bytes_match": None, "identifiers_not_in_capture": {},
                  "identifiers_only_in_capture": {}}
+        bodies[descriptor.get("id")] = None
         if not _source_uri_allowed(descriptor.get("uri")):
             reasons.add("source_host_not_allowed")
             doubtful = True
@@ -525,6 +539,7 @@ def _qualification_sources(root, fetch_source):
             reasons.add("source_fetch_failed")
             doubtful = True
         else:
+            bodies[descriptor.get("id")] = body
             try:
                 captured = ao_model_qualification._private_bytes(
                     descriptor.get("evidence_file"), ao_model_qualification.MAX_EVIDENCE_BYTES,
@@ -573,18 +588,87 @@ def _qualification_sources(root, fetch_source):
     else:
         outcome = "unchanged"
     revision = artifact.get("revision")
-    return {"artifact_present": True,
-            "revision": revision if isinstance(revision, int) and not isinstance(revision, bool)
-            else None,
-            "outcome": outcome, "reasons": sorted(reasons), "sources": entries}
+    return ({"artifact_present": True,
+             "revision": revision if isinstance(revision, int) and not isinstance(revision, bool)
+             else None,
+             "outcome": outcome, "reasons": sorted(reasons), "sources": entries}, bodies)
+
+
+def _qualification_draft(root, source_bodies, claude_code, controller, checked_at):
+    """The qualification_draft section: proposal rows and an inert draft, never an adoption."""
+    import ao_qualification_draft
+    empty = {"outcome": "no_qualification", "rows": [], "draft": None, "action": None,
+             "adoption": None, "reasons": []}
+    try:
+        artifact = _qualification_artifact(root)
+        pointer = ao_engineering_model.configured_qualification(root)
+    except Exception:
+        return {**empty, "outcome": "unknown", "reasons": ["qualification_artifact_unreadable"]}
+    if artifact is None:
+        return empty
+    claude_bin = controller.get("claude_bin") if isinstance(controller, dict) else None
+    if not isinstance(claude_bin, str) or not claude_bin:
+        return {**empty, "outcome": "unknown", "reasons": ["executable_unreadable"]}
+    try:
+        executable_ids = ao_qualification_draft.embedded_model_ids(claude_bin)
+    except Exception:
+        return {**empty, "outcome": "unknown", "reasons": ["executable_unreadable"]}
+    executable_version = _version_tuple(claude_code.get("configured", {}).get("version"))
+    try:
+        rows = ao_qualification_draft.proposals(artifact, source_bodies, executable_ids,
+                                               executable_version)
+    except Exception:
+        return {**empty, "outcome": "unknown", "reasons": ["proposal_failed"]}
+    reasons = sorted({row["reason"] for row in rows if row["reason"]})
+    section = {**empty, "rows": rows, "reasons": reasons}
+    if not any(row["to"] is not None for row in rows):
+        section["outcome"] = "none"
+        return section
+    try:
+        result = ao_qualification_draft.draft(root, artifact, pointer, source_bodies,
+                                              executable_ids, executable_version, checked_at)
+    except Exception:
+        section["outcome"] = "unknown"
+        section["reasons"] = sorted(set(reasons) | {"draft_failed"})
+        return section
+    if result is None:
+        section["outcome"] = "proposal"
+        return section
+    section["draft"] = result
+    try:
+        auto_adopt = (ao_engineering_model._private_config(root) or {}
+                      ).get("family_qualification_auto_adopt")
+    except Exception:
+        auto_adopt = None
+    if auto_adopt is True:
+        try:
+            adoption = ao_qualification_draft.adopt(
+                root, result["draft_dir"], ao_qualification_draft.AUTO_ADOPT_AUTHORIZATION,
+                executable_ids)
+        except Exception:
+            section["outcome"] = "unknown"
+            section["action"] = result["adopt_command"]
+            section["reasons"] = sorted(set(reasons) | {"adopt_failed"})
+            return section
+        section["outcome"] = "adopted"
+        section["action"] = None
+        section["adoption"] = {key: adoption.get(key) for key in
+                               ("record", "pointer", "revision", "engineering_models_added",
+                                "config_backup")}
+        return section
+    section["outcome"] = "drafted"
+    section["action"] = result["adopt_command"]
+    return section
 
 
 def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run, now=time.time,
           fetch_claude_latest=None, fetch_source=None, home=None):
     home = Path.home() if home is None else Path(home)
+    controller = _controller_config(root)
     claude_code = _claude_code(root, run, home,
-        _fetch_claude_latest if fetch_claude_latest is None else fetch_claude_latest)
-    qualification_sources = _qualification_sources(
+        _fetch_claude_latest if fetch_claude_latest is None else fetch_claude_latest,
+        controller=controller)
+    qualification_sources, source_bodies = _qualification_sources(
         root, _fetch_source if fetch_source is None else fetch_source)
 
     latest = None
@@ -660,6 +744,8 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         checked_at = _timestamp(now())
+        qualification_draft = _qualification_draft(
+            Path(root), source_bodies, claude_code, controller, checked_at)
         previous = _existing_record(record_path)
         evidence_saved = previous is not _LEGACY_EVIDENCE_NOT_PRESERVED
         if not evidence_saved:
@@ -677,6 +763,7 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
             "daemon": daemon,
             "claude_code": claude_code,
             "qualification_sources": qualification_sources,
+            "qualification_draft": qualification_draft,
         }
         if outcome != "unknown" and latest is not None:
             record["last_successful"] = dict(record)
@@ -698,6 +785,7 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
             ),
             "claude_code": claude_code,
             "qualification_sources": qualification_sources,
+            "qualification_draft": qualification_draft,
         }
     finally:
         os.close(lock_fd)
