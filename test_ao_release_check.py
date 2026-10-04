@@ -12,8 +12,10 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+import ao_engineering_model
 import ao_model_qualification
 import ao_project_room
+import ao_qualification_draft
 import ao_release_check
 import project_room
 import project_room_mcp
@@ -473,7 +475,7 @@ class ReleaseCheckTests(unittest.TestCase):
             set(result),
             {"outcome", "reasons", "latest_version", "installed_version", "running_version",
              "release_url", "checked_at", "last_successful_checked_at",
-             "claude_code", "qualification_sources"},
+             "claude_code", "qualification_sources", "qualification_draft"},
         )
 
     def test_release_metadata_is_sanitized(self):
@@ -855,6 +857,103 @@ class ReleaseCheckTests(unittest.TestCase):
         fetched = [call.args[0] for call in fetcher.call_args_list]
         self.assertEqual(sorted(fetched),
                          ["https://CODE.claude.com/x", "https://docs.claude.com/claude"])
+
+    def test_qualification_draft_drafts_and_never_modifies_configuration(self):
+        self.write_qualification()
+        run = self.claude_layout(configured="2.1.285")
+        self.claude_bin.write_bytes(
+            b"#!/bin/sh\n# models: claude-fable-5-5 claude-opus-5-5 claude-sonnet-5-5\n")
+        self.claude_bin.chmod(0o700)
+        body = (b"Synthetic source capture naming claude-opus-5-5 and claude-sonnet-5-5, "
+                b"now also claude-fable-5-5.\n")
+        controller_before = (self.base / "config.json").read_bytes()
+        ao_before = (self.root / "config.json").read_bytes()
+        result = self.check(run=run, fetch_source=Mock(return_value=body))
+        section = result["qualification_draft"]
+        self.assertEqual(section["outcome"], "drafted")
+        self.assertIn("adopt --draft", section["action"])
+        self.assertIn("<operator authorization>", section["action"])
+        fable = {row["family"]: row for row in section["rows"]}["fable"]
+        self.assertEqual(fable["to"], "claude-fable-5-5")
+        self.assertEqual(fable["floor"], "2.1.285")
+        self.assertIsNotNone(section["draft"])
+        draft_dir = Path(section["draft"]["draft_dir"])
+        self.assertEqual(draft_dir.parent,
+                         self.root.resolve() / ao_qualification_draft.DRAFTS)
+        record = json.loads((self.root / "version-check.json").read_bytes())
+        self.assertEqual(record["qualification_draft"]["outcome"], "drafted")
+        self.assertEqual((self.base / "config.json").read_bytes(), controller_before)
+        self.assertEqual((self.root / "config.json").read_bytes(), ao_before)
+
+    def test_qualification_draft_none_no_qualification_and_unreadable_executable(self):
+        self.write_qualification()
+        run = self.claude_layout(configured="2.1.285")
+        evidence = b"Synthetic source capture naming claude-opus-5-5.\n"
+        result = self.check(run=run, fetch_source=Mock(return_value=evidence))
+        self.assertEqual(result["qualification_draft"]["outcome"], "none")
+        self.assertIsNone(result["qualification_draft"]["draft"])
+        self.assertIsNone(result["qualification_draft"]["action"])
+        self.assertFalse((self.root / "qualification-drafts").exists())
+
+        (self.base / "config.json").unlink()
+        result = self.check(run=run, fetch_source=Mock(return_value=evidence))
+        section = result["qualification_draft"]
+        self.assertEqual(section["outcome"], "unknown")
+        self.assertEqual(section["reasons"], ["executable_unreadable"])
+
+        (self.root / "config.json").unlink()
+        result = self.check(fetch_source=Mock(return_value=evidence))
+        self.assertEqual(result["qualification_draft"]["outcome"], "no_qualification")
+
+    def _auto_adopt_fixture(self, auto_adopt):
+        self.write_qualification()
+        config = json.loads((self.root / "config.json").read_bytes())
+        config["family_qualification_auto_adopt"] = auto_adopt
+        (self.root / "config.json").write_text(json.dumps(config))
+        run = self.claude_layout(configured="2.1.285")
+        self.claude_bin.write_bytes(
+            b"#!/bin/sh\n# models: claude-fable-5-5 claude-opus-5-5 claude-sonnet-5-5\n")
+        self.claude_bin.chmod(0o700)
+        body = (b"Synthetic source capture naming claude-opus-5-5 and claude-sonnet-5-5, "
+                b"now also claude-fable-5-5.\n")
+        return run, body
+
+    def test_qualification_draft_auto_adopt_switches_pointer_and_records(self):
+        run, body = self._auto_adopt_fixture(True)
+        result = self.check(run=run, fetch_source=Mock(return_value=body))
+        section = result["qualification_draft"]
+        self.assertEqual(section["outcome"], "adopted")
+        self.assertIsNone(section["action"])
+        self.assertIsNotNone(section["adoption"])
+        self.assertTrue(Path(section["adoption"]["config_backup"]).exists())
+        record = json.loads(Path(section["adoption"]["record"]).read_bytes())
+        self.assertEqual(record["authorization"],
+                         ao_qualification_draft.AUTO_ADOPT_AUTHORIZATION)
+        config = json.loads((self.root / "config.json").read_bytes())
+        self.assertEqual(config["family_qualification"]["path"],
+                         str(Path(section["draft"]["draft_dir"]) / "artifact.json"))
+        self.assertEqual(len(list(self.root.glob("config.json.bak-*"))), 1)
+        policy, _ = ao_engineering_model.effective_policy(self.root.resolve())
+        self.assertIn("claude-fable-5-5", policy["models"])
+        # A second check finds nothing newer: the adopted revision is current,
+        # and no second backup or record is written.
+        second = self.check(run=run, fetch_source=Mock(return_value=body))
+        self.assertEqual(second["qualification_draft"]["outcome"], "none")
+        self.assertEqual(len(list(self.root.glob("config.json.bak-*"))), 1)
+
+    def test_qualification_draft_auto_adopt_failure_is_unknown_and_unchanged(self):
+        run, body = self._auto_adopt_fixture(True)
+        config = json.loads((self.root / "config.json").read_bytes())
+        config["engineering_models"] = "malformed"
+        before = json.dumps(config)
+        (self.root / "config.json").write_text(before)
+        result = self.check(run=run, fetch_source=Mock(return_value=body))
+        section = result["qualification_draft"]
+        self.assertEqual(section["outcome"], "unknown")
+        self.assertIn("adopt_failed", section["reasons"])
+        self.assertIsNotNone(section["draft"])
+        self.assertEqual((self.root / "config.json").read_bytes(), before.encode())
+        self.assertFalse(list(self.root.glob("config.json.bak-*")))
 
     def test_health_fetch_uses_healthz_and_reads_only_one_megabyte_plus_one_byte(self):
         body = json.dumps(self.health).encode()

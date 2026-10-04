@@ -85,6 +85,35 @@ a Claude Code release at or above `highest_family_floor` first, then run
 configuration or its evidence, rerun `ao_release_check`, and only then choose a
 release.
 
+`qualification_draft` goes one step further for each qualified family: when a
+strictly newer exact `claude-<family>` identifier (never a dated snapshot, never a
+downgrade) appears in every cited source's fresh capture **and** is embedded in the
+configured `claude_bin` executable, the check writes one inert draft of the next
+artifact revision under the private `ao/qualification-drafts/` directory — fresh
+evidence files with digests, the family's new `expected_model`, a floor equal to the
+configured executable's version, and the matching `engineering_models` additions —
+and reports `drafted` with the proposal rows and the exact `adopt` command.
+Outcomes: `none` (no newer qualified identifier; `rows[].reason` says why:
+`none_newer`, `not_in_source_capture`, `not_embedded_in_executable`,
+`source_unavailable`, `current_model_not_in_source_capture`,
+`executable_below_family_floor`, `executable_version_unknown`), `proposal` (a
+candidate exists but no draft was
+written because a source capture was unavailable: a draft never mixes stale and
+fresh evidence), `drafted`, `adopted`, `no_qualification` and `unknown`
+(`executable_unreadable`, `qualification_artifact_unreadable`, `proposal_failed`,
+`draft_failed`, `adopt_failed`). Adoption switches the controller's
+`family_qualification` pointer and adds the exact identifiers to
+`engineering_models` after the draft re-verifies, with a `config.json.bak-<stamp>`
+backup and an adoption record; it happens only through the printed `adopt` command
+with the operator's authorization text, or automatically within the same check when
+the private `ao/config.json` sets `family_qualification_auto_adopt: true` (the
+standing authorization is recorded as such). Adoption changes what new epochs
+qualify; an existing room still changes model only through the audited
+engineer-model transition at a stopped boundary. Both steps fail closed: an
+unreadable executable, a missing source body, a pointer that moved since the draft,
+a revision that is not exactly the next one, or an identifier no longer embedded in
+the executable refuses and leaves the current configuration untouched.
+
 For Linux/AppImage or `executable_not_app_bundle`, identify the running daemon
 from its endpoint's `GET /healthz` `executablePath`, then inspect that executable's
 version and installation provenance; a configured version string alone does not
