@@ -227,9 +227,11 @@ def _transition_label(result):
     return "abandoned" if result.get("abandoned") else "unknown"
 
 
-def apply(service, room_id, purpose):
+def apply(service, room_id, purpose, request_id):
     """Apply the room's standing family-member policy at this engineer dispatch boundary.
 
+    ``request_id`` is the send's own request id: when it already exists the send's idempotency path
+    owns the retry and this returns ``inactive`` with reason ``existing_request`` without writing.
     Returns {"outcome", "reason", "from", "to", "request_id", "record_sha256"}; every outcome except
     ``inactive`` appends an application record. A ``deferred`` outcome never blocks the send, which
     continues on the current pinned model; a ``transitioned`` outcome means the unchanged audited
@@ -245,6 +247,9 @@ def apply(service, room_id, purpose):
     result = {"outcome": "inactive", "reason": None, "from": None, "to": None,
               "request_id": None, "record_sha256": None}
     with service.locked(room_id) as (directory, state):
+        if request_id in (state.get("requests") or {}):
+            result["reason"] = "existing_request"
+            return result
         pointer = _pointer(directory, state)
         if pointer is None:
             return result
@@ -278,6 +283,13 @@ def apply(service, room_id, purpose):
                         outcome, reason, request_id = "no_change", None, None
                     elif not em.family_member(pointer["family"], target):
                         outcome, reason, request_id = "deferred", "family_mismatch", None
+                    elif (not isinstance(epoch.get("selector"), dict)
+                          or epoch["selector"].get("kind") != "exact"
+                          or not em.family_member(pointer["family"], current)):
+                        # The epoch moved outside the recorded family; the operator revokes or
+                        # replaces the policy, the automatic follow never crosses on its own.
+                        outcome, reason, request_id = (
+                            "deferred", "current_model_outside_policy_family", None)
                     elif ao_qualification_draft.version_tuple(target) \
                             <= ao_qualification_draft.version_tuple(current):
                         outcome, reason, request_id = "deferred", "qualified_not_newer", None
@@ -294,8 +306,9 @@ def apply(service, room_id, purpose):
                             outcome, reason, request_id = "deferred", "no_registered_source", None
                         else:
                             revision = provenance.get("family_qualification_revision")
-                            request_id = "standing-%s-r%s-%s" % (pointer["sha256"][:12],
-                                                                 revision, target)
+                            request_id = ("standing-%s-%s-r%s-%s"
+                                          % (pointer["sha256"][:12], ao.digest(epoch)[:12],
+                                             revision, target))
                             outcome, reason = None, (database, transcript)
         def application(outcome, reason, request_id):
             return {"version": VERSION, "room_id": state["room_id"], "recorded_at": _utc(),
@@ -312,6 +325,16 @@ def apply(service, room_id, purpose):
             return result
         database, transcript = reason
     # Outside the room lock: the unchanged audited pair takes it themselves.
+    policy_sha256 = pointer["sha256"]
+
+    def _policy_unchanged(locked_directory, locked_state):
+        """Revalidation under the transition lock before a new claim: the audit ran unlocked."""
+        current_pointer = locked_state.get(POINTER_KEY)
+        if (not isinstance(current_pointer, dict) or current_pointer.get("sha256") != policy_sha256
+                or current_pointer.get("active") is not True
+                or em.current(locked_directory, locked_state)["configured_model"] != current):
+            raise RoomError("standing policy changed or the epoch moved during the audit")
+
     audited = None
     try:
         audited = transition_module.audit(service, room_id, target, database, transcript)
@@ -334,7 +357,8 @@ def apply(service, room_id, purpose):
                 native_owner_database=database, native_transcript_path=transcript,
                 authorization=pointer["record_value"]["authorization"],
                 reason="standing policy %s: %s -> %s; qualification revision %s; policy record %s"
-                       % (POLICY, current, target, revision, pointer["sha256"][:12]))
+                       % (POLICY, current, target, revision, pointer["sha256"][:12]),
+                precondition=_policy_unchanged)
         except RoomError as exc:
             outcome, reason = "deferred", str(exc)[:400]
         else:

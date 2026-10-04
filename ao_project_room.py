@@ -758,7 +758,7 @@ class Service:
             # The standing family-member policy runs its own short lock windows at this dispatch
             # boundary, never nested inside the send lock; a deferral never blocks this send.
             import ao_engineering_policy
-            standing = ao_engineering_policy.apply(self, room_id, purpose)
+            standing = ao_engineering_policy.apply(self, room_id, purpose, request_id)
         with self.locked(room_id) as (directory, state):
             payload = {"role": role, "message": message, "request_id": request_id}
             if purpose is not None:

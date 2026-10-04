@@ -362,7 +362,7 @@ family is strictly newer than the room's pinned exact model; if the engineer is
 stopped with no open request, no semantic hold and no pending epoch, and the
 registered native source is present, the controller runs the ordinary audit and
 transition with the standing record as authorization, under a request id
-derived from the record and the qualification revision, and the send then
+derived from the record, the current epoch and the qualification revision, and the send then
 proceeds under the new committed epoch. Any refusal — an active request, a hold,
 a pending epoch, a missing source, an ineligible audit, a non-committed
 transition, a family mismatch or a qualified model that is not newer — defers:

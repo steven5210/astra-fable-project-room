@@ -481,14 +481,15 @@ open request, no semantic hold and no pending epoch, the qualified member is
 strictly newer (never a downgrade), and the registered native source — or the
 most recent committed transition's retained native paths — is present. It then
 runs the unchanged `audit` and `transition` pair in-process with the standing
-record's authorization, under a request id derived from the policy record and
+record's authorization, under a request id derived from the policy record, the current epoch and
 the qualification revision, and the send proceeds under the new committed
 epoch.
 
 Every check that does not pass produces `deferred` with a reason
 (`engineer_active`, `semantic_hold`, `transition_pending`, `family_mismatch`,
-`qualified_not_newer`, `no_registered_source`, `audit:<reason>` or
-`transition:<outcome>`), the send continues on the current pinned model, and
+`current_model_outside_policy_family`, `qualified_not_newer`,
+`no_registered_source`, `audit:<reason>` or `transition:<outcome>`), the send
+continues on the current pinned model, and
 one immutable application record is appended under
 `engineering-model/policy/applications/`; `ao_room_status` reports the compact
 `engineering_model_policy` summary and each send result and request record

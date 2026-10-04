@@ -82,6 +82,21 @@ class StandingPolicyFixture(QualificationFixture):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def count_patches(self):
+        """Count settings PATCH attempts through the fake transport without changing their handling."""
+        original = self.fake.request
+        count = [0]
+
+        def request(method, path, payload=None):
+            if method == 'PATCH':
+                count[0] += 1
+            return original(method, path, payload)
+
+        patcher = patch.object(self.fake, 'request', side_effect=request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return count
+
     def make_pending(self):
         """Leave one uncommitted transition in the journal via a PATCH that is never acknowledged."""
         self.configure_target(NEWER)
@@ -101,6 +116,7 @@ class StandingPolicyFixture(QualificationFixture):
                                authorization='The operator authorized this exact transition',
                                reason='synthetic lost PATCH for the pending-epoch fixture')
         self.assertTrue(result['pending'], result)
+        return audited
 
     def last_application(self):
         return self.state()[ep.POINTER_KEY]['last_application']
@@ -358,6 +374,153 @@ class ApplyTests(StandingPolicyFixture):
         self.assertEqual(application['outcome'], 'deferred')
         self.assertEqual(application['reason'], 'audit:boom')
         self.native_turn('audit-raises', FABLE)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+
+    def test_apply_defers_when_the_policy_moves_between_the_audit_and_the_lock(self):
+        self.standing_room()
+        self.set_policy()
+        self.configure_target(NEWER)
+        self.ready()
+        patches = self.count_patches()
+        original = et.audit
+
+        def audited(*args, **kwargs):
+            value = original(*args, **kwargs)
+            self.revoke_policy()  # the operator's decision lands between the audit and the claim
+            return value
+
+        with patch.object(et, 'audit', side_effect=audited):
+            result = self.send('spec_review', 'race-1')
+        self.assertEqual(result['standing_policy']['outcome'], 'deferred')
+        self.assertEqual(result['standing_policy']['reason'],
+                         'standing policy changed or the epoch moved during the audit')
+        self.assertEqual(patches[0], 0)
+        self.assertEqual(result['configured_model'], FABLE)
+        self.assertEqual(result['state'], 'submitted')
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], FABLE)
+        self.assertFalse(self.state()[ep.POINTER_KEY]['active'])
+        application = ao.read(self.applications()[-1])
+        self.assertEqual(application['outcome'], 'deferred')
+        self.native_turn('race-1', FABLE)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+
+    def test_a_pending_attempt_reconciles_without_consulting_the_precondition(self):
+        self.standing_room()
+        audited = self.make_pending()
+
+        def refuse(directory, state):
+            raise ao.RoomError('standing policy changed or the epoch moved during the audit')
+
+        # The recorded PATCH never applied; the reconcile observes the arrived settings and commits.
+        self.fake.snapshots['engineer']['settings'].update({'model': NEWER, 'reasoningEffort': 'max'})
+        result = et.transition(self.service, self.room, request_id='manual-lost-patch',
+                               source_model=FABLE, target_model=NEWER,
+                               audit_sha256=audited['audit_sha256'],
+                               spec_record_sha256=audited['spec_record_sha256'],
+                               candidate_sha256=audited['candidate_sha256'],
+                               native_history_sha256=audited['native_history_sha256'],
+                               native_owner_database=self.source['database'],
+                               native_transcript_path=self.source['transcript'],
+                               authorization='The operator authorized this exact transition',
+                               reason='synthetic lost PATCH for the pending-epoch fixture',
+                               precondition=refuse)
+        self.assertTrue(result['transitioned'], result)
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], NEWER)
+
+    def test_an_existing_request_id_is_the_send_idempotent_retry(self):
+        self.standing_room()
+        self.set_policy()
+        self.configure_target(FABLE)
+        first = self.send('spec_review', 'retry-1')
+        self.assertEqual(first['standing_policy']['outcome'], 'no_change')
+        self.native_turn('retry-1', FABLE)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+        # The qualification advancing must not make the retry patch or record anything new.
+        self.configure_target(NEWER)
+        self.ready()
+        patches = self.count_patches()
+        before = len(self.applications())
+        retry = self.send('spec_review', 'retry-1')
+        self.assertEqual(patches[0], 0)
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], FABLE)
+        self.assertEqual(retry['request_id'], 'retry-1')
+        self.assertEqual(retry['state'], 'completed')
+        self.assertEqual(retry['standing_policy'], first['standing_policy'])
+        self.assertEqual(self.request('retry-1')['standing_policy']['outcome'], 'no_change')
+        self.assertEqual(len(self.applications()), before)
+        self.assertEqual(self.state()[ep.POINTER_KEY]['last_application']['outcome'], 'no_change')
+
+    def test_apply_defers_when_the_current_epoch_left_the_policy_family(self):
+        self.standing_room()
+        self.set_policy()
+        self.ready()
+        self.patch_settings()
+        audited = et.audit(self.service, self.room, OPUS,
+                           self.source['database'], self.source['transcript'])
+        self.assertTrue(audited['eligible'], audited.get('reason'))
+        moved = et.transition(self.service, self.room, request_id='manual-opus',
+                              source_model=FABLE, target_model=OPUS,
+                              audit_sha256=audited['audit_sha256'],
+                              spec_record_sha256=audited['spec_record_sha256'],
+                              candidate_sha256=audited['candidate_sha256'],
+                              native_history_sha256=audited['native_history_sha256'],
+                              native_owner_database=self.source['database'],
+                              native_transcript_path=self.source['transcript'],
+                              authorization='The operator moved this room to the exact opus pin',
+                              reason='manual transition outside the standing family')
+        self.assertTrue(moved['transitioned'], moved)
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], OPUS)
+        self.configure_target(NEWER)
+        patches = self.count_patches()
+        result = self.send('spec_review', 'outside-1')
+        self.assertEqual(result['standing_policy']['outcome'], 'deferred')
+        self.assertEqual(result['standing_policy']['reason'], 'current_model_outside_policy_family')
+        self.assertEqual(patches[0], 0)
+        self.assertEqual(result['configured_model'], OPUS)
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], OPUS)
+        self.native_turn('outside-1', OPUS)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+
+    def test_the_transition_request_id_is_bound_to_the_epoch(self):
+        self.standing_room()
+        self.set_policy()
+        self.configure_target(NEWER)
+        self.ready()
+        self.patch_settings()
+        first = self.send('spec_review', 'epoch-1')
+        self.assertEqual(first['standing_policy']['outcome'], 'transitioned')
+        first_id = first['standing_policy']['request_id']
+        self.assertRegex(first_id, r'^standing-[0-9a-f]{12}-[0-9a-f]{12}-r9-' + NEWER + '$')
+        self.native_turn('epoch-1', NEWER)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+        audited = et.audit(self.service, self.room, FABLE,
+                           self.source['database'], self.source['transcript'])
+        self.assertTrue(audited['eligible'], audited.get('reason'))
+        moved = et.transition(self.service, self.room, request_id='manual-back',
+                              source_model=NEWER, target_model=FABLE,
+                              audit_sha256=audited['audit_sha256'],
+                              spec_record_sha256=audited['spec_record_sha256'],
+                              candidate_sha256=audited['candidate_sha256'],
+                              native_history_sha256=audited['native_history_sha256'],
+                              native_owner_database=self.source['database'],
+                              native_transcript_path=self.source['transcript'],
+                              authorization='The operator returned this room to the previous pin',
+                              reason='manual rollback to the earlier epoch')
+        self.assertTrue(moved['transitioned'], moved)
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], FABLE)
+        # The same policy and revision at a different epoch boundary derive a different request id.
+        second = self.send('spec_review', 'epoch-2')
+        self.assertEqual(second['standing_policy']['outcome'], 'transitioned')
+        self.assertNotEqual(second['standing_policy']['request_id'], first_id)
+        self.assertRegex(second['standing_policy']['request_id'],
+                         r'^standing-[0-9a-f]{12}-[0-9a-f]{12}-r9-' + NEWER + '$')
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], NEWER)
+        self.native_turn('epoch-2', NEWER)
         self.fake.finish('engineer', self.verdict())
         self.service.ao_room_sync(self.room)
 
