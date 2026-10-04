@@ -250,24 +250,32 @@ def _fold_plan(rows, uses, results):
     return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts}
 
 
-def _turn_window(rows, request, rank, group_size):
+def _turn_window(rows, request, start, end):
     """The request's anchor row and the turn rows after it, up to the next human row.
 
-    The transcript is append-only and the window is its tail, so the visible matching rows belong
-    to the LAST ``len(matches)`` requests of the same-text group; a request whose aligned row
-    scrolled out of the window reports no anchor rather than borrowing a later request's row.
+    The anchor is the earliest root human row carrying the request's text inside the
+    request's own time bounds: on or after ``start - 5`` seconds (a small grace for
+    native clock skew) and before the next same-session request's creation. A request
+    that was never delivered has no row inside its bounds, and a bare echo of the text
+    outside them cannot displace the delivered caller.
     """
     wanted = request.get("text_sha256")
-    matches = []
-    if isinstance(wanted, str):
+    anchor = None
+    if isinstance(wanted, str) and isinstance(start, (int, float)):
         for index, row in enumerate(rows):
             text = ao_native_outcome.human_text(row)
-            if text and hashlib.sha256(text.encode()).hexdigest() == wanted:
-                matches.append(index)
-    index = rank - (group_size - len(matches))
-    if not matches or not 0 <= index < len(matches):
+            if not text or hashlib.sha256(text.encode()).hexdigest() != wanted:
+                continue
+            try:
+                stamp = ao_native_outcome.timestamp(row.get("timestamp"))
+            except RoomError:
+                continue  # A row without a readable timestamp is never a candidate.
+            if stamp < start - 5.0 or (end is not None and stamp >= end):
+                continue
+            anchor = index
+            break
+    if anchor is None:
         return None, None
-    anchor = matches[index]
     window = []
     for row in rows[anchor + 1:]:
         if ao_native_outcome.human_text(row):
@@ -396,16 +404,23 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     except (RoomError, OSError) as exc:
         view["source"]["reason"] = _redact(str(exc))[:200]
         return view
-    # Identical request texts share one anchor digest; the request's rank among them picks its row.
-    same = sorted((other for other in requests.values()
-                   if isinstance(other, dict) and isinstance(request.get("text_sha256"), str)
-                   and other.get("text_sha256") == request.get("text_sha256")),
-                  key=_request_order)
-    rank = next((index for index, other in enumerate(same) if other is request), 0)
+    # The anchor is time-bounded: from the request's observed start (or its creation, with
+    # a small grace) until the next same-session request's creation. Identical request
+    # texts then correlate by when they were delivered rather than by matching order.
+    observed = request.get("observed_turn")
+    started = observed.get("startedAt") if isinstance(observed, dict) else None
+    start = (ao_native_outcome.timestamp(started) if isinstance(started, str)
+             else request.get("created_at"))
+    order = _request_order(request)
+    later = [other["created_at"] for other in requests.values()
+             if isinstance(other, dict) and other.get("session_id") == request.get("session_id")
+             and _request_order(other) > order
+             and isinstance(other.get("created_at"), (int, float))]
+    end = min(later) if later else None
     uses, results = _tools(rows)
     view["source"] = {"available": True}
     view["malformed_rows"] = malformed
-    anchor_row, turn_rows = _turn_window(rows, request, rank, len(same))
+    anchor_row, turn_rows = _turn_window(rows, request, start, end)
     view["turn"] = {"anchor_found": False} if anchor_row is None else _turn(anchor_row, turn_rows)
     if anchor_row is not None:
         # Launches belong to the request's own turn; without an anchor nothing is attributable.
