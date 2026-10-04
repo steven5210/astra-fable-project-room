@@ -312,11 +312,17 @@ def apply(service, room_id, purpose):
             return result
         database, transcript = reason
     # Outside the room lock: the unchanged audited pair takes it themselves.
-    audited = transition_module.audit(service, room_id, target, database, transcript)
-    if not audited["eligible"]:
+    audited = None
+    try:
+        audited = transition_module.audit(service, room_id, target, database, transcript)
+    except RoomError as exc:
+        # The standing policy never fails a send: an audit error defers like an ineligible audit.
+        outcome, reason = "deferred", "audit:" + str(exc)[:300]
+        transition_request_id = None
+    if audited is not None and not audited["eligible"]:
         outcome, reason = "deferred", "audit:" + str(audited.get("reason") or "unknown")[:300]
         transition_request_id = None
-    else:
+    if audited is not None and audited["eligible"]:
         transition_request_id = request_id
         try:
             outcome_result = transition_module.transition(

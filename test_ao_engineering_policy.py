@@ -340,6 +340,27 @@ class ApplyTests(StandingPolicyFixture):
         self.fake.finish('engineer', self.verdict())
         self.service.ao_room_sync(self.room)
 
+    def test_apply_defers_an_audit_error_and_the_send_dispatches_on_the_pin(self):
+        self.standing_room()
+        self.set_policy()
+        self.configure_target(NEWER)
+        self.ready()
+        with patch.object(et, 'audit', side_effect=ao.RoomError('boom')):
+            result = self.send('spec_review', 'audit-raises')
+        self.assertEqual(result['standing_policy']['outcome'], 'deferred')
+        self.assertEqual(result['standing_policy']['reason'], 'audit:boom')
+        self.assertEqual(result['standing_policy']['from'], FABLE)
+        self.assertEqual(result['standing_policy']['to'], NEWER)
+        self.assertEqual(result['configured_model'], FABLE)
+        self.assertEqual(result['state'], 'submitted')
+        self.assertEqual(em.current(self.directory(), self.state())['configured_model'], FABLE)
+        application = ao.read(self.applications()[-1])
+        self.assertEqual(application['outcome'], 'deferred')
+        self.assertEqual(application['reason'], 'audit:boom')
+        self.native_turn('audit-raises', FABLE)
+        self.fake.finish('engineer', self.verdict())
+        self.service.ao_room_sync(self.room)
+
     def test_apply_transitions_at_the_boundary_and_the_repeat_send_is_no_change(self):
         self.standing_room()
         self.set_policy()
