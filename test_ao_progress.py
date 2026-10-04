@@ -4,10 +4,12 @@ import contextlib
 from datetime import datetime, timezone
 import io
 import json
+import os
 import unittest
 import uuid
 from unittest.mock import patch
 
+import ao_native_outcome
 import ao_progress
 import ao_project_room as ao
 import project_room
@@ -269,6 +271,86 @@ class ProgressViewTests(Fixture):
         before = (self.directory() / 'state.json').read_bytes()
         self.view()
         self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
+
+    def _fstat_growth(self, step):
+        real = os.fstat
+        target = self.transcript.stat().st_ino
+        counts = {}
+
+        def observed(fd):
+            result = real(fd)
+            if result.st_ino != target:
+                return result
+            order = counts.get(fd, 0)
+            counts[fd] = order + 1
+            if order:
+                fields = list(result)
+                fields[6] += order * step  # st_size moves after the first stat on this descriptor
+                result = os.stat_result(fields)
+            return result
+
+        return observed
+
+    def test_a_growing_live_transcript_stays_available(self):
+        with patch.object(ao_progress.os, 'fstat', self._fstat_growth(4096)):
+            view = self.view()
+        self.assertTrue(view['source']['available'])
+        self.assertTrue(view['turn']['anchor_found'])
+        self.assertEqual(view['last_text'], self.LONG_TEXT[:400])
+
+    def test_a_truncated_transcript_reports_unavailable(self):
+        with patch.object(ao_progress.os, 'fstat', self._fstat_growth(-4096)):
+            view = self.view()
+        self.assertFalse(view['source']['available'])
+        self.assertIn('changed', view['source']['reason'])
+        self.assertNotIn('/', view['source']['reason'])
+
+    def test_a_partially_appended_last_line_is_dropped_not_malformed(self):
+        self._write_transcript()
+        with self.transcript.open('a') as stream:
+            stream.write('{"type": "assistant", "message": {"con')
+        view = self.view()
+        self.assertTrue(view['source']['available'])
+        self.assertEqual(view['malformed_rows'], 0)
+        self.assertEqual(view['last_text'], self.LONG_TEXT[:400])
+        self.assertEqual(view['turn']['assistant_rows'], 16)
+
+    def test_launches_scope_to_the_request_turn(self):
+        stamp = _iso(self.request['created_at'] + 0.5)
+        early = [
+            self._assistant('earlier-agent', stamp, [self._use('tu-ea', 'Agent',
+                            {'subagent_type': 'Explore', 'description': 'Earlier turn launch'})]),
+            self._result('earlier-agent-result', stamp, 'tu-ea', 'done'),
+        ]
+        self.native_events[self.native_events.index(self.anchor):0] = early
+        self._write_transcript()
+        view = self.view()
+        self.assertEqual([launch['description'] for launch in view['launches']],
+                         ['Survey the parser module', 'd' * 120, 'Long survey', 'Deep plan'])
+
+    def test_launches_cap_at_the_64_most_recent(self):
+        extra = [
+            self._assistant('extra-agent-%d' % index,
+                            _iso(self.request['created_at'] + 2.0 + index / 1000),
+                            [self._use('tu-x%d' % index, 'Agent',
+                                       {'subagent_type': 'Explore',
+                                        'description': 'unit %d' % index})])
+            for index in range(70)]
+        self.native_events[self.native_events.index(self.trailing):0] = extra
+        self._write_transcript()
+        launches = self.view()['launches']
+        self.assertEqual(len(launches), 64)
+        self.assertEqual(launches[0]['description'], 'unit 6')
+        self.assertEqual(launches[-1]['description'], 'unit 69')
+        self.assertEqual(launches[0]['status'], 'running')
+
+    def test_source_reason_never_names_a_path(self):
+        with patch.object(ao_native_outcome, 'validate_registered_source',
+                          side_effect=ao.RoomError('transcript /Users/x/y.jsonl missing')):
+            view = self.view()
+        self.assertFalse(view['source']['available'])
+        self.assertNotIn('/Users', json.dumps(view))
+        self.assertIn('<path>', view['source']['reason'])
 
 
 def agent_stamp(events, label):

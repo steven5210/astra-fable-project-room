@@ -38,6 +38,7 @@ INSTRUCTION = (
 MAX_WINDOW_BYTES = 64 * 1024 * 1024
 MAX_TEXT_CHARS = 2000
 MAX_STEPS = 64
+MAX_LAUNCHES = 64
 MAX_LABEL_CHARS = 200
 MAX_DESCRIPTION_CHARS = 120
 GUARD_REFUSAL = "Project Room routing guard"
@@ -62,12 +63,14 @@ def _window(path, native_session_id):
             stream.seek(offset)
         raw = stream.read(MAX_WINDOW_BYTES)
         after = os.fstat(stream.fileno())
-    if ((before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_ino, after.st_size, after.st_mtime_ns)):
+    # A live transcript grows between the two stats; only a replaced or truncated file refuses.
+    if (before.st_ino, before.st_dev) != (after.st_ino, after.st_dev) or after.st_size < before.st_size:
         raise RoomError("Native transcript changed while being observed")
     if offset:
         newline = raw.find(b"\n")
         raw = raw[newline + 1:] if newline >= 0 else b""  # The first partial line is outside the window.
+    if raw and not raw.endswith(b"\n"):
+        raw = raw[:raw.rfind(b"\n") + 1]  # An appended tail may still be mid-write; it is not malformed.
     rows, malformed = [], 0
     for line in raw.splitlines():
         if not line.strip():
@@ -222,6 +225,26 @@ def _fold_plan(rows, uses, results):
     return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts}
 
 
+def _turn_window(rows, request, anchors):
+    """The anchor row and the turn rows after it, up to the next controller human row; None when absent."""
+    wanted = request.get("text_sha256")
+    anchor = None
+    for index, row in enumerate(rows):
+        text = ao_native_outcome.human_text(row)
+        if isinstance(text, str) and isinstance(wanted, str) \
+                and hashlib.sha256(text.encode()).hexdigest() == wanted:
+            anchor = index
+    if anchor is None:
+        return None, None
+    window = []
+    for row in rows[anchor + 1:]:
+        text = ao_native_outcome.human_text(row)
+        if isinstance(text, str) and hashlib.sha256(text.encode()).hexdigest() in anchors:
+            break
+        window.append(row)
+    return rows[anchor], window
+
+
 def _launches(uses, results):
     rows = []
     for identity, use in uses.items():
@@ -249,22 +272,7 @@ def _launches(uses, results):
     return rows
 
 
-def _turn(rows, request, anchors):
-    wanted = request.get("text_sha256")
-    anchor = None
-    for index, row in enumerate(rows):
-        text = ao_native_outcome.human_text(row)
-        if isinstance(text, str) and isinstance(wanted, str) \
-                and hashlib.sha256(text.encode()).hexdigest() == wanted:
-            anchor = index
-    if anchor is None:
-        return {"anchor_found": False}
-    window = []
-    for row in rows[anchor + 1:]:
-        text = ao_native_outcome.human_text(row)
-        if isinstance(text, str) and hashlib.sha256(text.encode()).hexdigest() in anchors:
-            break
-        window.append(row)
+def _turn(anchor_row, window):
     assistant = [row for row in window if row.get("type") == "assistant"]
     served_models, stop_reasons, tool_calls = {}, {}, {}
     for row in assistant:
@@ -282,7 +290,7 @@ def _turn(rows, request, anchors):
                          if isinstance(block, dict) and block.get("type") == "tool_result"
                          and isinstance(_result_text(block.get("content")), str)
                          and _result_text(block.get("content")).startswith(GUARD_REFUSAL))
-    started_at = rows[anchor].get("timestamp")
+    started_at = anchor_row.get("timestamp")
     last_activity_at = window[-1].get("timestamp") if window else started_at
     try:
         elapsed = ao_native_outcome.timestamp(last_activity_at) - ao_native_outcome.timestamp(started_at)
@@ -341,15 +349,18 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         validated = ao_native_outcome.validate_registered_source(directory, state)
         rows, malformed = _window(validated["source"]["transcript"], validated["source"]["native_session_id"])
     except (RoomError, OSError) as exc:
-        view["source"]["reason"] = str(exc)[:200]
+        view["source"]["reason"] = re.sub(r"/[^\s'\"]+", "<path>", str(exc))[:200]
         return view
     anchors = {r.get("text_sha256") for r in requests.values()
                if r is not request and isinstance(r, dict) and isinstance(r.get("text_sha256"), str)}
     uses, results = _tools(rows)
     view["source"] = {"available": True}
     view["malformed_rows"] = malformed
-    view["turn"] = _turn(rows, request, anchors)
-    view["launches"] = _launches(uses, results)
+    anchor_row, turn_rows = _turn_window(rows, request, anchors)
+    view["turn"] = {"anchor_found": False} if anchor_row is None else _turn(anchor_row, turn_rows)
+    # Launches belong to the request's own turn; without an anchor the whole window is the fallback.
+    launch_uses, launch_results = _tools(rows if anchor_row is None else turn_rows)
+    view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
     view["plan"] = _fold_plan(rows, uses, results)
     if max_text_chars:
         text = _last_text(rows)
