@@ -1,8 +1,10 @@
 # Qualification drafts: report, draft, adopt
 
 When a newer member of an already qualified model family exists, `ao_release_check`
-reports it and retains a validated draft — but never adopts it. Adoption is a
-separate explicit operator action.
+reports it and retains a validated draft. Adoption is a separate explicit operator
+action — the printed `adopt` command — unless the operator has recorded the standing
+decision `family_qualification_auto_adopt: true` in the private `ao/config.json`, in
+which case the same check adopts the validated draft and reports `adopted`.
 
 ## What a proposal is
 
@@ -23,11 +25,12 @@ qualified family. A proposal requires all of:
 
 Rows without a proposal carry the reason: `source_unavailable`,
 `not_in_source_capture`, `not_embedded_in_executable`,
-`executable_below_family_floor`, `current_model_not_in_source_capture`, or
-`none_newer`. The last means the fresh captures no longer name the family's
-qualified model at all: a draft is never written while any row carries it —
-a revision never re-cites evidence that dropped a qualified model, and removal
-stays an explicit operator change.
+`executable_below_family_floor`, `executable_version_unknown`,
+`current_model_not_in_source_capture`, or `none_newer`.
+`current_model_not_in_source_capture` means the fresh captures no longer name
+the family's qualified model at all: a draft is never written while any row
+carries it — a revision never re-cites evidence that dropped a qualified model,
+and removal stays an explicit operator change.
 
 ## Drafts
 
