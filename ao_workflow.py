@@ -19,7 +19,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
-         "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1")
+         "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -673,6 +673,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
     from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
     texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
+    import ao_progress
+    texts[ao_progress.PART] = ao_progress.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)

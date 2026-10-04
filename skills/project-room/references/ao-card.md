@@ -25,6 +25,10 @@ Rules for every phase:
   at most a one-line update, and only when something changed. A `timeout` or
   `interrupted` wait reason is not a stall. `settled` is true only when every
   owned request is terminal. Sync each turn to terminal before another send.
+- For a progress update at a breakpoint or when the user asks, call
+  `ao_room_progress` (read-only: the engineer's task list, Agent launches,
+  served models, errors, last message) and format the checklist from it plus
+  the last report; never read the native transcript yourself.
 - Report usage as the attributable native subtotal from status, with delegates
   separate. Unknown is never zero, and it is not quota or billing.
 - Keep room IDs, native IDs, paths and receipts private.

@@ -179,6 +179,21 @@ Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata record
 with explicit truncation. Check legacy `room_list` before treating an ambiguous
 feature as new. Do not silently replace an existing legacy feature with an AO room.
 
+`ao_room_progress` is the read-only progress view of one request (the latest by
+default): the controller validates the registered native source, reads a bounded
+window of the root session's transcript rows and returns numbers, labels and
+bounded engineer-authored strings — the request's state and configured model, the
+turn's elapsed time, assistant rows, served-model and stop-reason histograms,
+tool-call counts, API errors, compactions and guard refusals, each Agent launch
+with its type, description, status and duration, the engineer's task list folded
+from TaskCreate/TaskUpdate/TaskList/TodoWrite with pending, in-progress and
+completed counts, and the last assistant text. An unregistered or unreadable
+source reports `source.available: false` with the reason instead of failing. The
+same task list drives AO's plan panel in the session view; the `progress_plan_v1`
+workflow part, delivered once per engineer session, asks Fable to keep it current
+per bounded work unit. The view never changes room state, never releases a hold
+and never replaces the receipts, the outcome audit or the report.
+
 If the current task still has an older tool inventory, use the installed plugin's
 CLI: `python3 project_room.py call ao_room_status --args-file /absolute/args.json`.
 The CLI exposes all `ao_room_*` operations using the same schemas as MCP. A new

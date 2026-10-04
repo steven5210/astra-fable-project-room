@@ -182,6 +182,8 @@ class NormalSendProjectionTests(NormalProjectionFixture):
         texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
         from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
         texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
+        import ao_progress
+        texts[ao_progress.PART] = ao_progress.INSTRUCTION
         sections = [texts[name] for name in ao_workflow.PARTS if name in carried["parts"]]
         spec = ao.read(directory / state["spec"])
         if carried["spec_delivery"] == "full":
