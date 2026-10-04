@@ -95,8 +95,9 @@ configured executable's version, and the matching `engineering_models` additions
 and reports `drafted` with the proposal rows and the exact `adopt` command.
 Outcomes: `none` (no newer qualified identifier; `rows[].reason` says why:
 `none_newer`, `not_in_source_capture`, `not_embedded_in_executable`,
-`source_unavailable`, `executable_below_family_floor`,
-`executable_version_unknown`), `proposal` (a candidate exists but no draft was
+`source_unavailable`, `current_model_not_in_source_capture`,
+`executable_below_family_floor`, `executable_version_unknown`), `proposal` (a
+candidate exists but no draft was
 written because a source capture was unavailable: a draft never mixes stale and
 fresh evidence), `drafted`, `adopted`, `no_qualification` and `unknown`
 (`executable_unreadable`, `qualification_artifact_unreadable`, `proposal_failed`,

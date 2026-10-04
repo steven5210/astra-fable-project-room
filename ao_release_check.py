@@ -644,7 +644,7 @@ def _qualification_draft(root, source_bodies, claude_code, controller, checked_a
         try:
             adoption = ao_qualification_draft.adopt(
                 root, result["draft_dir"], ao_qualification_draft.AUTO_ADOPT_AUTHORIZATION,
-                executable_ids)
+                executable_ids, executable_version)
         except Exception:
             section["outcome"] = "unknown"
             section["action"] = result["adopt_command"]
@@ -655,6 +655,8 @@ def _qualification_draft(root, source_bodies, claude_code, controller, checked_a
         section["adoption"] = {key: adoption.get(key) for key in
                                ("record", "pointer", "revision", "engineering_models_added",
                                 "config_backup")}
+        if adoption.get("recovered") is True:
+            section["adoption"]["recovered"] = True
         return section
     section["outcome"] = "drafted"
     section["action"] = result["adopt_command"]

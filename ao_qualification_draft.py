@@ -16,9 +16,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
+import uuid
 
 from room import RoomError
 import ao_engineering_model
@@ -66,13 +69,18 @@ def embedded_model_ids(path, chunk_bytes=CHUNK_BYTES):
     except OSError as exc:
         raise RoomError("The configured executable is unreadable") from exc
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.fstat(descriptor).st_size > MAX_EXECUTABLE_BYTES:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_EXECUTABLE_BYTES:
             raise RoomError("The configured executable is not a bounded regular file")
         found = set()
         tail = b""
+        total = 0
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             while True:
                 data = stream.read(chunk_bytes)
+                total += len(data)
+                if total > MAX_EXECUTABLE_BYTES:
+                    raise RoomError("The configured executable exceeds its bounded scan size")
                 buffer = tail + data
                 final = len(data) < chunk_bytes  # short read means the file ended inside it
                 # A match ending at the buffer end may be the prefix of a longer identifier
@@ -83,6 +91,10 @@ def embedded_model_ids(path, chunk_bytes=CHUNK_BYTES):
                 tail = buffer[-CHUNK_OVERLAP:]
                 if not data:
                     break
+        after = os.fstat(descriptor)
+        if (before.st_ino, before.st_size, before.st_mtime_ns) \
+                != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise RoomError("The configured executable changed during the scan")
     finally:
         os.close(descriptor)
     return found
@@ -120,7 +132,11 @@ def proposals(artifact, fresh_bodies, executable_ids, executable_version):
         in_executable = {identifier for identifier in executable_ids if newer(identifier)}
         candidates = in_sources & in_executable
         if not candidates:
-            if in_executable:
+            if current not in captured:
+                # The fresh captures no longer name the qualified model at all: a draft must
+                # never re-cite them, and removal stays an explicit operator change.
+                row["reason"] = "current_model_not_in_source_capture"
+            elif in_executable:
                 row["reason"] = "not_in_source_capture"
             elif in_sources:
                 row["reason"] = "not_embedded_in_executable"
@@ -165,6 +181,8 @@ def draft(root, artifact, pointer, fresh_bodies, executable_ids, executable_vers
     rows = proposals(artifact, fresh_bodies, executable_ids, executable_version)
     if not any(row["to"] is not None for row in rows):
         return None
+    if any(row.get("reason") == "current_model_not_in_source_capture" for row in rows):
+        return None  # a revision never re-cites a capture that dropped a qualified model
     if any(fresh_bodies.get(descriptor["id"]) is None for descriptor in artifact["sources"]):
         return None
     root = Path(root).resolve()
@@ -192,7 +210,40 @@ def draft(root, artifact, pointer, fresh_bodies, executable_ids, executable_vers
                              "minimum_claude_code_version": row["floor"]}
                  for row in rows
                  if row["to"] is not None and row["to"] not in ao_engineering_model.BUNDLED_MODELS}
-    if draft_dir.exists():
+    wrote = False
+    if not draft_dir.exists():
+        # Publish atomically: the complete draft is staged under a unique sibling name and one
+        # rename moves it into place, so an interrupted publish can never leave a partial final
+        # directory — at most an unverifiable staging directory this run removes.
+        staging_parent = root / DRAFTS / "staging"
+        staging_dir = staging_parent / (draft_dir.name + "." + uuid.uuid4().hex)
+        staging_relative = staging_dir.relative_to(root)
+        try:
+            for descriptor in artifact["sources"]:
+                ao_engineering_model.store_bytes_once(
+                    root, str(staging_relative / "evidence" / (descriptor["id"] + ".bin")),
+                    fresh_bodies[descriptor["id"]])
+            ao_engineering_model.store_once(root, str(staging_relative / "artifact.json"), draft_artifact)
+            ao_engineering_model.store_once(root, str(staging_relative / "engineering_models.json"), additions)
+            ao_engineering_model.store_once(root, str(staging_relative / "proposal.json"), proposal)
+            try:
+                os.rename(staging_dir, draft_dir)
+                wrote = True
+            except OSError:
+                if not draft_dir.exists():
+                    raise  # the rename failed for a reason other than a concurrent publish
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            try:
+                staging_parent.rmdir()
+            except OSError:
+                pass
+        if wrote:
+            ao_model_qualification.verify_sources(draft_artifact)
+    if not wrote:
+        if not (draft_dir / "proposal.json").is_file():
+            raise RoomError("A qualification draft directory already exists with other bytes; "
+                            "adopt it or remove it deliberately")
         prior_bytes = ao_model_qualification._private_bytes(
             str(draft_dir / "proposal.json"), MAX_PROPOSAL_BYTES,
             "Qualification draft proposal")
@@ -216,20 +267,11 @@ def draft(root, artifact, pointer, fresh_bodies, executable_ids, executable_vers
         if not isinstance(prior_artifact, dict) or ao_model_qualification.digest(prior_artifact) != artifact_sha256:
             raise RoomError("An existing qualification draft artifact does not match its proposal")
         ao_model_qualification.verify_sources(prior_artifact)
-    else:
-        relative = draft_dir.relative_to(root)
-        for descriptor in artifact["sources"]:
-            ao_engineering_model.store_bytes_once(
-                root, str(relative / "evidence" / (descriptor["id"] + ".bin")),
-                fresh_bodies[descriptor["id"]])
-        ao_engineering_model.store_once(root, str(relative / "artifact.json"), draft_artifact)
-        ao_engineering_model.store_once(root, str(relative / "engineering_models.json"), additions)
-        ao_engineering_model.store_once(root, str(relative / "proposal.json"), proposal)
-        ao_model_qualification.verify_sources(draft_artifact)
     return {"draft_dir": str(draft_dir), "revision": draft_artifact["revision"],
             "artifact_sha256": artifact_sha256, "rows": rows,
-            "adopt_command": ("python3 ao_qualification_draft.py --home \"%s\" adopt --draft \"%s\" "
-                              "--authorization \"<operator authorization>\"" % (root.parent, draft_dir))}
+            "adopt_command": ("python3 ao_qualification_draft.py --home " + shlex.quote(str(root.parent))
+                              + " adopt --draft " + shlex.quote(str(draft_dir))
+                              + " --authorization " + shlex.quote("<operator authorization>"))}
 
 
 def _draft_directory(root, draft_dir):
@@ -243,27 +285,33 @@ def _draft_directory(root, draft_dir):
     return candidate
 
 
-def _atomic_bytes(path, data):
-    """Replace one file's complete bytes via a sibling temporary file and fsync."""
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".restore-")
+def _draft_additions(directory):
+    """The draft's validated engineering_models additions; a bundled or malformed entry refuses."""
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        additions = json.loads(ao_model_qualification._private_bytes(
+            str(directory / "engineering_models.json"), MAX_PROPOSAL_BYTES,
+            "Qualification draft engineering models"))
+    except ValueError as exc:
+        raise RoomError("A qualification draft's engineering model additions are not valid JSON") from exc
+    if not isinstance(additions, dict):
+        raise RoomError("A qualification draft's engineering model additions are not an object")
+    for model, entry in additions.items():
+        if model in ao_engineering_model.BUNDLED_MODELS:
+            raise RoomError("A qualification draft never alters a bundled engineering model")
+        ao_engineering_model._entry(model, entry)
+    return additions
 
 
-def adopt(root, draft_dir, authorization, executable_ids):
+def adopt(root, draft_dir, authorization, executable_ids, executable_version):
     """Move the controller's family_qualification pointer to one verified draft, with evidence.
 
     Refuses unless the draft artifact still matches the proposal, its retained evidence verifies,
     the configured pointer still equals the draft's previous pointer, the revision is exactly the
-    next one, and every proposed identifier is still embedded in the configured executable. The
-    one already-adopted pointer returns unchanged instead of failing.
+    next one, every proposed identifier is still embedded in the configured executable, and that
+    executable's version is known and meets every proposed floor. The candidate configuration is
+    proven against a policy reload before the pointer switches, so a failed switch never needs a
+    restore; a pointer that switched while its adoption record was lost is completed and reported
+    as recovered. The one already-adopted pointer returns unchanged instead of failing.
     """
     import ao_project_room
     if not isinstance(authorization, str) or not authorization.strip():
@@ -296,12 +344,27 @@ def adopt(root, draft_dir, authorization, executable_ids):
     rows = proposal.get("rows")
     if not isinstance(rows, list):
         raise RoomError("A qualification draft proposal carries its rows")
+    record_relative = ADOPTIONS + "/r%d-%s.json" % (artifact["revision"], proposal["artifact_sha256"][:12])
     pointer = ao_engineering_model.configured_qualification(root)
     adopted_pointer = {"path": str(directory / "artifact.json"),
                        "sha256": proposal["artifact_sha256"]}
     if pointer == adopted_pointer:
-        return {"adopted": False, "already_adopted": True, "revision": artifact.get("revision"),
-                "pointer": adopted_pointer}
+        if (root / record_relative).is_file():
+            return {"adopted": False, "already_adopted": True, "revision": artifact.get("revision"),
+                    "pointer": adopted_pointer}
+        # The switch committed but the adoption record was lost before it was fsynced; complete
+        # the durable record now rather than leaving an unrecorded adoption.
+        additions = _draft_additions(directory)
+        backups = sorted(root.glob("config.json.bak-*-r%d-%s"
+                                   % (artifact["revision"], proposal["artifact_sha256"][:12])))
+        record = {"adopted_at": _utc_now(), "authorization": authorization,
+                  "previous_pointer": proposal["previous"], "pointer": adopted_pointer,
+                  "rows": rows, "engineering_models_added": sorted(additions),
+                  "config_backup": str(backups[-1]) if backups else None, "recovered": True}
+        ao_engineering_model.store_once(root, record_relative, record)
+        return {"adopted": True, "recovered": True, "revision": artifact["revision"],
+                "pointer": adopted_pointer, "engineering_models_added": sorted(additions),
+                "record": str(root / record_relative), "config_backup": record["config_backup"]}
     if pointer != proposal.get("previous"):
         raise RoomError("Qualification pointer changed since the draft; draft again")
     current_revision = 0
@@ -313,18 +376,15 @@ def adopt(root, draft_dir, authorization, executable_ids):
                if isinstance(row, dict) and row.get("to") and row["to"] not in executable_ids]
     if missing:
         raise RoomError("A proposed model is no longer embedded in the configured executable: " + ", ".join(missing))
-    try:
-        additions = json.loads(ao_model_qualification._private_bytes(
-            str(directory / "engineering_models.json"), MAX_PROPOSAL_BYTES,
-            "Qualification draft engineering models"))
-    except ValueError as exc:
-        raise RoomError("A qualification draft's engineering model additions are not valid JSON") from exc
-    if not isinstance(additions, dict):
-        raise RoomError("A qualification draft's engineering model additions are not an object")
-    for model, entry in additions.items():
-        if model in ao_engineering_model.BUNDLED_MODELS:
-            raise RoomError("A qualification draft never alters a bundled engineering model")
-        ao_engineering_model._entry(model, entry)
+    if executable_version is None:
+        raise RoomError("The configured executable's version is unknown at adoption")
+    below = [row["floor"] for row in rows
+             if isinstance(row, dict) and isinstance(row.get("floor"), str)
+             and _minimum_tuple(row["floor"]) > executable_version]
+    if below:
+        raise RoomError("The configured executable %s is below the proposed floor %s"
+                        % (_version_string(executable_version), below[0]))
+    additions = _draft_additions(directory)
     config_path = root / "config.json"
     raw_config = ao_model_qualification._private_bytes(str(config_path), ao_engineering_model.MAX_CONFIG,
                                                        "AO configuration")
@@ -341,23 +401,29 @@ def adopt(root, draft_dir, authorization, executable_ids):
         if existing is not None and existing != entry:
             raise RoomError("An engineering_models entry already exists with a different value: " + model)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_relative = "config.json.bak-" + stamp
+    backup_relative = ("config.json.bak-%s-r%d-%s"
+                       % (stamp, artifact["revision"], proposal["artifact_sha256"][:12]))
     ao_engineering_model.store_bytes_once(root, backup_relative, raw_config)
     new_config = copy.deepcopy(config)
     new_config[ao_engineering_model.QUALIFICATION_KEY] = adopted_pointer
     new_config[ao_engineering_model.CONFIG_KEY] = {**configured, **additions}
+    candidate_root = Path(tempfile.mkdtemp(dir=root, prefix="adopt-validate-"))
+    try:  # mkdtemp creates the mode-0700 sibling directory; it is always removed.
+        (candidate_root / "config.json").write_bytes(
+            json.dumps(new_config, sort_keys=True).encode("utf-8"))
+        try:
+            # The adopted pointer's path is absolute, so the artifact resolves from this root.
+            ao_engineering_model.effective_policy(candidate_root)
+        except Exception as exc:
+            raise RoomError("The candidate qualification configuration failed its effective-policy "
+                            "load before the switch; the configuration is unchanged") from exc
+    finally:
+        shutil.rmtree(candidate_root, ignore_errors=True)
     ao_project_room.atomic(config_path, new_config)
-    record_relative = ADOPTIONS + "/r%d-%s.json" % (artifact["revision"], proposal["artifact_sha256"][:12])
     record = {"adopted_at": _utc_now(), "authorization": authorization, "previous_pointer": proposal["previous"],
               "pointer": adopted_pointer, "rows": rows, "engineering_models_added": sorted(additions),
               "config_backup": str(root / backup_relative)}
     ao_engineering_model.store_once(root, record_relative, record)
-    try:
-        ao_engineering_model.effective_policy(root)
-    except Exception as exc:
-        _atomic_bytes(config_path, raw_config)
-        raise RoomError("Adopted qualification failed its effective-policy load; the previous configuration "
-                        "was restored") from exc
     return {"adopted": True, "revision": artifact["revision"], "pointer": adopted_pointer,
             "engineering_models_added": sorted(additions),
             "record": str(root / record_relative), "config_backup": str(root / backup_relative)}
@@ -416,7 +482,10 @@ def main():
     if args.command == "draft":
         result = _draft_command(root, claude_bin)
     else:
-        result = adopt(root, args.draft, args.authorization, embedded_model_ids(claude_bin))
+        import ao_release_check
+        executable_ids = embedded_model_ids(claude_bin)
+        executable_version = ao_release_check._claude_version(subprocess.run, claude_bin)
+        result = adopt(root, args.draft, args.authorization, executable_ids, executable_version)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

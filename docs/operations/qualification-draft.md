@@ -23,7 +23,11 @@ qualified family. A proposal requires all of:
 
 Rows without a proposal carry the reason: `source_unavailable`,
 `not_in_source_capture`, `not_embedded_in_executable`,
-`executable_below_family_floor`, or `none_newer`.
+`executable_below_family_floor`, `current_model_not_in_source_capture`, or
+`none_newer`. The last means the fresh captures no longer name the family's
+qualified model at all: a draft is never written while any row carries it —
+a revision never re-cites evidence that dropped a qualified model, and removal
+stays an explicit operator change.
 
 ## Drafts
 
@@ -61,18 +65,22 @@ python3 ao_qualification_draft.py --home ~/.project-room adopt \
 `adopt` refuses unless the draft still verifies end to end: its artifact digest
 matches `proposal.json`, every retained evidence file verifies, the current
 configured pointer still equals the draft's `previous` pointer (a stale draft is
-refused — draft again), the revision is exactly the next one, and every proposed
-identifier is still embedded in the configured executable. The draft path must be
+refused — draft again), the revision is exactly the next one, every proposed
+identifier is still embedded in the configured executable, and that executable's
+version is known and meets every proposed floor. The draft path must be
 a direct child of `qualification-drafts`; empty or oversized authorization
 refuses. If the pointer already names this draft's artifact, `adopt` returns
-`already_adopted` without writing.
+`already_adopted` — or, when the adoption record itself was lost after the
+switch, completes it once and reports `recovered`.
 
 On success `adopt` backs up the exact prior `<home>/ao/config.json` bytes to
-`config.json.bak-<UTC stamp>`, switches `family_qualification` to the draft
-artifact, merges the draft's `engineering_models` additions (a key colliding with
-a bundled model or an existing different entry refuses), records the adoption
-under `qualification-adoptions/` with the authorization, and finally reloads the
-effective policy — a failure restores the backup and refuses.
+`config.json.bak-<UTC stamp>-r<revision>-<sha12>`, proves the candidate
+configuration against an effective-policy reload **before** the switch (a
+failure refuses with the configuration untouched, so no restore is needed),
+then switches `family_qualification` to the draft artifact, merges the draft's
+`engineering_models` additions (a key colliding with a bundled model or an
+existing different entry refuses), and records the adoption under
+`qualification-adoptions/` with the authorization.
 
 When the private `<home>/ao/config.json` sets `family_qualification_auto_adopt:
 true`, the release check performs the same `adopt` call itself after drafting
