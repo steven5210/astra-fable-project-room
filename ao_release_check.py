@@ -595,7 +595,7 @@ def _qualification_sources(root, fetch_source):
 
 
 def _qualification_draft(root, source_bodies, claude_code, controller, checked_at):
-    """The qualification_draft section: proposal rows and an inert draft, never an adoption."""
+    """The qualification_draft section: proposal rows, an inert draft, and an adoption only under the standing flag."""
     import ao_qualification_draft
     empty = {"outcome": "no_qualification", "rows": [], "draft": None, "action": None,
              "adoption": None, "reasons": []}
