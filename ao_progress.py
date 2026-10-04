@@ -41,11 +41,18 @@ MAX_STEPS = 64
 MAX_LAUNCHES = 64
 MAX_LABEL_CHARS = 200
 MAX_DESCRIPTION_CHARS = 120
+MAX_KEY_CHARS = 64
+MAX_HISTOGRAM_KEYS = 32
 GUARD_REFUSAL = "Project Room routing guard"
 EARLY_EXIT = "Agent terminated early"
 _CREATED = re.compile(r"Task #(\S+) created successfully")
 _LIST_LINE = re.compile(r"#(\S+)\s+\[([^\]]+)\]\s*(.*)")
 _STEP_STATUSES = ("pending", "in_progress", "completed")
+
+
+def _redact(text):
+    """Absolute paths never leave the view; a slash inside a word keeps relative paths intact."""
+    return re.sub(r"(?<![^\s'\"(])/[^\s'\"]+", "<path>", str(text))
 
 
 def _window(path, native_session_id):
@@ -139,6 +146,21 @@ def _task_created_id(text):
     return match.group(1) if match else None
 
 
+def _task_succeeded(result):
+    """A task tool call advances the plan only through a present, non-error, non-false result."""
+    if not isinstance(result, dict) or result.get("is_error"):
+        return False
+    text = result.get("text")
+    if isinstance(text, str):
+        try:
+            value = json.loads(text)
+        except ValueError:
+            value = None
+        if isinstance(value, dict) and "success" in value and value["success"] is not True:
+            return False
+    return True
+
+
 def _task_list(text):
     if not isinstance(text, str):
         return None
@@ -152,6 +174,8 @@ def _task_list(text):
                   "activeForm": task.get("activeForm"), "status": task.get("status") or "pending"}
                  for task in value["tasks"] if isinstance(task, dict) and task.get("id") is not None]
     else:
+        if text.strip() == "No tasks found":
+            return []
         items = []
         for line in text.splitlines():
             match = _LIST_LINE.match(line.strip())
@@ -185,7 +209,8 @@ def _fold_plan(rows, uses, results):
                     kind = "todo_write"
             elif block.get("type") == "tool_use" and block.get("name") == "TaskCreate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
-                task_id = _task_created_id((results.get(block.get("id")) or {}).get("text"))
+                result = results.get(block.get("id"))
+                task_id = _task_created_id((result or {}).get("text")) if _task_succeeded(result) else None
                 if task_id is not None:
                     steps[task_id] = {"id": task_id, "subject": given.get("subject"),
                                       "activeForm": given.get("activeForm"), "status": "pending"}
@@ -193,7 +218,7 @@ def _fold_plan(rows, uses, results):
             elif block.get("type") == "tool_use" and block.get("name") == "TaskUpdate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
                 task_id = given.get("taskId", given.get("id"))
-                if task_id is not None:
+                if task_id is not None and _task_succeeded(results.get(block.get("id"))):
                     key = str(task_id)
                     if given.get("status") == "deleted":
                         if key in steps:
@@ -220,26 +245,26 @@ def _fold_plan(rows, uses, results):
         if status in counts:
             counts[status] += 1
         label = step.get("activeForm") if status == "in_progress" and step.get("activeForm") else step.get("subject")
-        output.append({"label": (str(label) if label is not None else "")[:MAX_LABEL_CHARS],
+        output.append({"label": (_redact(label)[:MAX_LABEL_CHARS] if label is not None else ""),
                        "status": status if status is not None else "pending"})
     return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts}
 
 
-def _turn_window(rows, request, anchors):
-    """The anchor row and the turn rows after it, up to the next controller human row; None when absent."""
+def _turn_window(rows, request, rank):
+    """The request's rank-th anchor row and the turn rows after it, up to the next human row."""
     wanted = request.get("text_sha256")
-    anchor = None
-    for index, row in enumerate(rows):
-        text = ao_native_outcome.human_text(row)
-        if isinstance(text, str) and isinstance(wanted, str) \
-                and hashlib.sha256(text.encode()).hexdigest() == wanted:
-            anchor = index
-    if anchor is None:
+    matches = []
+    if isinstance(wanted, str):
+        for index, row in enumerate(rows):
+            text = ao_native_outcome.human_text(row)
+            if text and hashlib.sha256(text.encode()).hexdigest() == wanted:
+                matches.append(index)
+    if not matches:
         return None, None
+    anchor = matches[rank] if rank < len(matches) else matches[-1]
     window = []
     for row in rows[anchor + 1:]:
-        text = ao_native_outcome.human_text(row)
-        if isinstance(text, str) and hashlib.sha256(text.encode()).hexdigest() in anchors:
+        if ao_native_outcome.human_text(row):
             break
         window.append(row)
     return rows[anchor], window
@@ -265,11 +290,21 @@ def _launches(uses, results):
                 duration = None
         description = given.get("description")
         rows.append({"subagent_type": given.get("subagent_type"),
-                     "description": (str(description)[:MAX_DESCRIPTION_CHARS]
+                     "description": (_redact(description)[:MAX_DESCRIPTION_CHARS]
                                      if description is not None else None),
                      "started_at": started, "ended_at": ended, "status": status,
                      "duration_seconds": duration})
     return rows
+
+
+def _bump(histogram, key):
+    """One bounded histogram entry; keys past 32 distinct fold into other."""
+    if not isinstance(key, str):
+        return
+    key = key[:MAX_KEY_CHARS]
+    if key not in histogram and len(histogram) >= MAX_HISTOGRAM_KEYS:
+        key = "other"
+    histogram[key] = histogram.get(key, 0) + 1
 
 
 def _turn(anchor_row, window):
@@ -277,12 +312,11 @@ def _turn(anchor_row, window):
     served_models, stop_reasons, tool_calls = {}, {}, {}
     for row in assistant:
         message = row.get("message") if isinstance(row.get("message"), dict) else {}
-        for histogram, key in ((served_models, message.get("model")), (stop_reasons, message.get("stop_reason"))):
-            if isinstance(key, str):
-                histogram[key] = histogram.get(key, 0) + 1
+        _bump(served_models, message.get("model"))
+        _bump(stop_reasons, message.get("stop_reason"))
         for block in _blocks(row):
-            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
-                tool_calls[block["name"]] = tool_calls.get(block["name"], 0) + 1
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                _bump(tool_calls, block.get("name"))
     api_errors = sum(1 for row in window if row.get("isApiErrorMessage") is True)
     compactions = sum(1 for row in window if row.get("type") == "user"
                       and row.get("isCompactSummary") is True and row.get("isVisibleInTranscriptOnly") is True)
@@ -317,6 +351,11 @@ def _last_text(rows):
     return None
 
 
+def _request_order(request):
+    return (request.get("created_order") if isinstance(request.get("created_order"), (int, float)) else 0,
+            request.get("created_at") if isinstance(request.get("created_at"), (int, float)) else 0)
+
+
 def _request_view(request):
     return {"request_id": request.get("request_id"), "state": request.get("state"),
             "purpose": request.get("purpose"), "created_at": request.get("created_at"),
@@ -334,8 +373,7 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         eligible = [request for request in requests.values() if isinstance(request, dict)]
         if not eligible:
             raise RoomError("The room has no requests")
-        request = max(eligible, key=lambda r: (r.get("created_order") if isinstance(r.get("created_order"), (int, float)) else 0,
-                                               r.get("created_at") if isinstance(r.get("created_at"), (int, float)) else 0))
+        request = max(eligible, key=_request_order)
     else:
         request = requests.get(request_id)
         if not isinstance(request, dict):
@@ -346,23 +384,29 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
                                      "counts": {status: 0 for status in _STEP_STATUSES}},
             "malformed_rows": 0}
     try:
-        validated = ao_native_outcome.validate_registered_source(directory, state)
+        # The bounded tail read in _window needs no file size cap; the dispatch default stays.
+        validated = ao_native_outcome.validate_registered_source(directory, state, transcript_size_limit=None)
         rows, malformed = _window(validated["source"]["transcript"], validated["source"]["native_session_id"])
     except (RoomError, OSError) as exc:
-        view["source"]["reason"] = re.sub(r"/[^\s'\"]+", "<path>", str(exc))[:200]
+        view["source"]["reason"] = _redact(str(exc))[:200]
         return view
-    anchors = {r.get("text_sha256") for r in requests.values()
-               if r is not request and isinstance(r, dict) and isinstance(r.get("text_sha256"), str)}
+    # Identical request texts share one anchor digest; the request's rank among them picks its row.
+    same = sorted((other for other in requests.values()
+                   if isinstance(other, dict) and isinstance(request.get("text_sha256"), str)
+                   and other.get("text_sha256") == request.get("text_sha256")),
+                  key=_request_order)
+    rank = next((index for index, other in enumerate(same) if other is request), 0)
     uses, results = _tools(rows)
     view["source"] = {"available": True}
     view["malformed_rows"] = malformed
-    anchor_row, turn_rows = _turn_window(rows, request, anchors)
+    anchor_row, turn_rows = _turn_window(rows, request, rank)
     view["turn"] = {"anchor_found": False} if anchor_row is None else _turn(anchor_row, turn_rows)
-    # Launches belong to the request's own turn; without an anchor the whole window is the fallback.
-    launch_uses, launch_results = _tools(rows if anchor_row is None else turn_rows)
-    view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
+    if anchor_row is not None:
+        # Launches belong to the request's own turn; without an anchor nothing is attributable.
+        launch_uses, launch_results = _tools(turn_rows)
+        view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
     view["plan"] = _fold_plan(rows, uses, results)
     if max_text_chars:
         text = _last_text(rows)
-        view["last_text"] = text[:max_text_chars] if text is not None else None
+        view["last_text"] = _redact(text)[:max_text_chars] if text is not None else None
     return view

@@ -214,8 +214,15 @@ class ProgressViewTests(Fixture):
         view = self.view(request_id='spec_review')
         self.assertEqual(view['request']['request_id'], 'spec_review')
         self.assertTrue(view['turn']['anchor_found'])
-        self.assertEqual(turn_timestamps(view['turn']), (self.trailing['timestamp'], self.trailing['timestamp']))
-        self.assertEqual(view['turn']['assistant_rows'], 0)
+        spec_caller = next(row for row in self.native_events if row.get('uuid') == 'spec_review-caller')
+        todo_result = next(row for row in self.native_events
+                           if row.get('uuid', '').startswith('impl-1-todo-write-result'))
+        # The spec turn now anchors on its own caller row and ends at the impl-1 human row.
+        self.assertEqual(turn_timestamps(view['turn']), (spec_caller['timestamp'], todo_result['timestamp']))
+        self.assertEqual(view['turn']['assistant_rows'], 2)
+        self.assertEqual(view['turn']['served_models'], {MODEL: 2})
+        self.assertEqual(view['turn']['tool_calls'], {'TodoWrite': 1})
+        self.assertEqual(view['launches'], [])
         self.assertEqual(self.view(request_id='impl-1')['request']['request_id'], 'impl-1')
         with self.assertRaises(ao.RoomError):
             self.view(request_id='no-such-request')
@@ -238,11 +245,17 @@ class ProgressViewTests(Fixture):
         self.assertNotIn('/', json.dumps(view))
 
     def test_anchor_outside_the_window_reports_only_turn_boundary(self):
-        with patch.object(ao_progress, 'MAX_WINDOW_BYTES', 400):
+        stray = self._assistant('window-stray', _iso(self.request['created_at'] + 6.0),
+                                [self._use('tu-ws', 'Agent', {'subagent_type': 'Explore',
+                                                            'description': 'unattributable launch'})])
+        self.native_events.append(stray)
+        self._write_transcript(extra=['{not json'])
+        with patch.object(ao_progress, 'MAX_WINDOW_BYTES', 1200):
             view = self.view()
         self.assertTrue(view['source']['available'])
         self.assertEqual(view['turn'], {'anchor_found': False})
         self.assertEqual(view['plan']['source'], 'none')
+        # The stray launch is inside the window but nothing is attributable without an anchor.
         self.assertEqual(view['launches'], [])
         self.assertEqual(view['malformed_rows'], 1)
 
@@ -351,6 +364,155 @@ class ProgressViewTests(Fixture):
         self.assertFalse(view['source']['available'])
         self.assertNotIn('/Users', json.dumps(view))
         self.assertIn('<path>', view['source']['reason'])
+
+    def test_progress_bypasses_the_dispatch_transcript_cap(self):
+        with self.assertRaises(ao.RoomError):
+            ao_native_outcome.validate_registered_source(self.directory(), self.state(),
+                                                         transcript_size_limit=10)
+        accepted = ao_native_outcome.validate_registered_source(self.directory(), self.state(),
+                                                                transcript_size_limit=None)
+        self.assertTrue(accepted['transcript_present'])
+        calls = []
+        real = ao_native_outcome.validate_registered_source
+
+        def observed(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        with patch.object(ao_native_outcome, 'validate_registered_source', side_effect=observed):
+            view = self.view()
+        self.assertTrue(view['source']['available'])
+        self.assertEqual(calls, [{'transcript_size_limit': None}])
+
+    def test_no_anchor_means_no_launches(self):
+        state = self.state()
+        state['requests']['impl-1']['text_sha256'] = '0' * 64
+        ao.atomic(self.directory() / 'state.json', state)
+        view = self.view(request_id='impl-1')
+        self.assertTrue(view['source']['available'])
+        self.assertEqual(view['turn'], {'anchor_found': False})
+        self.assertEqual(view['launches'], [])
+        self.assertTrue(view['plan']['steps'])
+
+    def test_failed_task_results_do_not_advance_the_plan(self):
+        stamp = _iso(self.request['created_at'] + 3.0)
+        failures = [
+            self._assistant('failed-update', stamp,
+                            [self._use('tu-fu', 'TaskUpdate', {'taskId': '3', 'status': 'completed'})]),
+            self._result('failed-update-result', stamp, 'tu-fu', 'update refused', is_error=True),
+            self._assistant('false-update', stamp,
+                            [self._use('tu-su', 'TaskUpdate', {'taskId': '1', 'status': 'in_progress'})]),
+            self._result('false-update-result', stamp, 'tu-su',
+                         json.dumps({'success': False, 'error': 'refused'})),
+            self._assistant('failed-create', stamp,
+                            [self._use('tu-fc', 'TaskCreate', {'subject': 'Phantom task'})]),
+            self._result('failed-create-result', stamp, 'tu-fc', 'boom', is_error=True),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = failures
+        self._write_transcript()
+        self.assertEqual(self.view()['plan'], {
+            'source': 'task_tools', 'updated_at': self.task_list_result['timestamp'],
+            'steps': [{'label': 'Implement parser', 'status': 'completed'},
+                      {'label': 'Gate evidence', 'status': 'pending'}],
+            'counts': {'pending': 1, 'in_progress': 0, 'completed': 1}})
+
+    def test_identical_request_texts_pick_the_ordered_anchor(self):
+        state = self.state()
+        first = state['requests']['impl-1']
+        state['requests']['impl-2'] = dict(first, request_id='impl-2',
+                                         created_order=first['created_order'] + 1,
+                                         created_at=first['created_at'] + 0.5)
+        ao.atomic(self.directory() / 'state.json', state)
+        # With only one matching human row the second request falls back to the last match.
+        self.assertEqual(self.view(request_id='impl-2')['turn']['started_at'], self.anchor['timestamp'])
+        stamp = _iso(self.request['created_at'] + 4.5)
+        second = [
+            {'type': 'user', 'uuid': _identity(), 'sessionId': self.NATIVE, 'timestamp': stamp,
+             'cwd': self.workspace, 'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': self.request['text']}},
+            self._assistant('second-agent', _iso(self.request['created_at'] + 4.6),
+                            [self._use('tu-sa', 'Agent', {'subagent_type': 'Explore',
+                                                        'description': 'Second turn launch'})]),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = second
+        self._write_transcript()
+        first_view = self.view(request_id='impl-1')
+        self.assertEqual(first_view['turn']['started_at'], self.anchor['timestamp'])
+        self.assertEqual(first_view['turn']['last_activity_at'], self.last_row['timestamp'])
+        self.assertNotIn('Second turn launch',
+                         [launch['description'] for launch in first_view['launches']])
+        second_view = self.view(request_id='impl-2')
+        self.assertEqual(second_view['turn']['started_at'], stamp)
+        self.assertEqual(second_view['turn']['assistant_rows'], 1)
+        self.assertEqual([launch['description'] for launch in second_view['launches']],
+                         ['Second turn launch'])
+
+    def test_any_human_row_ends_the_turn_window(self):
+        stamp = _iso(self.request['created_at'] + 4.0)
+        rows = [
+            {'type': 'user', 'uuid': _identity(), 'sessionId': self.NATIVE, 'timestamp': stamp,
+             'cwd': self.workspace, 'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': 'an unregistered human note'}},
+            self._assistant('late-agent', _iso(self.request['created_at'] + 4.1),
+                            [self._use('tu-la', 'Agent', {'subagent_type': 'Explore',
+                                                        'description': 'must not appear'})]),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = rows
+        self._write_transcript()
+        view = self.view()
+        self.assertEqual(view['turn']['last_activity_at'], self.last_row['timestamp'])
+        self.assertNotIn('must not appear', [launch['description'] for launch in view['launches']])
+
+    def test_an_empty_task_list_replaces_the_plan(self):
+        stamp = _iso(self.request['created_at'] + 3.0)
+        rows = [
+            self._assistant('list-empty', stamp, [self._use('tu-le', 'TaskList', {})]),
+            self._result('list-empty-result', stamp, 'tu-le', 'No tasks found'),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = rows
+        self._write_transcript()
+        plan = self.view()['plan']
+        self.assertEqual(plan['steps'], [])
+        self.assertEqual(plan['counts'], {'pending': 0, 'in_progress': 0, 'completed': 0})
+        self.assertEqual(plan['source'], 'task_tools')
+        self.assertEqual(plan['updated_at'], rows[1]['timestamp'])
+
+    def test_engineered_strings_redact_absolute_paths(self):
+        stamp = _iso(self.request['created_at'] + 3.0)
+        rows = [
+            self._assistant('path-create', stamp, [self._use('tu-pc', 'TaskCreate',
+                            {'subject': 'Fix /Users/x/secret.json and src/a.ts'})]),
+            self._result('path-create-result', stamp, 'tu-pc', 'Task #9 created successfully'),
+            self._assistant('path-agent', stamp, [self._use('tu-pa', 'Agent',
+                            {'subagent_type': 'Explore', 'description': 'Open /etc/hosts and src/b.ts'})]),
+            self._assistant('path-text', stamp,
+                            [{'type': 'text', 'text': 'Wrote /var/log/out.log then src/c.ts'}],
+                            stop='end_turn'),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = rows
+        self._write_transcript()
+        view = self.view()
+        self.assertIn({'label': 'Fix <path> and src/a.ts', 'status': 'pending'}, view['plan']['steps'])
+        self.assertIn('Open <path> and src/b.ts',
+                      [launch['description'] for launch in view['launches']])
+        self.assertEqual(view['last_text'], 'Wrote <path> then src/c.ts')
+        serialized = json.dumps(view)
+        self.assertNotIn('/Users/x/secret.json', serialized)
+        self.assertNotIn('/etc/hosts', serialized)
+        self.assertNotIn('/var/log/out.log', serialized)
+
+    def test_histogram_keys_are_bounded(self):
+        long_name = 'T' * 70
+        blocks = [self._use('tu-h-long', long_name, {})] + [
+            self._use('tu-h%d' % index, 'Tool%02d' % index, {}) for index in range(39)]
+        row = self._assistant('many-tools', _iso(self.request['created_at'] + 3.0), blocks)
+        self.native_events.insert(self.native_events.index(self.trailing), row)
+        self._write_transcript()
+        tool_calls = self.view()['turn']['tool_calls']
+        named = {key: count for key, count in tool_calls.items() if key != 'other'}
+        self.assertEqual(len(named), 32)
+        self.assertEqual(named[long_name[:64]], 1)
+        self.assertEqual(tool_calls['other'], 13)
 
 
 def agent_stamp(events, label):
