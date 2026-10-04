@@ -395,12 +395,15 @@ class AcceptanceMatrixTests(MatrixFixture):
 
     def test_p5c_extend_record_size_bound(self):
         audit = self.audit('fourth')
-        audit_path = self.audits_dir() / (audit['audit_sha256'] + '.json')
-        record = json.loads(audit_path.read_text(encoding='utf-8'))
-        max_manifest = max((self.directory() / path).stat().st_size
-                           for path in record['evidence']['manifest'])
-        bound = max_manifest + 1
-        with patch.object(extension, 'MAX_RECORD_BYTES', bound):
+        # Scope the tightened bound to the journal write alone: the largest manifest
+        # evidence file (a full packet receipt) can exceed the biggest grant entry.
+        real_store = extension._store
+
+        def tight_store(path, value, label):
+            with patch.object(extension, 'MAX_RECORD_BYTES', len(extension._serialized(value)) - 1):
+                return real_store(path, value, label)
+
+        with patch.object(extension, '_store', tight_store):
             with self.assertRaisesRegex(ao.RoomError,
                                         'continuation journal entry exceeds its readable size bound'):
                 self.service.ao_room_acceptance_review_extend(

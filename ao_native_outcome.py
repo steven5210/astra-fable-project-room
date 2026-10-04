@@ -599,14 +599,15 @@ def preflight_source(directory, state, database, transcript, role='engineer', wo
                      'provider and effective effort remain unobserved'}
 
 
-def validate_registered_source(directory, state, role='engineer'):
+def validate_registered_source(directory, state, role='engineer', transcript_size_limit=64_000_000):
     """Full read-only verification of one already-registered prospective source before dispatch.
 
     Uses the existing owner database reader, the bound session and the prepared workspace the turn
     is about to run in. The prospective transcript may not exist yet; when it does, it must be the
     exact owned non-symlink file for the retained provider conversation. This never calls a model
     and never requires a completed response; the first sync still requires the actual complete
-    identity proof.
+    identity proof. ``transcript_size_limit`` bounds the accepted file size; ``None`` lifts it for
+    readers that only ever take a bounded tail window.
     """
     from ao_native_identity import read_owner
     if role not in ('engineer', 'reviewer'):
@@ -644,7 +645,7 @@ def validate_registered_source(directory, state, role='engineer'):
     if path.exists():
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
-                or info.st_size > 64_000_000):
+                or (transcript_size_limit is not None and info.st_size > transcript_size_limit)):
             raise RoomError('Prospective native transcript file is unsafe')
     if role == 'engineer':
         from ao_delegates import validate_preparation
