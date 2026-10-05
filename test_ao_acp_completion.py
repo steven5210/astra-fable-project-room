@@ -241,7 +241,8 @@ class CompletionPatchTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.source_hash = hashlib.sha256(SYNTHETIC_MODULE).hexdigest()
         self.precedence_hash = hashlib.sha256(SYNTHETIC_MODULE.replace(acp.OLD, acp.NEW)).hexdigest()
-        self.pins = patch.multiple(acp, SOURCE_SHA256=self.source_hash, PRECEDENCE_SHA256=self.precedence_hash)
+        self.pins = patch.multiple(acp, SOURCE_SHA256=self.source_hash, PRECEDENCE_SHA256=self.precedence_hash,
+                                   PATCHED_SHA256={**acp.PATCHED_SHA256, self.source_hash: self.precedence_hash})
         self.pins.start(); self.addCleanup(self.pins.stop)
 
     def execute(self, body, patched=True):
