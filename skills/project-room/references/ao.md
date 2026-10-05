@@ -48,7 +48,9 @@ with the official latest stable release, stores private evidence in
 bundle matches the latest stable release. For `update_available`, review the
 release and arrange an update between jobs as below. For `mismatch`, restart AO
 between jobs and recheck. For `unknown`, warn with the reported reasons, never
-treat it as up to date, and do not block status, sync or recovery.
+treat it as up to date, and do not block status, sync or recovery. A single
+same-host GitHub redirect is followed and reported as `latest_repository_moved`;
+the repository moved to OrchestratorInc in October 2026.
 
 The same call carries two report-only sections. `claude_code` compares the
 configured `claude_bin` version with the highest bundled or qualified family

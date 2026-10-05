@@ -22,14 +22,18 @@ import project_room_mcp
 
 
 class FakeResponse:
-    def __init__(self, status, body):
+    def __init__(self, status, body, headers=None):
         self.status = status
         self.body = body
+        self.headers = headers or {}
         self.read_size = None
 
     def read(self, size):
         self.read_size = size
         return self.body
+
+    def getheader(self, name):
+        return self.headers.get(name)
 
 
 class FakeHealthResponse(FakeResponse):
@@ -42,18 +46,20 @@ class FakeHealthResponse(FakeResponse):
 
 class FakeConnection:
     def __init__(self, response):
-        self.response = response
+        self.responses = list(response) if isinstance(response, list) else [response]
         self.args = None
         self.request_args = None
+        self.paths = []
         self.closed = False
         self.request_count = 0
 
     def request(self, method, path, headers):
         self.request_count += 1
+        self.paths.append(path)
         self.request_args = (method, path, headers)
 
     def getresponse(self):
-        return self.response
+        return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 
     def close(self):
         self.closed = True
@@ -82,7 +88,7 @@ class ReleaseCheckTests(unittest.TestCase):
             "draft": False,
             "prerelease": False,
             "tag_name": "v0.13.2",
-            "html_url": "https://github.com/Untrivial-ai/agent-orchestrator/releases/tag/v0.13.2",
+            "html_url": "https://github.com/OrchestratorInc/agent-orchestrator/releases/tag/v0.13.2",
             "published_at": "2023-11-14T00:00:00Z",
         }
         self.write_bundle("0.13.2", self.process_start - 10)
@@ -492,7 +498,7 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIsNone(record["latest"]["html_url"])
         self.assertIsNone(record["latest"]["published_at"])
 
-    def test_latest_transport_is_bounded_and_does_not_follow_redirects(self):
+    def test_latest_transport_is_bounded_and_follows_one_same_host_redirect(self):
         body = json.dumps(self.latest).encode()
         response = FakeResponse(200, body)
         connection = FakeConnection(response)
@@ -504,7 +510,7 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertIsNotNone(https.call_args.kwargs["context"])
         self.assertEqual(connection.request_args, (
             "GET",
-            "/repos/Untrivial-ai/agent-orchestrator/releases/latest",
+            "/repos/OrchestratorInc/agent-orchestrator/releases/latest",
             {
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "astra-fable-project-room",
@@ -526,6 +532,51 @@ class ReleaseCheckTests(unittest.TestCase):
                 ao_release_check._fetch_latest()
         self.assertEqual(raised.exception.reason, "latest_fetch_failed")
         self.assertEqual(redirect.request_count, 1)
+
+    def test_a_same_host_redirect_is_followed_once_and_reported(self):
+        body = json.dumps(self.latest).encode()
+        location = "https://api.github.com/repositories/1156994049/releases/latest"
+        connection = FakeConnection([FakeResponse(301, b"", {"Location": location}), FakeResponse(200, body)])
+        with patch.object(ao_release_check.http.client, "HTTPSConnection", return_value=connection):
+            result = ao_release_check._fetch_latest()
+        self.assertEqual(result["tag_name"], "v0.13.2")
+        self.assertEqual(result["redirected_from"], "/repos/OrchestratorInc/agent-orchestrator/releases/latest")
+        self.assertEqual(connection.paths, ["/repos/OrchestratorInc/agent-orchestrator/releases/latest",
+                                          "/repositories/1156994049/releases/latest"])
+        self.assertEqual(connection.request_count, 2)
+
+        connection = FakeConnection([FakeResponse(301, b"", {"Location": location}), FakeResponse(200, body)])
+        with patch.object(ao_release_check.http.client, "HTTPSConnection", return_value=connection):
+            result = self.check(fetch_latest=None)
+        self.assertEqual(result["outcome"], "up_to_date")
+        self.assertEqual(result["latest_version"], "v0.13.2")
+        self.assertIn("latest_repository_moved", result["reasons"])
+        self.assertNotIn("latest_fetch_failed", result["reasons"])
+
+    def test_a_redirect_off_github_or_a_second_redirect_fails_closed(self):
+        body = json.dumps(self.latest).encode()
+        for location in ("https://example.com/repos/OrchestratorInc/agent-orchestrator/releases/latest",
+                         "http://api.github.com/repositories/1156994049/releases/latest",
+                         "https://api.github.com:444/repositories/1156994049/releases/latest",
+                         "https://user@api.github.com/repositories/1156994049/releases/latest",
+                         "https://api.github.com/other/1156994049"):
+            with self.subTest(location=location):
+                connection = FakeConnection([FakeResponse(301, b"", {"Location": location}), FakeResponse(200, body)])
+                with patch.object(ao_release_check.http.client, "HTTPSConnection", return_value=connection):
+                    with self.assertRaises(ao_release_check._FetchFailure) as raised:
+                        ao_release_check._fetch_latest()
+                self.assertEqual(raised.exception.reason, "latest_fetch_failed")
+                self.assertEqual(connection.request_count, 1)
+
+        location = "https://api.github.com/repositories/1156994049/releases/latest"
+        connection = FakeConnection([FakeResponse(301, b"", {"Location": location}),
+                                     FakeResponse(301, b"", {"Location": location}),
+                                     FakeResponse(200, body)])
+        with patch.object(ao_release_check.http.client, "HTTPSConnection", return_value=connection):
+            with self.assertRaises(ao_release_check._FetchFailure) as raised:
+                ao_release_check._fetch_latest()
+        self.assertEqual(raised.exception.reason, "latest_fetch_failed")
+        self.assertEqual(connection.request_count, 2)
 
     def test_rate_limited_transport_has_the_specific_reason(self):
         for status in (403, 429):
