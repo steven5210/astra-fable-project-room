@@ -314,6 +314,77 @@ class ProviderTransitionTests(DelegateFixture):
         self.assertEqual(status['delegate']['jobs']['backend'], 'official')
         self.assertEqual(len(self.fake.posts), 1)
 
+    def test_oversized_activity_payloads_bind_the_audit_by_digest_and_projection(self):
+        activities = [{'id': 'activity-large', 'sequence': 1, 'status': 'completed',
+                       'detail': 'x' * 300_000, 'output': 'y' * 50_000}]
+        self.fake.snapshots['engineer']['activities'] = copy.deepcopy(activities)
+        with patch.object(transition, 'MAX_AUDIT_BYTES', 200_000):
+            audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        self.assertEqual(saved['version'], 2)
+        observed = saved['observed_snapshot']
+        self.assertEqual(observed['activities_count'], 1)
+        self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
+        self.assertNotIn('detail', json.dumps(observed))
+
+    def test_a_saved_full_shape_audit_remains_readable(self):
+        directory = self.directory()
+        full = {'evidence': {'synthetic': 'full-shape audit'},
+                'observed_snapshot': {'activities': [{'id': 'a', 'detail': 'embedded payload'}]},
+                'observed_at': 1.0}
+        sha256 = ao.digest(full)
+        transition._store_once(transition._audit_path(directory, sha256), full)
+        self.assertEqual(transition._saved_audit(directory, sha256), full)
+
+    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+        self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
+            'status': 'completed', 'detail': 'Retained payload'}]
+        args = self.args()
+        before = (self.directory() / 'state.json').read_bytes()
+        posts = copy.deepcopy(self.fake.posts)
+        self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Mutated payload'
+        with self.assertRaisesRegex(ao.RoomError,
+                'Provider transition audit observed history changed; audit again'):
+            self.commit_transition(args)
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
+        self.assertEqual(self.fake.posts, posts)
+        self.assertFalse(transition._pending_receipts(self.directory()))
+        self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Retained payload'
+        self.assertTrue(self.commit_transition(args)['transitioned'])
+
+    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+        self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
+            'status': 'completed', 'detail': 'Retained payload'}]
+        args = self.args()
+        calls = []
+        original = transition._inspect
+        def drifting(service, directory, state, target_input, reconcile=None):
+            evidence, observed, snapshot = original(service, directory, state, target_input, reconcile)
+            calls.append(len(calls) + 1)
+            if len(calls) == 2:
+                snapshot = copy.deepcopy(snapshot)
+                snapshot['activities'][0]['detail'] = 'Mutated before commit'
+            return evidence, observed, snapshot
+        before = (self.directory() / 'state.json').read_bytes()
+        with patch.object(transition, '_inspect', side_effect=drifting):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Provider transition audit observed history changed; audit again'):
+                self.commit_transition(args)
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
+        self.assertFalse(transition._pending_receipts(self.directory()))
+        self.assertTrue(self.commit_transition(args)['transitioned'])
+
+    def test_a_legacy_full_shape_audit_still_transitions(self):
+        audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        legacy = {'evidence': saved['evidence'], 'observed': saved['observed'],
+                  'observed_snapshot': copy.deepcopy(self.fake.snapshots['engineer']),
+                  'observed_at': saved['observed_at']}
+        sha256 = ao.digest(legacy)
+        transition._store_once(transition._audit_path(self.directory(), sha256), legacy)
+        self.assertTrue(self.commit_transition(self.args({'audit_sha256': sha256}))['transitioned'])
+
     def test_durable_intent_survives_crash_and_only_identical_request_reconciles(self):
         args = self.args()
         before = (self.directory() / 'state.json').read_bytes()

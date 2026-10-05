@@ -38,6 +38,36 @@ def _read(path):
     return json.loads(owned_bytes(path))
 
 
+ACTIVITY_FIELDS = ('id', 'sequence', 'turnId', 'type', 'status', 'summary', 'createdAt',
+                   'updatedAt', 'startedAt', 'finishedAt')
+MAX_AUDIT_BYTES = 96_000_000
+
+
+def projected_snapshot(snapshot):
+    """The observed session identity an audit binds: every snapshot field, with the unbounded
+    activity rows (and a nested raw_conversation's, when present) replaced by the bounded
+    ACTIVITY_FIELDS projection plus their count and the digest of the full rows sorted by id."""
+    activities = snapshot.get('activities')
+    if not isinstance(activities, list):
+        return dict(snapshot)
+    full = sorted(activities, key=lambda item: item['id'])
+    projected = [{key: item[key] for key in ACTIVITY_FIELDS if key in item} for item in full]
+    result = {**snapshot, 'activities': projected, 'activities_count': len(full),
+              'activities_sha256': ao.digest(full)}
+    raw = result.get('raw_conversation')
+    if isinstance(raw, dict) and isinstance(raw.get('activities'), list):
+        result['raw_conversation'] = {**raw, 'activities': projected}
+    return result
+
+
+def observed_history_matches(saved_snapshot, snapshot):
+    """Whether a v2 audit's bound activity history still equals this fresh observation."""
+    projected = projected_snapshot(snapshot)
+    return (isinstance(saved_snapshot, dict)
+            and saved_snapshot.get('activities_count') == projected.get('activities_count')
+            and saved_snapshot.get('activities_sha256') == projected.get('activities_sha256'))
+
+
 def _audit_path(directory, audit_sha256):
     if not isinstance(audit_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", audit_sha256):
         raise RoomError("Use the exact saved provider transition audit digest")
@@ -46,7 +76,7 @@ def _audit_path(directory, audit_sha256):
 
 def _saved_audit(directory, audit_sha256):
     # Up to ten individually bounded 8 MB native history pages can be retained in this private observation.
-    value = json.loads(owned_bytes(_audit_path(directory, audit_sha256), 96_000_000))
+    value = json.loads(owned_bytes(_audit_path(directory, audit_sha256), MAX_AUDIT_BYTES))
     if ao.digest(value) != audit_sha256:
         raise RoomError("Provider transition audit was modified")
     return value
@@ -473,8 +503,14 @@ def _inspect(service, directory, state, target_input, reconcile=None):
 def audit(service, room_id, target_profile):
     with service.locked(room_id) as (directory, state):
         evidence, observed, snapshot = _inspect(service, directory, state, target_profile)
-        value = {"evidence": evidence, "observed": observed, "observed_snapshot": snapshot, "observed_at": time.time()}
+        value = {"version": 2, "evidence": evidence, "observed": observed,
+                 "observed_snapshot": projected_snapshot(snapshot), "observed_at": time.time()}
         audit_sha256 = ao.digest(value)
+        # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline; an oversized
+        # audit is never published.
+        serialized = (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+        if len(serialized) > MAX_AUDIT_BYTES:
+            raise RoomError("Complete provider transition audit exceeds its readable size bound; no audit was published")
         _store_once(_audit_path(directory, audit_sha256), value)
         return {"eligible": True, "audit_sha256": audit_sha256, "room_id": state["room_id"],
                 **{k: evidence[k] for k in ("spec", "handoff", "candidate", "accounting", "shared_registration_rooms")},
@@ -600,7 +636,9 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
             raise RoomError("An uncommitted provider transition receipt belongs to another payload; preserve it and diagnose before continuing")
         saved = _saved_audit(directory, audit_sha256)
         target_input = saved["evidence"]["target"]["input"]
-        evidence, observed, _ = _inspect(service, directory, state, target_input, reconcile)
+        evidence, observed, snapshot = _inspect(service, directory, state, target_input, reconcile)
+        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), snapshot):
+            raise RoomError("Provider transition audit observed history changed; audit again")
         if saved["evidence"] != evidence:
             raise RoomError("Provider transition audit is stale; inspect the changed room, ledger, candidate or native evidence")
         if observed["controller"] != STOPPED:
@@ -618,7 +656,9 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
                             "original_preparation": evidence["preparation"]["path"],
                             "original_preparation_sha256": evidence["preparation"]["sha256"],
                             "original_delegate_sha256": evidence["delegate"]["sha256"], "state": "committed"}}
-        repeated, observed_again, _ = _inspect(service, directory, state, target_input, reconcile)
+        repeated, observed_again, snapshot_again = _inspect(service, directory, state, target_input, reconcile)
+        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], snapshot_again):
+            raise RoomError("Provider transition audit observed history changed; audit again")
         if repeated != evidence or observed_again["controller"] != STOPPED:
             raise RoomError("Provider transition observations changed before commit")
         from ao_routing_adoption import launcher_compatibility

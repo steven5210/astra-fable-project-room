@@ -25,8 +25,8 @@ import deepseek_adapter
 
 SCHEMA = "ao-release-check/v1"
 GITHUB_HOST = "api.github.com"
-GITHUB_PATH = "/repos/Untrivial-ai/agent-orchestrator/releases/latest"
-GITHUB_RELEASE_PREFIX = "https://github.com/Untrivial-ai/agent-orchestrator/releases/"
+GITHUB_PATH = "/repos/OrchestratorInc/agent-orchestrator/releases/latest"
+GITHUB_RELEASE_PREFIX = "https://github.com/OrchestratorInc/agent-orchestrator/releases/"
 CLAUDE_GITHUB_PATH = "/repos/anthropics/claude-code/releases/latest"
 CLAUDE_RELEASE_PREFIX = "https://github.com/anthropics/claude-code/releases/"
 MAX_RESPONSE_BYTES = 1_000_000
@@ -49,21 +49,50 @@ class _FetchFailure(Exception):
         self.reason = reason
 
 
+def _redirect_target(location):
+    """The one redirect a release fetch follows: an https URL on api.github.com itself."""
+    if not isinstance(location, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(location)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme != "https" or parsed.hostname != GITHUB_HOST
+            or parsed.username is not None or parsed.password is not None
+            or (port is not None and port != 443)
+            or not (parsed.path.startswith("/repos/") or parsed.path.startswith("/repositories/"))):
+        return None
+    return parsed.path + ("?" + parsed.query if parsed.query else "")
+
+
 def _fetch_github_latest(path):
     connection = http.client.HTTPSConnection(
         GITHUB_HOST, 443, context=deepseek_adapter.tls_context(), timeout=10
     )
     try:
-        connection.request(
-            "GET",
-            path,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "astra-fable-project-room",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        response = connection.getresponse()
+        redirected_from = None
+        while True:
+            connection.request(
+                "GET",
+                path,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "astra-fable-project-room",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            response = connection.getresponse()
+            if response.status in (301, 302, 307, 308):
+                if redirected_from is not None:
+                    raise _FetchFailure("latest_fetch_failed")
+                target = _redirect_target(response.getheader("Location"))
+                if target is None:
+                    raise _FetchFailure("latest_fetch_failed")
+                response.read(MAX_RESPONSE_BYTES + 1)
+                redirected_from, path = path, target
+                continue
+            break
         if response.status in (403, 429):
             raise _FetchFailure("latest_rate_limited")
         if response.status != 200:
@@ -72,9 +101,12 @@ def _fetch_github_latest(path):
         if len(body) > MAX_RESPONSE_BYTES:
             raise _FetchFailure("latest_fetch_failed")
         try:
-            return json.loads(body)
+            record = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             raise _FetchFailure("latest_fetch_failed") from exc
+        if redirected_from is not None and isinstance(record, dict):
+            record["redirected_from"] = redirected_from
+        return record
     finally:
         connection.close()
 
@@ -685,6 +717,8 @@ def check(root, ao_url, fetch_latest=None, fetch_health=None, run=subprocess.run
         reasons.add("latest_fetch_failed")
     else:
         latest = _release(raw_latest)
+        if isinstance(raw_latest, dict) and raw_latest.get("redirected_from") is not None:
+            reasons.add("latest_repository_moved")
         if latest is None:
             reasons.add("latest_invalid")
         else:

@@ -168,6 +168,19 @@ class ProgressViewTests(Fixture):
         self.assertEqual(ao.digest(ao_progress.INSTRUCTION.encode()), ao_progress.INSTRUCTION_SHA256)
         self.assertEqual(self.state()['requests']['impl-1']['carried']['parts'], [])
 
+    def test_trailing_timestampless_metadata_rows_keep_the_last_timestamped_activity(self):
+        self.native_events.extend([
+            {'type': 'system', 'subtype': 'metadata', 'uuid': _identity(),
+             'sessionId': self.NATIVE, 'cwd': self.workspace},
+            {'type': 'system', 'subtype': 'metadata', 'uuid': _identity(), 'timestamp': 'not-a-timestamp',
+             'sessionId': self.NATIVE, 'cwd': self.workspace},
+        ])
+        self._write_transcript()
+        turn = self.view()['turn']
+        self.assertTrue(turn['anchor_found'])
+        self.assertEqual(turn['last_activity_at'], self.last_row['timestamp'])
+        self.assertIsNotNone(turn['elapsed_seconds'])
+
     def test_latest_request_view_matches_the_folded_window(self):
         view = self.view()
         self.assertEqual(view['request'], {'request_id': 'impl-1', 'state': 'completed', 'purpose': 'implementation',

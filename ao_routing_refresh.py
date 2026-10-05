@@ -37,6 +37,7 @@ import ao_routing
 import ao_workflow
 from ao_delegate_launcher import owned_bytes
 from ao_native_identity import read_owner
+from ao_provider_transition import ACTIVITY_FIELDS, projected_snapshot
 from implementation import candidate_snapshot
 from room import RoomError
 
@@ -46,7 +47,6 @@ MAX_CHAIN = 32
 MAX_RECORD_BYTES = 96_000_000
 CHANGED_ROUTING = {'files', 'guard_path', 'guard_sha256', 'hook_command'}
 AGENT_CHANGE = 'agent_selection_change'
-ACTIVITY_FIELDS = ('id', 'sequence', 'turnId', 'type', 'status', 'summary', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt')
 FIRST_BINDING_UNSUPPORTED = (
     'Qualified routing refresh requires the recorded effective Claude executable identity from its preparation; '
     'a replacement must go through the audited executable binding first. This preparation never recorded a '
@@ -526,12 +526,8 @@ def _inspect(service, directory, state, inputs, prepared, routing, target=None, 
 
 
 def _projected_snapshot(snapshot, activities):
-    """The observed session identity a new intent binds: every snapshot field, with the unbounded
-    activity rows replaced by the same ACTIVITY_FIELDS projection the evidence carries plus their
-    count and the digest of the full rows sorted by id."""
-    full = sorted(snapshot['activities'], key=lambda item: item['id'])
-    return {**snapshot, 'activities': activities, 'activities_count': len(full),
-            'activities_sha256': ao.digest(full)}
+    """The shared projection; the evidence projection is identical, so v2 digests stay exact."""
+    return projected_snapshot(snapshot)
 
 
 def _observed_history_unchanged(record, snapshot, evidence):

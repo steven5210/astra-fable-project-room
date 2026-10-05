@@ -8,7 +8,11 @@ from pathlib import Path
 
 import ao_project_room as ao
 import ao_workflow
+from ao_delegate_launcher import owned_bytes
 from room import RoomError
+
+
+MAX_AUDIT_BYTES = 96_000_000
 
 
 def _store_once(path, value):
@@ -33,7 +37,7 @@ def _audit_path(directory, audit_sha256):
 
 
 def _saved_audit(directory, audit_sha256):
-    value = ao.read(_audit_path(directory, audit_sha256))
+    value = json.loads(owned_bytes(_audit_path(directory, audit_sha256), MAX_AUDIT_BYTES))
     if ao.digest(value) != audit_sha256:
         raise RoomError("Reviewer recovery audit was modified")
     return value
@@ -187,8 +191,15 @@ def _inspect(service, directory, state):
 def audit(service, room_id):
     with service.locked(room_id) as (directory, state):
         evidence, snapshot = _inspect(service, directory, state)
-        value = {"evidence": evidence, "observed_snapshot": snapshot, "observed_at": time.time()}
+        from ao_provider_transition import projected_snapshot
+        value = {"version": 2, "evidence": evidence, "observed_snapshot": projected_snapshot(snapshot),
+                 "observed_at": time.time()}
         audit_sha256 = ao.digest(value)
+        # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline; an oversized
+        # audit is never published.
+        serialized = (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+        if len(serialized) > MAX_AUDIT_BYTES:
+            raise RoomError("Reviewer recovery audit exceeds its readable size bound; no audit was published")
         _store_once(_audit_path(directory, audit_sha256), value)
         return {"eligible": True, "audit_sha256": audit_sha256, **evidence,
                 "meaning": "Current unused-reviewer evidence only; recovery rechecks it and requires explicit authorization"}
@@ -240,13 +251,18 @@ def recover(service, room_id, audit_sha256, replacement_session_id, diagnosis, a
             return _result(state, record)
         saved = _saved_audit(directory, audit_sha256)
         evidence, old_snapshot = _inspect(service, directory, state)
+        from ao_provider_transition import observed_history_matches
+        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), old_snapshot):
+            raise RoomError("Reviewer recovery audit observed history changed; audit again")
         if saved["evidence"] != evidence:
             raise RoomError("Reviewer recovery audit is stale; inspect the changed state or native evidence")
         replacement, native, workspace, snapshot = _target(service, state, replacement_session_id, evidence)
         # Recheck both independent surfaces after preparation, while retaining the
         # global room/claim lock. AO itself remains an externally operated system.
-        repeated, _ = _inspect(service, directory, state)
+        repeated, old_snapshot_again = _inspect(service, directory, state)
         target_again = _target(service, state, replacement_session_id, evidence)
+        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], old_snapshot_again):
+            raise RoomError("Reviewer recovery audit observed history changed; audit again")
         if repeated != evidence or target_again[:3] != (replacement, native, workspace):
             raise RoomError("Reviewer recovery observations changed before commit")
         service.checkpoint(directory, state)

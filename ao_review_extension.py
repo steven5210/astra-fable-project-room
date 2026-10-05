@@ -252,7 +252,7 @@ def _consumption(directory, state, reference):
 
 def _audit(directory, sha256):
     value = _read(directory / BASE / 'audits' / (_hash(sha256, 'review-extension audit') + '.json'))
-    if ao.digest(value) != sha256 or value.get('version') != 1:
+    if ao.digest(value) != sha256 or value.get('version') not in (1, 2):
         raise RoomError('Review-extension audit was modified')
     return value
 
@@ -417,10 +417,12 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
               'native_session_id': native_session_id, 'native_owner_database': native_owner_database}
     with service.locked(room_id) as (directory, state):
         evidence, snapshots = _inspect(service, directory, state, target)
-        value = {'version': 1, 'evidence': evidence, 'observed_snapshots': snapshots, 'observed_at': time.time()}
+        from ao_provider_transition import projected_snapshot
+        value = {'version': 2, 'evidence': evidence, 'observed_at': time.time(),
+                 'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
         sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
-        # Keep both complete raw snapshots; an oversized audit is never published.
+        # Keep the projected snapshots; an oversized audit is never published.
         serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
         if len(serialized) > MAX_RECORD_BYTES:
             raise RoomError('Complete review-extension audit exceeds its readable size bound; no audit was published')
@@ -688,6 +690,18 @@ def consume(service, directory, state, request):
     request.update(review_extension_consumption=relative, review_extension_consumption_sha256=sha256)
 
 
+def _audit_history_unchanged(saved, snapshots):
+    """A v2 audit binds every role's activity rows by digest; the consuming action re-observes them."""
+    if saved.get('version') != 2:
+        return True
+    saved_snapshots = saved.get('observed_snapshots')
+    if not isinstance(saved_snapshots, dict) or set(saved_snapshots) != set(snapshots):
+        return False
+    from ao_provider_transition import observed_history_matches
+    return all(observed_history_matches(saved_snapshots.get(role), snapshot)
+               for role, snapshot in snapshots.items())
+
+
 def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id):
     ao.identifier(request_id); _hash(audit_sha256, 'review-extension audit')
     ao.nonempty(authorization, 'authorization: actual new user answer and its approval context')
@@ -708,7 +722,9 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
         if prior and (pending[0].name != request_id + '.json' or prior.get('inputs') != inputs):
             raise RoomError('An uncommitted review extension belongs to another payload')
         saved = _audit(directory, audit_sha256)
-        full_evidence, _ = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
+        full_evidence, snapshots = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
+        if not _audit_history_unchanged(saved, snapshots):
+            raise RoomError('Review extension audit observed history changed; audit again')
         evidence = full_evidence
         if ao.digest(evidence) != ao.digest(saved['evidence']):
             # Only an already durable legacy receipt may keep its original
@@ -725,7 +741,9 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
                   'evidence_sha256': ao.digest(evidence), 'recorded_at': prior['recorded_at'] if prior else time.time()}
         if prior and ao.digest(prior) != ao.digest(record):
             raise RoomError('Pending review-extension receipt differs from the recomputed grant')
-        repeated, _ = _inspect(service, directory, state, evidence['target'], reconcile=bool(prior))
+        repeated, snapshots_again = _inspect(service, directory, state, evidence['target'], reconcile=bool(prior))
+        if not _audit_history_unchanged(saved, snapshots_again):
+            raise RoomError('Review extension audit observed history changed; audit again')
         if ao.digest(repeated) != ao.digest(full_evidence):
             raise RoomError('Review-extension evidence changed before commit')
         relative = BASE + '/requests/' + request_id + '.json'

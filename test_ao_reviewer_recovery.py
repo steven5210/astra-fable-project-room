@@ -202,6 +202,94 @@ class ReviewerRecoveryTests(unittest.TestCase):
         self.assertEqual(receipt["replacement_snapshot"]["raw_conversation"], self.fake.snapshots["replacement"])
         self.assertEqual(self.fake.posts, [])
 
+    def test_oversized_activity_payloads_bind_the_audit_by_digest_and_projection(self):
+        activities = [{'id': 'activity-large', 'sequence': 1, 'status': 'completed', 'detail': 'x' * 300_000}]
+        snapshot = {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities),
+                    'raw_conversation': {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities)}}
+        with patch.object(recovery, '_inspect', return_value=({'synthetic': 'evidence'}, snapshot)), \
+                patch.object(recovery, 'MAX_AUDIT_BYTES', 200_000):
+            result = self.audit()
+        saved = recovery._saved_audit(self.directory, result['audit_sha256'])
+        self.assertEqual(saved['version'], 2)
+        observed = saved['observed_snapshot']
+        self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
+        self.assertEqual(observed['raw_conversation']['activities'], observed['activities'])
+        self.assertEqual(observed['activities_count'], 1)
+        self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertNotIn('detail', json.dumps(saved))
+
+    def test_a_projected_audit_over_the_bound_refuses_before_publication(self):
+        snapshot = {'sessionId': 'reviewer', 'activities': [
+            {'id': 'activity-large', 'sequence': 1, 'status': 'completed', 'summary': 's' * 300_000}]}
+        with patch.object(recovery, '_inspect', return_value=({'synthetic': 'evidence'}, snapshot)), \
+                patch.object(recovery, 'MAX_AUDIT_BYTES', 200_000):
+            with self.assertRaisesRegex(ao.RoomError, 'readable size bound'):
+                self.audit()
+        self.assertFalse(list((self.directory / 'reviewer-recovery' / 'audits').glob('*.json')))
+
+    def test_a_saved_full_shape_audit_remains_readable(self):
+        full = {'evidence': {'synthetic': 'full-shape audit'},
+                'observed_snapshot': {'activities': [{'id': 'a', 'detail': 'embedded payload'}]},
+                'observed_at': 1.0}
+        sha256 = ao.digest(full)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), full)
+        self.assertEqual(recovery._saved_audit(self.directory, sha256), full)
+
+    def _audit_with_activities(self, activities):
+        evidence = recovery._saved_audit(self.directory, self.audit()['audit_sha256'])['evidence']
+        snapshot = {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities),
+                    'raw_conversation': {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities)}}
+        import ao_provider_transition
+        value = {'version': 2, 'evidence': evidence, 'observed_at': 1.0,
+                 'observed_snapshot': ao_provider_transition.projected_snapshot(snapshot)}
+        sha256 = ao.digest(value)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), value)
+        return evidence, snapshot, self.args({'audit_sha256': sha256})
+
+    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+        evidence, snapshot, args = self._audit_with_activities(
+            [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
+        before = (self.directory / 'state.json').read_bytes()
+        changed = copy.deepcopy(snapshot)
+        changed['activities'][0]['detail'] = 'Mutated payload'
+        with patch.object(recovery, '_inspect', return_value=(evidence, changed)):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Reviewer recovery audit observed history changed; audit again'):
+                self.recover(args)
+        self.assertEqual((self.directory / 'state.json').read_bytes(), before)
+        self.assertEqual(self.fake.posts, [])
+        self.assertFalse((self.directory / 'reviewer-recovery' / 'requests').exists())
+        with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
+            self.assertTrue(self.recover(args)['recovered'])
+
+    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+        evidence, snapshot, args = self._audit_with_activities(
+            [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
+        calls = []
+        changed = copy.deepcopy(snapshot)
+        changed['activities'][0]['detail'] = 'Mutated before commit'
+        def drifting(service, directory, state):
+            calls.append(len(calls) + 1)
+            return evidence, copy.deepcopy(changed if len(calls) == 2 else snapshot)
+        before = (self.directory / 'state.json').read_bytes()
+        with patch.object(recovery, '_inspect', side_effect=drifting):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Reviewer recovery audit observed history changed; audit again'):
+                self.recover(args)
+        self.assertEqual((self.directory / 'state.json').read_bytes(), before)
+        self.assertFalse((self.directory / 'reviewer-recovery' / 'requests').exists())
+        with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
+            self.assertTrue(self.recover(args)['recovered'])
+
+    def test_a_legacy_full_shape_audit_still_recovers(self):
+        saved = recovery._saved_audit(self.directory, self.audit()['audit_sha256'])
+        legacy = {'evidence': saved['evidence'],
+                  'observed_snapshot': copy.deepcopy(self.fake.snapshots['reviewer']),
+                  'observed_at': saved['observed_at']}
+        sha256 = ao.digest(legacy)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), legacy)
+        self.assertTrue(self.recover(self.args({'audit_sha256': sha256}))['recovered'])
+
     def test_raw_identity_is_validated_by_the_normal_identity_contract(self):
         args = self.args()
         def change_identity(name):

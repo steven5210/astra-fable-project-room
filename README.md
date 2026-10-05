@@ -2,7 +2,7 @@
 
 Project Room turns a feature request into a versioned specification, an engineering handoff, executable verification evidence and an independent acceptance record, all kept in persistent private rooms outside the repository. It runs on two layers:
 
-- **Stock [Agent Orchestrator](https://github.com/Untrivial-ai/agent-orchestrator) (AO)** is the recommended native session and worktree layer. AO owns the Claude Code and Codex chat workers, their isolated Git worktrees, conversations, project hooks and project rules. No AO fork and no Paperclip are required.
+- **Stock [Agent Orchestrator](https://github.com/OrchestratorInc/agent-orchestrator) (AO)** is the recommended native session and worktree layer. AO owns the Claude Code and Codex chat workers, their isolated Git worktrees, conversations, project hooks and project rules. No AO fork and no Paperclip are required.
 - **Project Room** is the specification, handoff, evidence and acceptance layer. Its `ao_room_*` tools pin immutable spec revisions and gates, send each request once with a durable identity, prepare private delegates before the engineer launches, archive per-turn usage receipts, run the agreed gates against the exact candidate, and accept only an independent reviewer verdict that names the same spec, candidate and evidence hashes.
 
 The earlier Astra/Fable controller inside Codex (the `room_*` tools and `project_room.py` CLI) remains available as the legacy backend. Existing legacy rooms keep their recorded backend, exact revisions, session identity and pinned delegate provider; nothing migrates automatically. See [Legacy controller](docs/reference/legacy-controller.md#legacy-controller) below.
@@ -29,7 +29,7 @@ See [Roles, agreement and delegation](docs/guides/roles-and-delegation.md).
 - Git, with the project you want to work on cloned locally and clean at the commit that will become the handoff baseline.
 - Claude Code with its normal saved subscription login and access to the room's configured engineering selector (the `fable` family by default, or the room's explicitly selected qualified family or exact model). Qualification pins an expected model from retained source evidence; it is never a claim that a provider, account or quota is available. A signed-in Claude Desktop tab does not necessarily authenticate the standalone CLI.
 - Codex with local plugin and MCP support for Astra and for the legacy controller.
-- For AO work: a running, trusted local AO daemon at the official latest stable release, reachable on a loopback address, with the same native authentication AO already uses for its workers. Installing the daemon, adding a project and creating chat workers follow [AO's own documentation](https://github.com/Untrivial-ai/agent-orchestrator). The adapter was initially exercised against AO 0.12.12; that is a validation fact, not a pin.
+- For AO work: a running, trusted local AO daemon at the official latest stable release, reachable on a loopback address, with the same native authentication AO already uses for its workers. Installing the daemon, adding a project and creating chat workers follow [AO's own documentation](https://github.com/OrchestratorInc/agent-orchestrator). The adapter was initially exercised against AO 0.12.12; that is a validation fact, not a pin.
 - Optional: a separate key for the selected DeepInfra or official DeepSeek backend, entered only at your own terminal, for the first-tier delegate. Docker is only needed to run the Linux CI container locally.
 
 ## Install and authenticate
