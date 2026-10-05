@@ -60,6 +60,14 @@ def projected_snapshot(snapshot):
     return result
 
 
+def observed_history_matches(saved_snapshot, snapshot):
+    """Whether a v2 audit's bound activity history still equals this fresh observation."""
+    projected = projected_snapshot(snapshot)
+    return (isinstance(saved_snapshot, dict)
+            and saved_snapshot.get('activities_count') == projected.get('activities_count')
+            and saved_snapshot.get('activities_sha256') == projected.get('activities_sha256'))
+
+
 def _audit_path(directory, audit_sha256):
     if not isinstance(audit_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", audit_sha256):
         raise RoomError("Use the exact saved provider transition audit digest")
@@ -628,7 +636,9 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
             raise RoomError("An uncommitted provider transition receipt belongs to another payload; preserve it and diagnose before continuing")
         saved = _saved_audit(directory, audit_sha256)
         target_input = saved["evidence"]["target"]["input"]
-        evidence, observed, _ = _inspect(service, directory, state, target_input, reconcile)
+        evidence, observed, snapshot = _inspect(service, directory, state, target_input, reconcile)
+        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), snapshot):
+            raise RoomError("Provider transition audit observed history changed; audit again")
         if saved["evidence"] != evidence:
             raise RoomError("Provider transition audit is stale; inspect the changed room, ledger, candidate or native evidence")
         if observed["controller"] != STOPPED:
@@ -646,7 +656,9 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
                             "original_preparation": evidence["preparation"]["path"],
                             "original_preparation_sha256": evidence["preparation"]["sha256"],
                             "original_delegate_sha256": evidence["delegate"]["sha256"], "state": "committed"}}
-        repeated, observed_again, _ = _inspect(service, directory, state, target_input, reconcile)
+        repeated, observed_again, snapshot_again = _inspect(service, directory, state, target_input, reconcile)
+        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], snapshot_again):
+            raise RoomError("Provider transition audit observed history changed; audit again")
         if repeated != evidence or observed_again["controller"] != STOPPED:
             raise RoomError("Provider transition observations changed before commit")
         from ao_routing_adoption import launcher_compatibility

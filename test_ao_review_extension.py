@@ -461,7 +461,8 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         inputs = self.grant_inputs()
         posts = len(self.fake.posts)
         self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Different earlier activity'
-        with self.assertRaisesRegex(ao.RoomError, 'audit is stale'):
+        with self.assertRaisesRegex(ao.RoomError,
+                'Review extension audit observed history changed; audit again'):
             self.service.ao_room_spec_review_extend(**inputs)
         self.assertEqual(len(self.fake.posts), posts)
         self.assertNotIn('spec_review_extension', self.state())
@@ -1043,6 +1044,55 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         sha256 = ao.digest(full)
         extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), full)
         self.assertEqual(extension._audit(self.directory(), sha256), full)
+
+    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+        self.fake.snapshots['engineer']['activities'] = [{'id': 'earlier-activity', 'turnId': 'turn-1',
+            'activityKind': 'system', 'status': 'completed', 'detail': 'Retained earlier activity'}]
+        inputs = self.grant_inputs()
+        posts = len(self.fake.posts)
+        before = self.room_files()
+        self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Different earlier activity'
+        with self.assertRaisesRegex(ao.RoomError,
+                'Review extension audit observed history changed; audit again'):
+            self.service.ao_room_spec_review_extend(**inputs)
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(self.room_files(), before)
+        self.assertNotIn('spec_review_extension', self.state())
+        self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Retained earlier activity'
+        self.assertTrue(self.service.ao_room_spec_review_extend(**inputs)['extended'])
+
+    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+        self.fake.snapshots['engineer']['activities'] = [{'id': 'earlier-activity', 'turnId': 'turn-1',
+            'activityKind': 'system', 'status': 'completed', 'detail': 'Retained earlier activity'}]
+        inputs = self.grant_inputs()
+        calls = []
+        original = extension._inspect
+        def drifting(service, directory, state, target, reconcile=False):
+            evidence, snapshots = original(service, directory, state, target, reconcile)
+            calls.append(len(calls) + 1)
+            if len(calls) == 2:
+                snapshots = copy.deepcopy(snapshots)
+                snapshots['engineer']['activities'][0]['detail'] = 'Payload mutated before commit'
+            return evidence, snapshots
+        before = self.room_files()
+        with patch.object(extension, '_inspect', side_effect=drifting):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Review extension audit observed history changed; audit again'):
+                self.service.ao_room_spec_review_extend(**inputs)
+        self.assertEqual(self.room_files(), before)
+        self.assertNotIn('spec_review_extension', self.state())
+        self.assertTrue(self.service.ao_room_spec_review_extend(**inputs)['extended'])
+
+    def test_a_legacy_v1_full_shape_audit_still_grants(self):
+        audited = self.audit()
+        saved = extension._audit(self.directory(), audited['audit_sha256'])
+        legacy = {'version': 1, 'evidence': saved['evidence'], 'observed_at': saved['observed_at'],
+                  'observed_snapshots': {role: copy.deepcopy(snap)
+                                         for role, snap in self.fake.snapshots.items()}}
+        sha256 = ao.digest(legacy)
+        extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), legacy)
+        result = self.service.ao_room_spec_review_extend(**self.grant_inputs({'audit_sha256': sha256}))
+        self.assertTrue(result['extended'])
 
     def test_complete_two_role_audit_overflow_refuses_before_publication(self):
         self.register()

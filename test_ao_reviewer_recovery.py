@@ -235,6 +235,61 @@ class ReviewerRecoveryTests(unittest.TestCase):
         recovery._store_once(recovery._audit_path(self.directory, sha256), full)
         self.assertEqual(recovery._saved_audit(self.directory, sha256), full)
 
+    def _audit_with_activities(self, activities):
+        evidence = recovery._saved_audit(self.directory, self.audit()['audit_sha256'])['evidence']
+        snapshot = {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities),
+                    'raw_conversation': {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities)}}
+        import ao_provider_transition
+        value = {'version': 2, 'evidence': evidence, 'observed_at': 1.0,
+                 'observed_snapshot': ao_provider_transition.projected_snapshot(snapshot)}
+        sha256 = ao.digest(value)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), value)
+        return evidence, snapshot, self.args({'audit_sha256': sha256})
+
+    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+        evidence, snapshot, args = self._audit_with_activities(
+            [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
+        before = (self.directory / 'state.json').read_bytes()
+        changed = copy.deepcopy(snapshot)
+        changed['activities'][0]['detail'] = 'Mutated payload'
+        with patch.object(recovery, '_inspect', return_value=(evidence, changed)):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Reviewer recovery audit observed history changed; audit again'):
+                self.recover(args)
+        self.assertEqual((self.directory / 'state.json').read_bytes(), before)
+        self.assertEqual(self.fake.posts, [])
+        self.assertFalse((self.directory / 'reviewer-recovery' / 'requests').exists())
+        with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
+            self.assertTrue(self.recover(args)['recovered'])
+
+    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+        evidence, snapshot, args = self._audit_with_activities(
+            [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
+        calls = []
+        changed = copy.deepcopy(snapshot)
+        changed['activities'][0]['detail'] = 'Mutated before commit'
+        def drifting(service, directory, state):
+            calls.append(len(calls) + 1)
+            return evidence, copy.deepcopy(changed if len(calls) == 2 else snapshot)
+        before = (self.directory / 'state.json').read_bytes()
+        with patch.object(recovery, '_inspect', side_effect=drifting):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Reviewer recovery audit observed history changed; audit again'):
+                self.recover(args)
+        self.assertEqual((self.directory / 'state.json').read_bytes(), before)
+        self.assertFalse((self.directory / 'reviewer-recovery' / 'requests').exists())
+        with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
+            self.assertTrue(self.recover(args)['recovered'])
+
+    def test_a_legacy_full_shape_audit_still_recovers(self):
+        saved = recovery._saved_audit(self.directory, self.audit()['audit_sha256'])
+        legacy = {'evidence': saved['evidence'],
+                  'observed_snapshot': copy.deepcopy(self.fake.snapshots['reviewer']),
+                  'observed_at': saved['observed_at']}
+        sha256 = ao.digest(legacy)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), legacy)
+        self.assertTrue(self.recover(self.args({'audit_sha256': sha256}))['recovered'])
+
     def test_raw_identity_is_validated_by_the_normal_identity_contract(self):
         args = self.args()
         def change_identity(name):

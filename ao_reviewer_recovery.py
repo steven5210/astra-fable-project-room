@@ -251,13 +251,18 @@ def recover(service, room_id, audit_sha256, replacement_session_id, diagnosis, a
             return _result(state, record)
         saved = _saved_audit(directory, audit_sha256)
         evidence, old_snapshot = _inspect(service, directory, state)
+        from ao_provider_transition import observed_history_matches
+        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), old_snapshot):
+            raise RoomError("Reviewer recovery audit observed history changed; audit again")
         if saved["evidence"] != evidence:
             raise RoomError("Reviewer recovery audit is stale; inspect the changed state or native evidence")
         replacement, native, workspace, snapshot = _target(service, state, replacement_session_id, evidence)
         # Recheck both independent surfaces after preparation, while retaining the
         # global room/claim lock. AO itself remains an externally operated system.
-        repeated, _ = _inspect(service, directory, state)
+        repeated, old_snapshot_again = _inspect(service, directory, state)
         target_again = _target(service, state, replacement_session_id, evidence)
+        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], old_snapshot_again):
+            raise RoomError("Reviewer recovery audit observed history changed; audit again")
         if repeated != evidence or target_again[:3] != (replacement, native, workspace):
             raise RoomError("Reviewer recovery observations changed before commit")
         service.checkpoint(directory, state)
