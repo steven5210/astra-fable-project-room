@@ -437,7 +437,7 @@ above still applies.
 The reviewed AO 0.13.0 bundle contains a Claude ACP result path that checks
 `max_tokens` before `is_error`. The explicit `ao_acp_patch.py` operator tool adds
 `!message.is_error` to those two truncation conditions, allowing the existing
-typed failure handler to run. It accepts only the exact reviewed source SHA-256,
+typed failure handler to run. It accepts only an exact reviewed source SHA-256 (the 0.13.0/0.13.1 module and, since the review below, the 0.13.3 module),
 writes a private original-byte backup and immutable patch intent, and refuses an
 unknown/new upstream module. It is not run by installation, dispatch or an
 updater. No model, effort, output budget or provider is changed.
