@@ -457,6 +457,31 @@ class ProgressViewTests(Fixture):
         self.assertEqual([launch['description'] for launch in second_view['launches']],
                          ['Second turn launch'])
 
+    def test_last_text_stays_inside_the_request_turn(self):
+        state = self.state()
+        first = state['requests']['impl-1']
+        state['requests']['impl-2'] = dict(first, request_id='impl-2',
+                                         created_order=first['created_order'] + 1,
+                                         created_at=first['created_at'] + 10.0)
+        ao.atomic(self.directory() / 'state.json', state)
+        second = [
+            {'type': 'user', 'uuid': 'impl-2-caller', 'sessionId': self.NATIVE,
+             'timestamp': _iso(first['created_at'] + 10.5), 'cwd': self.workspace,
+             'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': self.request['text']}},
+            self._assistant('second-tools', _iso(first['created_at'] + 10.6),
+                            [self._use('tu-st', 'TaskList', {})]),
+        ]
+        self.native_events[self.native_events.index(self.trailing):0] = second
+        self._write_transcript()
+        # impl-2's turn has tool calls but no assistant text yet; the previous turn's
+        # LONG_TEXT must not leak across the anchor boundary.
+        view = self.view(request_id='impl-2')
+        self.assertTrue(view['turn']['anchor_found'])
+        self.assertEqual(view['turn']['tool_calls'], {'TaskList': 1})
+        self.assertIsNone(view['last_text'])
+        self.assertEqual(self.view(request_id='impl-1')['last_text'], self.LONG_TEXT[:400])
+
     def test_an_undelivered_same_text_request_finds_no_anchor(self):
         state = self.state()
         first = state['requests']['impl-1']

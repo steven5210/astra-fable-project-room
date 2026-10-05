@@ -635,6 +635,37 @@ class Service:
         value["truncated"] = len(rows) > LATEST_DELEGATE_JOBS
         return value
 
+    def _delegate_job_counts(self, room_id):
+        """Complete per-state totals for this room's delegate jobs from the private ledger: the same
+        read-only connection as _delegate_jobs but independent of its bounded latest-N projection, so a
+        truncated status still reports true totals. (None, reason) when the ledger cannot be read."""
+        ledger = self.home / "deepseek" / "ledger.sqlite3"
+        if not ledger.is_file():
+            return None, "ledger_missing"
+        try:
+            import deepseek_adapter
+        except ImportError:
+            return None, "adapter_unavailable"
+        try:
+            db = sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True, timeout=2)
+            try:
+                counts = {row[0]: row[1] for row in db.execute(
+                    "SELECT state, COUNT(*) FROM jobs WHERE room_id=? GROUP BY state", (room_id,))}
+                resolved = {row[0] for row in
+                            db.execute("SELECT job_id FROM resolutions WHERE room_id=?", (room_id,))}
+                marks = ",".join("?" for _ in deepseek_adapter.STOP_STATES)
+                stopping = {row[0] for row in db.execute(
+                    "SELECT id FROM jobs WHERE room_id=? AND state IN (" + marks + ")",
+                    (room_id, *deepseek_adapter.STOP_STATES))} if marks else set()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return None, "ledger_unreadable"
+        return {"counts": counts,
+                "active": sum(count for state, count in counts.items()
+                              if state in deepseek_adapter.ACTIVE_STATES),
+                "unresolved": len(stopping - resolved)}, None
+
     def room_spec_put(self, room_id, revision, content):
         positive_revision(revision)
         text_value(content, "content")

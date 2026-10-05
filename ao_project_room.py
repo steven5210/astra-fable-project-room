@@ -1266,13 +1266,46 @@ class Service:
                           "includes_delegates": False, "is_context_occupancy": False,
                           "limitation": "AO-reported native counters, not subscription quota or billing. Delegate ledgers remain separate."}}
 
-    def ao_room_status(self, room_id):
+    def _compact_status(self, result, state):
+        """The ``view="compact"`` projection: the same object minus the request and delegate bulk."""
+        ordered = sorted(state["requests"].values(), key=ao_prompt_metrics.presentation_order)
+        latest = {}
+        for request in ordered:
+            latest[request["role"]] = request
+        selected = sorted(latest.values(), key=ao_prompt_metrics.presentation_order)
+        counts = {}
+        for request in ordered:
+            counts[request["state"]] = counts.get(request["state"], 0) + 1
+        result["requests"] = [self.request_summary(request) for request in selected]
+        result["request_counts"] = counts
+        result["requests_truncated"] = len(ordered) > len(selected)
+        delegate = result.get("delegate")
+        if isinstance(delegate, dict):
+            jobs = delegate.get("jobs")
+            if isinstance(jobs, dict):
+                items = jobs.pop("items", None)
+                totals, totals_reason = ao_delegates.job_counts(self.root.parent, state["room_id"])
+                jobs["summary"] = _compact_jobs(items if isinstance(items, list) else [],
+                                                totals, jobs.get("unavailable_reason") or totals_reason)
+            routing = delegate.get("routing")
+            if isinstance(routing, dict):
+                delegate["routing"] = {key: routing[key] for key in
+                                       ("status", "guard_sha256", "execution_policy", "agents")
+                                       if key in routing}
+        result["view"] = "compact"
+        return result
+
+    def ao_room_status(self, room_id, view="full"):
         # State is atomically replaced, so status can remain available while a
         # verifier holds the mutation lock for a long-running gate.
+        if view not in ("full", "compact"):
+            raise RoomError("view must be 'full' or 'compact'")
         directory = self.root / "rooms" / identifier(room_id)
         if not (directory / "state.json").is_file():
             raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
-        return self.summary(directory, read(directory / "state.json"))
+        state = read(directory / "state.json")
+        result = self.summary(directory, state)
+        return self._compact_status(result, state) if view == "compact" else result
 
     def ao_room_progress(self, room_id, request_id=None, max_text_chars=400):
         # Read-only like status: one bounded observation, never a state write.
@@ -1292,6 +1325,20 @@ class Service:
                 items.append({key: state[key] for key in ("room_id", "project_path", "feature", "workflow", "created_at")})
         items.sort(key=lambda item: item["created_at"], reverse=True)
         return {"rooms": items[:50], "count": len(items), "truncated": len(items) > 50}
+
+
+def _compact_jobs(items, totals, unavailable_reason):
+    """Complete ledger totals plus the latest projected job; the list order is latest-first. Nulls,
+    never zeroes, with the reason kept when the projection or the ledger aggregation is unavailable."""
+    rows = [item for item in items if isinstance(item, dict)]
+    latest = ({"id": rows[0].get("job_id"), "state": rows[0].get("state"),
+               "created_at": rows[0].get("created_at"), "finished_at": rows[0].get("finished_at")}
+              if rows else None)
+    if totals is None or unavailable_reason is not None:
+        return {"counts": None, "active": None, "unresolved": None, "latest": latest,
+                "unavailable_reason": unavailable_reason}
+    return {"counts": totals["counts"], "active": totals["active"],
+            "unresolved": totals["unresolved"], "latest": latest}
 
 
 def schema(properties, required=None):
@@ -1330,7 +1377,7 @@ TOOL_SCHEMAS = {
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_release_check": ("Compare the running AO daemon with the official latest stable release once per new or resumed AO session. One bounded GitHub GET plus loopback /healthz and local bundle metadata; never invokes a model, restarts or updates AO, or touches rooms and workers. Outcome up_to_date | update_available | mismatch | unknown; unknown is never up to date. Two report-only sections are included: claude_code compares the configured claude_bin with the bundled and qualified family floors, the newest installed Claude Code and the latest published release, and names the exact setup command when one applies; qualification_sources re-fetches each captured qualification source and reports whether its bytes still match and whether its claude-<family> identifiers still match the retained capture. Neither section switches executables or models. Saves private evidence in version-check.json.", schema({"ao_url": S}, [])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
-    "ao_room_status": ("Read compact saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate.", schema(R)),
+    "ao_room_status": ("Read saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate. The optional view enum selects the full status (default) or a compact projection with the latest request per role, request counts and delegate job/routing summaries.", schema({**R, "view": {"type": "string", "enum": ["full", "compact"]}}, ["room_id"])),
     "ao_room_progress": ("Read one request's saved progress view (the latest by default): its engineer task list folded from native task-tool rows, Agent launches, served-model and stop-reason histograms, error and refusal counts, and the bounded last assistant text, plus the request's recorded state. Bounded local reads only; no AO/network/model calls, no state change; an unavailable native source reports its reason instead of failing.", schema({**R, "request_id": S, "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 2000}}, ["room_id"])),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),

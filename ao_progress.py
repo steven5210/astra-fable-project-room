@@ -428,6 +428,9 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
     view["plan"] = _fold_plan(rows, uses, results)
     if max_text_chars:
-        text = _last_text(rows)
+        # With an anchor the text belongs to the request's own turn; a turn that has
+        # produced only tool calls has no assistant text yet. Without an anchor the
+        # whole-window tail remains the only view available.
+        text = _last_text(turn_rows if anchor_row is not None else rows)
         view["last_text"] = _redact(text)[:max_text_chars] if text is not None else None
     return view
