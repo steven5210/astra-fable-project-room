@@ -581,13 +581,15 @@ def _assembly(gather, join):
     return gather
 
 
-def session_window_notice(state, role, now=None):
+def session_window_notice(state, role, directory, now=None):
     """Controller-derived session-window note for a send after a quota-limited engineer turn.
 
     It names the previous terminal engineer request, quotes the provider's own reset text when AO
-    recorded one, and computes this window's start and expected five-hour cutoff in the zone the
-    reset text names (UTC when no parenthesized token is a zone the platform accepts). It grants no
-    new instruction and accompanies every engineer send while that quota diagnosis stands.
+    recorded one — the saved semantic outcome's terminal evidence first, then the request's
+    observed-turn snapshot — and reports this send's dispatch instant and the five-hour cutoff in
+    the zone the reset text names (UTC when no parenthesized token is a zone the platform accepts).
+    It grants no new instruction and accompanies every engineer send while that quota diagnosis
+    stands.
     """
     from datetime import datetime, timedelta, timezone
     import re
@@ -599,8 +601,19 @@ def session_window_notice(state, role, now=None):
     previous = ao_outcomes.latest_for_role(state, "engineer")
     if previous is None or (previous.get("semantic_status") or {}).get("kind") != "quota_limit":
         return None
-    observed = previous.get("observed_turn")
-    error_message = observed.get("errorMessage") if isinstance(observed, dict) else None
+    error_message = None
+    if previous.get("semantic_outcome"):
+        try:
+            record = ao_outcomes.load(directory, previous)
+            terminal = record.get("ao_terminal") if isinstance(record, dict) else None
+            fresh = terminal.get("errorMessage") if isinstance(terminal, dict) else None
+            if isinstance(fresh, str):
+                error_message = fresh
+        except (RoomError, OSError, ValueError, KeyError, TypeError):
+            error_message = None  # Any unreadable outcome falls back to the request's snapshot.
+    if error_message is None:
+        observed = previous.get("observed_turn")
+        error_message = observed.get("errorMessage") if isinstance(observed, dict) else None
     reset_text = error_message[:200] if isinstance(error_message, str) else "the account's session limit"
     zone = None
     for candidate in re.findall(r"\(([^()]+)\)", reset_text):
@@ -612,16 +625,19 @@ def session_window_notice(state, role, now=None):
     zone = zone if zone is not None else timezone.utc
     moment = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
     start = moment.astimezone(zone)
-    cutoff = start + timedelta(hours=5)
+    # Add the five hours to the UTC instant, then render in the zone: wall-clock addition across
+    # a DST transition would move the limit by an hour the provider never granted.
+    cutoff = (start.astimezone(timezone.utc) + timedelta(hours=5)).astimezone(zone)
     render = (lambda point: point.strftime("%Y-%m-%d %H:%M %Z") if point.date() != moment.date()
               else point.strftime("%H:%M %Z"))
     text = ("Session window notice (controller-derived, no new instruction): the previous turn "
             + str(previous.get("request_id")) + " ended at the account's session limit (" + reset_text
-            + "). This turn starts a new window at " + render(start)
-            + "; if the provider's five-hour window applies as before, expect the limit again near "
-            + render(cutoff)
-            + ". Size each work unit so its worker hands back before then, keep the task list current "
-            "at every unit boundary, and avoid leaving a unit mid-flight at the cut-off.")
+            + "). This turn is dispatched at " + render(start)
+            + "; if the provider's five-hour window applies as before and starts with this request, "
+            "expect the limit again no later than about " + render(cutoff)
+            + " — earlier if the account was used elsewhere since the reset. Size each work unit so "
+            "its worker hands back before then, keep the task list current at every unit boundary, "
+            "and avoid leaving a unit mid-flight at the cut-off.")
     return text, {"previous_request_id": previous.get("request_id"), "reset_text": reset_text,
                   "window_started_at": start.astimezone(timezone.utc).isoformat(),
                   "expected_cutoff_at": cutoff.astimezone(timezone.utc).isoformat(),
@@ -750,7 +766,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
                 framing = superseded_routing_framing(directory, state, prepared)
                 if framing is not None:
                     assembly.add("workflow", framing)
-    notice = session_window_notice(state, role, now)
+    notice = session_window_notice(state, role, directory, now)
     if notice is not None:
         assembly.add("workflow", notice[0])
         carried["session_window_notice"] = notice[1]
