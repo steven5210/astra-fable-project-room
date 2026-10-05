@@ -339,7 +339,15 @@ def _turn(anchor_row, window):
                          and isinstance(_result_text(block.get("content")), str)
                          and _result_text(block.get("content")).startswith(GUARD_REFUSAL))
     started_at = anchor_row.get("timestamp")
-    last_activity_at = window[-1].get("timestamp") if window else started_at
+    last_activity_at = started_at
+    for row in reversed(window):
+        stamp = row.get("timestamp")
+        try:
+            ao_native_outcome.timestamp(stamp)
+        except RoomError:
+            continue
+        last_activity_at = stamp
+        break
     try:
         elapsed = ao_native_outcome.timestamp(last_activity_at) - ao_native_outcome.timestamp(started_at)
     except RoomError:
