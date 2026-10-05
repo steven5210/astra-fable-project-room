@@ -1284,7 +1284,9 @@ class Service:
             jobs = delegate.get("jobs")
             if isinstance(jobs, dict):
                 items = jobs.pop("items", None)
-                jobs["summary"] = _compact_jobs(items if isinstance(items, list) else [])
+                totals, totals_reason = ao_delegates.job_counts(self.root.parent, state["room_id"])
+                jobs["summary"] = _compact_jobs(items if isinstance(items, list) else [],
+                                                totals, jobs.get("unavailable_reason") or totals_reason)
             routing = delegate.get("routing")
             if isinstance(routing, dict):
                 delegate["routing"] = {key: routing[key] for key in
@@ -1325,24 +1327,18 @@ class Service:
         return {"rooms": items[:50], "count": len(items), "truncated": len(items) > 50}
 
 
-def _compact_jobs(items):
-    """Bounded counts over the delegate ledger's allowlisted job rows; the list order is latest-first."""
-    try:
-        from deepseek_adapter import ACTIVE_STATES
-    except ImportError:
-        ACTIVE_STATES = ()
+def _compact_jobs(items, totals, unavailable_reason):
+    """Complete ledger totals plus the latest projected job; the list order is latest-first. Nulls,
+    never zeroes, with the reason kept when the projection or the ledger aggregation is unavailable."""
     rows = [item for item in items if isinstance(item, dict)]
-    counts = {}
-    active = unresolved = 0
-    for row in rows:
-        name = row.get("state")
-        counts[name] = counts.get(name, 0) + 1
-        active += name in ACTIVE_STATES
-        unresolved += row.get("stops_room_lane") is True
     latest = ({"id": rows[0].get("job_id"), "state": rows[0].get("state"),
                "created_at": rows[0].get("created_at"), "finished_at": rows[0].get("finished_at")}
               if rows else None)
-    return {"counts": counts, "active": active, "unresolved": unresolved, "latest": latest}
+    if totals is None or unavailable_reason is not None:
+        return {"counts": None, "active": None, "unresolved": None, "latest": latest,
+                "unavailable_reason": unavailable_reason}
+    return {"counts": totals["counts"], "active": totals["active"],
+            "unresolved": totals["unresolved"], "latest": latest}
 
 
 def schema(properties, required=None):

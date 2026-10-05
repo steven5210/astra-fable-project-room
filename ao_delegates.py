@@ -384,6 +384,15 @@ def verify_delegation(home, directory, state, report):
     return evidence
 
 
+def job_counts(home, room_id):
+    """Complete per-state totals for one room's delegate ledger for the compact status view: the same
+    read-only projection helper family as status, independent of the latest-N item bound."""
+    from project_room import Service
+    controller = object.__new__(Service)
+    controller.home = Path(home)
+    return controller._delegate_job_counts(room_id)
+
+
 def status(home, directory, state):
     from project_room import Service
     # Reuse the read-only status projection without constructing/mutating the

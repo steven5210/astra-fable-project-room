@@ -126,6 +126,56 @@ class CompactStatusTests(DelegateFixture):
         self.assertEqual([request['request_id'] for request in printed['requests']],
                          ['acceptance_review', 'impl-18'])
 
+    def test_a_missing_ledger_reports_null_totals_and_the_reason(self):
+        (self.home / 'deepseek' / 'ledger.sqlite3').unlink()
+        jobs = self.service.ao_room_status(self.room, view='compact')['delegate']['jobs']
+        self.assertNotIn('items', jobs)
+        self.assertEqual(jobs['summary'], {'counts': None, 'active': None, 'unresolved': None,
+                                           'latest': None, 'unavailable_reason': 'ledger_missing'})
+
+
+class CompactStatusCompleteCountsTests(DelegateFixture):
+    """Counts come from the complete ledger, not the bounded latest-20 projection."""
+
+    def setUp(self):
+        super().setUp()
+        self.bind(); self.agree(); self.implement(); self.review()
+        ledger = deepseek_adapter.Ledger(self.home)
+        with ledger.transaction() as db:
+            for index in range(21):
+                state = 'failed_after_send' if index == 0 else (
+                    'unknown_delivery' if index == 1 else 'completed')
+                created = '2026-09-09T00:%02d:00+00:00' % index
+                finished = '2026-09-09T00:%02d:30+00:00' % index
+                db.execute('INSERT INTO jobs(id,room_id,request_id,lane,payload_sha256,profile_sha256,'
+                           'state,created_at,requested_model,thinking,reasoning_effort,max_tokens,'
+                           'input_bytes,reserved_bytes,possibly_billed,finished_at) '
+                           'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                           ('%032d' % index, self.room, 'r-%02d' % index, 'deep', 'p' * 64, 'q' * 64,
+                            state, created, deepseek_adapter.DEFAULT_MODEL, 'enabled', 'max', 393216,
+                            100, 0, 1, finished))
+            # The second job is a resolved stop state: it stays out of unresolved.
+            db.execute('INSERT INTO resolutions(job_id,room_id,note_sha256,note,created_at) '
+                       'VALUES(?,?,?,?,?)',
+                       ('%032d' % 1, self.room, 'n' * 64, 'resolved by the user',
+                        '2026-09-09T01:00:00+00:00'))
+
+    def test_counts_cover_all_ledger_rows_beyond_the_projection(self):
+        full_jobs = self.service.ao_room_status(self.room)['delegate']['jobs']
+        self.assertEqual(len(full_jobs['items']), 20)
+        self.assertIs(full_jobs['truncated'], True)
+        # The oldest job is the unresolved stop state and is outside the projection entirely.
+        self.assertNotIn('%032d' % 0, {item['job_id'] for item in full_jobs['items']})
+        summary = self.service.ao_room_status(self.room, view='compact')['delegate']['jobs']['summary']
+        self.assertEqual(sum(summary['counts'].values()), 21)
+        self.assertEqual(summary['counts'],
+                         {'completed': 19, 'failed_after_send': 1, 'unknown_delivery': 1})
+        self.assertEqual(summary['active'], 0)
+        self.assertEqual(summary['unresolved'], 1)
+        self.assertEqual(summary['latest'], {'id': '%032d' % 20, 'state': 'completed',
+                                             'created_at': '2026-09-09T00:20:00+00:00',
+                                             'finished_at': '2026-09-09T00:20:30+00:00'})
+
 
 if __name__ == '__main__':
     unittest.main()
