@@ -157,6 +157,57 @@ class RoutingRefreshTests(Fixture):
         self.assertNotIn('agent_selection_change', record['evidence'])  # selectors change only on explicit request
         self.assertNotIn('agent_selection', record['inputs'])
 
+    def test_large_activity_payloads_bind_by_digest_and_projection(self):
+        activities = [{'id': 'activity-small', 'sequence': 1, 'type': 'status', 'status': 'completed',
+                       'summary': 'small', 'createdAt': 'a'},
+                      {'id': 'activity-large', 'sequence': 2, 'type': 'command', 'status': 'completed',
+                       'summary': 'large', 'createdAt': 'b',
+                       'detail': 'x' * 300_000, 'output': 'y' * 50_000}]
+        self.fake.snapshots['engineer']['activities'] = copy.deepcopy(activities)
+        with patch.object(refresh, 'MAX_RECORD_BYTES', 200_000):
+            self.do_refresh()
+        record = self.journal()
+        self.assertEqual(record['version'], 2)
+        observed = record['observed_snapshot']
+        self.assertEqual(observed['activities_count'], len(activities))
+        self.assertEqual(observed['activities_sha256'], ao.digest(sorted(activities, key=lambda item: item['id'])))
+        full = sorted(activities, key=lambda item: item['id'])
+        self.assertEqual(observed['activities'], record['evidence']['activities'])
+        self.assertEqual(observed['activities'],
+                         [{key: item[key] for key in refresh.ACTIVITY_FIELDS if key in item} for item in full])
+        self.assertLessEqual(len(refresh._json(record)), 200_000)
+        embedded = {**record, 'observed_snapshot': {key: value for key, value in observed.items()
+                    if key not in ('activities_count', 'activities_sha256')}}
+        embedded['observed_snapshot']['activities'] = activities
+        self.assertGreater(len(refresh._json(embedded)), 200_000)
+
+    def test_a_v1_pending_intent_with_the_full_snapshot_reconciles_unchanged(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'legacy payload'}]
+        self.pending()
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        record = json.loads(path.read_text())
+        self.assertEqual(record['version'], 2)
+        full = copy.deepcopy(self.fake.snapshots['engineer']['activities'])
+        observed = {key: value for key, value in record['observed_snapshot'].items()
+                    if key not in ('activities_count', 'activities_sha256')}
+        observed['activities'] = full
+        record.update(version=1, observed_snapshot=observed)
+        path.write_bytes(refresh._json(record))
+        self.do_refresh()
+        record = self.journal()
+        self.assertEqual(record['version'], 1)
+        self.assertEqual(record['observed_snapshot']['activities'], full)
+        self.assertNotIn('activities_count', record['observed_snapshot'])
+
+    def test_a_projected_record_over_the_bound_still_refuses(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'summary': 's' * 300_000}]
+        with patch.object(refresh, 'MAX_RECORD_BYTES', 200_000):
+            with self.assertRaisesRegex(ao.RoomError, 'bounded readable size'):
+                self.do_refresh()
+        self.assert_no_intent()
+
     def test_prepared_target_guard_blocks_actual_synthetic_quota_before_opus(self):
         self.do_refresh()
         routing = refresh.effective(self.directory(), self.state(), self.prepared)

@@ -430,7 +430,7 @@ def superseded_routing_framing(directory, state, prepared):
     record = ao_routing_refresh._read(directory, pointer)
     if record.get("target") == routing:
         return None
-    if (record.get("version") != 1 or record.get("room_id") != state.get("room_id")
+    if (record.get("version") not in (1, 2) or record.get("room_id") != state.get("room_id")
             or record.get("preparation") != state.get("preparation")
             or record.get("preparation_sha256") != state.get("preparation_sha256")):
         raise RoomError("The committed routing refresh does not match this room's retained preparation; preserve "
