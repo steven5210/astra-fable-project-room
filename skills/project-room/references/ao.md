@@ -161,7 +161,9 @@ Call `ao_room_open` with the actual project path, stable feature name, existing 
 project ID and the user's existing implementation authorization. Reopening returns
 the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
 `ao_room_sync` to reconcile active work. Status reads saved facts without network
-access. Sync makes bounded AO GET requests and saves evidence; it never invokes a
+access. `ao_room_status` accepts `view` `compact` for a reduced projection: the latest
+request per role, per-state request counts, and delegate job and routing summaries
+instead of the full lists. Sync makes bounded AO GET requests and saves evidence; it never invokes a
 model. AO must be reachable for operations that check whether workers are idle.
 While an owned turn is submitted or running, call `ao_room_sync` with
 `wait_seconds` at the maximum its schema lists and repeat those waits. Never

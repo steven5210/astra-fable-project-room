@@ -45,7 +45,7 @@ Then `ao_room_list` (plus legacy
 `room_list` if it is listed), `ao_room_status`, and `ao_room_sync` for active work.
 Resume the recorded backend and state before anything new.
 After a context compaction, or when resuming a room in a new thread, reload only
-this card, then call the room's `ao_room_status`. Do not re-read `SKILL.md`:
+this card, then call the room's `ao_room_status` (view `compact`; `full` only when a Stop line needs history). Do not re-read `SKILL.md`:
 Codex re-injects its own skill index, and this card carries every AO rule. Do
 not open `ao.md` unless a **Stop** line or an entry under "Situations outside the
 card" matches the status you see. Status
