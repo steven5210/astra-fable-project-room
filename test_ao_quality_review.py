@@ -318,7 +318,9 @@ class MigrationTests(fixtures.Fixture):
             self.continue_request('unauthorized-resume')
         self.assertEqual(len(self.fake.posts), posts)
         self.continue_request('resume')
-        self.assertEqual(self.fake.posts[-1][1]['text'], 'Continue.')  # No repeated quality instruction.
+        resume_text = self.fake.posts[-1][1]['text']  # No repeated quality instruction.
+        self.assertTrue(resume_text.startswith('Session window notice'))
+        self.assertTrue(resume_text.endswith('Continue.'))
         request = self.state()['requests']['failed-pilot']
         self.assertEqual(request['state'], 'settled_failure')
         self.assertEqual(ao.read(self.directory() / request['receipt'])['turn']['state'], 'failed')
@@ -592,7 +594,9 @@ class ReconciledQualityTests(unittest.TestCase):
         self.assertEqual(actual['delivery'], 'verified_delivered')
         f.send('correction', 'continue-once'); f.send('correction', 'continue-once')
         self.assertEqual(len(f.fake.posts), before_posts + 1)
-        self.assertEqual(f.fake.posts[-1][1]['text'], 'Perform the exact authorized purpose.')
+        sent_text = f.fake.posts[-1][1]['text']
+        self.assertTrue(sent_text.startswith('Session window notice'))
+        self.assertTrue(sent_text.endswith('Perform the exact authorized purpose.'))
         f.assert_preserved()
 
     def test_reconciliation_records_are_owned_readonly_and_fail_closed(self):

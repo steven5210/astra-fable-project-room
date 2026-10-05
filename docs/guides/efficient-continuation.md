@@ -412,6 +412,26 @@ acceptance. Unknown delivery, arbitrary crashes, unresolved paid delegates and
 generic transport failures cannot use these exceptions. Review budgets are never
 renewed here.
 
+## Session window notice
+
+A send after a quota-limited turn does not need an operator to repeat the window
+arithmetic. When the latest engineer request's semantic outcome stands at
+`quota_limit`, every later engineer `ao_room_send` of any purpose appends one
+controller-derived notice fragment after the workflow parts. It names the
+previous request and quotes the provider's own reset text — the saved outcome's
+terminal `errorMessage` first, then the request's observed snapshot, bounded to
+200 characters, else a generic phrase. The zone named in that text sets the
+rendered times (UTC when unnamed or unreadable): the notice reports this send's
+dispatch instant and, if the provider's five-hour window applies as before and
+starts with this request, the expected limit no later than about five real
+hours later — earlier if the account was used elsewhere since the reset. The
+notice is not a one-time workflow part: it accompanies every send while the
+diagnosis stands, and the request's `carried.session_window_notice` records the
+previous request id, the reset text, both instants in ISO UTC and the fragment's
+digest. It grants no new instruction, does not clear the semantic hold and does
+not prove the provider's window behaves as before; the authorized-resume path
+above still applies.
+
 ## Affected AO bridge workaround
 
 The reviewed AO 0.13.0 bundle contains a Claude ACP result path that checks
