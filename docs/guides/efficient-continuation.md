@@ -485,6 +485,21 @@ prove that every historical or future version enforces it correctly.
 
 For protected app bundles, copy the packaged ACP runtime to a separate operator-owned directory, patch that copy, and configure AO’s supported `AO_ACP_RUNTIME_DIR` override at daemon startup. Verify the copied runtime and upstream source hashes before each start; an upstream update requires a new compatibility check. This preserves the official app. Restart the idle daemon to select the override, then explicitly exit/resume each affected idle native controller. Persistent ACP hosts can survive a daemon restart; verify the new process uses the copied runtime and retains the same native conversation, without sending a model prompt.
 
+The reviewed AO 0.13.3 bundle's `acp-agent.js` (upstream SHA-256
+`64cce3640aba406202e2fd1f4b6f65191ccea4db3b2cb5cb69edc97f94c5d8e4`) differs from
+the 0.13.1 module only by an additive block that calls the SDK's
+`getContextUsage()` with a two-second timeout for AO's context display; both
+`max_tokens` precedence anchors are unchanged. `ao_acp_patch.py` accepts it as a
+second reviewed source and pins the produced module to the reviewed patched
+digest `af5179e7a87f4eab3e9f8c114c148801aafe00a1fcdaca450395e8d2d1174477`,
+refusing every other upstream module exactly as before. To switch a running
+daemon to the 0.13.3 bundle between jobs: back up the AO state, stop the daemon
+with no owned turn running, start the 0.13.3 bundle with the same `AO_DATA_DIR`
+and tmux environment and `AO_ACP_RUNTIME_DIR` pointing at a runtime patched from
+the 0.13.3 bundle, then run a `/healthz` and session-list smoke test and
+`ao_release_check` (`up_to_date`) before new work. Roll back with the retained
+0.13.1 bundle, the old runtime directory and the state backup.
+
 Verify that the affected runtime is idle before using the tool. Existing native
 controllers must reload the patched module through a separately verified
 stop/start preserving the same native session; changing disk bytes alone does

@@ -124,7 +124,8 @@ until proven. Leave `version-check.json` to the tool.
 When a newer stable release is available, review its changes and arrange an update
 between jobs. Preserve the existing runtime/state and a consistent backup before
 switching; check adapter compatibility and a read-only daemon smoke test before
-new model work. Follow existing upgrade authorization, escalating only actual
+new model work. `ao_acp_patch.py` accepts the reviewed 0.13.3 bridge module as a
+second hash-pinned source, so the same switch procedure covers it. Follow existing upgrade authorization, escalating only actual
 breaking changes or decisions outside that scope. Never silently switch to a nightly,
 restart active workers, migrate rooms or replay uncertain requests for an update.
 

@@ -22,6 +22,14 @@ OLD = b'if (message.stop_reason === "max_tokens") {'
 NEW = b'if (message.stop_reason === "max_tokens" && !message.is_error) {'
 PRECEDENCE_SHA256 = '7ee854a6bbcdfa07556aa023eb4c691e7406e26ffb29b49383ded8c316fe4b95'
 
+# Every accepted upstream module, oldest first: 0.13.3 adds only a context-usage
+# call after a result; both precedence anchors are unchanged. A new release needs
+# a fresh compatibility review, never a widened match.
+REVIEWED_SOURCES = {'0.13.0/0.13.1': SOURCE_SHA256,
+                    '0.13.3': '64cce3640aba406202e2fd1f4b6f65191ccea4db3b2cb5cb69edc97f94c5d8e4'}
+PATCHED_SHA256 = {SOURCE_SHA256: PRECEDENCE_SHA256,
+                  REVIEWED_SOURCES['0.13.3']: 'af5179e7a87f4eab3e9f8c114c148801aafe00a1fcdaca450395e8d2d1174477'}
+
 # This helper is inserted into the verified vendor module, without another
 # runtime dependency. A task's terminal edge / a background-set snapshot proves
 # the worker stopped, not that its queued notification has been processed.
@@ -181,13 +189,17 @@ def _completion_edits():
 
 def patched(raw, completion_barrier=False):
     digest = hashlib.sha256(raw).hexdigest()
+    # The disabled completion transform stays limited to the 0.13.0/0.13.1 module.
+    allowed = {SOURCE_SHA256} if completion_barrier else set(PATCHED_SHA256)
     if completion_barrier and digest == PRECEDENCE_SHA256:
         original = raw.replace(NEW, OLD)
         if raw.count(NEW) != 2 or hashlib.sha256(original).hexdigest() != SOURCE_SHA256:
             raise ValueError('ACP precedence patch no longer matches the reviewed upstream module')
-    elif digest != SOURCE_SHA256 or raw.count(OLD) != 2:
+    elif digest not in allowed or raw.count(OLD) != 2:
         raise ValueError('ACP source differs from the reviewed AO 0.13 module; do not patch an unknown update')
     updated = raw.replace(OLD, NEW)
+    if digest in PATCHED_SHA256 and hashlib.sha256(updated).hexdigest() != PATCHED_SHA256[digest]:
+        raise ValueError('ACP patched output differs from the reviewed patched module')
     if completion_barrier:
         for old, new in _completion_edits():
             if updated.count(old) != 1:
@@ -216,7 +228,7 @@ def apply(module_path, evidence_directory, confirmed_idle, completion_barrier=Fa
     if receipt_path.exists():
         prior = json.loads(receipt_path.read_text())
         if prior.get('module') == str(path) and hashlib.sha256(raw).hexdigest() == prior.get('target_sha256'):
-            allowed_sources = {SOURCE_SHA256, PRECEDENCE_SHA256} if completion_barrier else {SOURCE_SHA256}
+            allowed_sources = {SOURCE_SHA256, PRECEDENCE_SHA256} if completion_barrier else set(PATCHED_SHA256)
             source = prior.get('source_sha256')
             if (source not in allowed_sources or prior.get('backup') != str(evidence / (source + '.js'))
                     or Path(prior['backup']).is_symlink()):
