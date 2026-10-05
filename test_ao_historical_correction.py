@@ -102,7 +102,9 @@ class HistoricalCorrectionTests(AdoptionFixture):
         self.assertEqual(self.state()['requests']['section']['receipt_sha256'], before['receipt_sha256'])
         self.assertEqual(self.state()['requests']['section']['state'], 'settled_failure')
         self.assertNotIn('provider_amendment_sha256', self.state()['requests']['correction']['carried'])
-        self.assertEqual(self.state()['requests']['correction']['text'], 'Continue.')
+        correction_text = self.state()['requests']['correction']['text']
+        self.assertTrue(correction_text.startswith('Session window notice'))
+        self.assertTrue(correction_text.endswith('Continue.'))
         (self.repo/'feature.txt').write_text('implemented' + chr(10))
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)

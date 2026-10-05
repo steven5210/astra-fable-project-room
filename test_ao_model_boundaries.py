@@ -618,10 +618,12 @@ class PreCharterRefreshFramingTests(Fixture):
         from ao_report_contract import PART, INSTRUCTION, DELEGATION_PART, DELEGATION_INSTRUCTION
         from ao_review_followups import PART as FOLLOWUPS_PART, INSTRUCTION as FOLLOWUPS_INSTRUCTION
         import ao_progress
+        import ao_read_admission
         texts[PART] = INSTRUCTION
         texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
         texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
         texts[ao_progress.PART] = ao_progress.INSTRUCTION
+        texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
         assembly = ao_prompt_metrics.PromptAssembly('\n')
         for name in request['carried']['parts']:
             assembly.add('workflow', texts[name])

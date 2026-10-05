@@ -19,7 +19,8 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
-         "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1")
+         "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
+         "read_admission_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -580,7 +581,55 @@ def _assembly(gather, join):
     return gather
 
 
-def packet(service, directory, state, role, purpose, message, snapshot=None, gather=None, quality=None):
+def session_window_notice(state, role, now=None):
+    """Controller-derived session-window note for a send after a quota-limited engineer turn.
+
+    It names the previous terminal engineer request, quotes the provider's own reset text when AO
+    recorded one, and computes this window's start and expected five-hour cutoff in the zone the
+    reset text names (UTC when no parenthesized token is a zone the platform accepts). It grants no
+    new instruction and accompanies every engineer send while that quota diagnosis stands.
+    """
+    from datetime import datetime, timedelta, timezone
+    import re
+    import zoneinfo
+    import ao_outcomes
+    from ao_project_room import digest
+    if role != "engineer":
+        return None
+    previous = ao_outcomes.latest_for_role(state, "engineer")
+    if previous is None or (previous.get("semantic_status") or {}).get("kind") != "quota_limit":
+        return None
+    observed = previous.get("observed_turn")
+    error_message = observed.get("errorMessage") if isinstance(observed, dict) else None
+    reset_text = error_message[:200] if isinstance(error_message, str) else "the account's session limit"
+    zone = None
+    for candidate in re.findall(r"\(([^()]+)\)", reset_text):
+        try:
+            zone = zoneinfo.ZoneInfo(candidate)
+        except Exception:
+            continue
+        break
+    zone = zone if zone is not None else timezone.utc
+    moment = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    start = moment.astimezone(zone)
+    cutoff = start + timedelta(hours=5)
+    render = (lambda point: point.strftime("%Y-%m-%d %H:%M %Z") if point.date() != moment.date()
+              else point.strftime("%H:%M %Z"))
+    text = ("Session window notice (controller-derived, no new instruction): the previous turn "
+            + str(previous.get("request_id")) + " ended at the account's session limit (" + reset_text
+            + "). This turn starts a new window at " + render(start)
+            + "; if the provider's five-hour window applies as before, expect the limit again near "
+            + render(cutoff)
+            + ". Size each work unit so its worker hands back before then, keep the task list current "
+            "at every unit boundary, and avoid leaving a unit mid-flight at the cut-off.")
+    return text, {"previous_request_id": previous.get("request_id"), "reset_text": reset_text,
+                  "window_started_at": start.astimezone(timezone.utc).isoformat(),
+                  "expected_cutoff_at": cutoff.astimezone(timezone.utc).isoformat(),
+                  "fragment_sha256": digest(text.encode())}
+
+
+def packet(service, directory, state, role, purpose, message, snapshot=None, gather=None, quality=None,
+           now=None):
     """One native message. Every controller check stays; only text the session already holds is omitted.
 
     The real assembly runs once through tagged fragments (``gather`` when the caller supplies it),
@@ -675,6 +724,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
     import ao_progress
     texts[ao_progress.PART] = ao_progress.INSTRUCTION
+    import ao_read_admission
+    texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)
@@ -699,6 +750,10 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
                 framing = superseded_routing_framing(directory, state, prepared)
                 if framing is not None:
                     assembly.add("workflow", framing)
+    notice = session_window_notice(state, role, now)
+    if notice is not None:
+        assembly.add("workflow", notice[0])
+        carried["session_window_notice"] = notice[1]
     if epoch is not None:
         import ao_provider_transition
         if not ao_provider_transition.amendment_delivered(directory, state):

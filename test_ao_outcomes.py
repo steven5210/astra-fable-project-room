@@ -232,7 +232,9 @@ class OutcomeWorkflowTests(Fixture):
                                                'Native quota rejection identified; user confirmed availability', 'Continue once')
             self.assertEqual(self.state()['requests']['implementation']['state'], 'settled_failure')
             self.service.ao_room_send(self.room, 'engineer', 'Continue.', 'resume', purpose='correction')
-            self.assertEqual(self.state()['requests']['resume']['text'], 'Continue.')
+            resume_text = self.state()['requests']['resume']['text']
+            self.assertTrue(resume_text.startswith('Session window notice'))
+            self.assertTrue(resume_text.endswith('Continue.'))
             request = self.state()['requests']['implementation']
             self.assertEqual(ao.read(self.directory() / request['receipt'])['turn']['state'], 'failed')
 
