@@ -177,6 +177,13 @@ class RoutingRefreshTests(Fixture):
         after = subprocess.run([sys.executable, routing['guard_path']], input=json.dumps(event), capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(after.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
 
+    def test_refresh_writes_the_task_tools_flag_and_reruns_idempotently(self):
+        self.do_refresh()
+        settings = ao.read(self.repo / '.claude' / 'settings.local.json')
+        self.assertEqual(settings['env']['CLAUDE_CODE_ENABLE_TODO_TOOLS'], 'true')
+        self.assertEqual(settings['env']['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'], '1')
+        self.assertTrue(self.do_refresh()['idempotent'])
+
     def test_idempotent_reply_and_different_inputs_preserve_exact_receipt(self):
         first = self.do_refresh()
         before = (self.directory() / 'state.json').read_bytes()

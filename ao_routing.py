@@ -68,6 +68,9 @@ ENV = {"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_
 # This setting is pinned by new local-settings bytes, not added to historical
 # routing env/rules snapshots that retained preparations must still reproduce.
 FOREGROUND_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+# Headless Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools only for an
+# allow-list of older models, interactive runs, or this variable; pinned the same way.
+TASK_TOOLS_ENV = {"CLAUDE_CODE_ENABLE_TODO_TOOLS": "true"}
 # A forced subagent model overrides explicit definitions; the plain default only
 # applies to agents without a model and is recorded, not treated as protection.
 CONTRADICTORY_ENV = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE",)
@@ -519,11 +522,13 @@ def _foreground_env(value, label):
     env = _environment(value, label + " env")
     if any(key in env and env[key] != expected for key, expected in FOREGROUND_ENV.items()):
         raise RoomError(label + " conflicts with foreground native delegation (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS must be exactly '1')")
+    if any(key in env and env[key] != expected for key, expected in TASK_TOOLS_ENV.items()):
+        raise RoomError(label + " conflicts with the pinned native task tools (CLAUDE_CODE_ENABLE_TODO_TOOLS must be exactly 'true')")
 
 
 def foreground_settings(settings):
     _foreground_env(settings.get("env"), "Local settings")
-    return {**settings, "env": {**_mapping(settings.get("env"), "Local settings env"), **FOREGROUND_ENV}}
+    return {**settings, "env": {**_mapping(settings.get("env"), "Local settings env"), **FOREGROUND_ENV, **TASK_TOOLS_ENV}}
 
 
 def settings_document(existing, command, *, foreground=False, agents=None, qualification=None):
