@@ -236,7 +236,7 @@ def _chain(directory, state, prepared, *, check_unclaimed=True):
         if not isinstance(pointer, dict) or pointer.get('path') in found or len(found) >= MAX_CHAIN:
             raise RoomError('Routing refresh history is malformed, cyclic or exceeds its bound')
         record = _read(directory, pointer)
-        if (record.get('version') != 1 or record.get('room_id') != state['room_id']
+        if (record.get('version') not in (1, 2) or record.get('room_id') != state['room_id']
                 or record.get('engineer') != state['bindings'].get('engineer')
                 or record.get('preparation') != state['preparation']
                 or record.get('preparation_sha256') != state['preparation_sha256']
@@ -503,7 +503,8 @@ def _inspect(service, directory, state, inputs, prepared, routing, target=None, 
     if 'compaction' in routing:
         ao_routing._compaction_sources(routing['compaction'], routing['claude_config_dir'], Path(prepared['worktree']), os.environ)
         ao_routing._compaction_project(_CompleteClient(service.client(state)), state, routing['compaction'])
-    # Keep the full original snapshot in the immutable intent, but compare the
+    # A new intent binds the observed identity with the activity history projected and
+    # digested (v2); retained v1 intents keep their full snapshot bytes. Compare the
     # observed native/history/settings and activity facts rather than changing
     # elapsed-time or observation-age fields on the public response envelope.
     activities = sorted(({key: item[key] for key in ACTIVITY_FIELDS if key in item}
@@ -522,6 +523,28 @@ def _inspect(service, directory, state, inputs, prepared, routing, target=None, 
         # and old pending reconciliation semantics.
         evidence['current_executable'] = checked_executable
     return evidence, snapshot
+
+
+def _projected_snapshot(snapshot, activities):
+    """The observed session identity a new intent binds: every snapshot field, with the unbounded
+    activity rows replaced by the same ACTIVITY_FIELDS projection the evidence carries plus their
+    count and the digest of the full rows sorted by id."""
+    full = sorted(snapshot['activities'], key=lambda item: item['id'])
+    return {**snapshot, 'activities': activities, 'activities_count': len(full),
+            'activities_sha256': ao.digest(full)}
+
+
+def _observed_history_unchanged(record, snapshot, evidence):
+    """A v2 intent binds the complete activity rows by count and digest, not only their bounded
+    projection: a payload-only change outside ACTIVITY_FIELDS between observations refuses."""
+    if record.get('version') != 2:
+        return
+    projected = _projected_snapshot(snapshot, evidence['activities'])
+    stored = record.get('observed_snapshot')
+    stored = stored if isinstance(stored, dict) else {}
+    if (stored.get('activities_count') != projected['activities_count']
+            or stored.get('activities_sha256') != projected['activities_sha256']):
+        raise RoomError('Pending routing refresh observed history changed; preserve its immutable intent')
 
 
 def _sync_directory(path):
@@ -629,7 +652,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                 raise RoomError('Pending routing refresh state or ancestry changed; preserve and diagnose')
             target, source_bundle, target_bundle = existing['target'], existing['source_bundle'], existing['target_bundle']
             _bundle_valid(source, source_bundle); _bundle_valid(target, target_bundle)
-            if (existing.get('version') != 1 or existing.get('room_id') != room_id
+            if (existing.get('version') not in (1, 2) or existing.get('room_id') != room_id
                     or existing.get('preparation') != state['preparation']
                     or existing.get('delegate_sha256') != ao.digest(state['delegate'])
                     or not _same_policy(source, target)
@@ -663,14 +686,16 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                                       qualification=target.get('worker_qualification'))
             ao_routing._alias_project(service.client(state), state)
         evidence, observed_snapshot = current_evidence()
-        record = existing or {'version': 1, 'room_id': room_id, 'inputs': inputs, 'recorded_at': time.time(),
+        record = existing or {'version': 2, 'room_id': room_id, 'inputs': inputs, 'recorded_at': time.time(),
             'before_state_sha256': ao.digest(state), 'engineer': state['bindings']['engineer'],
             'preparation': state['preparation'], 'preparation_sha256': state['preparation_sha256'],
             'delegate_sha256': ao.digest(state['delegate']), 'previous': state.get('routing_refresh'),
             'source': source, 'target': target, 'source_bundle': source_bundle, 'target_bundle': target_bundle,
-            'evidence': evidence, 'observed_snapshot': observed_snapshot}
+            'evidence': evidence,
+            'observed_snapshot': _projected_snapshot(observed_snapshot, evidence['activities'])}
         if record['evidence'] != evidence:
             raise RoomError('Pending routing refresh evidence changed; preserve its immutable intent')
+        _observed_history_unchanged(record, observed_snapshot, evidence)
         if len(_json(record)) > MAX_RECORD_BYTES:
             raise RoomError('Routing refresh intent exceeds its bounded readable size')
         proposed = {**state, 'routing_refresh': {'path': relative, 'sha256': ao.digest(record)}}
@@ -691,8 +716,10 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
         for name in ao_routing.FILES:
             _replace_runtime(Path(prepared['worktree']), name, source_bundle['files'][name].encode(), target_bundle['files'][name].encode())
         check_foreground()
-        if current_evidence()[0] != record['evidence']:
+        commit_evidence, commit_snapshot = current_evidence()
+        if commit_evidence != record['evidence']:
             raise RoomError('Routing refresh evidence changed before commit; leave the exact intent pending')
+        _observed_history_unchanged(record, commit_snapshot, commit_evidence)
         effective(directory, proposed, prepared)
         service.save(directory, proposed)
         return {**proposed['routing_refresh'], 'model_dispatch': False, 'idempotent': False,

@@ -184,7 +184,11 @@ the reviewed definitions and guard through an immutable routing journal. Supply
 `--native-session-id`, `--authorization` and `--diagnosis`. It requires the bound
 engineering orchestrator at its current effective model and MAX, stopped, with
 settled requests and delegates, complete native history, unchanged candidate and
-provider attachment, and the existing ignored runtime paths. Stop only after independently checking native quiescence; an AO idle label
+provider attachment, and the existing ignored runtime paths. The intent binds
+that observed session identity without embedding activity payloads: new intents
+store the bounded activity identity projection together with the count and
+digest of the complete activity rows. Stop only after independently checking
+native quiescence; an AO idle label
 alone is insufficient when diagnosing premature completion.
 
 The operation changes only the three ignored routing files and their
