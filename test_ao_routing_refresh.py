@@ -208,6 +208,57 @@ class RoutingRefreshTests(Fixture):
                 self.do_refresh()
         self.assert_no_intent()
 
+    def test_a_v2_pending_intent_refuses_a_payload_only_activity_change(self):
+        activities = [{'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'original'}]
+        self.fake.snapshots['engineer']['activities'] = copy.deepcopy(activities)
+        self.pending()
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        raw = path.read_bytes()
+        self.fake.snapshots['engineer']['activities'][0]['detail'] = 'changed'
+        with self.assertRaisesRegex(ao.RoomError, 'observed history changed'):
+            self.do_refresh()
+        self.assertEqual(path.read_bytes(), raw)  # the immutable intent is untouched
+        self.assertEqual(self.state(), self.original)
+        self.assertEqual({name: (self.repo / name).read_bytes() for name in ao_routing.FILES}, self.original_files)
+        self.assertEqual(self.fake.posts, self.posts)
+        self.fake.snapshots['engineer']['activities'] = activities
+        self.do_refresh()
+        self.assertEqual(self.journal()['version'], 2)
+
+    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'original'}]
+        original = refresh._inspect
+        calls = []
+
+        def changed_detail(*args, **kwargs):
+            evidence, snapshot = original(*args, **kwargs)
+            calls.append(True)
+            if len(calls) > 1:
+                snapshot['activities'] = [{**snapshot['activities'][0], 'detail': 'changed before commit'}]
+            return evidence, snapshot
+
+        with patch.object(refresh, '_inspect', side_effect=changed_detail):
+            with self.assertRaisesRegex(ao.RoomError, 'observed history changed'):
+                self.do_refresh()
+        self.assertEqual(self.state(), self.original)  # nothing committed; the exact intent stays pending
+        self.do_refresh()
+        record = self.journal()
+        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['observed_snapshot']['activities_sha256'],
+                         ao.digest(self.fake.snapshots['engineer']['activities']))
+
+    def test_an_identical_v2_pending_observation_retries_and_commits(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        self.pending()
+        self.do_refresh()
+        record = self.journal()
+        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['observed_snapshot']['activities_count'], 1)
+        self.assertEqual(record['observed_snapshot']['activities_sha256'],
+                         ao.digest(self.fake.snapshots['engineer']['activities']))
+
     def test_prepared_target_guard_blocks_actual_synthetic_quota_before_opus(self):
         self.do_refresh()
         routing = refresh.effective(self.directory(), self.state(), self.prepared)
@@ -262,8 +313,10 @@ class RoutingRefreshTests(Fixture):
             if method == 'GET' and '/conversation?' in path:
                 calls.append(True)
                 value.update(elapsedMs=len(calls), observedAt='synthetic-observation-' + str(len(calls)))
+                # A v2 intent digests the complete activity rows, so only observation-age
+                # fields outside the payload rows may vary between observations.
                 value['activities'].append({'id': 'stable-activity', 'status': 'completed', 'sequence': 1,
-                                            'elapsedMs': len(calls)})
+                                            'summary': 'stable'})
             return value
 
         self.fake.request = changing_age
