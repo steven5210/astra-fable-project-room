@@ -202,6 +202,39 @@ class ReviewerRecoveryTests(unittest.TestCase):
         self.assertEqual(receipt["replacement_snapshot"]["raw_conversation"], self.fake.snapshots["replacement"])
         self.assertEqual(self.fake.posts, [])
 
+    def test_oversized_activity_payloads_bind_the_audit_by_digest_and_projection(self):
+        activities = [{'id': 'activity-large', 'sequence': 1, 'status': 'completed', 'detail': 'x' * 300_000}]
+        snapshot = {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities),
+                    'raw_conversation': {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities)}}
+        with patch.object(recovery, '_inspect', return_value=({'synthetic': 'evidence'}, snapshot)), \
+                patch.object(recovery, 'MAX_AUDIT_BYTES', 200_000):
+            result = self.audit()
+        saved = recovery._saved_audit(self.directory, result['audit_sha256'])
+        self.assertEqual(saved['version'], 2)
+        observed = saved['observed_snapshot']
+        self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
+        self.assertEqual(observed['raw_conversation']['activities'], observed['activities'])
+        self.assertEqual(observed['activities_count'], 1)
+        self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertNotIn('detail', json.dumps(saved))
+
+    def test_a_projected_audit_over_the_bound_refuses_before_publication(self):
+        snapshot = {'sessionId': 'reviewer', 'activities': [
+            {'id': 'activity-large', 'sequence': 1, 'status': 'completed', 'summary': 's' * 300_000}]}
+        with patch.object(recovery, '_inspect', return_value=({'synthetic': 'evidence'}, snapshot)), \
+                patch.object(recovery, 'MAX_AUDIT_BYTES', 200_000):
+            with self.assertRaisesRegex(ao.RoomError, 'readable size bound'):
+                self.audit()
+        self.assertFalse(list((self.directory / 'reviewer-recovery' / 'audits').glob('*.json')))
+
+    def test_a_saved_full_shape_audit_remains_readable(self):
+        full = {'evidence': {'synthetic': 'full-shape audit'},
+                'observed_snapshot': {'activities': [{'id': 'a', 'detail': 'embedded payload'}]},
+                'observed_at': 1.0}
+        sha256 = ao.digest(full)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), full)
+        self.assertEqual(recovery._saved_audit(self.directory, sha256), full)
+
     def test_raw_identity_is_validated_by_the_normal_identity_contract(self):
         args = self.args()
         def change_identity(name):

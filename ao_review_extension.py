@@ -252,7 +252,7 @@ def _consumption(directory, state, reference):
 
 def _audit(directory, sha256):
     value = _read(directory / BASE / 'audits' / (_hash(sha256, 'review-extension audit') + '.json'))
-    if ao.digest(value) != sha256 or value.get('version') != 1:
+    if ao.digest(value) != sha256 or value.get('version') not in (1, 2):
         raise RoomError('Review-extension audit was modified')
     return value
 
@@ -417,10 +417,12 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
               'native_session_id': native_session_id, 'native_owner_database': native_owner_database}
     with service.locked(room_id) as (directory, state):
         evidence, snapshots = _inspect(service, directory, state, target)
-        value = {'version': 1, 'evidence': evidence, 'observed_snapshots': snapshots, 'observed_at': time.time()}
+        from ao_provider_transition import projected_snapshot
+        value = {'version': 2, 'evidence': evidence, 'observed_at': time.time(),
+                 'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
         sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
-        # Keep both complete raw snapshots; an oversized audit is never published.
+        # Keep the projected snapshots; an oversized audit is never published.
         serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
         if len(serialized) > MAX_RECORD_BYTES:
             raise RoomError('Complete review-extension audit exceeds its readable size bound; no audit was published')

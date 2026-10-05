@@ -15,6 +15,7 @@ from unittest.mock import patch
 import ao_native_identity
 import ao_native_outcome
 import ao_project_room as ao
+import ao_provider_transition
 import ao_review_extension as extension
 import ao_workflow
 import project_room
@@ -1018,11 +1019,37 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             self.assertEqual(self.fake.posts, posts)
         self.assertEqual(self.service.ao_room_spec_review_extend(**inputs)['remaining_spec_reviews'], 1)
 
+    def test_oversized_activity_payloads_bind_the_audit_by_digest_and_projection(self):
+        self.register()
+        activities = [{'id': 'activity-large', 'sequence': 1, 'status': 'completed', 'detail': 'x' * 300_000}]
+        for role in ('engineer', 'reviewer'):
+            self.fake.snapshots[role]['activities'] = copy.deepcopy(activities)
+        with patch.object(extension, 'MAX_RECORD_BYTES', 200_000):
+            first = self.audit()
+        saved = extension._audit(self.directory(), first['audit_sha256'])
+        self.assertEqual(saved['version'], 2)
+        for role in ('engineer', 'reviewer'):
+            observed = saved['observed_snapshots'][role]
+            self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
+            self.assertEqual(observed['activities_count'], 1)
+            self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertNotIn('detail', json.dumps(saved['observed_snapshots']))
+
+    def test_a_saved_v1_full_shape_audit_remains_readable(self):
+        self.register()
+        full = {'version': 1, 'evidence': {'synthetic': 'full-shape audit'},
+                'observed_snapshots': {'engineer': {'activities': [{'id': 'a', 'detail': 'embedded'}]}},
+                'observed_at': 1.0}
+        sha256 = ao.digest(full)
+        extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), full)
+        self.assertEqual(extension._audit(self.directory(), sha256), full)
+
     def test_complete_two_role_audit_overflow_refuses_before_publication(self):
         self.register()
         for role in ('engineer', 'reviewer'):
             self.fake.snapshots[role]['activities'].append({'id': role + '-large-observation',
-                'activityKind': 'tool', 'detail': '🧭' * 15_000, 'status': 'completed'})
+                'activityKind': 'tool', 'summary': '🧭' * 15_000, 'status': 'completed',
+                'detail': 'not retained'})
         before = self.room_files()
         with patch.object(extension, 'MAX_RECORD_BYTES', 100_000):
             with self.assertRaisesRegex(ao.RoomError, 'exceeds its readable size bound'):
@@ -1031,7 +1058,8 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
 
     def test_exact_serialized_audit_bound_retains_full_unicode_snapshots_and_remains_readable(self):
         self.register()
-        self.fake.snapshots['reviewer']['activities'].append({'id': 'unicode-observation', 'detail': '🧭' * 128})
+        self.fake.snapshots['reviewer']['activities'].append({'id': 'unicode-observation', 'summary': '🧭' * 128,
+                                                              'detail': 'not retained'})
         with patch.object(extension.time, 'time', return_value=123.25):
             first = self.audit()
             path = self.directory() / extension.BASE / 'audits' / (first['audit_sha256'] + '.json')
@@ -1039,7 +1067,9 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             with patch.object(extension, 'MAX_RECORD_BYTES', len(raw)):
                 second = self.audit()
                 saved = extension._audit(self.directory(), second['audit_sha256'])
-                self.assertEqual(saved['observed_snapshots']['reviewer']['activities'], self.fake.snapshots['reviewer']['activities'])
+                self.assertEqual(saved['observed_snapshots']['reviewer']['activities'],
+                                 ao_provider_transition.projected_snapshot(
+                                     self.fake.snapshots['reviewer'])['activities'])
                 self.assertEqual(path.read_bytes(), raw)
                 self.service.ao_room_spec_review_extend(**self.grant_inputs(second))
 
@@ -1215,7 +1245,8 @@ class SyntheticService:
 
 with tempfile.TemporaryDirectory() as temp:
     directory = Path(temp).resolve()
-    snapshots = {role: {'activities': [{'detail': '\U0001f9ed'}]} for role in ('engineer', 'reviewer')}
+    snapshots = {role: {'activities': [{'id': role + '-activity', 'detail': '\U0001f9ed'}]}
+                 for role in ('engineer', 'reviewer')}
     with patch.object(extension, '_inspect', return_value=({'synthetic_evidence': '\U0001f9ed'}, snapshots)):
         result = extension.audit(SyntheticService(), 'synthetic-room', 2, 'a' * 64, 'b' * 64,
                                  'synthetic-native-owner', str(directory / 'synthetic.db'))
@@ -1223,7 +1254,11 @@ with tempfile.TemporaryDirectory() as temp:
     path = directory / extension.BASE / 'audits' / (result['audit_sha256'] + '.json')
     expected = json.dumps(record, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
     assert path.read_bytes() == expected
-    assert record['observed_snapshots'] == snapshots
+    expected_snapshots = {role: {**s, 'activities': [{'id': s['activities'][0]['id']}],
+                                 'activities_count': 1,
+                                 'activities_sha256': ao.digest(s['activities'])}
+                          for role, s in snapshots.items()}
+    assert record['observed_snapshots'] == expected_snapshots
     assert len(list(path.parent.iterdir())) == 1
     assert ao.read(path) == record
     recovery_path = directory / 'reviewer-recovery' / 'audits' / (result['audit_sha256'] + '.json')
