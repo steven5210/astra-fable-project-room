@@ -28,6 +28,7 @@ import test_ao_routing_v1_fixture as frozen
 
 
 FLAG = 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'
+TODO = 'CLAUDE_CODE_ENABLE_TODO_TOOLS'
 
 
 def agent(name='pr-sonnet', **params):
@@ -109,13 +110,20 @@ class ForegroundTests(unittest.TestCase):
         current = ao_routing.settings_document(original, 'synthetic-hook', foreground=True)
         self.assertEqual(original, before)
         self.assertNotIn(FLAG, legacy['env'])
-        self.assertEqual(current, {**legacy, 'env': {**legacy['env'], FLAG: '1'}})
+        self.assertNotIn(TODO, legacy['env'])
+        self.assertEqual(current, {**legacy, 'env': {**legacy['env'], FLAG: '1', TODO: 'true'}})
         self.assertEqual(ao_routing.ENV, compaction_fixtures.LEGACY_ENV)
         self.assertNotIn(FLAG, ao_routing.RECORDED_ENV)
+        self.assertNotIn(TODO, ao_routing.RECORDED_ENV)
         for value in ('0', '', True, False, 1, None):
             existing = {'env': {FLAG: value}}
             self.assertEqual(ao_routing.settings_document(existing, 'synthetic-hook')['env'][FLAG], value)
             with self.assertRaisesRegex(ao.RoomError, 'foreground native delegation'):
+                ao_routing.settings_document(existing, 'synthetic-hook', foreground=True)
+        for value in ('0', '', 'false', 'TRUE', True, 1, None):
+            existing = {'env': {TODO: value}}
+            self.assertEqual(ao_routing.settings_document(existing, 'synthetic-hook')['env'][TODO], value)
+            with self.assertRaisesRegex(ao.RoomError, 'CLAUDE_CODE_ENABLE_TODO_TOOLS'):
                 ao_routing.settings_document(existing, 'synthetic-hook', foreground=True)
 
     def test_fresh_prepare_pins_flag_and_copied_guard_inherits_settings_without_rewriting_preparation(self):
@@ -123,9 +131,13 @@ class ForegroundTests(unittest.TestCase):
         prepared = case.prepare()
         settings = case.settings()
         self.assertEqual(settings['env'][FLAG], '1')
+        self.assertEqual(settings['env'][TODO], 'true')
         self.assertNotIn(FLAG, prepared['routing']['env'])
         self.assertNotIn(FLAG, prepared['routing']['prepare_environment'])
         self.assertNotIn(FLAG, prepared['routing']['rules']['recorded_env'])
+        self.assertNotIn(TODO, prepared['routing']['env'])
+        self.assertNotIn(TODO, prepared['routing']['prepare_environment'])
+        self.assertNotIn(TODO, prepared['routing']['rules']['recorded_env'])
         original = case.immutable_bytes(prepared)
         self.assertEqual(case.prepare(), prepared)
         self.assertEqual(ao_routing.validate_local(prepared), prepared['routing'])
@@ -141,6 +153,17 @@ class ForegroundTests(unittest.TestCase):
         self.assertEqual(prepared['routing']['effort'], 'max')
         self.assertEqual(prepared['routing']['agents'], case.QUALIFIED_WORKERS)
         self.assertEqual(case.fake.posts, [])
+
+    def test_a_conflicting_task_tools_value_refuses_fresh_prepare_before_any_write(self):
+        case = self.fixture(compaction_fixtures.CompactionFixture)
+        candidate = ao.candidate_snapshot(case.repo)
+        path = case.repo / '.claude' / 'settings.local.json'
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({'env': {TODO: 'false'}}))
+        with self.assertRaisesRegex(ao.RoomError, 'CLAUDE_CODE_ENABLE_TODO_TOOLS'):
+            case.prepare()
+        self.assertEqual(json.loads(path.read_text()), {'env': {TODO: 'false'}})
+        self.assertEqual(ao.candidate_snapshot(case.repo), candidate)
 
     def test_every_external_flag_zero_refuses_fresh_prepare_before_runtime_publication(self):
         case = self.fixture(compaction_fixtures.CompactionFixture)

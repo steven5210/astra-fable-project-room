@@ -464,6 +464,12 @@ worker restrictions remain intact. DeepSeek's external submit/status/result jobs
 are unchanged. The reviewed native version also disables automatic migration of
 long foreground workers; this is not a new task timeout or model budget.
 
+New preparations and the audited routing refresh also pin
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless
+Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools to current
+models only with it, and the `progress_plan_v1` part and AO's plan panel depend
+on them.
+
 Keep the existing precedence-only ACP workaround. A stopped, positively quiescent
 retained controller must reload the audited settings and guard before new work;
 no daemon restart or experimental runtime switch is needed. Historical preparation
