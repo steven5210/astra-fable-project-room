@@ -39,6 +39,8 @@ All AO configuration lives in the private data directory, never in the plugin or
 
    Install it only for the creation of the intended engineer, create the Astra reviewer before installing it or after restoring the previous configuration, and restore the prior hook afterwards. A failed preparation leaves the room unprepared and AO does not launch the paid worker. The full procedure, including the user and managed Claude settings that must not disable hooks or force subagent models, is in [Native delegation routing](../../skills/project-room/references/ao.md#native-delegation-routing).
 
+   `python3 project_room.py setup --claude-bin` verifies the given executable — an executable regular file under 1 GB whose `--version` reports a Claude Code version — and retains a copy under `PROJECT_ROOM_HOME/claude-code/<version>-<sha256[:12]>/claude` (directory `0700`, file `0755`, created once: identical bytes are reused, different bytes under the same name refuse, and an already-retained path is re-verified by digest rather than copied again). The retained path is pinned as `claude_bin` and the given path recorded as `claude_bin_source`, so the managed installer's pruning or replacement of the original cannot break a prepared or future room; `doctor` reports whether the pinned executable is retained or installer-managed. An existing configuration keeps its installer-managed path until the next explicit `--claude-bin`; nothing is migrated.
+
 Long native histories use [bounded smaller history pages](../reference/ao-history-reads.md),
 including complete activity evidence. An oversized observation is never a reason
 to resend a model turn. The MCP connector also retains its own coherent runtime

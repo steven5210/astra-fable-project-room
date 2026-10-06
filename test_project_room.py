@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,9 @@ root = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 if args == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "fixture", "private": "DO_NOT_EXPOSE"}))
+    raise SystemExit(0)
+if args == ["--version"]:
+    print("2.1.282 (Claude Code)")
     raise SystemExit(0)
 control = json.loads((root / "control.json").read_text())
 prompt = sys.stdin.read()
@@ -68,7 +72,8 @@ class ProjectFixture(unittest.TestCase):
         self.project = self.base / "project"
         self.project.mkdir()
         self.fake = self.base / "fake-claude"
-        self.fake.write_text(FAKE_CLAUDE.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
+        self.fake.write_text(FAKE_CLAUDE.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1)
+                                        .replace("pathlib.Path(__file__).parent", "pathlib.Path(" + repr(str(self.base)) + ")"))
         self.fake.chmod(0o700)
         self.control()
         self.service = project_room.Service(self.home)
@@ -76,6 +81,10 @@ class ProjectFixture(unittest.TestCase):
             self.service.setup(claude_bin=str(self.fake))
         config = self.service.settings()
         config["review_timeout_seconds"] = 12
+        # Room fixtures pin the live fake path so mid-test content swaps still
+        # select the phase's fake; the retained copy setup created is exercised
+        # by the dedicated retention tests.
+        config["claude_bin"] = str(self.fake)
         project_room.atomic_json(self.home / "config.json", config)
         self.entry = self.service.room_open(str(self.project), "Saved filters")
         self.room_id = self.entry["id"]
@@ -163,7 +172,10 @@ class ProjectRoomTests(ProjectFixture):
         self.assertEqual(self.calls()[0]["config_dir"], str(self.base / "claude-storage"))
         next_room = fresh.room_open(str(self.project), "Another feature")
         self.assertNotEqual(next_room["id"], self.room_id)
-        self.assertEqual(json.loads((Path(next_room["path"]) / "settings.json").read_text())["claude_bin"], str(second_fake))
+        # The new room pins the retained copy setup made from the newer executable.
+        self.assertEqual(json.loads((Path(next_room["path"]) / "settings.json").read_text())["claude_bin"],
+                         fresh.settings()["claude_bin"])
+        self.assertNotEqual(fresh.settings()["claude_bin"], str(second_fake))
 
     def test_replay_survives_service_restart_and_changed_content_never_launches(self):
         initial = self.review()
@@ -425,6 +437,90 @@ class ProjectRoomTests(ProjectFixture):
         (self.base / "release").touch()
         for job in (first, second):
             self.assertEqual(self.service.room_job_status(job["id"], 15)["status"], "succeeded")
+
+
+class SetupRetentionTests(ProjectFixture):
+    """`setup --claude-bin` retains a verified copy under the private home and pins it."""
+
+    def installed(self, name="installed-claude", content=None):
+        """A managed-installer style executable outside the private home."""
+        path = self.base / name
+        path.write_text(self.fake.read_text() if content is None else content)
+        path.chmod(0o700)
+        return path
+
+    def test_setup_retains_a_verified_copy_and_pins_it(self):
+        source = self.installed()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.base / "claude-storage")}):
+            self.service.setup(claude_bin=str(source))
+        config = self.service.settings()
+        retained = Path(config["claude_bin"])
+        self.assertEqual(config["claude_bin_source"], str(source))
+        self.assertEqual(retained.parent.parent, self.home / "claude-code")
+        self.assertEqual(retained.name, "claude")
+        self.assertEqual(retained.parent.name,
+                         "2.1.282-" + hashlib.sha256(source.read_bytes()).hexdigest()[:12])
+        self.assertEqual(retained.read_bytes(), source.read_bytes())
+        self.assertEqual(retained.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(retained.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.home / "claude-code").stat().st_mode & 0o777, 0o700)
+
+    def test_an_identical_re_setup_reuses_the_retained_copy(self):
+        source = self.installed()
+        self.service.setup(claude_bin=str(source))
+        retained = self.service.settings()["claude_bin"]
+        self.service.setup(claude_bin=str(source))
+        self.assertEqual(self.service.settings()["claude_bin"], retained)
+
+    def test_differing_bytes_under_the_same_name_refuse(self):
+        source = self.installed()
+        self.service.setup(claude_bin=str(source))
+        retained = Path(self.service.settings()["claude_bin"])
+        with retained.open("wb") as handle:
+            handle.truncate()
+            handle.write(b"differing retained bytes\n")
+        with self.assertRaises(room.RoomError):
+            self.service.setup(claude_bin=str(source))
+        # The poisoned retained path is refused as a source as well, not re-copied.
+        with self.assertRaises(room.RoomError):
+            self.service.setup(claude_bin=str(retained))
+
+    def test_an_unparsable_version_refuses(self):
+        silent = self.installed("claude-silent", "#!/bin/sh\nexit 0\n")
+        with self.assertRaisesRegex(room.RoomError, "did not report a Claude Code version"):
+            self.service.setup(claude_bin=str(silent))
+
+    def test_an_already_retained_path_is_reverified_not_recopied(self):
+        source = self.installed()
+        self.service.setup(claude_bin=str(source))
+        retained = self.service.settings()["claude_bin"]
+        self.service.setup(claude_bin=retained)
+        config = self.service.settings()
+        self.assertEqual((config["claude_bin"], config["claude_bin_source"]), (retained, retained))
+        self.assertEqual([path.name for path in Path(retained).parent.iterdir()], ["claude"])
+
+    def test_pruned_source_keeps_doctor_and_new_preparations_working(self):
+        source = self.installed()
+        self.service.setup(claude_bin=str(source))
+        retained = Path(self.service.settings()["claude_bin"])
+        source.unlink()
+        doctor = self.service.room_doctor()
+        self.assertTrue(doctor["claude_executable_exists"])
+        self.assertTrue(doctor["claude_executable_retained"])
+        self.assertEqual(doctor["claude_bin_source"], str(source))
+        entry = self.service.room_open(str(self.project), "Pruned source")
+        settings = json.loads((Path(entry["path"]) / "settings.json").read_text())
+        self.assertEqual(settings["claude_bin"], str(retained))
+        self.assertTrue(retained.is_file())
+        self.service.room_spec_put(entry["id"], 1, "# Pruned source\n")
+        submitted = self.service.room_review_submit(entry["id"], 1, "Review independently", "review-pruned")
+        self.assertEqual(self.service.room_job_status(submitted["id"], 15)["status"], "succeeded")
+
+    def test_doctor_reports_an_installer_managed_executable(self):
+        # The fixture re-pins the live path, standing in for a pre-existing unmanaged config.
+        doctor = self.service.room_doctor()
+        self.assertFalse(doctor["claude_executable_retained"])
+        self.assertTrue(doctor["claude_executable_exists"])
 
 
 if __name__ == "__main__":

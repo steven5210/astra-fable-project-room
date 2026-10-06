@@ -50,8 +50,15 @@ class WiringFixture(ProjectFixture):
         self.review_executable = self.fake.read_text()
 
     def configure(self, provider, **extra):
-        return self.service.setup(claude_bin=str(self.fake), delegate_provider=provider,
-                                  deepseek_config=str(self.provider_config) if provider == "deepseek" else None, **extra)
+        result = self.service.setup(claude_bin=str(self.fake), delegate_provider=provider,
+                                    deepseek_config=str(self.provider_config) if provider == "deepseek" else None, **extra)
+        # Room fixtures pin the live fake path so mid-test content swaps still
+        # select the phase's fake; the retained copy setup created is exercised
+        # by the dedicated retention tests.
+        config = self.service.settings()
+        config["claude_bin"] = str(self.fake)
+        project_room.atomic_json(self.home / "config.json", config)
+        return result
 
     def open_room(self, feature):
         entry = self.service.room_open(str(self.project), feature)
@@ -138,7 +145,10 @@ class ProviderSetupTests(WiringFixture):
         repaired = self.service.setup(claude_bin=str(repaired_bin))
         self.assertEqual((repaired["delegate_provider"], repaired["deepseek_configured"]), ("deepseek", True))
         settings = self.service.settings()
-        self.assertEqual((settings["claude_bin"], settings["deepseek_config"], settings["delegate_provider"]), (str(repaired_bin), str(moved), "deepseek"))
+        self.assertEqual((settings["claude_bin_source"], settings["deepseek_config"], settings["delegate_provider"]),
+                         (str(repaired_bin), str(moved), "deepseek"))
+        self.assertTrue(settings["claude_bin"].startswith(str(self.home / "claude-code")),
+                        "setup pins the retained copy, not the managed path")
         with self.assertRaisesRegex(room.RoomError, "config_missing"):
             self.service.setup(claude_bin=str(repaired_bin), delegate_provider="deepseek")  # an explicit reselection validates the stored file
         with self.assertRaisesRegex(room.RoomError, "config_missing"):

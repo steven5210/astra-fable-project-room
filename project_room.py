@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -74,6 +75,97 @@ def discover_claude():
     if candidates:
         return str(max(candidates, key=lambda p: p.stat().st_mtime))
     raise room.RoomError("Claude Code executable not found; run setup --claude-bin /absolute/path/to/claude")
+
+
+MAX_EXECUTABLE_BYTES = 1_000_000_000  # The shared executable bound ao_qualification_draft enforces.
+
+
+def _claude_version(path):
+    """The candidate's own --version line parsed by the shared Claude version grammar; never inferred."""
+    import ao_engineering_model
+    try:
+        completed = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise room.RoomError("claude_bin --version probe failed: " + type(exc).__name__) from exc
+    lines = completed.stdout.splitlines()
+    match = ao_engineering_model.CLAUDE_VERSION.match(lines[0].strip()) if completed.returncode == 0 and lines else None
+    if match is None:
+        raise room.RoomError("claude_bin did not report a Claude Code version")
+    return match.group(0)
+
+
+def _executable_bytes(path):
+    """Read the candidate executable once under the shared bound; the same bytes are hashed and retained."""
+    path = Path(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise room.RoomError("claude_bin must name an executable file") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK) or not 0 < info.st_size <= MAX_EXECUTABLE_BYTES:
+            raise room.RoomError("claude_bin must name an executable file")
+        chunks, total = [], 0
+        while total <= MAX_EXECUTABLE_BYTES:
+            block = os.read(fd, min(1024 * 1024, MAX_EXECUTABLE_BYTES + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+        if total != info.st_size or total > MAX_EXECUTABLE_BYTES:
+            raise room.RoomError("claude_bin changed while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _retain_claude(home, source):
+    """Verify a given claude_bin and pin its retained copy under the controller home.
+
+    The retained file lives at claude-code/<version>-<sha256[:12]>/claude, created
+    once from the same bytes that were hashed and probed: identical existing bytes
+    are reused, differing bytes under the same name refuse, and an already-retained
+    path is re-verified by digest instead of being copied again.
+    """
+    retained_home = Path(home) / "claude-code"
+    source = Path(source)
+    data = _executable_bytes(source)
+    digest = hashlib.sha256(data).hexdigest()
+    version = _claude_version(source)
+    if source.parent.parent == retained_home and source.name == "claude":
+        name_version, _, name_digest = source.parent.name.rpartition("-")
+        if not re.fullmatch(r"[0-9a-f]{12}", name_digest) or name_digest != digest[:12] or name_version != version:
+            raise room.RoomError("The retained claude_bin does not match its recorded version and digest")
+        return source
+    directory = retained_home / (version + "-" + digest[:12])
+    target = directory / "claude"
+    if target.exists():
+        if _executable_bytes(target) != data:
+            raise room.RoomError("The retained claude_bin name already holds different bytes; refusing to replace it")
+        return target
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    os.chmod(retained_home, 0o700)
+    temporary = directory / (".claude-" + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("xb") as handle:
+            os.chmod(temporary, 0o755)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _retained_claude(home, claude_bin):
+    """Whether the pinned executable lives under the controller's retained claude-code directory."""
+    try:
+        return isinstance(claude_bin, str) and Path(claude_bin).expanduser().resolve().is_relative_to(
+            (Path(home) / "claude-code").resolve())
+    except (OSError, ValueError):
+        return False
 
 
 def transcript_path(config_dir, cwd, session_id):
@@ -244,11 +336,23 @@ class Service:
                 # later worker or retained MCP would resolve somewhere else.
                 override = resolved
             config_dir = str(Path(recorded or override or Path.home() / ".claude").expanduser().resolve())
+            if claude_bin or not prior.get("claude_bin"):
+                # Retain a verified copy under the private home so installer pruning of the
+                # managed directory cannot break rooms pinned to it; an already-retained
+                # path is re-verified by digest and kept rather than copied again.
+                claude_bin_source = executable
+                executable = str(_retain_claude(self.home, executable))
+            else:
+                # An existing configuration is never migrated silently; the next
+                # explicit --claude-bin retains a copy then.
+                claude_bin_source = prior.get("claude_bin_source")
             config = {"version": 1, "claude_bin": executable, "model": MODEL,
                       "claude_config_dir": config_dir, "claude_config_dir_override": override,
                       "qwen_config": qwen, "deepseek_config": deepseek,
                       "review_timeout_seconds": prior.get("review_timeout_seconds", 1800),
                       "implementation_timeout_seconds": prior.get("implementation_timeout_seconds", 3600)}
+            if claude_bin_source is not None:
+                config["claude_bin_source"] = claude_bin_source  # provenance only; never used for launches
             if selected is not None:
                 config["delegate_provider"] = selected
             atomic_json(target, config)
@@ -281,6 +385,8 @@ class Service:
             return {"configured": False, "error": str(exc)}
         result = {"configured": True, "model": config["model"], "home": str(self.home),
                   "claude_executable_exists": Path(config["claude_bin"]).is_file(),
+                  "claude_executable_retained": _retained_claude(self.home, config.get("claude_bin")),
+                  "claude_bin_source": config.get("claude_bin_source"),
                   "delegate_provider": provider_name(config),
                   "delegate_provider_selected": "delegate_provider" in config,
                   "qwen_configured": bool(config.get("qwen_config")),

@@ -18,8 +18,11 @@ import test_room
 FAKE = r'''#!/usr/bin/env python3
 import datetime, json, os, pathlib, sys, time
 root = pathlib.Path(__file__).parent
-mode = (root / "implementation-mode.txt").read_text().strip()
 argv = sys.argv[1:]
+if argv == ["--version"]:
+    print("2.1.282 (Claude Code)")
+    raise SystemExit(0)
+mode = (root / "implementation-mode.txt").read_text().strip()
 prompt = sys.stdin.read()
 packet = json.loads(prompt.split("IMPLEMENTATION PACKET (JSON):\n", 1)[1])
 session = argv[argv.index("--resume") + 1] if "--resume" in argv else argv[argv.index("--session-id") + 1]
