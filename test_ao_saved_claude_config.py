@@ -28,7 +28,9 @@ class SavedClaudeConfigTests(unittest.TestCase):
         environment = patch.dict(os.environ, {'HOME': str(self.user_home)}, clear=True)
         environment.start(); self.addCleanup(environment.stop)
         self.stub = self.root / 'never-executed-claude'
-        self.stub.write_text('This fixture must never be executed.\n'); self.stub.chmod(0o700)
+        self.stub.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.282 (Claude Code)"; exit 0; fi\n'
+                             'echo "This fixture must never be executed beyond --version."\nexit 3\n')
+        self.stub.chmod(0o700)
         self.service = project_room.Service(self.controller_home)
         self.config_path = self.controller_home / 'config.json'
         self.ao_service = SimpleNamespace(root=self.controller_home / 'ao')
@@ -36,7 +38,16 @@ class SavedClaudeConfigTests(unittest.TestCase):
         os.chdir(self.caller)
 
     def setup(self):
-        with patch.object(subprocess, 'Popen', side_effect=AssertionError('Setup must not invoke a CLI')):
+        real_popen = subprocess.Popen
+        retained_home = self.controller_home / 'claude-code'
+        def guarded(argv, *args, **kwargs):
+            # Setup's one verification probe: the --version call runs against the staged
+            # retained copy (or an already-retained path), never the managed path.
+            probed = Path(argv[0])
+            if list(argv[1:]) == ['--version'] and retained_home in probed.parents:
+                return real_popen(argv, *args, **kwargs)
+            raise AssertionError('Setup must not invoke a CLI')
+        with patch.object(subprocess, 'Popen', side_effect=guarded):
             self.service.setup(claude_bin=str(self.stub), delegate_provider='none')
         return json.loads(self.config_path.read_bytes())
 

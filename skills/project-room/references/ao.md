@@ -58,6 +58,12 @@ floor, the newest Claude Code installed under `~/.local/share/claude/versions`,
 and the latest published `vX.Y.Z` release. `below_floor` means the configured
 executable cannot run a qualified family: run the reported
 `python3 project_room.py setup --claude-bin` command before any new dispatch.
+`setup --claude-bin` retains a verified copy of that executable under the
+private `claude-code` directory — created once, identical bytes reused,
+different bytes under the same name refused — and pins it as `claude_bin`, so
+the executable a room launches survives installer pruning of the managed path;
+`doctor` reports whether the pinned executable is retained or
+installer-managed.
 `update_available` means a newer install or release exists: arrange the update
 between jobs. `unknown` is not up to date. `qualification_sources` re-fetches
 each captured engineering-model qualification source and reports per-source `unchanged`,
