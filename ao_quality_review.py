@@ -246,10 +246,13 @@ def _reconciled_history(reader, state, request, receipt, latest):
     from ao_outcomes import native_quota_failure
     sha = request.get(PROOF)
     proof = _history_record(reader, "history-reconciliations", request, sha)
-    _require(request.get("state") == "completed" and receipt.get("history_truncated") is True
-             and proof.get("kind") == "complete_history_native_quota" and proof.get("saved_history_truncated") is True
+    kind = proof.get("kind")
+    _require(receipt.get("history_truncated") is True and proof.get("saved_history_truncated") is True
              and proof.get("receipt_sha256") == request["receipt_sha256"]
-             and proof.get("text_sha256") == request["text_sha256"])
+             and proof.get("text_sha256") == request["text_sha256"]
+             and ((kind == "complete_history_native_quota" and request.get("state") == "completed")
+                  or (kind == "complete_history_native_quota_failed_turn"
+                      and request.get("state") == "settled_failure")))
     head = request.get(INVALIDATION)
     cursor, seen = head, set()
     while cursor is not None:
@@ -285,7 +288,8 @@ def _reconciled_history(reader, state, request, receipt, latest):
     # it must not be rebound to today's transcript path. No native file is read.
     _require(not latest or source == state.get("native_outcome_source"))
     terminal = outcome.get("ao_terminal")
-    _require(isinstance(terminal, dict) and terminal.get("state") == "completed"
+    expected_state = "completed" if kind == "complete_history_native_quota" else "failed"
+    _require(isinstance(terminal, dict) and terminal.get("state") == expected_state
              and terminal.get("id") == request["turn_id"] and terminal.get("providerTurnId") == identity["provider_turn_id"])
     anchors = {key: request[key] for key in ("session_id", "role", "turn_id", "conversation_id", "branch_id")}
     anchors.update(provider_turn_id=identity["provider_turn_id"], baseline_sha256=digest(request["baseline"]),
@@ -293,6 +297,8 @@ def _reconciled_history(reader, state, request, receipt, latest):
                    provider_failures_sha256=digest(outcome.get("provider_failures")),
                    session_failures_sha256=digest(outcome.get("session_failures")))
     _require(all(inputs.get(key) == value for key, value in anchors.items()) and _hash(inputs.get("turns_sha256")))
+    if kind == "complete_history_native_quota_failed_turn":
+        _require(inputs.get("saved_turn_sha256") == digest(receipt["turn"]))
 
 
 def _receipt_integrity(reader, request, binding):

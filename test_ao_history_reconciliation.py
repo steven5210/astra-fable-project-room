@@ -14,6 +14,9 @@ from test_ao_reviewer_native_outcome import ReviewerNativeFixture
 
 class HistoryReconciliationTests(Fixture):
     NATIVE = 'native-fixture'
+    # The owned AO turn's terminal state; the failed-turn lane subclass reuses
+    # this exact fixture with a failed turn instead of a completed one.
+    TURN_STATE = 'completed'
 
     def setUp(self):
         super().setUp()
@@ -56,7 +59,7 @@ class HistoryReconciliationTests(Fixture):
         ]
         self.native_events = self.prefix + self.events
         self.write_native()
-        self.fake.finish('engineer', '')
+        self.fake.finish('engineer', '', state=self.TURN_STATE)
         self.snapshot = self.fake.snapshots['engineer']
         self.snapshot['history_truncated'] = True
         # Produce the historical receipt using the prior non-strict capture path.
@@ -417,6 +420,193 @@ class HistoryReconciliationTests(Fixture):
         self.assertEqual(proof['inputs']['native']['anchor_uuid'], 'caller')
         self.assertTrue(proof['saved_history_truncated'])
         self.assertTrue(result['outcome']['hold'])
+
+
+class FailedTurnReconciliationTests(HistoryReconciliationTests):
+    """The same truncated-history room, except the owned AO turn itself failed.
+
+    The saved failed-turn receipt keeps its original bytes and refusal; only an
+    explicit audit can bind a fresh complete strict observation of the same
+    failed turn to native 429/rate-limit evidence through the separate proof.
+    """
+    TURN_STATE = 'failed'
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.request['state'], 'uncertain')
+        self.assertEqual(self.request['observed_turn']['state'], 'failed')
+        self.assertTrue(json.loads(self.receipt_bytes)['history_truncated'])
+        self.assertNotIn(reconciliation.PROOF, self.request)
+
+    # The failed-turn lane refuses rather than returning a non-eligible record:
+    # the truncated saved receipt stays unusable without a still-valid proof.
+    def assert_refused(self, result_of=None):
+        with self.assertRaisesRegex(ao.RoomError, 'Failed-turn evidence is incomplete or changed'):
+            self.audit()
+        self.assertNotIn(reconciliation.PROOF, self.current())
+
+    def test_explicit_audit_proves_and_settles_the_failed_turn(self):
+        posts = len(self.fake.posts)
+        result = self.audit()
+        self.assertTrue(result['resume_eligible'])
+        self.assertEqual(result['outcome']['kind'], 'quota_limit')
+        self.assertTrue(result['outcome']['hold'])
+        self.assertEqual(len(self.fake.posts), posts)
+        request = self.current()
+        proof = reconciliation.load_proof(self.directory(), request)
+        self.assertEqual(proof['kind'], 'complete_history_native_quota_failed_turn')
+        self.assertTrue(proof['saved_history_truncated'])
+        self.assertEqual(proof['receipt_sha256'], request['receipt_sha256'])
+        self.assertEqual(proof['inputs']['saved_turn_sha256'],
+                         ao.digest(json.loads(self.receipt_bytes)['turn']))
+        self.assert_preserved()
+        self.release(result)
+        self.assertEqual(self.current()['state'], 'settled_failure')
+        self.assert_preserved()
+        self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assert_preserved()
+
+    def test_changed_fresh_turn_error_message_cannot_originate(self):
+        self.snapshot['turns'][-1]['errorMessage'] = 'a different provider error'
+        self.assert_refused()
+
+    def test_different_saved_or_observed_turn_identity_cannot_originate(self):
+        saved = json.loads(self.receipt_bytes)
+        for field, wrong in (('id', 'different-turn'), ('providerTurnId', 'different-provider')):
+            with self.subTest(field=field):
+                tampered = copy.deepcopy(saved)
+                tampered['turn'][field] = wrong
+                self.receipt_path.write_text(json.dumps(tampered) + '\n')
+                self.assert_refused()
+                self.receipt_path.write_bytes(self.receipt_bytes)
+        # A fresh observation carrying a different turn identity is refused by
+        # the unchanged attribution guard before any proof can originate.
+        self.snapshot['turns'][-1]['id'] = 'observed-different-turn'
+        with self.assertRaises(ao.RoomError):
+            self.audit()
+        self.assertNotIn(reconciliation.PROOF, self.current())
+
+    def test_non_quota_native_evidence_cannot_originate(self):
+        self.events[-1].update(error='invalid_request', apiErrorStatus=400)
+        self.write_native()
+        self.assert_refused()
+
+    def test_still_truncated_fresh_observation_cannot_originate(self):
+        self.snapshot['history_truncated'] = True
+        with self.assertRaises(ao.RoomError):
+            self.audit()
+        self.assertNotIn(reconciliation.PROOF, self.current())
+
+    def test_changed_native_evidence_invalidates_the_proof(self):
+        self.audit()
+        request = self.current()
+        self.assertIn(reconciliation.PROOF, request)
+        self.events[-1].update(error='invalid_request', apiErrorStatus=400)
+        self.write_native()
+        with self.assertRaisesRegex(ao.RoomError, 'Failed-turn evidence is incomplete or changed'):
+            self.audit()
+        current = self.current()
+        self.assertEqual(current['state'], 'uncertain')
+        self.assertIn(reconciliation.INVALIDATION, current)
+        self.assert_preserved()
+
+    def test_no_release_or_successor_before_audit_and_resume(self):
+        self.assertEqual(self.current()['state'], 'uncertain')
+        posts = len(self.fake.posts)
+        with self.assertRaises(ao.RoomError):
+            self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertNotIn(reconciliation.PROOF, self.current())
+        self.assert_preserved()
+
+    def test_explicit_audit_release_and_exactly_one_successor_preserve_receipt(self):
+        # Sync never semantically observes an uncertain failed turn; only the
+        # explicit audit produces and binds the reconciled outcome.
+        posts = len(self.fake.posts)
+        self.service.ao_room_sync(self.room)
+        self.assertNotIn('semantic_status', self.current())
+        self.assertNotIn(reconciliation.PROOF, self.current())
+        result = self.audit()
+        self.assertTrue(result['resume_eligible'])
+        self.assertEqual(result['outcome']['kind'], 'quota_limit')
+        self.assertTrue(result['outcome']['hold'])
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assert_preserved()
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.current()['semantic_outcome_sha256'], result['outcome_sha256'])
+        self.release(result); self.release(result)
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assert_preserved()
+        self.send('correction', 'continue-once'); self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assert_preserved()
+
+    def test_missing_baseline_turn_cannot_originate_or_revive_proof(self):
+        baseline = self.request['baseline']['turn_ids'][0]
+        original = copy.deepcopy(self.snapshot['turns'])
+        self.snapshot['turns'] = [t for t in original if t['id'] != baseline]
+        with self.assertRaises(ao.RoomError):
+            self.audit()
+        self.assertNotIn(reconciliation.PROOF, self.current())
+        self.snapshot['turns'] = copy.deepcopy(original)
+        result = self.audit(); self.release(result)
+        self.snapshot['turns'] = [t for t in original if t['id'] != baseline]
+        self.service.ao_room_sync(self.room)
+        self.snapshot['turns'] = original
+        self.assert_stale_requires_new_audit(result)
+
+    # Completed-lane tests whose expectation differs for the failed lane: a
+    # genuine quota proof can originate here, and non-quota evidence refuses
+    # instead of returning a non-eligible outcome.
+    def test_settled_retry_error_and_successful_final_do_not_originate(self):
+        final = copy.deepcopy(self.events[-1]); final.update(uuid='answer', isApiErrorMessage=False)
+        final.pop('error'); final.pop('apiErrorStatus')
+        final['timestamp'] = datetime.fromtimestamp(self.request['created_at'] + 0.3, timezone.utc).isoformat()
+        final['message'] = {'model': 'claude-fable-5-1', 'id': 'response', 'stop_reason': 'end_turn'}
+        self.events.append(final); self.write_native()
+        self.assert_refused()
+
+    def test_wrong_or_ambiguous_native_anchor_does_not_originate(self):
+        original = copy.deepcopy(self.events)
+        for mode in ('changed', 'duplicate', 'foreign', 'later-human'):
+            with self.subTest(mode=mode):
+                self.events = copy.deepcopy(original)
+                if mode == 'changed': self.events[0]['message']['content'] = 'Different instruction'
+                if mode == 'duplicate': self.events.insert(1, {**self.events[0], 'uuid': 'duplicate'})
+                if mode == 'foreign': self.events[-1]['sessionId'] = 'foreign-session'
+                if mode == 'later-human':
+                    self.events.append({**self.events[0], 'uuid': 'later', 'timestamp':
+                        datetime.fromtimestamp(self.request['created_at'] + 0.4, timezone.utc).isoformat()})
+                self.write_native()
+                self.assert_refused()
+
+    def test_wrong_native_owner_never_originates(self):
+        original = copy.deepcopy(self.owner)
+        for key in ('project_id', 'provider_conversation_id', 'workspace_path', 'ao_conversation_id', 'active_branch_id'):
+            with self.subTest(key=key):
+                self.owner = {**original, key: 'wrong'}
+                self.assert_refused()
+
+    def test_malformed_current_failures_cannot_originate_a_proof(self):
+        self.snapshot['sessionFailures'] = ['malformed']
+        self.assert_refused()
+
+    def test_unknown_and_non_quota_native_results_never_originate(self):
+        for error, status in (('invalid_request', 400), ('auth_required', 401), (None, None)):
+            with self.subTest(error=error):
+                self.events[-1].update(error=error, apiErrorStatus=status); self.write_native()
+                self.assert_refused()
+        self.transcript.write_text('malformed native data\n')
+        self.assert_refused()
+
+    def test_failed_transport_does_not_enter_this_lane(self):
+        # In this fixture the saved turn is already failed; a fresh completed
+        # observation of the same turn contradicts it and cannot originate.
+        self.snapshot['turns'][-1]['state'] = 'completed'
+        with self.assertRaises(ao.RoomError):
+            self.audit()
+        self.assertNotIn(reconciliation.PROOF, self.current())
 
 
 class ReviewerHistoryReconciliationTests(ReviewerNativeFixture):

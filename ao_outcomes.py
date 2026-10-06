@@ -123,14 +123,20 @@ def classify(receipt, native=None, require_structured=True):
     return {'kind': 'final_available', 'hold': False, 'reason': 'Final observed; semantic report and acceptance checks remain separate'}
 
 
-def receipt(directory, request):
+def receipt(directory, request, explicit_audit=False):
     if request.get('state') == 'uncertain' and (request.get('observed_turn') or {}).get('state') == 'failed':
         from ao_project_room import digest, read, sent_message
         value = read(directory / request['receipt'])
         turn = value.get('turn') or {}
+        # A truncated saved receipt is admitted only for an explicit audit that can
+        # establish the separate failed-turn reconciliation proof, or while one is
+        # already named. The proof itself is revalidated against fresh complete
+        # observation at the reconciliation boundary in _observe.
         if (digest(value) != request['receipt_sha256'] or turn.get('state') != 'failed'
                 or not request.get('provider_turn_id') or turn.get('providerTurnId') != request['provider_turn_id']
-                or turn.get('id') != request.get('turn_id') or value.get('history_truncated')
+                or turn.get('id') != request.get('turn_id')
+                or (value.get('history_truncated')
+                    and not request.get('history_reconciliation_sha256') and not explicit_audit)
                 or not sent_message(request, value) or request.get('model_reroute')):
             raise RoomError('Failed-turn evidence is incomplete or changed')
         return value  # Evidence for audit only; this does not grant continuation.
@@ -140,7 +146,7 @@ def receipt(directory, request):
 
 def native_quota_failure(record):
     native = record.get('native') or {}
-    return (record['outcome']['kind'] == 'quota_limit' and not inconclusive(record)
+    return ((record.get('outcome') or {}).get('kind') == 'quota_limit' and not inconclusive(record)
             and bool(native.get('anchor_uuid')) and native.get('next_human_uuid') is None
             and any(e.get('error') == 'rate_limit' or e.get('http_status') == 429 for e in native.get('errors', [])))
 
@@ -585,7 +591,7 @@ def validate_settlement(directory, request):
 def audit_quiet(service, directory, state, request):
     failed = request.get('state') == 'uncertain' and (request.get('observed_turn') or {}).get('state') == 'failed'
     if failed:
-        receipt(directory, request)
+        receipt(directory, request, explicit_audit=True)
     service.quiet(state, outcome_request_id=request['request_id'] if failed else None)
 
 
@@ -613,7 +619,7 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
     identity = native_turn_identity(request)
     if identity and not request.get('provider_turn_id'):
         request['provider_turn_id'] = identity
-    saved = receipt(directory, request)
+    saved = receipt(directory, request, explicit_audit=allow_unknown_clear)
     live_messages = [m for m in snapshot.get('messages', []) if m.get('turnId') == request.get('turn_id')]
     turns = [t for t in snapshot.get('turns', []) if t.get('id') == request.get('turn_id')]
     # The exact single-message AO restoration of the retained synthetic thrashing error is only
@@ -687,10 +693,21 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
             for p in (native or {}).get(field, [])}) if not (native or {}).get('unknown') else set()
         if extra_turns - proven_imports:
             raise RoomError('Native history contains unverified recovered context; audit its exact source before continuing')
-    from ao_history_reconciliation import reconcile
-    proof_sha256 = reconcile(service, directory, state, request, saved, observed, snapshot, native, allow_unknown_clear)
+    from ao_history_reconciliation import reconcile, reconcile_failed
+    if request.get('state') == 'completed':
+        proof_sha256 = reconcile(service, directory, state, request, saved, observed, snapshot, native,
+                                 allow_unknown_clear)
+    elif request.get('state') in ('uncertain', 'settled_failure'):
+        proof_sha256 = reconcile_failed(service, directory, state, request, saved, observed, snapshot,
+                                        native, allow_unknown_clear)
+    else:
+        proof_sha256 = None
     if proof_sha256:
         observed = {**observed, 'history_truncated': False}
+    elif saved.get('history_truncated') and request.get('state') in ('uncertain', 'settled_failure'):
+        # The truncated failed-turn receipt is usable evidence only through a
+        # still-valid failed-turn reconciliation proof.
+        raise RoomError('Failed-turn evidence is incomplete or changed')
     value = {'version': 1, 'room_id': state['room_id'], 'request_id': request['request_id'],
              'receipt_sha256': request['receipt_sha256'], 'text_sha256': request['text_sha256'],
              'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],

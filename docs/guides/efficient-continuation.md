@@ -399,7 +399,7 @@ This lane does not establish quota availability, clear a provider safety refusal
 resume an uncertain failed transport or reset review budgets. An active delegate
 or native owner continues to block recovery. No model is called by reconciliation.
 
-An AO `failed` turn ordinarily remains uncertain. There are two narrow settlement
+An AO `failed` turn ordinarily remains uncertain. There are three narrow settlement
 exceptions, each requiring its own exact positive evidence. The first is a
 matched native API quota error with exact delivery evidence, an idle retained
 owner and actual continuation authorization. The second is the separately
@@ -410,6 +410,8 @@ safety or refusal evidence disqualifies it. The read-admission mitigation for
 that compaction lane binds only the exact settled diagnosis; it does not let a
 contradictory or ambiguous record bypass the fresh positive proof. See
 [compaction-failure recovery](../operations/compaction-failure-recovery.md).
+The third is the audited complete-history lane below for the same quota
+diagnosis when the saved receipt itself was captured with truncated history.
 The original failed receipt, partial work, native identity and consumed attempts
 remain intact in either case. Neither state is successful engineering or
 acceptance. Unknown delivery, arbitrary crashes, unresolved paid delegates and
@@ -426,6 +428,23 @@ projected rows count toward the aggregate bound, so a long session's complete
 history still fits the bounded read. The typed `provider.failure` details used
 by failure classification are on the retained list and arrive verbatim, and a
 payload-only change still alters the marker digest and fails closed.
+
+### A failed receipt captured with truncated history
+
+The same audited reconciliation structure covers one narrower case: the owned
+request remains `uncertain`, its saved receipt has `history_truncated: true`,
+and the receipt's failed AO turn — same turn and provider-turn identity and the
+same error message — is still the failed turn in a fresh complete strict
+observation. Verified native evidence must again establish the typed quota
+error with a unique owned caller anchor, no later human instruction, an idle
+owner and no unproven extra turns. The separate proof additionally binds the
+saved failed turn itself; ordinary sync can only validate or invalidate it, and
+only an explicit outcome audit creates or renews it. The original receipt bytes
+and the failed AO state are never rewritten, and a successful retry or final
+response is no ground for this proof. A valid proof lets a separate authorized
+`ao_room_outcome_resume` settle the request as `settled_failure` and admit its
+one named successor; changed or unknown evidence, a non-quota native outcome,
+and any active delegate refuse and invalidate through the same immutable chain.
 
 ## Session window notice
 

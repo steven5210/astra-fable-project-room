@@ -51,6 +51,15 @@ def requires_strict_history(directory, state, binding):
                 # Selection is not receipt admission. Preserve unrelated operations
                 # before any proof exists; outcome audit still validates the receipt.
                 return False
+        if (request.get('state') == 'uncertain' and request.get('receipt')
+                and (request.get('observed_turn') or {}).get('state') == 'failed'
+                and not request.get('model_reroute')):
+            try:
+                from ao_project_room import read
+                value = read(directory / request['receipt'])
+                return isinstance(value, dict) and value.get('history_truncated') is True
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
     return False
 
 
@@ -101,7 +110,7 @@ def load_proof(directory, request):
     if sha is None:
         return None
     value = _record(directory, 'history-reconciliations', request['request_id'], sha)
-    if (value.get('kind') != 'complete_history_native_quota'
+    if (value.get('kind') not in ('complete_history_native_quota', 'complete_history_native_quota_failed_turn')
             or value.get('receipt_sha256') != request.get('receipt_sha256')
             or value.get('text_sha256') != request.get('text_sha256')):
         raise RoomError('History reconciliation proof no longer binds the original receipt')
@@ -230,6 +239,107 @@ def reconcile(service, directory, state, request, saved, observed, snapshot, nat
     if normal(state) or 'delegate' in state:
         ao_delegates.assert_settled(service.root.parent, state, directory)
     value = {'version': 1, 'kind': 'complete_history_native_quota', 'room_id': state['room_id'],
+             'request_id': request['request_id'], 'receipt_sha256': request['receipt_sha256'],
+             'text_sha256': request['text_sha256'], 'saved_history_truncated': True,
+             'inputs': inputs, 'invalidation_sha256': head,
+             'supersedes_outcome_sha256': request.get('semantic_outcome_sha256')}
+    sha = _write(directory, 'history-reconciliations', value)
+    request[PROOF] = sha
+    return sha
+
+
+def _failed_inputs(state, request, saved, observed, snapshot, native):
+    """Proof inputs for an uncertain failed turn whose saved receipt was truncated.
+
+    The failed-turn proof keeps the settled request's evidence loadable: a settled
+    request must still validate the same immutable inputs against a fresh complete
+    observation. Minting remains reachable only through the uncertain state because
+    settlement itself requires the proof.
+    """
+    from ao_project_room import busy, conflicting_reroute, digest, sent_message
+    from ao_native_outcome import source_keys
+    from ao_outcomes import classify, _unowned_context_turns
+    saved_turn = saved.get('turn')
+    observed_turn = observed.get('turn')
+    if (request.get('state') not in ('uncertain', 'settled_failure')
+            or saved.get('history_truncated') is not True
+            or not isinstance(saved_turn, dict) or not isinstance(observed_turn, dict)
+            or saved_turn.get('id') != request.get('turn_id')
+            or saved_turn.get('providerTurnId') != request.get('provider_turn_id')
+            or saved_turn.get('state') != 'failed'
+            or observed_turn.get('id') != saved_turn.get('id')
+            or observed_turn.get('providerTurnId') != saved_turn.get('providerTurnId')
+            or observed_turn.get('state') != 'failed'
+            or observed_turn.get('errorMessage') != saved_turn.get('errorMessage')
+            or snapshot.get('history_truncated') is not False
+            or busy(snapshot) or not sent_message(request, snapshot)
+            or request.get('model_reroute') or request.get('conflicting_reroute')
+            or conflicting_reroute(request, snapshot)
+            or not isinstance(native, dict) or native.get('unknown')
+            or not isinstance(native.get('anchor_uuid'), str) or not native['anchor_uuid']
+            or native.get('next_human_uuid') is not None):
+        return None
+    source = native.get('source')
+    source_key, _ = source_keys(request['role'])
+    errors = native.get('errors')
+    if (not isinstance(source, dict) or source != state.get(source_key)
+            or source.get('session_id') != request['session_id']
+            or not isinstance(native.get('source_sha256'), str)
+            or not re.fullmatch('[0-9a-f]{64}', native['source_sha256'])
+            or not isinstance(errors, list) or any(not isinstance(e, dict) for e in errors)
+            or not any(e.get('error') == 'rate_limit' or e.get('http_status') == 429 for e in errors)):
+        return None
+    baseline_turns = set(request['baseline']['turn_ids'])
+    current_turns = {turn['id'] for turn in snapshot['turns']}
+    proven_context = _unowned_context_turns(state, {
+        item['turn_id'] for field in ('compaction_imports', 'task_notification_imports')
+        for item in native.get(field, [])})
+    if (not baseline_turns <= current_turns
+            or current_turns - baseline_turns - {request['turn_id']} - proven_context):
+        return None
+    # The derived complete-history view never replaces the original receipt,
+    # its bytes, its turn rows or its usage.
+    if classify({**observed, 'history_truncated': False}, native)['kind'] != 'quota_limit':
+        return None
+    return {'session_id': request['session_id'], 'role': request['role'],
+            'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],
+            'conversation_id': snapshot.get('conversationId'), 'branch_id': snapshot.get('activeBranchId'),
+            'baseline_sha256': digest(request['baseline']), 'messages_sha256': digest(saved['messages']),
+            'turns_sha256': digest(snapshot['turns']), 'ao_terminal_sha256': digest(observed['turn']),
+            'saved_turn_sha256': digest(saved_turn),
+            'provider_failures_sha256': digest(observed['provider_failures']),
+            'session_failures_sha256': digest(observed['sessionFailures']), 'native': native}
+
+
+def reconcile_failed(service, directory, state, request, saved, observed, snapshot, native, explicit_audit):
+    """Return the exact failed-turn proof digest only when the current evidence authorizes it.
+
+    This mirrors the completed lane exactly: the proof is created once, binds the
+    immutable truncated receipt and the fresh complete observation, is revalidated
+    against current inputs and the invalidation head on every read, and is minted
+    only by an explicit outcome audit. The original receipt is never rewritten.
+    """
+    from ao_workflow import normal
+    import ao_delegates
+    if request.get('state') not in ('uncertain', 'settled_failure') or saved.get('history_truncated') is not True:
+        return None
+    inputs = _failed_inputs(state, request, saved, observed, snapshot, native)
+    prior = load_proof(directory, request)
+    head = invalidation_head(directory, request)
+    if (prior and (prior.get('kind') != 'complete_history_native_quota_failed_turn' or inputs is None
+                   or prior.get('inputs') != inputs or prior.get('invalidation_sha256') != head)):
+        invalidate(service, directory, state, request['request_id'],
+                   'Complete-history reconciliation evidence changed or became unknown')
+        head = invalidation_head(directory, request)
+    elif prior and inputs is not None:
+        if normal(state) or 'delegate' in state:
+            ao_delegates.assert_settled(service.root.parent, state, directory)
+        return request[PROOF]
+    if not explicit_audit or inputs is None:
+        return None
+    if normal(state) or 'delegate' in state:
+        ao_delegates.assert_settled(service.root.parent, state, directory)
+    value = {'version': 1, 'kind': 'complete_history_native_quota_failed_turn', 'room_id': state['room_id'],
              'request_id': request['request_id'], 'receipt_sha256': request['receipt_sha256'],
              'text_sha256': request['text_sha256'], 'saved_history_truncated': True,
              'inputs': inputs, 'invalidation_sha256': head,
