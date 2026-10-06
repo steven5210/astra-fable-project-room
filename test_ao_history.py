@@ -1,6 +1,7 @@
 """History transport and workflow regressions. Synthetic data, no sockets or models."""
 
 import copy
+import hashlib
 import io
 import json
 import unittest
@@ -9,6 +10,7 @@ import urllib.parse
 from unittest.mock import patch
 
 import ao_history as history
+import ao_outcomes
 import ao_project_room as ao
 from ao_provider_transition import _CompleteClient
 from test_ao_normal import Fixture
@@ -129,6 +131,81 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ao.RoomError, "conflicting activities"):
             self.observe(pages)
 
+    def test_activity_payloads_project_by_digest_while_load_bearing_kinds_are_kept(self):
+        pages = self.pages()
+        big = {"output": "x" * 300_000, "exit": 0}
+        pages[1]["activities"] = [
+            {"id": "sys", "sequence": 2, "activityKind": "system",
+             "detail": {"event": "provider.failure", "category": "limit", "severity": "error"}},
+            {"id": "cmd", "sequence": 3, "activityKind": "command_execution", "detail": big},
+            {"id": "plan", "sequence": 4, "activityKind": "plan", "detail": {"steps": ["kept"]}},
+            {"id": "bare", "sequence": 5}]
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                raw, result = self.observe(pages, strict)
+                by_id = {a["id"]: a for a in result["activities"]}
+                self.assertEqual(by_id["sys"]["detail"],
+                                 {"event": "provider.failure", "category": "limit", "severity": "error"})
+                self.assertEqual(by_id["plan"]["detail"], {"steps": ["kept"]})
+                self.assertEqual(by_id["cmd"]["detail"],
+                                 {"omitted_by": "project_room_history_projection",
+                                  "sha256": hashlib.sha256(history.canonical(big)).hexdigest(),
+                                  "bytes": len(history.canonical(big))})
+                self.assertNotIn("detail", by_id["bare"])
+                self.assertFalse(result["history_truncated"])
+
+    def test_projected_overlap_compares_identically_and_payload_drift_conflicts(self):
+        # The same payload observed on two pages projects to the identical row; a
+        # changed payload still conflicts because its bound digest changes.
+        pages = self.pages()
+        row = {"id": "a2", "sequence": 21, "activityKind": "command_execution",
+               "detail": {"output": "x" * 2000}}
+        pages[0]["activities"] = [copy.deepcopy(row)]
+        pages[1]["activities"].append(copy.deepcopy(row))
+        raw, result = self.observe(pages)
+        self.assertEqual({a["id"] for a in result["activities"]}, {"a1", "a2"})
+        changed = self.pages()
+        changed[0]["activities"] = [copy.deepcopy(row)]
+        changed[1]["activities"].append({**row, "detail": {"output": "y" * 2000}})
+        with self.assertRaisesRegex(ao.RoomError, "conflicting activities"):
+            self.observe(changed)
+
+    def test_projected_rows_fit_under_an_aggregate_bound_the_raw_pages_exceed(self):
+        pages = self.pages()
+        detail = {"output": "x" * 3000}
+        pages[0]["activities"] = [{"id": "a2", "sequence": 21,
+                                   "activityKind": "command_execution", "detail": detail}]
+        raw_total = sum(len(history.canonical(p)) for p in pages)
+        marker = {"omitted_by": "project_room_history_projection",
+                  "sha256": hashlib.sha256(history.canonical(detail)).hexdigest(),
+                  "bytes": len(history.canonical(detail))}
+        projected = copy.deepcopy(pages)
+        projected[0]["activities"] = [{**pages[0]["activities"][0], "detail": marker}]
+        retained = sum(len(history.canonical(p)) for p in projected)
+        self.assertGreater(raw_total, retained)
+        for strict in (False, True):
+            with self.subTest(strict=strict), patch.object(history, "MAX_OBSERVATION_BYTES", retained):
+                raw, result = self.observe(pages, strict)
+                self.assertFalse(result["history_truncated"])
+                self.assertFalse(result["hasMoreBefore"])
+        with patch.object(history, "MAX_OBSERVATION_BYTES", retained - 1):
+            with self.assertRaises(history.HistoryObservationLimit) as caught:
+                self.observe(pages)
+            self.assertEqual(caught.exception.limit_kind, "aggregate_bytes")
+            self.assertEqual(caught.exception.observed_bytes, retained)
+
+    def test_system_provider_failure_detail_survives_for_outcome_classification(self):
+        pages = self.pages()
+        failure = {"event": "provider.failure", "category": "limit", "severity": "error"}
+        pages[0]["activities"] = [
+            {"id": "f", "turnId": "t2", "activityKind": "system", "status": "completed",
+             "detail": failure},
+            {"id": "c", "turnId": "t2", "activityKind": "command_execution", "status": "completed",
+             "detail": {**failure, "output": "x" * 1000}}]
+        raw, result = self.observe(pages)
+        self.assertEqual([f["activity_id"] for f in ao_outcomes.activity_failures(result, "t2")], ["f"])
+        self.assertEqual(result["activities"][1]["detail"]["omitted_by"], "project_room_history_projection")
+
     def test_invalid_cursors_and_contradictory_truncation_refuse(self):
         for cursor in (True, 0, -1, "20", 20, 21):
             pages = self.pages(); pages[1].update(hasMoreBefore=True, oldestSequence=cursor)
@@ -191,7 +268,7 @@ class HistoryTests(unittest.TestCase):
         return entries, calls, result
 
     def test_real_page_cap_supports_20000_entry_history(self):
-        self.assertEqual((history.PAGE_ITEMS, history.MAX_PAGES, history.MAX_REQUESTS), (100, 200, 207))
+        self.assertEqual((history.PAGE_ITEMS, history.MAX_PAGES, history.MAX_REQUESTS), (100, 2000, 2007))
         for strict in (False, True):
             with self.subTest(count=20000, strict=strict):
                 entries, calls, result = self.observe_large_timeline(20000, strict)
@@ -203,7 +280,10 @@ class HistoryTests(unittest.TestCase):
                 actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
                 self.assertEqual(actual, entries)
 
-            with self.subTest(count=20001, strict=strict):
+            # Exercise the unchanged page-bound mechanics at a patched-down
+            # ceiling rather than a 200,001-entry fixture.
+            with self.subTest(count=20001, strict=strict), \
+                    patch.object(history, "MAX_PAGES", 200), patch.object(history, "MAX_REQUESTS", 207):
                 calls = []
                 if strict:
                     with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
@@ -220,8 +300,11 @@ class HistoryTests(unittest.TestCase):
                     self.assertNotIn(entries[0], result["activities"])
 
     def test_smaller_pages_still_refuse_when_history_exceeds_the_cap(self):
+        # The bound mechanics are unchanged; exercise them at a patched-down
+        # ceiling rather than a 200,000-entry fixture.
         for strict in (False, True):
-            with self.subTest(count=5008, strict=strict):
+            with patch.object(history, "MAX_PAGES", 200), patch.object(history, "MAX_REQUESTS", 207), \
+                    self.subTest(count=5008, strict=strict):
                 calls = []
                 if strict:
                     with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
@@ -240,7 +323,8 @@ class HistoryTests(unittest.TestCase):
                     self.assertEqual(min(item["sequence"] for item in actual), 9)
                     self.assertNotIn(entries[0], result["activities"])
 
-            with self.subTest(count=10001, strict=strict):
+            with patch.object(history, "MAX_PAGES", 200), patch.object(history, "MAX_REQUESTS", 207), \
+                    self.subTest(count=10001, strict=strict):
                 calls = []
                 if strict:
                     with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
@@ -281,7 +365,8 @@ class HistoryTests(unittest.TestCase):
                 actual = sorted(result["messages"] + result["activities"], key=lambda item: item["sequence"])
                 self.assertEqual(actual, entries)
 
-            with self.subTest(count=201, strict=strict):
+            with self.subTest(count=201, strict=strict), \
+                    patch.object(history, "MAX_PAGES", 200), patch.object(history, "MAX_REQUESTS", 207):
                 calls = []
                 if strict:
                     with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
@@ -371,7 +456,7 @@ class HistoryTests(unittest.TestCase):
                                     ("GET", "/sessions/fixture/conversation?limit=50&beforeSequence=20")])
 
     def test_elapsed_bound_fails_before_another_read(self):
-        with patch.object(history.time, "monotonic", side_effect=[0, 0, 1, 151]):
+        with patch.object(history.time, "monotonic", side_effect=[0, 0, 1, 301]):
             with self.assertRaisesRegex(ao.RoomError, "bounded observation window"):
                 self.observe(self.pages())
 

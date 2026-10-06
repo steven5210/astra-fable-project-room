@@ -416,6 +416,17 @@ acceptance. Unknown delivery, arbitrary crashes, unresolved paid delegates and
 generic transport failures cannot use these exceptions. Review budgets are never
 renewed here.
 
+History reads project large activity payloads before accumulation and before
+the overlap comparison: an activity row whose `activityKind` is not one of
+`system`, `error`, `approval`, `user_input`, `plan` or `usage` retains its
+identity, kind, status, summary and timestamps, while its `detail` is replaced
+by a marker recording the omitted byte count and the SHA-256 of the canonical
+original. The per-response bound still applies to the raw page; only the
+projected rows count toward the aggregate bound, so a long session's complete
+history still fits the bounded read. The typed `provider.failure` details used
+by failure classification are on the retained list and arrive verbatim, and a
+payload-only change still alters the marker digest and fails closed.
+
 ## Session window notice
 
 A send after a quota-limited turn does not need an operator to repeat the window

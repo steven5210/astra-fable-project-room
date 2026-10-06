@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import ao_history
 import ao_project_room as ao
 import ao_provider_transition as transition
 import ao_reviewer_recovery as recovery
@@ -324,7 +325,8 @@ class ProviderTransitionTests(DelegateFixture):
         self.assertEqual(saved['version'], 2)
         observed = saved['observed_snapshot']
         self.assertEqual(observed['activities_count'], 1)
-        self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertEqual(observed['activities_sha256'],
+                         ao.digest([ao_history._project_activity(item) for item in activities]))
         self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
         self.assertNotIn('detail', json.dumps(observed))
 

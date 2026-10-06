@@ -18,15 +18,22 @@ before. Both require explicit arrays and pagination flags, unique identities
 within each page, descending cursors and stable conversation, branch, controller,
 settings and materialization metadata. Missing history is never treated as empty.
 
+An activity row whose `activityKind` is not `system`, `error`, `approval`,
+`user_input`, `plan` or `usage` has its `detail` replaced before accumulation by
+a marker recording the omitted canonical byte count and SHA-256. Every other
+field and the retained kinds arrive verbatim, so failure classification keeps
+its typed details and a payload-only change still fails the overlap comparison.
+
 Resource limits remain explicit:
 
 - 8 MB for each transport response.
-- 50 successful pages, retaining the former 5,000-item capacity at the default
-  page size; shrinking a page can reduce the reachable history within this bound.
-- At most 57 GET attempts, with no additional dispatch allowance.
-- 80 MB of serialized observations, including the bounded bytes consumed by
-  oversized responses. Escaped serialization can conservatively exceed wire size.
-- A 150-second observation deadline checked between and after reads. An in-flight
+- 2,000 successful pages, retaining up to 200,000 entries at the default page
+  size; shrinking a page can reduce the reachable history within this bound.
+- At most 2,007 GET attempts, with no additional dispatch allowance.
+- 160 MB of retained serialized observations after projection, including the
+  bounded bytes consumed by oversized responses. Escaped serialization can
+  conservatively exceed wire size.
+- A 300-second observation deadline checked between and after reads. An in-flight
   request retains the transport's 15-second timeout.
 
 An ordinary read that reaches a resource bound returns only its validated pages

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
+import ao_history
 import ao_native_identity
 import ao_native_outcome
 import ao_project_room as ao
@@ -1033,7 +1034,8 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             observed = saved['observed_snapshots'][role]
             self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
             self.assertEqual(observed['activities_count'], 1)
-            self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+            self.assertEqual(observed['activities_sha256'],
+                             ao.digest([ao_history._project_activity(item) for item in activities]))
         self.assertNotIn('detail', json.dumps(saved['observed_snapshots']))
 
     def test_a_saved_v1_full_shape_audit_remains_readable(self):

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import ao_delegates
 import ao_executable_binding
+import ao_history
 import ao_project_room as ao
 import ao_routing
 import ao_routing_guard
@@ -170,7 +171,8 @@ class RoutingRefreshTests(Fixture):
         self.assertEqual(record['version'], 2)
         observed = record['observed_snapshot']
         self.assertEqual(observed['activities_count'], len(activities))
-        self.assertEqual(observed['activities_sha256'], ao.digest(sorted(activities, key=lambda item: item['id'])))
+        projected = [ao_history._project_activity(item) for item in activities]
+        self.assertEqual(observed['activities_sha256'], ao.digest(sorted(projected, key=lambda item: item['id'])))
         full = sorted(activities, key=lambda item: item['id'])
         self.assertEqual(observed['activities'], record['evidence']['activities'])
         self.assertEqual(observed['activities'],
@@ -246,7 +248,8 @@ class RoutingRefreshTests(Fixture):
         record = self.journal()
         self.assertEqual(record['version'], 2)
         self.assertEqual(record['observed_snapshot']['activities_sha256'],
-                         ao.digest(self.fake.snapshots['engineer']['activities']))
+                         ao.digest([ao_history._project_activity(item)
+                                    for item in self.fake.snapshots['engineer']['activities']]))
 
     def test_an_identical_v2_pending_observation_retries_and_commits(self):
         self.fake.snapshots['engineer']['activities'] = [
@@ -257,7 +260,8 @@ class RoutingRefreshTests(Fixture):
         self.assertEqual(record['version'], 2)
         self.assertEqual(record['observed_snapshot']['activities_count'], 1)
         self.assertEqual(record['observed_snapshot']['activities_sha256'],
-                         ao.digest(self.fake.snapshots['engineer']['activities']))
+                         ao.digest([ao_history._project_activity(item)
+                                    for item in self.fake.snapshots['engineer']['activities']]))
 
     def test_prepared_target_guard_blocks_actual_synthetic_quota_before_opus(self):
         self.do_refresh()
