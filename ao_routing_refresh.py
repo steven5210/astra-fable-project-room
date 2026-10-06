@@ -531,15 +531,20 @@ def _projected_snapshot(snapshot, activities):
 
 
 def _observed_history_unchanged(record, snapshot, evidence):
-    """A v3 intent binds the complete activity rows by count and digest, not only their bounded
+    """A v2/v3 intent binds the complete activity rows by count and digest, not only their bounded
     projection: a payload-only change outside ACTIVITY_FIELDS between observations refuses."""
-    if record.get('version') != 3:
+    version = record.get('version')
+    if version not in (2, 3):
         return
     projected = _projected_snapshot(snapshot, evidence['activities'])
     stored = record.get('observed_snapshot')
     stored = stored if isinstance(stored, dict) else {}
     if (stored.get('activities_count') != projected['activities_count']
             or stored.get('activities_sha256') != projected['activities_sha256']):
+        if version == 2:
+            # The intent digested raw activity rows; only a digest built from rows
+            # without projected payloads can still match a projection-era read.
+            raise RoomError('Pending routing refresh intent predates the history projection; preserve and diagnose')
         raise RoomError('Pending routing refresh observed history changed; preserve its immutable intent')
 
 
@@ -648,11 +653,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                 raise RoomError('Pending routing refresh state or ancestry changed; preserve and diagnose')
             target, source_bundle, target_bundle = existing['target'], existing['source_bundle'], existing['target_bundle']
             _bundle_valid(source, source_bundle); _bundle_valid(target, target_bundle)
-            if existing.get('version') == 2:
-                # A v2 intent digested raw activity rows; a fresh read now digests the
-                # projected rows, so its history check can never pass again.
-                raise RoomError('Pending routing refresh intent predates the history projection; preserve and diagnose')
-            if (existing.get('version') not in (1, 3) or existing.get('room_id') != room_id
+            if (existing.get('version') not in (1, 2, 3) or existing.get('room_id') != room_id
                     or existing.get('preparation') != state['preparation']
                     or existing.get('delegate_sha256') != ao.digest(state['delegate'])
                     or not _same_policy(source, target)

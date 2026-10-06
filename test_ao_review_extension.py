@@ -1047,10 +1047,29 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), full)
         self.assertEqual(extension._audit(self.directory(), sha256), full)
 
-    def test_a_v2_audit_predates_the_projection_and_refuses_explicitly(self):
+    def test_a_v2_audit_with_matching_digests_still_extends(self):
+        # A v2 audit digested raw activity rows; when no row carried a projected
+        # payload the digest is identical either way, so the audit remains usable.
         audited = self.audit()
         saved = extension._audit(self.directory(), audited['audit_sha256'])
         stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), stale)
+        result = self.service.ao_room_spec_review_extend(**self.grant_inputs({'audit_sha256': sha256}))
+        self.assertTrue(result['extended'])
+
+    def test_a_v2_audit_with_a_raw_payload_digest_refuses_explicitly(self):
+        raw = [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        for role in ('engineer', 'reviewer'):
+            self.fake.snapshots[role]['activities'] = copy.deepcopy(raw)
+        audited = self.audit()
+        saved = extension._audit(self.directory(), audited['audit_sha256'])
+        # A pre-projection v2 audit bound the raw rows; a projection-era
+        # observation can never reproduce that digest, so refuse explicitly.
+        raw_sha256 = ao.digest(sorted(raw, key=lambda item: item['id']))
+        stale = {**saved, 'version': 2,
+                 'observed_snapshots': {role: {**snap, 'activities_sha256': raw_sha256}
+                                        for role, snap in saved['observed_snapshots'].items()}}
         sha256 = ao.digest(stale)
         path = self.directory() / extension.BASE / 'audits' / (sha256 + '.json')
         extension._store_once(path, stale)

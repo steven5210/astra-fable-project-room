@@ -210,15 +210,31 @@ class RoutingRefreshTests(Fixture):
                 self.do_refresh()
         self.assert_no_intent()
 
-    def test_a_v2_pending_intent_predates_the_projection_and_refuses_explicitly(self):
+    def test_a_v2_pending_intent_retries_when_its_digest_still_matches(self):
+        # A v2 intent digested raw activity rows; when no row carried a projected
+        # payload that digest equals the projection-era digest, so the exact
+        # pending retry still reconciles and commits.
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'summary': 'retained'}]
         self.pending()
         path = self.directory() / refresh.BASE / 'refresh-one.json'
         record = json.loads(path.read_text())
-        self.assertEqual(record['version'], 3)
-        # A v2 intent digested raw activity rows; its history check can never pass
-        # a projection-era observation, so the refusal names the incompatibility
-        # instead of reporting changed history. There is no abandon lane: preserve.
         record['version'] = 2
+        path.write_bytes(refresh._json(record))
+        self.do_refresh()
+        self.assertEqual(self.journal()['version'], 2)
+
+    def test_a_v2_pending_intent_with_a_raw_payload_digest_refuses_explicitly(self):
+        raw = [{'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        self.fake.snapshots['engineer']['activities'] = copy.deepcopy(raw)
+        self.pending()
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        record = json.loads(path.read_text())
+        # A pre-projection v2 intent digested the raw rows; a projection-era
+        # observation can never reproduce that digest, so the refusal names the
+        # incompatibility. There is no abandon lane: preserve and diagnose.
+        record['version'] = 2
+        record['observed_snapshot']['activities_sha256'] = ao.digest(sorted(raw, key=lambda item: item['id']))
         path.write_bytes(refresh._json(record))
         with self.assertRaisesRegex(ao.RoomError,
                 'Pending routing refresh intent predates the history projection; preserve and diagnose'):

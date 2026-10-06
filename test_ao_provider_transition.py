@@ -339,12 +339,27 @@ class ProviderTransitionTests(DelegateFixture):
         transition._store_once(transition._audit_path(directory, sha256), full)
         self.assertEqual(transition._saved_audit(directory, sha256), full)
 
-    def test_a_v2_audit_predates_the_projection_and_refuses_explicitly(self):
+    def test_a_v2_audit_with_a_matching_digest_still_transitions(self):
+        # A v2 audit digested raw activity rows; when no row carried a projected
+        # payload the digest is identical either way, so the audit remains usable.
         audited = self.audit_transition()
         saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
-        # A v2 audit digested raw activity rows; a fresh projection-era read can
-        # never reproduce that digest, so the refusal names the incompatibility.
         stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        transition._store_once(transition._audit_path(self.directory(), sha256), stale)
+        self.assertTrue(self.commit_transition(self.args({'audit_sha256': sha256}))['transitioned'])
+        # The committed chain loads the same v2 audit during ordinary validation.
+        self.service.ao_room_sync(self.room)
+
+    def test_a_v2_audit_with_a_raw_payload_digest_refuses_explicitly(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        raw = self.fake.snapshots['engineer']['activities']
+        stale = {**saved, 'version': 2,
+                 'observed_snapshot': {**saved['observed_snapshot'],
+                                       'activities_sha256': ao.digest(sorted(raw, key=lambda item: item['id']))}}
         sha256 = ao.digest(stale)
         path = transition._audit_path(self.directory(), sha256)
         transition._store_once(path, stale)

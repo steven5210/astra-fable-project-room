@@ -40,11 +40,25 @@ def _saved_audit(directory, audit_sha256):
     value = json.loads(owned_bytes(_audit_path(directory, audit_sha256), MAX_AUDIT_BYTES))
     if ao.digest(value) != audit_sha256:
         raise RoomError("Reviewer recovery audit was modified")
-    if value.get("version") == 2:
-        # Its history digest bound raw activity rows; fresh reads now bind the
-        # projected rows, so the recorded digest can never be re-established.
-        raise RoomError("Reviewer recovery audit predates the history projection; run the audit again")
     return value
+
+
+def _audit_history_unchanged(saved, snapshot):
+    """A v2/v3 audit binds the observed activity rows by digest; recover re-observes them.
+
+    A v2 audit predates the history projection and digested the raw rows. It can still
+    match when none of them carried a projected payload, so its refusal names the
+    incompatibility rather than reporting a changed history.
+    """
+    version = saved.get("version")
+    if version not in (2, 3):
+        return
+    from ao_provider_transition import observed_history_matches
+    if observed_history_matches(saved.get("observed_snapshot"), snapshot):
+        return
+    if version == 2:
+        raise RoomError("Reviewer recovery audit predates the history projection; run the audit again")
+    raise RoomError("Reviewer recovery audit observed history changed; audit again")
 
 
 def validate(service, state):
@@ -255,9 +269,7 @@ def recover(service, room_id, audit_sha256, replacement_session_id, diagnosis, a
             return _result(state, record)
         saved = _saved_audit(directory, audit_sha256)
         evidence, old_snapshot = _inspect(service, directory, state)
-        from ao_provider_transition import observed_history_matches
-        if saved.get("version") == 3 and not observed_history_matches(saved.get("observed_snapshot"), old_snapshot):
-            raise RoomError("Reviewer recovery audit observed history changed; audit again")
+        _audit_history_unchanged(saved, old_snapshot)
         if saved["evidence"] != evidence:
             raise RoomError("Reviewer recovery audit is stale; inspect the changed state or native evidence")
         replacement, native, workspace, snapshot = _target(service, state, replacement_session_id, evidence)
@@ -265,8 +277,7 @@ def recover(service, room_id, audit_sha256, replacement_session_id, diagnosis, a
         # global room/claim lock. AO itself remains an externally operated system.
         repeated, old_snapshot_again = _inspect(service, directory, state)
         target_again = _target(service, state, replacement_session_id, evidence)
-        if saved.get("version") == 3 and not observed_history_matches(saved["observed_snapshot"], old_snapshot_again):
-            raise RoomError("Reviewer recovery audit observed history changed; audit again")
+        _audit_history_unchanged(saved, old_snapshot_again)
         if repeated != evidence or target_again[:3] != (replacement, native, workspace):
             raise RoomError("Reviewer recovery observations changed before commit")
         service.checkpoint(directory, state)
