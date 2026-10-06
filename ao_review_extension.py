@@ -252,8 +252,12 @@ def _consumption(directory, state, reference):
 
 def _audit(directory, sha256):
     value = _read(directory / BASE / 'audits' / (_hash(sha256, 'review-extension audit') + '.json'))
-    if ao.digest(value) != sha256 or value.get('version') not in (1, 2):
+    if ao.digest(value) != sha256 or value.get('version') not in (1, 2, 3):
         raise RoomError('Review-extension audit was modified')
+    if value.get('version') == 2:
+        # Its history digest bound raw activity rows; fresh reads now bind the
+        # projected rows, so the recorded digest can never be re-established.
+        raise RoomError('Review extension audit predates the history projection; run the audit again')
     return value
 
 
@@ -418,7 +422,7 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
     with service.locked(room_id) as (directory, state):
         evidence, snapshots = _inspect(service, directory, state, target)
         from ao_provider_transition import projected_snapshot
-        value = {'version': 2, 'evidence': evidence, 'observed_at': time.time(),
+        value = {'version': 3, 'evidence': evidence, 'observed_at': time.time(),
                  'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
         sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
@@ -691,8 +695,8 @@ def consume(service, directory, state, request):
 
 
 def _audit_history_unchanged(saved, snapshots):
-    """A v2 audit binds every role's activity rows by digest; the consuming action re-observes them."""
-    if saved.get('version') != 2:
+    """A v3 audit binds every role's activity rows by digest; the consuming action re-observes them."""
+    if saved.get('version') != 3:
         return True
     saved_snapshots = saved.get('observed_snapshots')
     if not isinstance(saved_snapshots, dict) or set(saved_snapshots) != set(snapshots):

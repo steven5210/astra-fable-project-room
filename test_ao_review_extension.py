@@ -1029,7 +1029,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         with patch.object(extension, 'MAX_RECORD_BYTES', 200_000):
             first = self.audit()
         saved = extension._audit(self.directory(), first['audit_sha256'])
-        self.assertEqual(saved['version'], 2)
+        self.assertEqual(saved['version'], 3)
         for role in ('engineer', 'reviewer'):
             observed = saved['observed_snapshots'][role]
             self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
@@ -1047,7 +1047,22 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         extension._store_once(self.directory() / extension.BASE / 'audits' / (sha256 + '.json'), full)
         self.assertEqual(extension._audit(self.directory(), sha256), full)
 
-    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+    def test_a_v2_audit_predates_the_projection_and_refuses_explicitly(self):
+        audited = self.audit()
+        saved = extension._audit(self.directory(), audited['audit_sha256'])
+        stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        path = self.directory() / extension.BASE / 'audits' / (sha256 + '.json')
+        extension._store_once(path, stale)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ao.RoomError,
+                'Review extension audit predates the history projection; run the audit again'):
+            self.service.ao_room_spec_review_extend(**self.grant_inputs({'audit_sha256': sha256}))
+        self.assertEqual(path.read_bytes(), before)  # the predated record is preserved
+        self.assertNotIn('spec_review_extension', self.state())
+        self.assertTrue(self.service.ao_room_spec_review_extend(**self.grant_inputs())['extended'])
+
+    def test_a_v3_audit_refuses_a_payload_only_activity_change(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'earlier-activity', 'turnId': 'turn-1',
             'activityKind': 'system', 'status': 'completed', 'detail': 'Retained earlier activity'}]
         inputs = self.grant_inputs()
@@ -1063,7 +1078,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Retained earlier activity'
         self.assertTrue(self.service.ao_room_spec_review_extend(**inputs)['extended'])
 
-    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+    def test_a_v3_payload_change_between_observations_refuses_before_commit(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'earlier-activity', 'turnId': 'turn-1',
             'activityKind': 'system', 'status': 'completed', 'detail': 'Retained earlier activity'}]
         inputs = self.grant_inputs()

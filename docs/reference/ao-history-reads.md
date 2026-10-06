@@ -43,8 +43,10 @@ whether an observation is sufficient; this repair changes no room receipts,
 native session, review allowance, model or effort setting.
 
 Offline probes cover an actual oversized synthetic response, the full reconstructed
-305-entry timeline, older failure activities, the 5,000-item default window,
-conflicts, missing fields, resource limits, unchanged uncertain-turn holds and
-the ordinary send/sync/verify/accept workflow. These checks invoke no model.
+305-entry timeline, older failure activities, the retained 5,000-item default
+window, a 20,000-entry history within the page bound, payload projection with
+its digest markers, conflicts, missing fields, resource limits, unchanged
+uncertain-turn holds and the ordinary send/sync/verify/accept workflow. These
+checks invoke no model.
 Smaller history reads do not themselves reduce Claude context or demonstrate
 subscription savings.

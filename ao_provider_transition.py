@@ -79,6 +79,10 @@ def _saved_audit(directory, audit_sha256):
     value = json.loads(owned_bytes(_audit_path(directory, audit_sha256), MAX_AUDIT_BYTES))
     if ao.digest(value) != audit_sha256:
         raise RoomError("Provider transition audit was modified")
+    if value.get("version") == 2:
+        # Its history digest bound raw activity rows; fresh reads now bind the
+        # projected rows, so the recorded digest can never be re-established.
+        raise RoomError("Provider transition audit predates the history projection; run the audit again")
     return value
 
 
@@ -503,7 +507,7 @@ def _inspect(service, directory, state, target_input, reconcile=None):
 def audit(service, room_id, target_profile):
     with service.locked(room_id) as (directory, state):
         evidence, observed, snapshot = _inspect(service, directory, state, target_profile)
-        value = {"version": 2, "evidence": evidence, "observed": observed,
+        value = {"version": 3, "evidence": evidence, "observed": observed,
                  "observed_snapshot": projected_snapshot(snapshot), "observed_at": time.time()}
         audit_sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline; an oversized
@@ -637,7 +641,7 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
         saved = _saved_audit(directory, audit_sha256)
         target_input = saved["evidence"]["target"]["input"]
         evidence, observed, snapshot = _inspect(service, directory, state, target_input, reconcile)
-        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), snapshot):
+        if saved.get("version") == 3 and not observed_history_matches(saved.get("observed_snapshot"), snapshot):
             raise RoomError("Provider transition audit observed history changed; audit again")
         if saved["evidence"] != evidence:
             raise RoomError("Provider transition audit is stale; inspect the changed room, ledger, candidate or native evidence")
@@ -657,7 +661,7 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
                             "original_preparation_sha256": evidence["preparation"]["sha256"],
                             "original_delegate_sha256": evidence["delegate"]["sha256"], "state": "committed"}}
         repeated, observed_again, snapshot_again = _inspect(service, directory, state, target_input, reconcile)
-        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], snapshot_again):
+        if saved.get("version") == 3 and not observed_history_matches(saved["observed_snapshot"], snapshot_again):
             raise RoomError("Provider transition audit observed history changed; audit again")
         if repeated != evidence or observed_again["controller"] != STOPPED:
             raise RoomError("Provider transition observations changed before commit")

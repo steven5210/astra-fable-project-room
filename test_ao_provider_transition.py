@@ -322,7 +322,7 @@ class ProviderTransitionTests(DelegateFixture):
         with patch.object(transition, 'MAX_AUDIT_BYTES', 200_000):
             audited = self.audit_transition()
         saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
-        self.assertEqual(saved['version'], 2)
+        self.assertEqual(saved['version'], 3)
         observed = saved['observed_snapshot']
         self.assertEqual(observed['activities_count'], 1)
         self.assertEqual(observed['activities_sha256'],
@@ -339,7 +339,23 @@ class ProviderTransitionTests(DelegateFixture):
         transition._store_once(transition._audit_path(directory, sha256), full)
         self.assertEqual(transition._saved_audit(directory, sha256), full)
 
-    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+    def test_a_v2_audit_predates_the_projection_and_refuses_explicitly(self):
+        audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        # A v2 audit digested raw activity rows; a fresh projection-era read can
+        # never reproduce that digest, so the refusal names the incompatibility.
+        stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        path = transition._audit_path(self.directory(), sha256)
+        transition._store_once(path, stale)
+        before = path.read_bytes()
+        self.assert_refused_without_change(
+            lambda: self.service.ao_room_provider_transition(**self.args({'audit_sha256': sha256})),
+            'Provider transition audit predates the history projection; run the audit again')
+        self.assertEqual(path.read_bytes(), before)  # the predated record is preserved
+        self.assertTrue(self.commit_transition()['transitioned'])  # a fresh v3 audit still works
+
+    def test_a_v3_audit_refuses_a_payload_only_activity_change(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
             'status': 'completed', 'detail': 'Retained payload'}]
         args = self.args()
@@ -355,7 +371,7 @@ class ProviderTransitionTests(DelegateFixture):
         self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Retained payload'
         self.assertTrue(self.commit_transition(args)['transitioned'])
 
-    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+    def test_a_v3_payload_change_between_observations_refuses_before_commit(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
             'status': 'completed', 'detail': 'Retained payload'}]
         args = self.args()
