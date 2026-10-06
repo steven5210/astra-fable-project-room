@@ -122,9 +122,11 @@ The caller constructs the validated session path; this helper only issues GETs.
             raise RoomError("Raw native history contains contradictory truncation evidence")
         # Project activity payloads before accumulation, byte accounting and overlap
         # comparison, identically for strict and ordinary reads. Rows lacking a dict
-        # shape pass through and are refused by the identity check below.
-        page = {**page, "activities": [_project_activity(item) if isinstance(item, dict) else item
-                                       for item in page["activities"]]}
+        # shape pass through and are refused by the identity check below. A page
+        # without the array is left untouched for the shape check above.
+        if isinstance(page.get("activities"), list):
+            page = {**page, "activities": [_project_activity(item) if isinstance(item, dict) else item
+                                           for item in page["activities"]]}
         observed_bytes += len(canonical(page))
         if observed_bytes > MAX_OBSERVATION_BYTES:
             return bounded_result("aggregate_bytes")

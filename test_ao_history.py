@@ -125,6 +125,17 @@ class HistoryTests(unittest.TestCase):
                 with self.subTest(strict=strict, duplicate=name), self.assertRaisesRegex(ao.RoomError, "duplicate identities"):
                     self.observe(pages, strict)
 
+    def test_null_activities_array_refuses_with_the_shape_check_not_projection(self):
+        # A null activities field must hit the explicit-arrays refusal, not the
+        # projection's iteration, so the diagnostic stays the existing RoomError.
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                pages = self.pages()
+                pages[1]["activities"] = None
+                with self.assertRaisesRegex(ao.RoomError,
+                                            "explicit complete native history arrays"):
+                    self.observe(pages, strict)
+
     def test_activity_conflicts_are_rejected_by_complete_audit(self):
         pages = self.pages()
         pages[1]["activities"].append({**pages[0]["activities"][0], "status": "failed"})
