@@ -471,6 +471,119 @@ class FailedTurnReconciliationTests(HistoryReconciliationTests):
         self.snapshot['turns'][-1]['errorMessage'] = 'a different provider error'
         self.assert_refused()
 
+    def test_restart_cleared_error_message_still_originates_and_revalidates(self):
+        # AO clears a failed turn's errorMessage when its native controller
+        # restarts; the lane binds the provider text through the preserved
+        # receipt, so the cleared live row neither blocks minting nor
+        # invalidates the proof across later observations.
+        for cleared in (None, ''):
+            self.snapshot['turns'][-1]['errorMessage'] = cleared
+            result = self.audit()
+            self.assertTrue(result['resume_eligible'])
+            self.assertEqual(result['outcome']['kind'], 'quota_limit')
+        proof = reconciliation.load_proof(self.directory(), self.current())
+        self.assertEqual(proof['inputs']['saved_error_message_sha256'],
+                         ao.digest(json.loads(self.receipt_bytes)['turn'].get('errorMessage')))
+        self.assert_preserved()
+        self.release(result)
+        sha = self.current()[reconciliation.PROOF]
+        # A second observation of the still-cleared row revalidates the proof.
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.current()['state'], 'settled_failure')
+        self.assertEqual(self.current().get(reconciliation.PROOF), sha)
+        self.send('correction', 'continue-once')
+        self.assert_preserved()
+
+    def test_pre_normalization_proof_invalidates_and_a_fresh_audit_remints(self):
+        # Rebuild the proof's value in the pre-normalization input shape:
+        # digests over the raw turn rows and no saved_error_message_sha256.
+        self.audit()
+        request = self.current()
+        proof = reconciliation.load_proof(self.directory(), request)
+        old_inputs = {key: value for key, value in proof['inputs'].items()
+                      if key != 'saved_error_message_sha256'}
+        old_inputs['turns_sha256'] = ao.digest(self.snapshot['turns'])
+        old_inputs['ao_terminal_sha256'] = ao.digest(self.snapshot['turns'][-1])
+        sha = reconciliation._write(self.directory(), 'history-reconciliations',
+                                    {**proof, 'inputs': old_inputs})
+        state = self.state()
+        state['requests']['implementation'][reconciliation.PROOF] = sha
+        ao.atomic(self.directory() / 'state.json', state)
+        # The controller restart clears the live errorMessage; the old-shape
+        # inputs can never be recomputed, so the next audited observation
+        # invalidates the proof and the same explicit audit mints the
+        # normalized replacement.
+        self.snapshot['turns'][-1]['errorMessage'] = None
+        fresh = self.audit()
+        self.assertTrue(fresh['resume_eligible'])
+        current = self.current()
+        self.assertIn(reconciliation.INVALIDATION, current)
+        self.assertIn(reconciliation.PROOF, current)
+        self.assertNotEqual(current[reconciliation.PROOF], sha)
+        reminted = current[reconciliation.PROOF]
+        proof = reconciliation.load_proof(self.directory(), self.current())
+        self.assertEqual(proof['inputs']['ao_terminal_sha256'],
+                         ao.digest(reconciliation._terminal_identity(self.snapshot['turns'][-1])))
+        self.assertEqual(proof['inputs']['turns_sha256'],
+                         ao.digest([reconciliation._terminal_identity(t) for t in self.snapshot['turns']]))
+        self.assertEqual(proof['inputs']['saved_error_message_sha256'],
+                         ao.digest(json.loads(self.receipt_bytes)['turn'].get('errorMessage')))
+        self.release(fresh)
+        # A second observation with the cleared row revalidates the new proof.
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.current().get(reconciliation.PROOF), reminted)
+        self.assert_preserved()
+
+    def test_a_non_error_field_change_still_invalidates_the_proof(self):
+        result = self.audit()
+        self.snapshot['turns'][-1]['statusMessage'] = 'changed after the audit'
+        with self.assertRaises(ao.RoomError):
+            self.release(result)
+        self.assertIn(reconciliation.INVALIDATION, self.current())
+        self.assert_stale_requires_new_audit(result)
+
+    def test_normalization_binds_only_the_owned_failed_turn(self):
+        # Only the owned failed turn's errorMessage is normalized out of the
+        # bound turn rows; the same field changing on any other turn still
+        # invalidates the proof and the release.
+        result = self.audit(); self.release(result)
+        other = next(t for t in self.snapshot['turns'] if t['id'] != self.request['turn_id'])
+        other['errorMessage'] = 'cleared by the restart too'
+        self.service.ao_room_sync(self.room)
+        self.assertIn(reconciliation.INVALIDATION, self.current())
+        posts = len(self.fake.posts)
+        with self.assertRaises(ao.RoomError):
+            self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assert_preserved()
+
+    def test_cleared_error_message_keeps_the_outcome_identity_for_the_successor(self):
+        # The reserved successor was authorized under the pre-restart outcome:
+        # AO clearing the live errorMessage afterwards must not rewrite the
+        # bound outcome digest, so the named successor still dispatches.
+        result = self.audit(); self.release(result)
+        posts = len(self.fake.posts)
+        self.snapshot['turns'][-1]['errorMessage'] = None
+        self.service.ao_room_sync(self.room)
+        current = self.current()
+        self.assertEqual(current['state'], 'settled_failure')
+        self.assertEqual(current['semantic_outcome_sha256'], result['outcome_sha256'])
+        self.assertNotIn(reconciliation.INVALIDATION, current)
+        self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assert_preserved()
+
+    def test_other_terminal_drift_still_stales_the_authorized_successor(self):
+        result = self.audit(); self.release(result)
+        self.snapshot['turns'][-1]['statusMessage'] = 'changed after the release'
+        self.service.ao_room_sync(self.room)
+        self.assertIn(reconciliation.INVALIDATION, self.current())
+        posts = len(self.fake.posts)
+        with self.assertRaises(ao.RoomError):
+            self.send('correction', 'continue-once')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assert_preserved()
+
     def test_different_saved_or_observed_turn_identity_cannot_originate(self):
         saved = json.loads(self.receipt_bytes)
         for field, wrong in (('id', 'different-turn'), ('providerTurnId', 'different-provider')):

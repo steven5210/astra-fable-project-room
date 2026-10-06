@@ -761,6 +761,21 @@ def _observe(service, directory, state, request, snapshot, allow_unknown_clear=F
         if source_verification is None and not (allow_unknown_clear and inconclusive(old)):
             return old
         value['outcome'] = old['outcome']  # A verified source move cannot clear the existing sticky hold.
+    if (request.get('role') == 'engineer' and value['ao_terminal'].get('state') == 'failed'
+            and isinstance(old, dict) and isinstance(old.get('ao_terminal'), dict)):
+        from ao_history_reconciliation import _terminal_identity
+        prior_terminal = old['ao_terminal']
+        new_terminal = value['ao_terminal']
+        # AO clears a failed turn's errorMessage when its native controller restarts.
+        # An outcome whose only drift is that cleared field keeps the prior record and
+        # digest, so an authorized successor's bound outcome stays exact; the fresh
+        # observation and the proof still show the cleared live row.
+        if (new_terminal.get('errorMessage') in (None, '')
+                and (prior_terminal.get('errorMessage') not in (None, '')
+                     or new_terminal.get('errorMessage') == prior_terminal.get('errorMessage'))
+                and {**value, 'ao_terminal': _terminal_identity(new_terminal)}
+                    == {**old, 'ao_terminal': _terminal_identity(prior_terminal)}):
+            return old
     path = 'outcomes/' + request['request_id'] + '/' + digest(value) + '.json'
     if (directory / path).exists():
         if read(directory / path) != value:

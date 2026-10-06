@@ -435,9 +435,12 @@ The same audited reconciliation structure covers one narrower case: the owned
 request remains `uncertain`, its saved receipt has `history_truncated: true`,
 and the receipt's failed AO turn — same turn and provider-turn identity and the
 same error message — is still the failed turn in a fresh complete strict
-observation. Verified native evidence must again establish the typed quota
-error with a unique owned caller anchor, no later human instruction, an idle
-owner and no unproven extra turns. The separate proof additionally binds the
+observation. AO clears a failed turn's error message when its native controller
+restarts, so the lane binds the provider error text through the preserved
+receipt instead of the live AO row, whose message can stay the same or become
+empty but can never change to a different message. Verified native evidence
+must again establish the typed quota error with a unique owned caller anchor,
+no later human instruction, an idle owner and no unproven extra turns. The separate proof additionally binds the
 saved failed turn itself; ordinary sync can only validate or invalidate it, and
 only an explicit outcome audit creates or renews it. The original receipt bytes
 and the failed AO state are never rewritten, and a successful retry or final
