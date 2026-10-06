@@ -252,7 +252,7 @@ def _consumption(directory, state, reference):
 
 def _audit(directory, sha256):
     value = _read(directory / BASE / 'audits' / (_hash(sha256, 'review-extension audit') + '.json'))
-    if ao.digest(value) != sha256 or value.get('version') not in (1, 2):
+    if ao.digest(value) != sha256 or value.get('version') not in (1, 2, 3):
         raise RoomError('Review-extension audit was modified')
     return value
 
@@ -418,7 +418,7 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
     with service.locked(room_id) as (directory, state):
         evidence, snapshots = _inspect(service, directory, state, target)
         from ao_provider_transition import projected_snapshot
-        value = {'version': 2, 'evidence': evidence, 'observed_at': time.time(),
+        value = {'version': 3, 'evidence': evidence, 'observed_at': time.time(),
                  'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
         sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
@@ -691,15 +691,27 @@ def consume(service, directory, state, request):
 
 
 def _audit_history_unchanged(saved, snapshots):
-    """A v2 audit binds every role's activity rows by digest; the consuming action re-observes them."""
-    if saved.get('version') != 2:
-        return True
+    """A v2/v3 audit binds every role's activity rows by digest; the action re-observes them.
+
+    A v2 audit predates the history projection and digested the raw rows. It can still
+    match when none of them carried a projected payload, so its refusal names the
+    incompatibility rather than reporting a changed history.
+    """
+    version = saved.get('version')
+    if version not in (2, 3):
+        return
     saved_snapshots = saved.get('observed_snapshots')
     if not isinstance(saved_snapshots, dict) or set(saved_snapshots) != set(snapshots):
-        return False
-    from ao_provider_transition import observed_history_matches
-    return all(observed_history_matches(saved_snapshots.get(role), snapshot)
-               for role, snapshot in snapshots.items())
+        unchanged = False
+    else:
+        from ao_provider_transition import observed_history_matches
+        unchanged = all(observed_history_matches(saved_snapshots.get(role), snapshot)
+                        for role, snapshot in snapshots.items())
+    if unchanged:
+        return
+    if version == 2:
+        raise RoomError('Review extension audit predates the history projection; run the audit again')
+    raise RoomError('Review extension audit observed history changed; audit again')
 
 
 def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id):
@@ -723,8 +735,7 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
             raise RoomError('An uncommitted review extension belongs to another payload')
         saved = _audit(directory, audit_sha256)
         full_evidence, snapshots = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
-        if not _audit_history_unchanged(saved, snapshots):
-            raise RoomError('Review extension audit observed history changed; audit again')
+        _audit_history_unchanged(saved, snapshots)
         evidence = full_evidence
         if ao.digest(evidence) != ao.digest(saved['evidence']):
             # Only an already durable legacy receipt may keep its original
@@ -742,8 +753,7 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
         if prior and ao.digest(prior) != ao.digest(record):
             raise RoomError('Pending review-extension receipt differs from the recomputed grant')
         repeated, snapshots_again = _inspect(service, directory, state, evidence['target'], reconcile=bool(prior))
-        if not _audit_history_unchanged(saved, snapshots_again):
-            raise RoomError('Review extension audit observed history changed; audit again')
+        _audit_history_unchanged(saved, snapshots_again)
         if ao.digest(repeated) != ao.digest(full_evidence):
             raise RoomError('Review-extension evidence changed before commit')
         relative = BASE + '/requests/' + request_id + '.json'

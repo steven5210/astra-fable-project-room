@@ -610,7 +610,10 @@ turn. Failed, interrupted and cancelled AO outcomes remain uncertain even when
 they have a turn ID: the native driver can assign that ID before a later transport
 failure. Status exposes the observed `ao_turn_state` separately. This conservative
 initial adapter has no automatic recovery lane for such outcomes; diagnose them
-without resending. There is no automatic retry, timeout cancellation or worker failover.
+without resending. A failed turn whose saved receipt was captured with
+`history_truncated` true can settle only through the audited complete-history
+lane in the efficient-continuation guide, as `settled_failure`, without
+rewriting the original receipt. There is no automatic retry, timeout cancellation or worker failover.
 AO may import historical turns as `recovered`: those turns are no longer active,
 but their success or failure is unknown. Unrelated recovered history does not
 block a new authorized request. An owned request with a recovered outcome remains

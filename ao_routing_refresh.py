@@ -236,7 +236,7 @@ def _chain(directory, state, prepared, *, check_unclaimed=True):
         if not isinstance(pointer, dict) or pointer.get('path') in found or len(found) >= MAX_CHAIN:
             raise RoomError('Routing refresh history is malformed, cyclic or exceeds its bound')
         record = _read(directory, pointer)
-        if (record.get('version') not in (1, 2) or record.get('room_id') != state['room_id']
+        if (record.get('version') not in (1, 2, 3) or record.get('room_id') != state['room_id']
                 or record.get('engineer') != state['bindings'].get('engineer')
                 or record.get('preparation') != state['preparation']
                 or record.get('preparation_sha256') != state['preparation_sha256']
@@ -526,20 +526,25 @@ def _inspect(service, directory, state, inputs, prepared, routing, target=None, 
 
 
 def _projected_snapshot(snapshot, activities):
-    """The shared projection; the evidence projection is identical, so v2 digests stay exact."""
+    """The shared projection; the evidence projection is identical, so v3 digests stay exact."""
     return projected_snapshot(snapshot)
 
 
 def _observed_history_unchanged(record, snapshot, evidence):
-    """A v2 intent binds the complete activity rows by count and digest, not only their bounded
+    """A v2/v3 intent binds the complete activity rows by count and digest, not only their bounded
     projection: a payload-only change outside ACTIVITY_FIELDS between observations refuses."""
-    if record.get('version') != 2:
+    version = record.get('version')
+    if version not in (2, 3):
         return
     projected = _projected_snapshot(snapshot, evidence['activities'])
     stored = record.get('observed_snapshot')
     stored = stored if isinstance(stored, dict) else {}
     if (stored.get('activities_count') != projected['activities_count']
             or stored.get('activities_sha256') != projected['activities_sha256']):
+        if version == 2:
+            # The intent digested raw activity rows; only a digest built from rows
+            # without projected payloads can still match a projection-era read.
+            raise RoomError('Pending routing refresh intent predates the history projection; preserve and diagnose')
         raise RoomError('Pending routing refresh observed history changed; preserve its immutable intent')
 
 
@@ -648,7 +653,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                 raise RoomError('Pending routing refresh state or ancestry changed; preserve and diagnose')
             target, source_bundle, target_bundle = existing['target'], existing['source_bundle'], existing['target_bundle']
             _bundle_valid(source, source_bundle); _bundle_valid(target, target_bundle)
-            if (existing.get('version') not in (1, 2) or existing.get('room_id') != room_id
+            if (existing.get('version') not in (1, 2, 3) or existing.get('room_id') != room_id
                     or existing.get('preparation') != state['preparation']
                     or existing.get('delegate_sha256') != ao.digest(state['delegate'])
                     or not _same_policy(source, target)
@@ -682,7 +687,7 @@ def refresh(service, room_id, request_id, database_path, native_session_id, auth
                                       qualification=target.get('worker_qualification'))
             ao_routing._alias_project(service.client(state), state)
         evidence, observed_snapshot = current_evidence()
-        record = existing or {'version': 2, 'room_id': room_id, 'inputs': inputs, 'recorded_at': time.time(),
+        record = existing or {'version': 3, 'room_id': room_id, 'inputs': inputs, 'recorded_at': time.time(),
             'before_state_sha256': ao.digest(state), 'engineer': state['bindings']['engineer'],
             'preparation': state['preparation'], 'preparation_sha256': state['preparation_sha256'],
             'delegate_sha256': ao.digest(state['delegate']), 'previous': state.get('routing_refresh'),

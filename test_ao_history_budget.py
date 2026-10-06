@@ -94,11 +94,11 @@ class HistoryBudgetTests(unittest.TestCase):
 
     def test_time_diagnostic_stops_before_another_get(self):
         pages = self.pages()
-        with patch.object(history.time, "monotonic", side_effect=[0, 0, 1, 151]):
+        with patch.object(history.time, "monotonic", side_effect=[0, 0, 1, 301]):
             with self.assertRaises(history.HistoryObservationLimit) as caught:
                 history.conversation(lambda *args: pages.pop(0), "/sessions/fixture/conversation", strict=True)
         self.assertEqual((caught.exception.limit_kind, caught.exception.limit, caught.exception.pages,
-                          caught.exception.requests), ("elapsed_seconds", 150, 1, 1))
+                          caught.exception.requests), ("elapsed_seconds", 300, 1, 1))
         self.assertEqual(len(pages), 1)
 
     def test_oversized_response_accounting_reaches_byte_limit_without_retry(self):

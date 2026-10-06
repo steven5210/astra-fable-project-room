@@ -61,11 +61,26 @@ def projected_snapshot(snapshot):
 
 
 def observed_history_matches(saved_snapshot, snapshot):
-    """Whether a v2 audit's bound activity history still equals this fresh observation."""
+    """Whether a v2/v3 audit's bound activity history still equals this fresh observation."""
     projected = projected_snapshot(snapshot)
     return (isinstance(saved_snapshot, dict)
             and saved_snapshot.get('activities_count') == projected.get('activities_count')
             and saved_snapshot.get('activities_sha256') == projected.get('activities_sha256'))
+
+
+def audit_history_unchanged(saved, snapshot):
+    """A v2/v3 audit binds the observed activity rows by digest; the action re-observes them.
+
+    A v2 audit predates the history projection and digested the raw rows. It can still
+    match when none of them carried a projected payload, so its refusal names the
+    incompatibility rather than reporting a changed history.
+    """
+    version = saved.get("version")
+    if version not in (2, 3) or observed_history_matches(saved.get("observed_snapshot"), snapshot):
+        return
+    if version == 2:
+        raise RoomError("Provider transition audit predates the history projection; run the audit again")
+    raise RoomError("Provider transition audit observed history changed; audit again")
 
 
 def _audit_path(directory, audit_sha256):
@@ -503,7 +518,7 @@ def _inspect(service, directory, state, target_input, reconcile=None):
 def audit(service, room_id, target_profile):
     with service.locked(room_id) as (directory, state):
         evidence, observed, snapshot = _inspect(service, directory, state, target_profile)
-        value = {"version": 2, "evidence": evidence, "observed": observed,
+        value = {"version": 3, "evidence": evidence, "observed": observed,
                  "observed_snapshot": projected_snapshot(snapshot), "observed_at": time.time()}
         audit_sha256 = ao.digest(value)
         # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline; an oversized
@@ -637,8 +652,7 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
         saved = _saved_audit(directory, audit_sha256)
         target_input = saved["evidence"]["target"]["input"]
         evidence, observed, snapshot = _inspect(service, directory, state, target_input, reconcile)
-        if saved.get("version") == 2 and not observed_history_matches(saved.get("observed_snapshot"), snapshot):
-            raise RoomError("Provider transition audit observed history changed; audit again")
+        audit_history_unchanged(saved, snapshot)
         if saved["evidence"] != evidence:
             raise RoomError("Provider transition audit is stale; inspect the changed room, ledger, candidate or native evidence")
         if observed["controller"] != STOPPED:
@@ -657,8 +671,7 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
                             "original_preparation_sha256": evidence["preparation"]["sha256"],
                             "original_delegate_sha256": evidence["delegate"]["sha256"], "state": "committed"}}
         repeated, observed_again, snapshot_again = _inspect(service, directory, state, target_input, reconcile)
-        if saved.get("version") == 2 and not observed_history_matches(saved["observed_snapshot"], snapshot_again):
-            raise RoomError("Provider transition audit observed history changed; audit again")
+        audit_history_unchanged(saved, snapshot_again)
         if repeated != evidence or observed_again["controller"] != STOPPED:
             raise RoomError("Provider transition observations changed before commit")
         from ao_routing_adoption import launcher_compatibility

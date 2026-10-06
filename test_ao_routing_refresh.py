@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import ao_delegates
 import ao_executable_binding
+import ao_history
 import ao_project_room as ao
 import ao_routing
 import ao_routing_guard
@@ -167,10 +168,11 @@ class RoutingRefreshTests(Fixture):
         with patch.object(refresh, 'MAX_RECORD_BYTES', 200_000):
             self.do_refresh()
         record = self.journal()
-        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['version'], 3)
         observed = record['observed_snapshot']
         self.assertEqual(observed['activities_count'], len(activities))
-        self.assertEqual(observed['activities_sha256'], ao.digest(sorted(activities, key=lambda item: item['id'])))
+        projected = [ao_history._project_activity(item) for item in activities]
+        self.assertEqual(observed['activities_sha256'], ao.digest(sorted(projected, key=lambda item: item['id'])))
         full = sorted(activities, key=lambda item: item['id'])
         self.assertEqual(observed['activities'], record['evidence']['activities'])
         self.assertEqual(observed['activities'],
@@ -187,7 +189,7 @@ class RoutingRefreshTests(Fixture):
         self.pending()
         path = self.directory() / refresh.BASE / 'refresh-one.json'
         record = json.loads(path.read_text())
-        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['version'], 3)
         full = copy.deepcopy(self.fake.snapshots['engineer']['activities'])
         observed = {key: value for key, value in record['observed_snapshot'].items()
                     if key not in ('activities_count', 'activities_sha256')}
@@ -208,7 +210,39 @@ class RoutingRefreshTests(Fixture):
                 self.do_refresh()
         self.assert_no_intent()
 
-    def test_a_v2_pending_intent_refuses_a_payload_only_activity_change(self):
+    def test_a_v2_pending_intent_retries_when_its_digest_still_matches(self):
+        # A v2 intent digested raw activity rows; when no row carried a projected
+        # payload that digest equals the projection-era digest, so the exact
+        # pending retry still reconciles and commits.
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'summary': 'retained'}]
+        self.pending()
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        record = json.loads(path.read_text())
+        record['version'] = 2
+        path.write_bytes(refresh._json(record))
+        self.do_refresh()
+        self.assertEqual(self.journal()['version'], 2)
+
+    def test_a_v2_pending_intent_with_a_raw_payload_digest_refuses_explicitly(self):
+        raw = [{'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        self.fake.snapshots['engineer']['activities'] = copy.deepcopy(raw)
+        self.pending()
+        path = self.directory() / refresh.BASE / 'refresh-one.json'
+        record = json.loads(path.read_text())
+        # A pre-projection v2 intent digested the raw rows; a projection-era
+        # observation can never reproduce that digest, so the refusal names the
+        # incompatibility. There is no abandon lane: preserve and diagnose.
+        record['version'] = 2
+        record['observed_snapshot']['activities_sha256'] = ao.digest(sorted(raw, key=lambda item: item['id']))
+        path.write_bytes(refresh._json(record))
+        with self.assertRaisesRegex(ao.RoomError,
+                'Pending routing refresh intent predates the history projection; preserve and diagnose'):
+            self.do_refresh()
+        self.assertEqual(json.loads(path.read_text()), record)
+        self.assertEqual(self.state(), self.original)
+
+    def test_a_v3_pending_intent_refuses_a_payload_only_activity_change(self):
         activities = [{'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'original'}]
         self.fake.snapshots['engineer']['activities'] = copy.deepcopy(activities)
         self.pending()
@@ -223,9 +257,9 @@ class RoutingRefreshTests(Fixture):
         self.assertEqual(self.fake.posts, self.posts)
         self.fake.snapshots['engineer']['activities'] = activities
         self.do_refresh()
-        self.assertEqual(self.journal()['version'], 2)
+        self.assertEqual(self.journal()['version'], 3)
 
-    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+    def test_a_v3_payload_change_between_observations_refuses_before_commit(self):
         self.fake.snapshots['engineer']['activities'] = [
             {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'original'}]
         original = refresh._inspect
@@ -244,20 +278,22 @@ class RoutingRefreshTests(Fixture):
         self.assertEqual(self.state(), self.original)  # nothing committed; the exact intent stays pending
         self.do_refresh()
         record = self.journal()
-        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['version'], 3)
         self.assertEqual(record['observed_snapshot']['activities_sha256'],
-                         ao.digest(self.fake.snapshots['engineer']['activities']))
+                         ao.digest([ao_history._project_activity(item)
+                                    for item in self.fake.snapshots['engineer']['activities']]))
 
-    def test_an_identical_v2_pending_observation_retries_and_commits(self):
+    def test_an_identical_v3_pending_observation_retries_and_commits(self):
         self.fake.snapshots['engineer']['activities'] = [
             {'id': 'activity-one', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
         self.pending()
         self.do_refresh()
         record = self.journal()
-        self.assertEqual(record['version'], 2)
+        self.assertEqual(record['version'], 3)
         self.assertEqual(record['observed_snapshot']['activities_count'], 1)
         self.assertEqual(record['observed_snapshot']['activities_sha256'],
-                         ao.digest(self.fake.snapshots['engineer']['activities']))
+                         ao.digest([ao_history._project_activity(item)
+                                    for item in self.fake.snapshots['engineer']['activities']]))
 
     def test_prepared_target_guard_blocks_actual_synthetic_quota_before_opus(self):
         self.do_refresh()

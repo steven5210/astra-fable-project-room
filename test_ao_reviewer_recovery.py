@@ -7,6 +7,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
+import ao_history
 import ao_project_room as ao
 import ao_reviewer_recovery as recovery
 import project_room
@@ -210,7 +211,7 @@ class ReviewerRecoveryTests(unittest.TestCase):
                 patch.object(recovery, 'MAX_AUDIT_BYTES', 200_000):
             result = self.audit()
         saved = recovery._saved_audit(self.directory, result['audit_sha256'])
-        self.assertEqual(saved['version'], 2)
+        self.assertEqual(saved['version'], 3)
         observed = saved['observed_snapshot']
         self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
         self.assertEqual(observed['raw_conversation']['activities'], observed['activities'])
@@ -240,13 +241,49 @@ class ReviewerRecoveryTests(unittest.TestCase):
         snapshot = {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities),
                     'raw_conversation': {'sessionId': 'reviewer', 'activities': copy.deepcopy(activities)}}
         import ao_provider_transition
-        value = {'version': 2, 'evidence': evidence, 'observed_at': 1.0,
+        value = {'version': 3, 'evidence': evidence, 'observed_at': 1.0,
                  'observed_snapshot': ao_provider_transition.projected_snapshot(snapshot)}
         sha256 = ao.digest(value)
         recovery._store_once(recovery._audit_path(self.directory, sha256), value)
         return evidence, snapshot, self.args({'audit_sha256': sha256})
 
-    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+    def test_a_v2_audit_with_a_matching_digest_still_recovers(self):
+        # A v2 audit digested raw activity rows; when no row carried a projected
+        # payload the digest is identical either way, so the audit remains usable.
+        audited = self.audit()
+        saved = recovery._saved_audit(self.directory, audited['audit_sha256'])
+        stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        recovery._store_once(recovery._audit_path(self.directory, sha256), stale)
+        self.assertTrue(self.recover(self.args({'audit_sha256': sha256}))['recovered'])
+
+    def test_a_v2_audit_with_a_raw_payload_digest_refuses_explicitly(self):
+        raw = [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}]
+        evidence, snapshot, args = self._audit_with_activities(raw)
+        saved = recovery._saved_audit(self.directory, args['audit_sha256'])
+        # projected_snapshot digests the rows it is given, so this synthetic audit
+        # already binds the raw payload exactly like a pre-projection v2 record.
+        stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        path = recovery._audit_path(self.directory, sha256)
+        recovery._store_once(path, stale)
+        before = path.read_bytes()
+        # The fresh observation arrives projected, as the projection-era reader
+        # produces it, so the bound raw digest can never match again.
+        observed = copy.deepcopy(snapshot)
+        observed['activities'] = [ao_history._project_activity(item) for item in observed['activities']]
+        args = self.args({'audit_sha256': sha256})
+        state_before = (self.directory / 'state.json').read_bytes()
+        with patch.object(recovery, '_inspect', return_value=(evidence, observed)):
+            with self.assertRaisesRegex(ao.RoomError,
+                    'Reviewer recovery audit predates the history projection; run the audit again'):
+                self.recover(args)
+        self.assertEqual((self.directory / 'state.json').read_bytes(), state_before)
+        self.assertEqual(path.read_bytes(), before)  # the predated record is preserved
+        with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
+            self.assertTrue(self.recover()['recovered'])  # a fresh v3 audit still recovers
+
+    def test_a_v3_audit_refuses_a_payload_only_activity_change(self):
         evidence, snapshot, args = self._audit_with_activities(
             [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
         before = (self.directory / 'state.json').read_bytes()
@@ -262,7 +299,7 @@ class ReviewerRecoveryTests(unittest.TestCase):
         with patch.object(recovery, '_inspect', return_value=(evidence, copy.deepcopy(snapshot))):
             self.assertTrue(self.recover(args)['recovered'])
 
-    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+    def test_a_v3_payload_change_between_observations_refuses_before_commit(self):
         evidence, snapshot, args = self._audit_with_activities(
             [{'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'Retained payload'}])
         calls = []

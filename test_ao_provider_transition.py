@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import ao_history
 import ao_project_room as ao
 import ao_provider_transition as transition
 import ao_reviewer_recovery as recovery
@@ -321,10 +322,11 @@ class ProviderTransitionTests(DelegateFixture):
         with patch.object(transition, 'MAX_AUDIT_BYTES', 200_000):
             audited = self.audit_transition()
         saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
-        self.assertEqual(saved['version'], 2)
+        self.assertEqual(saved['version'], 3)
         observed = saved['observed_snapshot']
         self.assertEqual(observed['activities_count'], 1)
-        self.assertEqual(observed['activities_sha256'], ao.digest(activities))
+        self.assertEqual(observed['activities_sha256'],
+                         ao.digest([ao_history._project_activity(item) for item in activities]))
         self.assertEqual(observed['activities'], [{'id': 'activity-large', 'sequence': 1, 'status': 'completed'}])
         self.assertNotIn('detail', json.dumps(observed))
 
@@ -337,7 +339,38 @@ class ProviderTransitionTests(DelegateFixture):
         transition._store_once(transition._audit_path(directory, sha256), full)
         self.assertEqual(transition._saved_audit(directory, sha256), full)
 
-    def test_a_v2_audit_refuses_a_payload_only_activity_change(self):
+    def test_a_v2_audit_with_a_matching_digest_still_transitions(self):
+        # A v2 audit digested raw activity rows; when no row carried a projected
+        # payload the digest is identical either way, so the audit remains usable.
+        audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        stale = {**saved, 'version': 2}
+        sha256 = ao.digest(stale)
+        transition._store_once(transition._audit_path(self.directory(), sha256), stale)
+        self.assertTrue(self.commit_transition(self.args({'audit_sha256': sha256}))['transitioned'])
+        # The committed chain loads the same v2 audit during ordinary validation.
+        self.service.ao_room_sync(self.room)
+
+    def test_a_v2_audit_with_a_raw_payload_digest_refuses_explicitly(self):
+        self.fake.snapshots['engineer']['activities'] = [
+            {'id': 'activity-1', 'sequence': 1, 'status': 'completed', 'detail': 'payload'}]
+        audited = self.audit_transition()
+        saved = transition._saved_audit(self.directory(), audited['audit_sha256'])
+        raw = self.fake.snapshots['engineer']['activities']
+        stale = {**saved, 'version': 2,
+                 'observed_snapshot': {**saved['observed_snapshot'],
+                                       'activities_sha256': ao.digest(sorted(raw, key=lambda item: item['id']))}}
+        sha256 = ao.digest(stale)
+        path = transition._audit_path(self.directory(), sha256)
+        transition._store_once(path, stale)
+        before = path.read_bytes()
+        self.assert_refused_without_change(
+            lambda: self.service.ao_room_provider_transition(**self.args({'audit_sha256': sha256})),
+            'Provider transition audit predates the history projection; run the audit again')
+        self.assertEqual(path.read_bytes(), before)  # the predated record is preserved
+        self.assertTrue(self.commit_transition()['transitioned'])  # a fresh v3 audit still works
+
+    def test_a_v3_audit_refuses_a_payload_only_activity_change(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
             'status': 'completed', 'detail': 'Retained payload'}]
         args = self.args()
@@ -353,7 +386,7 @@ class ProviderTransitionTests(DelegateFixture):
         self.fake.snapshots['engineer']['activities'][0]['detail'] = 'Retained payload'
         self.assertTrue(self.commit_transition(args)['transitioned'])
 
-    def test_a_v2_payload_change_between_observations_refuses_before_commit(self):
+    def test_a_v3_payload_change_between_observations_refuses_before_commit(self):
         self.fake.snapshots['engineer']['activities'] = [{'id': 'activity-1', 'sequence': 1,
             'status': 'completed', 'detail': 'Retained payload'}]
         args = self.args()

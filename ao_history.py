@@ -4,6 +4,7 @@ Only an oversized, body-free history GET may be repeated with a smaller page.
 Dispatch, lifecycle calls, network failures and ambiguous evidence are never retried.
 """
 
+import hashlib
 import json
 import time
 
@@ -11,12 +12,15 @@ from room import RoomError
 
 
 PAGE_ITEMS = 100
-MAX_PAGES = 200  # Up to 20,000 entries at the default size; byte/time bounds still apply.
+MAX_PAGES = 2000  # Up to 200,000 entries at the default size; byte/time bounds still apply.
 MAX_REQUESTS = MAX_PAGES + 7  # Bounded room for 100 -> 50 -> ... -> 1 reductions.
 MAX_RESPONSE_BYTES = 8_000_000
-MAX_OBSERVATION_BYTES = 160_000_000  # Aggregate history only; each response remains capped at 8 MB.
-MAX_OBSERVATION_SECONDS = 150
+MAX_OBSERVATION_BYTES = 160_000_000  # Retained bytes after projection; each raw response remains capped at 8 MB.
+MAX_OBSERVATION_SECONDS = 300
 COLLECTIONS = ("turns", "messages", "activities")
+# Only these activity kinds carry load-bearing payloads (typed provider/session failures,
+# operator input, plans and usage). Every other row's detail is bound by digest, not retained.
+KEEP_DETAIL_KINDS = ("system", "error", "approval", "user_input", "plan", "usage")
 IDENTITY_FIELDS = ("sessionId", "conversationId", "activeBranchId", "controller", "settings", "branchMaterialization")
 
 
@@ -46,6 +50,23 @@ def canonical(value):
         return json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False).encode()
     except (ValueError, TypeError, RecursionError) as exc:
         raise RoomError("Raw native history contains invalid JSON evidence") from exc
+
+
+def _project_activity(item):
+    """Bind a non-load-bearing activity payload by digest instead of retaining its bytes.
+
+    AO has no parameter to omit activity detail payloads, so long sessions cannot be
+    observed completely within the retained-bytes bound. The projection keeps the row's
+    identity, kind, status, summary and timestamps intact and records the canonical
+    payload digest and size, so strict overlap comparison still detects any change.
+    """
+    detail = item.get("detail")
+    if detail is None or item.get("activityKind") in KEEP_DETAIL_KINDS:
+        return item
+    encoded = canonical(detail)
+    return {**item, "detail": {"omitted_by": "project_room_history_projection",
+                               "sha256": hashlib.sha256(encoded).hexdigest(),
+                               "bytes": len(encoded)}}
 
 
 def conversation(request, path, *, strict=False):
@@ -94,16 +115,23 @@ The caller constructs the validated session path; this helper only issues GETs.
             limit = max(1, limit // 2)
             continue  # Same history cursor, smaller read; never a model request.
         pages += 1
-        observed_bytes += len(canonical(page))
-        if observed_bytes > MAX_OBSERVATION_BYTES:
-            return bounded_result("aggregate_bytes")
-        if time.monotonic() >= deadline:
-            return bounded_result("elapsed_seconds")
         if (not isinstance(page, dict) or any(not isinstance(page.get(k), list) for k in COLLECTIONS)
                 or type(page.get("hasMoreBefore")) is not bool):
             raise RoomError("AO requires explicit complete native history arrays in the raw AO response")
         if "history_truncated" in page and page["history_truncated"] is not False:
             raise RoomError("Raw native history contains contradictory truncation evidence")
+        # Project activity payloads before accumulation, byte accounting and overlap
+        # comparison, identically for strict and ordinary reads. Rows lacking a dict
+        # shape pass through and are refused by the identity check below. A page
+        # without the array is left untouched for the shape check above.
+        if isinstance(page.get("activities"), list):
+            page = {**page, "activities": [_project_activity(item) if isinstance(item, dict) else item
+                                           for item in page["activities"]]}
+        observed_bytes += len(canonical(page))
+        if observed_bytes > MAX_OBSERVATION_BYTES:
+            return bounded_result("aggregate_bytes")
+        if time.monotonic() >= deadline:
+            return bounded_result("elapsed_seconds")
         if result is not None and any(canonical(page.get(k)) != canonical(result.get(k)) for k in IDENTITY_FIELDS):
             raise RoomError("Native conversation identity changed during bounded history observation")
         for name, target in collections.items():
