@@ -514,9 +514,37 @@ class SetupRetentionTests(ProjectFixture):
         source.chmod(0o775)
         with mock.patch.object(project_room.subprocess, "run",
                                side_effect=AssertionError("--version must not be probed")) as probe:
-            with self.assertRaisesRegex(room.RoomError, "owned executable"):
+            with self.assertRaisesRegex(room.RoomError, "owned by you or root and not group- or world-writable"):
                 self.service.setup(claude_bin=str(source))
         probe.assert_not_called()
+
+    def test_a_root_owned_source_passes_but_any_other_owner_refuses(self):
+        source = self.installed("claude-system")
+        real_fstat = os.fstat
+        def owned_by(uid, fd):
+            fields = list(real_fstat(fd))
+            fields[4] = uid  # st_uid
+            return os.stat_result(tuple(fields))
+        with mock.patch.object(project_room.os, "fstat", side_effect=lambda fd: owned_by(0, fd)):
+            self.service.setup(claude_bin=str(source))
+        self.assertTrue(self.service.settings()["claude_bin"].startswith(str(self.home / "claude-code")),
+                        "a root-owned system install is accepted")
+        other = self.installed("claude-foreign")
+        with mock.patch.object(project_room.os, "fstat",
+                               side_effect=lambda fd: owned_by(os.getuid() + 1, fd)):
+            with self.assertRaisesRegex(room.RoomError, "owned by you or root"):
+                self.service.setup(claude_bin=str(other))
+
+    def test_a_probe_that_mutates_the_staged_copy_refuses(self):
+        mutator = self.installed("claude-mutating",
+            '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.282 (Claude Code)"; echo x >> "$0"; fi\nexit 0\n')
+        expected = "2.1.282-" + hashlib.sha256(mutator.read_bytes()).hexdigest()[:12]
+        before = self.service.settings()["claude_bin"]
+        with self.assertRaisesRegex(room.RoomError, "changed while its version was probed"):
+            self.service.setup(claude_bin=str(mutator))
+        self.assertEqual(self.service.settings()["claude_bin"], before, "nothing is re-pinned")
+        self.assertFalse((self.home / "claude-code" / expected).exists(), "no final directory is created")
+        self.assertEqual(list((self.home / "claude-code").glob(".staging-*")), [], "the staging directory is removed")
 
     def test_an_already_retained_path_is_reverified_not_recopied(self):
         source = self.installed()

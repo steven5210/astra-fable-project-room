@@ -105,8 +105,8 @@ def _executable_bytes(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK) or not 0 < info.st_size <= MAX_EXECUTABLE_BYTES:
             raise room.RoomError("claude_bin must name an executable file")
-        if info.st_uid != os.getuid() or info.st_mode & 0o022:
-            raise room.RoomError("claude_bin must be an owned executable that is not group- or world-writable")
+        if info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022:
+            raise room.RoomError("claude_bin must be an executable owned by you or root and not group- or world-writable")
         chunks, total = [], 0
         while total <= MAX_EXECUTABLE_BYTES:
             block = os.read(fd, min(1024 * 1024, MAX_EXECUTABLE_BYTES + 1 - total))
@@ -153,6 +153,8 @@ def _retain_claude(home, source):
             handle.flush()
             os.fsync(handle.fileno())
         version = _claude_version(temporary)  # probe the staged copy: the version names these exact bytes
+        if hashlib.sha256(_executable_bytes(temporary)).hexdigest() != digest:
+            raise room.RoomError("claude_bin changed while its version was probed; refusing to retain it")
         directory = retained_home / (version + "-" + digest[:12])
         target = directory / "claude"
         if target.exists():
