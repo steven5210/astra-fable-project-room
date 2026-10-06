@@ -291,14 +291,20 @@ def _reconciled_history(reader, state, request, receipt, latest):
     expected_state = "completed" if kind == "complete_history_native_quota" else "failed"
     _require(isinstance(terminal, dict) and terminal.get("state") == expected_state
              and terminal.get("id") == request["turn_id"] and terminal.get("providerTurnId") == identity["provider_turn_id"])
+    if kind == "complete_history_native_quota_failed_turn":
+        # AO clears a failed turn's errorMessage when its native controller restarts;
+        # the proof binds the provider text through the preserved receipt instead.
+        from ao_history_reconciliation import _terminal_identity
+        terminal = _terminal_identity(terminal)
     anchors = {key: request[key] for key in ("session_id", "role", "turn_id", "conversation_id", "branch_id")}
     anchors.update(provider_turn_id=identity["provider_turn_id"], baseline_sha256=digest(request["baseline"]),
-                   messages_sha256=digest(receipt["messages"]), ao_terminal_sha256=digest(outcome.get("ao_terminal")),
+                   messages_sha256=digest(receipt["messages"]), ao_terminal_sha256=digest(terminal),
                    provider_failures_sha256=digest(outcome.get("provider_failures")),
                    session_failures_sha256=digest(outcome.get("session_failures")))
     _require(all(inputs.get(key) == value for key, value in anchors.items()) and _hash(inputs.get("turns_sha256")))
     if kind == "complete_history_native_quota_failed_turn":
-        _require(inputs.get("saved_turn_sha256") == digest(receipt["turn"]))
+        _require(inputs.get("saved_turn_sha256") == digest(receipt["turn"])
+                 and inputs.get("saved_error_message_sha256") == digest(receipt["turn"].get("errorMessage")))
 
 
 def _receipt_integrity(reader, request, binding):

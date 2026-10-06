@@ -248,6 +248,16 @@ def reconcile(service, directory, state, request, saved, observed, snapshot, nat
     return sha
 
 
+def _terminal_identity(turn):
+    """A turn row minus the errorMessage AO clears when its native controller restarts.
+
+    The provider error text is bound separately through the preserved receipt, so a
+    restart that empties the live row does not invalidate the proof while every
+    other field still does.
+    """
+    return {key: value for key, value in turn.items() if key != 'errorMessage'}
+
+
 def _failed_inputs(state, request, saved, observed, snapshot, native):
     """Proof inputs for an uncertain failed turn whose saved receipt was truncated.
 
@@ -270,7 +280,11 @@ def _failed_inputs(state, request, saved, observed, snapshot, native):
             or observed_turn.get('id') != saved_turn.get('id')
             or observed_turn.get('providerTurnId') != saved_turn.get('providerTurnId')
             or observed_turn.get('state') != 'failed'
-            or observed_turn.get('errorMessage') != saved_turn.get('errorMessage')
+            # AO clears a failed turn's errorMessage when its native controller restarts;
+            # the observed text must be the saved provider text or empty, never a
+            # different message.
+            or (observed_turn.get('errorMessage') not in (None, '')
+                and observed_turn.get('errorMessage') != saved_turn.get('errorMessage'))
             or snapshot.get('history_truncated') is not False
             or busy(snapshot) or not sent_message(request, snapshot)
             or request.get('model_reroute') or request.get('conflicting_reroute')
@@ -305,8 +319,10 @@ def _failed_inputs(state, request, saved, observed, snapshot, native):
             'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],
             'conversation_id': snapshot.get('conversationId'), 'branch_id': snapshot.get('activeBranchId'),
             'baseline_sha256': digest(request['baseline']), 'messages_sha256': digest(saved['messages']),
-            'turns_sha256': digest(snapshot['turns']), 'ao_terminal_sha256': digest(observed['turn']),
+            'turns_sha256': digest([_terminal_identity(turn) for turn in snapshot['turns']]),
+            'ao_terminal_sha256': digest(_terminal_identity(observed_turn)),
             'saved_turn_sha256': digest(saved_turn),
+            'saved_error_message_sha256': digest(saved_turn.get('errorMessage')),
             'provider_failures_sha256': digest(observed['provider_failures']),
             'session_failures_sha256': digest(observed['sessionFailures']), 'native': native}
 
