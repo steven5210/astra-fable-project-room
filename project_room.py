@@ -105,6 +105,8 @@ def _executable_bytes(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK) or not 0 < info.st_size <= MAX_EXECUTABLE_BYTES:
             raise room.RoomError("claude_bin must name an executable file")
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise room.RoomError("claude_bin must be an owned executable that is not group- or world-writable")
         chunks, total = [], 0
         while total <= MAX_EXECUTABLE_BYTES:
             block = os.read(fd, min(1024 * 1024, MAX_EXECUTABLE_BYTES + 1 - total))
@@ -122,41 +124,49 @@ def _executable_bytes(path):
 def _retain_claude(home, source):
     """Verify a given claude_bin and pin its retained copy under the controller home.
 
-    The retained file lives at claude-code/<version>-<sha256[:12]>/claude, created
-    once from the same bytes that were hashed and probed: identical existing bytes
-    are reused, differing bytes under the same name refuse, and an already-retained
-    path is re-verified by digest instead of being copied again.
+    The given executable is staged inside claude-code first and its --version is
+    probed on the staged copy, so the recorded version always describes the retained
+    bytes; the copy then moves to claude-code/<version>-<sha256[:12]>/claude, created
+    once: identical existing bytes are reused, differing bytes under the same name
+    refuse, and an already-retained path is re-verified by digest and version against
+    itself instead of being copied again.
     """
     retained_home = Path(home) / "claude-code"
     source = Path(source)
     data = _executable_bytes(source)
     digest = hashlib.sha256(data).hexdigest()
-    version = _claude_version(source)
     if source.parent.parent == retained_home and source.name == "claude":
+        version = _claude_version(source)
         name_version, _, name_digest = source.parent.name.rpartition("-")
         if not re.fullmatch(r"[0-9a-f]{12}", name_digest) or name_digest != digest[:12] or name_version != version:
             raise room.RoomError("The retained claude_bin does not match its recorded version and digest")
         return source
-    directory = retained_home / (version + "-" + digest[:12])
-    target = directory / "claude"
-    if target.exists():
-        if _executable_bytes(target) != data:
-            raise room.RoomError("The retained claude_bin name already holds different bytes; refusing to replace it")
-        return target
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(directory, 0o700)
-    os.chmod(retained_home, 0o700)
-    temporary = directory / (".claude-" + uuid.uuid4().hex + ".tmp")
+    staging = retained_home / (".staging-" + uuid.uuid4().hex)
+    temporary = staging / "claude"
     try:
+        staging.mkdir(parents=True, mode=0o700)
+        os.chmod(retained_home, 0o700)
+        os.chmod(staging, 0o700)
         with temporary.open("xb") as handle:
             os.chmod(temporary, 0o755)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        version = _claude_version(temporary)  # probe the staged copy: the version names these exact bytes
+        directory = retained_home / (version + "-" + digest[:12])
+        target = directory / "claude"
+        if target.exists():
+            if _executable_bytes(target) != data:
+                raise room.RoomError("The retained claude_bin name already holds different bytes; refusing to replace it")
+            return target
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
         os.replace(temporary, target)
+        return target
     finally:
         temporary.unlink(missing_ok=True)
-    return target
+        with contextlib.suppress(OSError):
+            staging.rmdir()
 
 
 def _retained_claude(home, claude_bin):

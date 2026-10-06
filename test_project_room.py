@@ -490,6 +490,34 @@ class SetupRetentionTests(ProjectFixture):
         with self.assertRaisesRegex(room.RoomError, "did not report a Claude Code version"):
             self.service.setup(claude_bin=str(silent))
 
+    def test_the_version_probe_runs_against_the_staged_copy(self):
+        source = self.installed()
+        calls = []
+        real_run = subprocess.run
+        def recording(argv, *args, **kwargs):
+            calls.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+        with mock.patch.object(project_room.subprocess, "run", side_effect=recording):
+            self.service.setup(claude_bin=str(source))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1:], ["--version"])
+        probed = calls[0][0]
+        self.assertEqual(Path(probed).name, "claude")
+        self.assertTrue(Path(probed).parent.name.startswith(".staging-"),
+                        "the --version probe runs against the staged copy, not the source")
+        self.assertEqual(Path(probed).parent.parent, self.home / "claude-code")
+        self.assertNotEqual(probed, str(source))
+        self.assertFalse(Path(probed).exists(), "the staging directory is removed after setup")
+
+    def test_a_group_or_world_writable_source_refuses_before_any_probe(self):
+        source = self.installed()
+        source.chmod(0o775)
+        with mock.patch.object(project_room.subprocess, "run",
+                               side_effect=AssertionError("--version must not be probed")) as probe:
+            with self.assertRaisesRegex(room.RoomError, "owned executable"):
+                self.service.setup(claude_bin=str(source))
+        probe.assert_not_called()
+
     def test_an_already_retained_path_is_reverified_not_recopied(self):
         source = self.installed()
         self.service.setup(claude_bin=str(source))

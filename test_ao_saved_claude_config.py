@@ -39,8 +39,12 @@ class SavedClaudeConfigTests(unittest.TestCase):
 
     def setup(self):
         real_popen = subprocess.Popen
+        retained_home = self.controller_home / 'claude-code'
         def guarded(argv, *args, **kwargs):
-            if list(argv) == [str(self.stub), "--version"]:  # setup's one verification probe
+            # Setup's one verification probe: the --version call runs against the staged
+            # retained copy (or an already-retained path), never the managed path.
+            probed = Path(argv[0])
+            if list(argv[1:]) == ['--version'] and retained_home in probed.parents:
                 return real_popen(argv, *args, **kwargs)
             raise AssertionError('Setup must not invoke a CLI')
         with patch.object(subprocess, 'Popen', side_effect=guarded):
