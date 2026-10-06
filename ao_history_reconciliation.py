@@ -319,7 +319,9 @@ def _failed_inputs(state, request, saved, observed, snapshot, native):
             'turn_id': request['turn_id'], 'provider_turn_id': request['provider_turn_id'],
             'conversation_id': snapshot.get('conversationId'), 'branch_id': snapshot.get('activeBranchId'),
             'baseline_sha256': digest(request['baseline']), 'messages_sha256': digest(saved['messages']),
-            'turns_sha256': digest([_terminal_identity(turn) for turn in snapshot['turns']]),
+            'turns_sha256': digest([_terminal_identity(turn)
+                                    if isinstance(turn, dict) and turn.get('id') == request['turn_id']
+                                    else turn for turn in snapshot['turns']]),
             'ao_terminal_sha256': digest(_terminal_identity(observed_turn)),
             'saved_turn_sha256': digest(saved_turn),
             'saved_error_message_sha256': digest(saved_turn.get('errorMessage')),
