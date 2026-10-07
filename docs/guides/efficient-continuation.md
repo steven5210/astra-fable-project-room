@@ -500,6 +500,12 @@ for their result before continuing. The existing isolation, fork, team and neste
 worker restrictions remain intact. DeepSeek's external submit/status/result jobs
 are unchanged. The reviewed native version also disables automatic migration of
 long foreground workers; this is not a new task timeout or model budget.
+Independently of the guard, the worker-identity audit records every unrecognized
+Agent input key: keys that could steer what runs or what it binds to (model,
+isolation, resume, fork, session, team, identity, tool, settings or
+working-directory overrides) still refuse as `launch_unsupported_override`, while
+any other recorded key is listed as `extra_keys_ignored` and the child's own
+bounded evidence alone decides identity.
 
 New preparations and the audited routing refresh also pin
 `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless

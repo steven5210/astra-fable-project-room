@@ -327,7 +327,8 @@ class Room:
                 self.receipt if receipt is None else receipt,
                 {"source_sha256": self.parent_digest()} if native is None else native)
 
-    def observe_outcome(self, request=None, payload=None, failures=None, activities=None, read=None):
+    def observe_outcome(self, request=None, payload=None, failures=None, activities=None, read=None,
+                        **observe_kwargs):
         request = request if request is not None else self.request
         payload = payload or self.receipt_payload()
         self.write_receipt(request, payload)
@@ -337,7 +338,8 @@ class Room:
         with mock.patch("ao_delegates.validate_preparation", return_value=self.prepared()), \
              mock.patch.object(ao_worker_identity.ao_model_boundaries, "read", return_value=reader), \
              mock.patch("ao_history_reconciliation.reconcile", return_value=None):
-            return ao_outcomes.observe(service, self.directory, self.state, request, snapshot), service
+            return ao_outcomes.observe(service, self.directory, self.state, request, snapshot,
+                                       **observe_kwargs), service
 
     def qualified_parent(self, agent_id="agent-opus-1", role="pr-opus", tool_id="toolu_1", seconds=2.0,
                          result_seconds=3.0, prompt="Do work"):
@@ -543,6 +545,92 @@ class WorkerIdentityTests(unittest.TestCase):
                 self.assertIn(reason, value["reasons"])
                 self.assertFalse(value["qualified"])
                 self.assertNotEqual(value["launches"][0]["outcome"], "qualified")
+
+    def test_ignored_non_override_launch_keys_keep_the_child_evidence_path(self):
+        # A launch input key the launch guard never sees is recorded, never a reason by itself.
+        self.room.write_parent([self.room.human(),
+                                self.room.launch("toolu_1", input_extra={"subject": "pr-opus"}),
+                                self.room.result("toolu_1",
+                                                 structured=self.room.completed("agent-opus-1"))])
+        self.room.qualified_child("agent-opus-1")
+        value = self.room.workers()
+        self.assertTrue(value["qualified"])
+        launch = value["launches"][0]
+        self.assertEqual(launch["outcome"], "qualified")
+        self.assertEqual(launch["extra_keys"], ["subject"])
+        self.assertEqual(launch["extra_keys_ignored"], ["subject"])
+        self.assertEqual(launch["reasons"], [])
+        self.assertNotIn("launch_unsupported_override", value["reasons"])
+
+    def test_override_keys_still_refuse_even_beside_ignored_ones(self):
+        for override_key in ("model", "resume"):
+            with self.subTest(override_key=override_key):
+                for path in self.room.subagents.glob("*.jsonl"):
+                    path.unlink()
+                self.room.write_parent([self.room.human(),
+                                        self.room.launch("toolu_1",
+                                                         input_extra={"subject": "pr-opus",
+                                                                      override_key: "steered"}),
+                                        self.room.result("toolu_1",
+                                                         structured=self.room.completed("agent-opus-1"))])
+                self.room.qualified_child("agent-opus-1")
+                value = self.room.workers()
+                launch = value["launches"][0]
+                self.assertIn("launch_unsupported_override", launch["reasons"])
+                self.assertEqual(launch["extra_keys_ignored"], ["subject"])
+                self.assertEqual(launch["outcome"], "unsupported")
+                self.assertFalse(value["qualified"])
+
+    def test_denied_launch_keys_are_overrides_never_ignored(self):
+        for denied_key in ("resume_from", "isolationMode"):
+            with self.subTest(denied_key=denied_key):
+                self.room.write_parent([self.room.human(),
+                                        self.room.launch("toolu_1", input_extra={denied_key: "prev"}),
+                                        self.room.result("toolu_1",
+                                                         structured=self.room.completed("agent-opus-1"))])
+                self.room.qualified_child("agent-opus-1")
+                value = self.room.workers()
+                launch = value["launches"][0]
+                self.assertEqual(launch["extra_keys"], [denied_key])
+                self.assertNotIn("extra_keys_ignored", launch)
+                self.assertIn("launch_unsupported_override", launch["reasons"])
+                self.assertIn("launch_unsupported_launch", launch["reasons"])
+                self.assertEqual(launch["outcome"], "unsupported")
+                self.assertFalse(value["qualified"])
+
+    def test_ignored_keys_still_require_the_child_evidence(self):
+        self.room.write_parent([self.room.human(),
+                                self.room.launch("toolu_1", input_extra={"subject": "pr-opus"}),
+                                self.room.result("toolu_1",
+                                                 structured=self.room.completed("agent-opus-1"))])
+        value = self.room.workers()
+        launch = value["launches"][0]
+        self.assertEqual(launch["outcome"], "unresolved")
+        self.assertEqual(launch["extra_keys_ignored"], ["subject"])
+        self.assertEqual(launch["reasons"], ["child_missing"])
+        self.assertIn("child_missing", value["reasons"])
+        self.assertFalse(value["qualified"])
+        self.assertEqual(value["status"], "incomplete")
+
+    def test_a_held_unknown_outcome_clears_on_the_explicit_audit(self):
+        request = self.room.request
+        request.setdefault("native_worker_expectations", self.room.frozen_value())
+        self.room.write_parent([self.room.human(),
+                                self.room.launch("toolu_1", input_extra={"subject": "pr-opus"}),
+                                self.room.result("toolu_1",
+                                                 structured=self.room.completed("agent-opus-1"))])
+        held, _ = self.room.observe_outcome(request)
+        self.assertEqual(held["outcome"]["kind"], "unknown")
+        self.assertTrue(held["outcome"]["hold"])
+        with self.assertRaises(RoomError):
+            ao_outcomes.usable(self.room.directory, request)
+        # The child evidence appears; the explicit audit boundary re-observes and lifts the hold.
+        self.room.qualified_child("agent-opus-1")
+        cleared, _ = self.room.observe_outcome(request, allow_unknown_clear=True)
+        self.assertEqual(cleared["outcome"]["kind"], "final_available")
+        self.assertTrue(cleared["worker_observations"]["qualified"])
+        self.assertEqual(cleared["worker_observations"]["launches"][0]["extra_keys_ignored"], ["subject"])
+        ao_outcomes.usable(self.room.directory, request)
 
     def test_missing_and_torn_child_sources_are_incomplete(self):
         self.room.qualified_parent()
