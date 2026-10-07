@@ -41,6 +41,13 @@ VERSION = 1
 API_ERROR_PREFIX = "Agent terminated early due to an API error: "
 API_ERROR_RESULT_PREFIX = "Error: "
 HEX64 = re.compile("[0-9a-f]{64}")
+# Launch input keys outside the admitted set that could still steer what runs or what it is bound
+# to: model, resume/fork/session, identity, team, tool or working-directory overrides. Any other
+# unrecognized key is inert evidence -- recorded as ignored, never a reason by itself.
+OVERRIDE_KEYS = frozenset({"model", "isolation", "resume", "resume_session", "resumeSessionAt",
+                           "fork", "fork_session", "team", "teams", "team_name", "name", "agentId",
+                           "agent_id", "session_id", "sessionId", "settings", "mcp_servers", "tools",
+                           "allowed_tools", "disallowed_tools", "permission_mode", "cwd"})
 COVERAGE_REASONS = frozenset(native.SOURCE_DIMENSION | native.INTERVAL_DIMENSION)
 BASIS = ("Bounded read-only native observation of this request's own frozen worker expectation: the retained "
          "expectation, the same parent source digest the parent native outcome used, each in-interval Agent/Task "
@@ -180,13 +187,17 @@ def _nested_entry(candidate, parent_agent_id):
     projection = getattr(candidate, "identity", None)
     projection = projection if isinstance(projection, dict) else {}
     role = projection.get("role")
-    return {"tool_use_id": getattr(candidate, "tool_id", None), "name": getattr(candidate, "name", None),
-            "launcher_uuid": candidate.launch_uuid, "role": role if isinstance(role, str) else None,
-            "extra_keys": sorted(projection.get("extra") or ()), "flagged": bool(projection.get("flagged")),
-            "background": bool(projection.get("background")), "parent_agent_id": parent_agent_id,
-            "agent_id": candidate.agent_id, "interval": None, "source_sha256": None, "model": None,
-            "stop_row_uuid": None, "stop_row_ids": [], "outcome": "unsupported",
-            "reasons": ["nested_launch_unsupported"]}
+    entry = {"tool_use_id": getattr(candidate, "tool_id", None), "name": getattr(candidate, "name", None),
+             "launcher_uuid": candidate.launch_uuid, "role": role if isinstance(role, str) else None,
+             "extra_keys": sorted(projection.get("extra") or ()), "flagged": bool(projection.get("flagged")),
+             "background": bool(projection.get("background")), "parent_agent_id": parent_agent_id,
+             "agent_id": candidate.agent_id, "interval": None, "source_sha256": None, "model": None,
+             "stop_row_uuid": None, "stop_row_ids": [], "outcome": "unsupported",
+             "reasons": ["nested_launch_unsupported"]}
+    ignored = [key for key in entry["extra_keys"] if key not in OVERRIDE_KEYS]
+    if ignored:
+        entry["extra_keys_ignored"] = ignored
+    return entry
 
 
 def _api_error_termination(entry, observations):
@@ -459,7 +470,13 @@ def _sources(root, parent_root, parent_parts, collector, limits, notes, scan_not
             entry["reasons"].append("launch_unsupported_task")
             continue
         if entry["extra_keys"]:
-            entry["reasons"].append("launch_unsupported_override")
+            if any(key in OVERRIDE_KEYS for key in entry["extra_keys"]):
+                entry["reasons"].append("launch_unsupported_override")
+            ignored = [key for key in entry["extra_keys"] if key not in OVERRIDE_KEYS]
+            if ignored:
+                # Recorded inert input: Claude Code does not present these keys to the launch
+                # guard and the audit never acts on them; the child's own evidence decides.
+                entry["extra_keys_ignored"] = ignored
         if entry["flagged"]:
             entry["reasons"].append("launch_unsupported_launch")
         if entry["background"]:
