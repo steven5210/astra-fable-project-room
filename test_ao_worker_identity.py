@@ -581,6 +581,23 @@ class WorkerIdentityTests(unittest.TestCase):
                 self.assertEqual(launch["outcome"], "unsupported")
                 self.assertFalse(value["qualified"])
 
+    def test_denied_launch_keys_are_overrides_never_ignored(self):
+        for denied_key in ("resume_from", "isolationMode"):
+            with self.subTest(denied_key=denied_key):
+                self.room.write_parent([self.room.human(),
+                                        self.room.launch("toolu_1", input_extra={denied_key: "prev"}),
+                                        self.room.result("toolu_1",
+                                                         structured=self.room.completed("agent-opus-1"))])
+                self.room.qualified_child("agent-opus-1")
+                value = self.room.workers()
+                launch = value["launches"][0]
+                self.assertEqual(launch["extra_keys"], [denied_key])
+                self.assertNotIn("extra_keys_ignored", launch)
+                self.assertIn("launch_unsupported_override", launch["reasons"])
+                self.assertIn("launch_unsupported_launch", launch["reasons"])
+                self.assertEqual(launch["outcome"], "unsupported")
+                self.assertFalse(value["qualified"])
+
     def test_ignored_keys_still_require_the_child_evidence(self):
         self.room.write_parent([self.room.human(),
                                 self.room.launch("toolu_1", input_extra={"subject": "pr-opus"}),

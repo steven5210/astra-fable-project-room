@@ -42,12 +42,14 @@ API_ERROR_PREFIX = "Agent terminated early due to an API error: "
 API_ERROR_RESULT_PREFIX = "Error: "
 HEX64 = re.compile("[0-9a-f]{64}")
 # Launch input keys outside the admitted set that could still steer what runs or what it is bound
-# to: model, resume/fork/session, identity, team, tool or working-directory overrides. Any other
-# unrecognized key is inert evidence -- recorded as ignored, never a reason by itself.
-OVERRIDE_KEYS = frozenset({"model", "isolation", "resume", "resume_session", "resumeSessionAt",
-                           "fork", "fork_session", "team", "teams", "team_name", "name", "agentId",
-                           "agent_id", "session_id", "sessionId", "settings", "mcp_servers", "tools",
-                           "allowed_tools", "disallowed_tools", "permission_mode", "cwd"})
+# to: the reader's denied resume/isolation/remote shapes plus model, resume/fork/session, identity,
+# team, tool or working-directory overrides. Any other unrecognized key is inert evidence --
+# recorded as ignored, never a reason by itself.
+OVERRIDE_KEYS = frozenset(native.LAUNCH_DENIED_KEYS) | frozenset(
+    {"model", "isolation", "resume", "resume_session", "resumeSessionAt",
+     "fork", "fork_session", "team", "teams", "team_name", "name", "agentId",
+     "agent_id", "session_id", "sessionId", "settings", "mcp_servers", "tools",
+     "allowed_tools", "disallowed_tools", "permission_mode", "cwd"})
 COVERAGE_REASONS = frozenset(native.SOURCE_DIMENSION | native.INTERVAL_DIMENSION)
 BASIS = ("Bounded read-only native observation of this request's own frozen worker expectation: the retained "
          "expectation, the same parent source digest the parent native outcome used, each in-interval Agent/Task "
