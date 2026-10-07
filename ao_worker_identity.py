@@ -94,6 +94,7 @@ def _limits():
             "record": audit_io.MAX_RECORD_BYTES, "records": audit_io.MAX_RECORDS,
             "record_ids": audit_io.MAX_RECORD_IDS, "tool_ids": audit_io.MAX_TOOL_IDS,
             "depth": audit_io.MAX_JSON_DEPTH, "directory": audit_io.MAX_DIRECTORY_ENTRIES,
+            "subagents": audit_io.MAX_SUBAGENT_ENTRIES,
             "children": audit_io.MAX_CHILD_ACTORS, "child_files": audit_io.MAX_CHILD_FILES}
 
 
@@ -414,7 +415,8 @@ def _sources(root, parent_root, parent_parts, collector, limits, notes, scan_not
     if len(matches) > 1:
         notes.add("identity_conflict")
         return _unqualified(request_id, summary, "identity_conflict", notes)
-    required = [{"parts": ("projects",), "names": names, "identity": listing_identity, "overflow": overflow}]
+    required = [{"parts": ("projects",), "names": names, "identity": listing_identity,
+                 "overflow": overflow, "limit": limits["directory"]}]
     owner_sha256 = ao_prompt_metrics.digest(
         {"native_owner": {key: owner[key] for key in ao_native_identity.QUERY_COLUMNS},
          "preparation_sha256": state.get("preparation_sha256")})
@@ -497,26 +499,30 @@ def _sources(root, parent_root, parent_parts, collector, limits, notes, scan_not
                 lineage_bindings = root.find_lineage(names, native_id)
             except audit_io.SourceError as exc:
                 subagents = {"parts": None, "names": None, "identity": None, "overflow": False,
-                             "present": False, "error": exc.reason, "project_dir": None}
+                             "present": False, "error": exc.reason, "project_dir": None,
+                             "limit": limits["subagents"]}
             else:
                 lineage_seen = [binding.parts[1] for binding in lineage_bindings]
                 if len(lineage_bindings) > 1:
                     subagents = {"parts": None, "names": None, "identity": None, "overflow": False,
-                                 "present": False, "error": "identity_conflict", "project_dir": None}
+                                 "present": False, "error": "identity_conflict", "project_dir": None,
+                                 "limit": limits["subagents"]}
                 elif not lineage_bindings:
                     subagents = {"parts": None, "names": None, "identity": None, "overflow": False,
-                                 "present": False, "error": "child_missing", "project_dir": None}
+                                 "present": False, "error": "child_missing", "project_dir": None,
+                                 "limit": limits["subagents"]}
                 else:
                     parts = ("projects", lineage_seen[0], native_id, "subagents")
                     try:
-                        sub_names, sub_identity, sub_overflow = root.list_dir(parts, limits["directory"],
+                        sub_names, sub_identity, sub_overflow = root.list_dir(parts, limits["subagents"],
                                                                               "source_missing", "source_unsafe")
                         subagents = {"parts": parts, "names": sub_names, "identity": sub_identity,
                                      "overflow": sub_overflow, "present": True, "error": None,
-                                     "project_dir": lineage_seen[0]}
+                                     "project_dir": lineage_seen[0], "limit": limits["subagents"]}
                     except audit_io.SourceError as exc:
                         subagents = {"parts": parts, "names": None, "identity": None, "overflow": False,
-                                     "present": False, "error": exc.reason, "project_dir": lineage_seen[0]}
+                                     "present": False, "error": exc.reason, "project_dir": lineage_seen[0],
+                                     "limit": limits["subagents"]}
             if subagents["parts"] is not None:
                 required.append(subagents)
             if subagents["overflow"]:
@@ -642,7 +648,7 @@ def _sources(root, parent_root, parent_parts, collector, limits, notes, scan_not
             notes.add(exc.reason)
     for listing in required:
         try:
-            after = root.list_dir(listing["parts"], limits["directory"], "source_missing", "source_unsafe")
+            after = root.list_dir(listing["parts"], listing["limit"], "source_missing", "source_unsafe")
         except audit_io.SourceError as exc:
             notes.add(exc.reason)
             continue

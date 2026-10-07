@@ -14,8 +14,8 @@ import os
 import stat
 
 
-MAX_TRANSCRIPT_BYTES = 67_108_864
-MAX_AGGREGATE_BYTES = 268_435_456
+MAX_TRANSCRIPT_BYTES = 1_073_741_824  # Long-lived sessions outgrow 64 MiB; reads stay chunked and per-record bounded.
+MAX_AGGREGATE_BYTES = 2_147_483_648  # Kept at 2x the per-file bound as before.
 MAX_RECORD_BYTES = 4_194_304
 MAX_RECORDS = 100_000
 MAX_RECORD_IDS = 100_000
@@ -23,6 +23,9 @@ MAX_TOOL_IDS = 50_000
 MAX_CHILD_ACTORS = 32
 MAX_CHILD_FILES = 32
 MAX_DIRECTORY_ENTRIES = 256
+# A long-lived session's subagents/ inventory is much larger than a projects/ listing; the
+# separate bound keeps the child-file names bounded without loosening project discovery.
+MAX_SUBAGENT_ENTRIES = 8192
 MAX_JSON_DEPTH = 64
 MAX_PATH_BYTES = 16_384
 MAX_IDENTITY_BYTES = 16_384

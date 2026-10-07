@@ -182,13 +182,14 @@ ledger absence, unreadability and unsafe file types remain distinct outcomes.
 
 | Limit | Version 1 ceiling |
 | --- | --- |
-| Transcript bytes | 64 MiB per file, 256 MiB aggregate per pass. |
-| Transcript passes | Two; at most 512 MiB total admitted data. |
+| Transcript bytes | 1 GiB per file, 2 GiB aggregate per pass. |
+| Transcript passes | Two; at most 4 GiB total admitted data. |
 | JSONL line | 4 MiB. |
 | Records and record IDs | 100,000 each, aggregate. |
 | Tool IDs | 50,000 aggregate across actor-local tool-use and tool-result ID unions, including orphan results. |
 | Child actors and files | 32; missing authorized actors also consume the actor limit. |
 | Discovery directory | 256 entries, including nonmatching entries. |
+| Subagents directory | 8,192 entries. |
 | JSON container depth | 64. |
 | Path/pages strings | 16 KiB of UTF-8. |
 | Binding, receipt and preparation file | 8 MiB each. |

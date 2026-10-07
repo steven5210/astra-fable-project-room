@@ -128,6 +128,40 @@ class LimitBoundaryTests(AuditFixture, unittest.TestCase):
         self.assertIn("binding_bytes_limit", report["reasons"])
         self.assertNotEqual(report["coverage"], "complete")
 
+    def with_one_child(self):
+        self.write_transcript([self.human(),
+                               self.assistant_tools("u-launch", "2026-01-01T00:00:11+00:00",
+                                                    [{"type": "tool_use", "id": "t1", "name": "Agent",
+                                                      "input": {"prompt": "Read bounded evidence."}}]),
+                               self.user_results("u-result", "2026-01-01T00:00:12+00:00",
+                                                 [{"type": "tool_result", "tool_use_id": "t1",
+                                                   "content": "bounded result"}],
+                                                 toolUseResult=completed_result("a1", "Read bounded evidence.")),
+                               self.human(uuid="human-2", timestamp="2026-01-01T00:01:00+00:00", text="Next.")])
+        self.write_child("a1", [self.child_record("assistant", "c1-read", "2026-01-01T00:00:11.500000+00:00",
+                                                  [{"type": "tool_use", "id": "k1", "name": "Read",
+                                                    "input": {"file_path": self.target("a.txt")}}]),
+                                self.child_record("user", "c1-result", "2026-01-01T00:00:11.750000+00:00",
+                                                  [{"type": "tool_result", "tool_use_id": "k1",
+                                                    "content": "bounded result"}])])
+        self.build()
+
+    def test_subagent_entry_bound(self):
+        self.with_one_child()
+        self.assertEqual(self.report_with("MAX_SUBAGENT_ENTRIES", 1)["coverage"], "complete")
+        report = self.report_with("MAX_SUBAGENT_ENTRIES", 0)
+        self.assertIn("directory_entry_limit", report["reasons"])
+        self.assertNotEqual(report["coverage"], "complete")
+
+    def test_a_subagents_inventory_larger_than_the_project_bound_still_completes(self):
+        self.with_one_child()
+        self.assertLess(300, ao_evidence_audit_io.MAX_SUBAGENT_ENTRIES)
+        for index in range(ao_evidence_audit_io.MAX_DIRECTORY_ENTRIES + 44):
+            (self.subagents / ("agent-unrelated-%03d.jsonl" % index)).write_text("", encoding="utf-8")
+        report = self.audit_in_process()
+        self.assertEqual(report["coverage"], "complete")
+        self.assertNotIn("directory_entry_limit", report["reasons"])
+
     def test_json_depth_and_path_byte_bounds(self):
         depth = max(self.record_depth(item) for item in self.records)
         self.assertEqual(self.report_with("MAX_JSON_DEPTH", depth)["coverage"], "complete")
