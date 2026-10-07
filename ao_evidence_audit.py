@@ -579,6 +579,7 @@ def _limits():
             "record": audit_io.MAX_RECORD_BYTES, "records": audit_io.MAX_RECORDS,
             "record_ids": audit_io.MAX_RECORD_IDS, "tool_ids": audit_io.MAX_TOOL_IDS,
             "depth": audit_io.MAX_JSON_DEPTH, "directory": audit_io.MAX_DIRECTORY_ENTRIES,
+            "subagents": audit_io.MAX_SUBAGENT_ENTRIES,
             "children": audit_io.MAX_CHILD_ACTORS, "child_files": audit_io.MAX_CHILD_FILES}
 
 
@@ -609,10 +610,10 @@ def _scan(collector, root, parts, scanner, limits):
 
 
 def _list_subagents(config_root, project_dir, native_id, limits):
-    state = {"parts": ("projects", project_dir, native_id, "subagents"), "present": False, "identity": None, "names": None,
-             "overflow": False}
+    state = {"parts": ("projects", project_dir, native_id, "subagents"), "present": False, "identity": None,
+             "names": None, "overflow": False, "limit": limits["subagents"]}
     try:
-        names, identity, overflow = config_root.list_dir(state["parts"], limits["directory"], "source_missing",
+        names, identity, overflow = config_root.list_dir(state["parts"], limits["subagents"], "source_missing",
                                                          "source_unsafe")
     except audit_io.SourceError:
         return state
@@ -623,7 +624,7 @@ def _list_subagents(config_root, project_dir, native_id, limits):
 def _recheck_listing(config_root, state, limits, collector):
     if not state["present"]:
         try:
-            config_root.list_dir(state["parts"], limits["directory"], "source_missing", "source_changed")
+            config_root.list_dir(state["parts"], state["limit"], "source_missing", "source_changed")
         except audit_io.SourceError as exc:
             if exc.reason != "source_missing":
                 collector.note("source_changed")
@@ -633,7 +634,7 @@ def _recheck_listing(config_root, state, limits, collector):
             return True
         return False
     try:
-        names, identity, overflow = config_root.list_dir(state["parts"], limits["directory"], "source_changed",
+        names, identity, overflow = config_root.list_dir(state["parts"], state["limit"], "source_changed",
                                                          "source_changed")
     except audit_io.SourceError:
         collector.note("source_changed")
@@ -710,7 +711,7 @@ def _gather_sources(binding, collector, limits, notes, config_root):
         return _gather_unavailable("identity_conflict", notes)
     project_dir = matches[0]
     required_listings = [{"parts": ("projects",), "present": True, "identity": listing_identity, "names": names,
-                          "overflow": overflow}]
+                          "overflow": overflow, "limit": limits["directory"]}]
     parent_scan = native.RecordScanner(collector, parent_actor, "parent", None, native_id, binding["workspace"],
                                        binding["evidence_norm"])
     if binding["source_active"]:

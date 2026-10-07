@@ -664,6 +664,20 @@ class WorkerIdentityTests(unittest.TestCase):
         self.assertEqual(value["coverage"], "incomplete")
         self.assertFalse(value["qualified"])
 
+    def test_a_subagents_inventory_larger_than_the_project_bound_still_qualifies(self):
+        self.qualified()
+        self.assertLess(300, ao_evidence_audit_io.MAX_SUBAGENT_ENTRIES)
+        for index in range(ao_evidence_audit_io.MAX_DIRECTORY_ENTRIES + 44):
+            (self.room.subagents / ("agent-unrelated-%03d.jsonl" % index)).write_text("")
+        value = self.room.workers()
+        self.assertEqual(value["status"], "qualified")
+        self.assertTrue(value["qualified"])
+        self.assertEqual(value["coverage"], "complete")
+        self.assertNotIn("directory_entry_limit", value["reasons"])
+        # The end-of-observation re-listing used the same 8192 bound: a stale 256 re-list
+        # would compare a truncated listing against the stored names and report a change.
+        self.assertNotIn("source_changed", value["reasons"])
+
     def test_active_owner_is_incomplete_coverage(self):
         self.qualified()
         self.room.write_owner(activity="working")
@@ -805,7 +819,8 @@ class WorkerIdentityTests(unittest.TestCase):
                   "record": ao_evidence_audit_io.MAX_RECORD_BYTES, "records": ao_evidence_audit_io.MAX_RECORDS,
                   "record_ids": ao_evidence_audit_io.MAX_RECORD_IDS, "tool_ids": ao_evidence_audit_io.MAX_TOOL_IDS,
                   "depth": ao_evidence_audit_io.MAX_JSON_DEPTH,
-                  "directory": ao_evidence_audit_io.MAX_DIRECTORY_ENTRIES}
+                  "directory": ao_evidence_audit_io.MAX_DIRECTORY_ENTRIES,
+                  "subagents": ao_evidence_audit_io.MAX_SUBAGENT_ENTRIES}
         root = ao_evidence_audit_io.Root(str(self.room.config_root), "source_missing", "source_unsafe")
         self.addCleanup(root.close)
         parts = ("projects", self.room.project_dir.name, NATIVE + ".jsonl")
