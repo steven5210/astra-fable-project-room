@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -60,8 +61,9 @@ class CompactStatusTests(DelegateFixture):
     def test_compact_keeps_everything_except_the_listed_sections(self):
         full = self.service.ao_room_status(self.room)
         compact = self.service.ao_room_status(self.room, view='compact')
-        changed = {'requests', 'request_counts', 'requests_truncated', 'delegate', 'view'}
-        self.assertEqual(set(compact), set(full) | {'request_counts', 'view'})
+        changed = {'requests', 'request_counts', 'requests_truncated', 'delegate', 'view',
+                   'rate_limits'}
+        self.assertEqual(set(compact), set(full) | {'request_counts', 'view', 'rate_limits'})
         self.assertEqual({key: value for key, value in compact.items() if key not in changed},
                          {key: value for key, value in full.items() if key not in changed})
         self.assertEqual(compact['view'], 'compact')
@@ -92,6 +94,30 @@ class CompactStatusTests(DelegateFixture):
                          {key: full_routing[key] for key in
                           ('status', 'guard_sha256', 'execution_policy', 'agents') if key in full_routing})
         self.assertIn('status', delegate['routing'])
+
+    def test_compact_carries_the_small_rate_limit_subset(self):
+        compact = self.service.ao_room_status(self.room, view='compact')
+        self.assertEqual(compact['rate_limits'], {'unavailable_reason': 'database_unreadable'})
+        database = self.root / 'owner.db'
+        with sqlite3.connect(database) as connection:
+            connection.execute('CREATE TABLE conversation_provider_events '
+                               '(session_id TEXT, method TEXT, received_at TEXT, payload_json TEXT)')
+            connection.execute('INSERT INTO conversation_provider_events VALUES (?,?,?,?)',
+                               (self.state()['requests']['impl-18']['session_id'],
+                                'account.rateLimits', '2026-10-07 23:49:24.123456 +0000 UTC',
+                                json.dumps({'rateLimits': {'PrimaryUsedPercent': 92,
+                                                           'SecondaryUsedPercent': 61,
+                                                           'PrimaryResetsInSeconds': 900,
+                                                           'SecondaryResetsInSeconds': 400000,
+                                                           'PlanLabel': 'five hour',
+                                                           'CodexCapacity': None}})))
+        compact = self.service.ao_room_status(self.room, view='compact')
+        rate_limits = compact['rate_limits']
+        self.assertEqual(rate_limits['label'], 'five hour')
+        self.assertEqual(rate_limits['used_percent'], 92)
+        self.assertEqual(rate_limits['resets_at'], '2026-10-08T00:04:24.123456+00:00')
+        self.assertIsNone(rate_limits['minutes_remaining_at_current_rate'])
+        self.assertIsInstance(rate_limits['age_seconds'], float)
 
     def test_compact_is_much_smaller_than_full(self):
         full = self.service.ao_room_status(self.room)

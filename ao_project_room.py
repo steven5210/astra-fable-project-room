@@ -1292,6 +1292,20 @@ class Service:
                 delegate["routing"] = {key: routing[key] for key in
                                        ("status", "guard_sha256", "execution_policy", "agents")
                                        if key in routing}
+        import ao_rate_limits
+        engineer = latest.get("engineer") or {}
+        reading = ao_rate_limits.latest((state.get("native_outcome_source") or {}).get("database"),
+                                        engineer.get("session_id"))
+        if reading["available"]:
+            window = reading["window"]
+            result["rate_limits"] = {"label": window["label"],
+                                     "used_percent": window["used_percent"] if window["reported"] else "not reported",
+                                     "resets_at": window["resets_at"],
+                                     "minutes_remaining_at_current_rate":
+                                         reading["burn"]["minutes_remaining_at_current_rate"],
+                                     "age_seconds": reading["age_seconds"]}
+        else:
+            result["rate_limits"] = {"unavailable_reason": reading["unavailable_reason"]}
         result["view"] = "compact"
         return result
 
