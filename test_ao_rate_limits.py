@@ -67,8 +67,10 @@ class RateLimitViewTests(unittest.TestCase):
         self.assertEqual(value["rows_read"], 2)
 
     def test_a_reported_sequence_carries_slope_and_remaining_minutes(self):
-        self.event(90, 300)
-        self.event(92, 150)
+        # One reset cycle: the provider's seconds count down, so all three rows
+        # share the reset instant now + 1800 s.
+        self.event(90, 300, resets=2100)
+        self.event(92, 150, resets=1950)
         self.event(95, 0, secondary=63, resets=1800)
         value = self.latest()
         self.assertEqual(value["window"]["label"], "five hour")
@@ -95,13 +97,13 @@ class RateLimitViewTests(unittest.TestCase):
         self.assertIsNone(value["burn"]["minutes_remaining_at_current_rate"])
 
     def test_insufficient_samples_and_short_spans_give_no_slope(self):
-        self.event(70, 0)
+        self.event(72, 0)
         value = self.latest()
         self.assertIsNone(value["burn"]["percent_per_minute"])
-        self.event(72, -20, session="other")
+        self.event(70, -20, session="other")
         with sqlite3.connect(self.database) as connection:
-            payload = {"rateLimits": {"PrimaryUsedPercent": 72, "SecondaryUsedPercent": -1,
-                                      "PrimaryResetsInSeconds": 60, "SecondaryResetsInSeconds": -1,
+            payload = {"rateLimits": {"PrimaryUsedPercent": 70, "SecondaryUsedPercent": -1,
+                                      "PrimaryResetsInSeconds": 3620, "SecondaryResetsInSeconds": -1,
                                       "PlanLabel": "five hour", "CodexCapacity": None}}
             connection.execute("INSERT INTO conversation_provider_events VALUES (?,?,?,?)",
                                ("session-1", "account.rateLimits",
@@ -110,8 +112,51 @@ class RateLimitViewTests(unittest.TestCase):
         self.assertEqual(value["burn"]["samples"], 2)
         self.assertIsNone(value["burn"]["percent_per_minute"])
 
+    def test_burn_stays_inside_the_newest_reset_cycle(self):
+        # The reviewer's live shape: 0%, then 95%, then a fresh-cycle 5% — all
+        # "five hour". The older rows' reset instants belong to the old cycle.
+        self.event(0, 540, resets=120)
+        self.event(95, 120, resets=300)
+        self.event(5, 0, resets=3600)
+        value = self.latest()
+        self.assertEqual(value["window"]["used_percent"], 5)
+        self.assertEqual(value["burn"]["samples"], 1)
+        self.assertIsNone(value["burn"]["percent_per_minute"])
+        self.assertIsNone(value["burn"]["minutes_remaining_at_current_rate"])
+
+    def test_burn_stops_at_a_percent_drop_when_reset_instants_match(self):
+        # Same reset instant (the countdown keeps one instant), but 95% two
+        # minutes ago cannot precede 5% now inside one cycle.
+        self.event(90, 300, resets=3900)
+        self.event(95, 120, resets=3720)
+        self.event(5, 0, resets=3600)
+        value = self.latest()
+        self.assertEqual(value["burn"]["samples"], 1)
+        self.assertIsNone(value["burn"]["percent_per_minute"])
+
+    def test_burn_falls_back_to_the_monotone_rule_without_reset_seconds(self):
+        # No reset seconds at all: the newest row is 7%, one minute ago; 3% kept
+        # beside it, and 97% seven minutes ago belongs to the previous cycle.
+        self.event(97, 420, resets=-1)
+        self.event(3, 180, resets=-1)
+        self.event(7, 60, resets=-1)
+        value = self.latest()
+        self.assertEqual(value["window"]["used_percent"], 7)
+        self.assertEqual(value["burn"]["samples"], 2)
+        self.assertEqual(value["burn"]["percent_per_minute"], 2.0)
+
+    def test_out_of_range_reset_seconds_report_null_without_malforming(self):
+        self.event(80, 0, resets=10 ** 15, secondary=40, secondary_resets=10 ** 20)
+        value = self.latest()
+        self.assertTrue(value["available"])
+        self.assertEqual(value["window"]["used_percent"], 80)
+        self.assertIsNone(value["window"]["resets_in_seconds"])
+        self.assertIsNone(value["window"]["resets_at"])
+        self.assertIsNone(value["secondary"]["resets_at"])
+        self.assertEqual(value["rows_malformed"], 0)
+
     def test_malformed_rows_are_skipped_and_counted(self):
-        self.event(90, 60)
+        self.event(91, 60)
         with sqlite3.connect(self.database) as connection:
             connection.execute("INSERT INTO conversation_provider_events VALUES (?,?,?,?)",
                                ("session-1", "account.rateLimits",
@@ -120,11 +165,14 @@ class RateLimitViewTests(unittest.TestCase):
                                ("session-1", "account.rateLimits",
                                 stamp(self.now - datetime.timedelta(seconds=10)),
                                 json.dumps({"rateLimits": {"PrimaryUsedPercent": "high"}})))
+            connection.execute("INSERT INTO conversation_provider_events VALUES (?,?,?,?)",
+                               ("session-1", "account.rateLimits",
+                                stamp(self.now - datetime.timedelta(seconds=5)), "null"))
         value = self.latest()
         self.assertTrue(value["available"])
-        self.assertEqual(value["window"]["used_percent"], 90)
-        self.assertEqual(value["rows_read"], 3)
-        self.assertEqual(value["rows_malformed"], 2)
+        self.assertEqual(value["window"]["used_percent"], 91)
+        self.assertEqual(value["rows_read"], 4)
+        self.assertEqual(value["rows_malformed"], 3)
 
     def test_unavailable_readings_never_raise_and_never_guess(self):
         self.assertEqual(self.latest_unbound()["unavailable_reason"], "database_unbound")

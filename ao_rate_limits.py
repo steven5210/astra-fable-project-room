@@ -11,9 +11,12 @@ Every percent is the provider's own figure: ``-1`` means the provider did not
 report a reading at all — it is never a zero. Reset times are reported whenever
 the provider's reset seconds are positive, independently of the percent, so a
 not-reported window still carries its reset time; a value of 0 means no window
-is running and reports null. The burn arithmetic summarizes the reported
-readings only; ``minutes_remaining_at_current_rate`` is arithmetic over those
-readings, not a forecast of the provider's policy.
+is running and reports null, as does any value beyond sixty days (the largest
+real window is seven days). The burn arithmetic summarizes the reported
+readings in the newest row's reset cycle only — rows with a different reset
+instant or a percent that drops toward the present belong to an earlier cycle —
+and ``minutes_remaining_at_current_rate`` is arithmetic over those readings,
+not a forecast of the provider's policy.
 """
 
 import datetime
@@ -27,6 +30,8 @@ SOURCE = "ao_provider_events"
 QUERY = ("SELECT received_at, payload_json FROM conversation_provider_events "
          "WHERE session_id = ? AND method = 'account.rateLimits' "
          "ORDER BY received_at DESC LIMIT ?")
+MAX_RESET_SECONDS = 60 * 24 * 3600
+RESET_CYCLE_TOLERANCE_SECONDS = 120
 _STAMP_FORMATS = ("%Y-%m-%d %H:%M:%S.%f %z", "%Y-%m-%d %H:%M:%S %z")
 
 
@@ -55,10 +60,13 @@ def _reading(row):
     """One row's timestamp and rateLimits object, or None when the row is malformed."""
     moment = _received_at(row[0])
     try:
-        limits = json.loads(row[1]).get("rateLimits")
+        payload = json.loads(row[1])
     except (TypeError, json.JSONDecodeError):
         return None
-    if moment is None or not isinstance(limits, dict):
+    if moment is None or not isinstance(payload, dict):
+        return None
+    limits = payload.get("rateLimits")
+    if not isinstance(limits, dict):
         return None
     fields = {}
     for name in ("PrimaryUsedPercent", "SecondaryUsedPercent", "PrimaryResetsInSeconds",
@@ -76,17 +84,40 @@ def _reading(row):
             "secondary_seconds": fields["SecondaryResetsInSeconds"]}
 
 
+def _reset_seconds(value):
+    """A provider reset-seconds figure, bounded below the largest real window."""
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= MAX_RESET_SECONDS:
+        return None
+    return value
+
+
 def _resets_at(moment, seconds):
-    if not isinstance(seconds, int) or seconds <= 0:
+    if seconds is None:
         return None
     return (moment + datetime.timedelta(seconds=seconds)).astimezone(datetime.timezone.utc).isoformat()
 
 
 def _burn(newest, readings, window_seconds):
-    basis = "reported readings with the newest row's label within the last " + str(window_seconds) + " seconds"
-    samples = [row for row in readings
-               if 0 <= newest["moment"].timestamp() - row["moment"].timestamp() <= window_seconds
-               and row["label"] == newest["label"] and row["primary"] >= 0]
+    basis = ("reported readings with the newest row's label in the newest row's reset cycle "
+             "within the last " + str(window_seconds) + " seconds")
+    newest_reset = _reset_seconds(newest["primary_seconds"])
+    newest_instant = (None if newest_reset is None
+                      else newest["moment"].timestamp() + newest_reset)
+    samples = []
+    for row in readings:
+        if not (0 <= newest["moment"].timestamp() - row["moment"].timestamp() <= window_seconds
+                and row["label"] == newest["label"] and row["primary"] >= 0):
+            continue
+        row_reset = _reset_seconds(row["primary_seconds"])
+        if (newest_instant is not None and row_reset is not None
+                and abs(newest_instant - (row["moment"].timestamp() + row_reset))
+                > RESET_CYCLE_TOLERANCE_SECONDS):
+            continue
+        # Percent must be non-decreasing toward the present; the first older sample
+        # above its newer neighbor belongs to an earlier cycle and ends the set.
+        if samples and row["primary"] > samples[-1]["primary"]:
+            break
+        samples.append(row)
     slope, remaining = None, None
     if len(samples) >= 2:
         points = [(row["moment"].timestamp() / 60.0, row["primary"]) for row in samples]
@@ -141,17 +172,18 @@ def latest(database_path, session_id, *, now=None, window_seconds=600, max_rows=
         current = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
     reported = newest["primary"] >= 0
     secondary_reported = newest["secondary"] >= 0
+    primary_reset = _reset_seconds(newest["primary_seconds"])
+    secondary_reset = _reset_seconds(newest["secondary_seconds"])
     return {"source": SOURCE, "available": True,
             "observed_at": moment.astimezone(datetime.timezone.utc).isoformat(),
             "age_seconds": (current - moment).total_seconds(),
             "window": {"label": newest["label"], "reported": reported,
                        "used_percent": newest["primary"] if reported else None,
-                       "resets_in_seconds": newest["primary_seconds"] if newest["primary_seconds"] > 0 else None,
-                       "resets_at": _resets_at(moment, newest["primary_seconds"])},
+                       "resets_in_seconds": primary_reset,
+                       "resets_at": _resets_at(moment, primary_reset)},
             "secondary": {"reported": secondary_reported,
                           "used_percent": newest["secondary"] if secondary_reported else None,
-                          "resets_in_seconds": (newest["secondary_seconds"]
-                                                if newest["secondary_seconds"] > 0 else None),
-                          "resets_at": _resets_at(moment, newest["secondary_seconds"])},
+                          "resets_in_seconds": secondary_reset,
+                          "resets_at": _resets_at(moment, secondary_reset)},
             "burn": _burn(newest, readings, window_seconds),
             "rows_read": len(rows), "rows_malformed": malformed}
