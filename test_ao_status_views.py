@@ -118,6 +118,20 @@ class CompactStatusTests(DelegateFixture):
         self.assertEqual(rate_limits['resets_at'], '2026-10-08T00:04:24.123456+00:00')
         self.assertIsNone(rate_limits['minutes_remaining_at_current_rate'])
         self.assertIsInstance(rate_limits['age_seconds'], float)
+        # A not-reported percent still carries its reset time, which Astra needs for send timing.
+        with sqlite3.connect(database) as connection:
+            connection.execute('INSERT INTO conversation_provider_events VALUES (?,?,?,?)',
+                               (self.state()['requests']['impl-18']['session_id'],
+                                'account.rateLimits', '2026-10-08 01:00:00.000000 +0000 UTC',
+                                json.dumps({'rateLimits': {'PrimaryUsedPercent': -1,
+                                                           'SecondaryUsedPercent': -1,
+                                                           'PrimaryResetsInSeconds': 13429,
+                                                           'SecondaryResetsInSeconds': 0,
+                                                           'PlanLabel': 'five hour',
+                                                           'CodexCapacity': None}})))
+        rate_limits = self.service.ao_room_status(self.room, view='compact')['rate_limits']
+        self.assertEqual(rate_limits['used_percent'], 'not reported')
+        self.assertEqual(rate_limits['resets_at'], '2026-10-08T04:43:49+00:00')
 
     def test_compact_is_much_smaller_than_full(self):
         full = self.service.ao_room_status(self.room)

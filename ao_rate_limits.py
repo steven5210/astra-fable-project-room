@@ -8,9 +8,12 @@ explicit outcome audit already recorded — no writes, no model, no network, and
 unavailability is reported, never guessed.
 
 Every percent is the provider's own figure: ``-1`` means the provider did not
-report a reading at all — it is never a zero. The burn arithmetic summarizes
-the reported readings only; ``minutes_remaining_at_current_rate`` is arithmetic
-over those readings, not a forecast of the provider's policy.
+report a reading at all — it is never a zero. Reset times are reported whenever
+the provider's reset seconds are positive, independently of the percent, so a
+not-reported window still carries its reset time; a value of 0 means no window
+is running and reports null. The burn arithmetic summarizes the reported
+readings only; ``minutes_remaining_at_current_rate`` is arithmetic over those
+readings, not a forecast of the provider's policy.
 """
 
 import datetime
@@ -74,7 +77,7 @@ def _reading(row):
 
 
 def _resets_at(moment, seconds):
-    if not isinstance(seconds, int) or seconds < 0:
+    if not isinstance(seconds, int) or seconds <= 0:
         return None
     return (moment + datetime.timedelta(seconds=seconds)).astimezone(datetime.timezone.utc).isoformat()
 
@@ -143,12 +146,12 @@ def latest(database_path, session_id, *, now=None, window_seconds=600, max_rows=
             "age_seconds": (current - moment).total_seconds(),
             "window": {"label": newest["label"], "reported": reported,
                        "used_percent": newest["primary"] if reported else None,
-                       "resets_in_seconds": newest["primary_seconds"] if reported else None,
-                       "resets_at": _resets_at(moment, newest["primary_seconds"]) if reported else None},
+                       "resets_in_seconds": newest["primary_seconds"] if newest["primary_seconds"] > 0 else None,
+                       "resets_at": _resets_at(moment, newest["primary_seconds"])},
             "secondary": {"reported": secondary_reported,
                           "used_percent": newest["secondary"] if secondary_reported else None,
-                          "resets_in_seconds": newest["secondary_seconds"] if secondary_reported else None,
-                          "resets_at": (_resets_at(moment, newest["secondary_seconds"])
-                                        if secondary_reported else None)},
+                          "resets_in_seconds": (newest["secondary_seconds"]
+                                                if newest["secondary_seconds"] > 0 else None),
+                          "resets_at": _resets_at(moment, newest["secondary_seconds"])},
             "burn": _burn(newest, readings, window_seconds),
             "rows_read": len(rows), "rows_malformed": malformed}

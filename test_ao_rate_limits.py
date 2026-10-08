@@ -47,13 +47,20 @@ class RateLimitViewTests(unittest.TestCase):
 
     def test_unreported_rows_are_available_but_carry_no_figure(self):
         self.event(-1, 60)
-        self.event(-1, 30)
+        self.event(-1, 30, resets=13429, secondary_resets=0)
         value = self.latest()
         self.assertTrue(value["available"])
         self.assertEqual(value["observed_at"], (self.now - datetime.timedelta(seconds=30)).isoformat())
         self.assertFalse(value["window"]["reported"])
         self.assertIsNone(value["window"]["used_percent"])
-        self.assertIsNone(value["window"]["resets_at"])
+        # Reset times ride on the provider's own seconds, independently of the percent;
+        # a reset of 0 means no window is running and reports null.
+        self.assertEqual(value["window"]["resets_in_seconds"], 13429)
+        self.assertEqual(value["window"]["resets_at"],
+                         (self.now - datetime.timedelta(seconds=30)
+                          + datetime.timedelta(seconds=13429)).isoformat())
+        self.assertIsNone(value["secondary"]["resets_in_seconds"])
+        self.assertIsNone(value["secondary"]["resets_at"])
         self.assertEqual(value["burn"]["samples"], 0)
         self.assertIsNone(value["burn"]["percent_per_minute"])
         self.assertIsNone(value["burn"]["minutes_remaining_at_current_rate"])
