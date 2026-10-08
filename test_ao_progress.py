@@ -246,9 +246,13 @@ class ProgressViewTests(Fixture):
                                - ao_native_outcome.timestamp(launches[0]['started_at']), places=6)
         self.assertEqual(view['plan'], {
             'source': 'task_tools', 'updated_at': self.task_list_result['timestamp'],
-            'steps': [{'label': 'Implement parser', 'status': 'completed'},
-                      {'label': 'Gate evidence', 'status': 'pending'}],
-            'counts': {'pending': 1, 'in_progress': 0, 'completed': 1}})
+            'steps': [{'label': 'Implement parser', 'status': 'completed', 'stale_in_progress': False},
+                      {'label': 'Gate evidence', 'status': 'pending', 'stale_in_progress': False}],
+            'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
+            'total': 2, 'shown': 2,
+            'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
+            'groups': [{'key': 'other', 'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
+                        'completed_of_total': '1/2', 'active': []}]})
         self.assertEqual(view['last_text'], self.LONG_TEXT[:400])
         self.assertEqual(len(view['last_text']), 400)
         self.assertNotIn(str(self.transcript), json.dumps(view))
@@ -292,7 +296,10 @@ class ProgressViewTests(Fixture):
         self.assertTrue(view['source']['reason'])
         self.assertEqual(view['turn'], {'anchor_found': False})
         self.assertEqual(view['plan'], {'source': 'none', 'updated_at': None, 'steps': [],
-                                        'counts': {'pending': 0, 'in_progress': 0, 'completed': 0}})
+                                        'counts': {'pending': 0, 'in_progress': 0, 'completed': 0},
+                                        'total': 0, 'shown': 0,
+                                        'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
+                                        'groups': []})
         self.assertEqual(view['launches'], [])
         self.assertEqual(view['malformed_rows'], 0)
         self.assertNotIn('last_text', view)
@@ -466,9 +473,13 @@ class ProgressViewTests(Fixture):
         self._write_transcript()
         self.assertEqual(self.view()['plan'], {
             'source': 'task_tools', 'updated_at': self.task_list_result['timestamp'],
-            'steps': [{'label': 'Implement parser', 'status': 'completed'},
-                      {'label': 'Gate evidence', 'status': 'pending'}],
-            'counts': {'pending': 1, 'in_progress': 0, 'completed': 1}})
+            'steps': [{'label': 'Implement parser', 'status': 'completed', 'stale_in_progress': False},
+                      {'label': 'Gate evidence', 'status': 'pending', 'stale_in_progress': False}],
+            'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
+            'total': 2, 'shown': 2,
+            'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
+            'groups': [{'key': 'other', 'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
+                        'completed_of_total': '1/2', 'active': []}]})
 
     def test_identical_request_texts_anchor_within_their_time_bounds(self):
         state = self.state()
@@ -633,7 +644,8 @@ class ProgressViewTests(Fixture):
         self.native_events[self.native_events.index(self.trailing):0] = rows
         self._write_transcript()
         view = self.view()
-        self.assertIn({'label': 'Fix <path> and src/a.ts', 'status': 'pending'}, view['plan']['steps'])
+        self.assertIn({'label': 'Fix <path> and src/a.ts', 'status': 'pending',
+                       'stale_in_progress': False}, view['plan']['steps'])
         self.assertIn('Open <path> and src/b.ts',
                       [launch['description'] for launch in view['launches']])
         self.assertEqual(view['last_text'], 'Wrote <path> then src/c.ts')
@@ -641,6 +653,125 @@ class ProgressViewTests(Fixture):
         self.assertNotIn('/Users/x/secret.json', serialized)
         self.assertNotIn('/etc/hosts', serialized)
         self.assertNotIn('/var/log/out.log', serialized)
+
+    def _task_rows(self, stamp, task_id, subject, status=None, active=None):
+        """A TaskCreate pair plus an optional TaskUpdate pair, like the fixture's own rows."""
+        use = 'tu-t' + task_id
+        rows = [self._assistant('create-' + task_id, stamp,
+                                [self._use(use, 'TaskCreate',
+                                           {'subject': subject, 'activeForm': active})]),
+                self._result('create-' + task_id + '-result', stamp, use,
+                             'Task #' + task_id + ' created successfully')]
+        if status is not None:
+            given = {'taskId': task_id, 'status': status}
+            if active is not None:
+                given['activeForm'] = active
+            rows += [self._assistant('update-' + task_id, stamp,
+                                     [self._use(use + 'u', 'TaskUpdate', given)]),
+                     self._result('update-' + task_id + '-result', stamp, use + 'u',
+                                  'Task #' + task_id + ' updated')]
+        return rows
+
+    def test_group_key_codes_and_rounds(self):
+        cases = [('EXIT-12: shipped', 'EXIT'), ('BARS-1c: open unit', 'BARS'),
+                 ('UI-PROOF-2 remains', 'UI-PROOF'), ('FINAL-REVIEW-2: verdict', 'FINAL-REVIEW'),
+                 ('P3 remaining', 'P3'), ('CLAMP-9', 'CLAMP'), ('123: digits', '123'),
+                 ('implement the parser', 'other'), ('lower-1: no code', 'other'),
+                 ('  spaced lead', 'other'), ('', 'other'), (None, 'other')]
+        for subject, key in cases:
+            with self.subTest(subject=subject):
+                self.assertEqual(ao_progress._group_key(subject), key)
+
+    def test_the_bounded_plan_counts_everything_and_prefers_active_and_newest(self):
+        base = self.request['created_at'] + 1.0
+        tick = [0]
+
+        def at():
+            tick[0] += 1
+            return _iso(base + tick[0] / 1000)
+
+        rows = []
+        for index in range(26):  # tasks 100-125 completed
+            task_id = str(100 + index)
+            rows += self._task_rows(at(), task_id, 'EXIT-' + task_id + ': shipped unit', 'completed')
+        for index in range(3):   # tasks 126-128 in progress
+            task_id = str(126 + index)
+            rows += self._task_rows(at(), task_id, 'BARS-1' + 'abc'[index] + ': open unit',
+                                    'in_progress', active='Running BARS unit ' + task_id)
+        for index in range(39):  # tasks 129-167 pending
+            task_id = str(129 + index)
+            rows += self._task_rows(at(), task_id, 'P3 pending unit ' + task_id)
+        self.native_events.extend(rows)
+        self._write_transcript()
+        # 70 tasks with the fixture's own two: 40 pending, 3 in progress, 27 completed.
+        plan = self.view()['plan']
+        self.assertEqual(plan['total'], 70)
+        self.assertEqual(plan['shown'], 64)
+        self.assertEqual(plan['counts'], {'pending': 40, 'in_progress': 3, 'completed': 27})
+        self.assertEqual(plan['omitted'], {'pending': 0, 'in_progress': 0, 'completed': 6})
+        steps = plan['steps']
+        self.assertEqual([step['status'] for step in steps[:3]], ['in_progress'] * 3)
+        self.assertEqual([step['label'] for step in steps[:3]],
+                         ['Running BARS unit 126', 'Running BARS unit 127', 'Running BARS unit 128'])
+        self.assertTrue(all(step['stale_in_progress'] is False for step in steps))
+        pending_labels = [step['label'] for step in steps[3:43]]
+        self.assertEqual(pending_labels[:2], ['P3 pending unit 167', 'P3 pending unit 166'])
+        self.assertEqual(pending_labels[-1], 'Gate evidence')  # the oldest pending still makes it
+        completed = steps[43:]
+        self.assertEqual(len(completed), 21)
+        self.assertTrue(all(step['status'] == 'completed' for step in completed))
+        self.assertEqual(completed[0]['label'], 'EXIT-125: shipped unit')
+        self.assertEqual(completed[-1]['label'], 'EXIT-105: shipped unit')
+        self.assertNotIn('Implement parser', [step['label'] for step in steps])
+        self.assertEqual([group['key'] for group in plan['groups']], ['BARS', 'EXIT', 'P3', 'other'])
+        groups = {group['key']: group for group in plan['groups']}
+        self.assertEqual(groups['EXIT']['counts'], {'pending': 0, 'in_progress': 0, 'completed': 26})
+        self.assertEqual(groups['EXIT']['completed_of_total'], '26/26')
+        self.assertEqual(groups['BARS']['completed_of_total'], '0/3')
+        self.assertEqual(groups['BARS']['active'],
+                         ['Running BARS unit 126', 'Running BARS unit 127', 'Running BARS unit 128'])
+        self.assertEqual(groups['P3']['completed_of_total'], '0/39')
+        self.assertEqual(groups['other']['completed_of_total'], '1/2')
+        self.assertEqual(sum(group['counts'][status] for group in plan['groups']
+                             for status in ('pending', 'in_progress', 'completed')), 70)
+
+    def test_a_task_list_sourced_plan_counts_all_of_the_list(self):
+        rows = [
+            self._assistant('list-65', _iso(self.request['created_at'] + 4.0),
+                            [self._use('tu-l65', 'TaskList', {})]),
+            self._result('list-65-result', _iso(self.request['created_at'] + 4.1), 'tu-l65',
+                         '\n'.join('#%d [pending] Task %d' % (index, index) for index in range(1, 66))),
+        ]
+        self.native_events.extend(rows)
+        self._write_transcript()
+        plan = self.view()['plan']
+        self.assertEqual(plan['total'], 65)
+        self.assertEqual(plan['shown'], 64)
+        self.assertEqual(plan['counts'], {'pending': 65, 'in_progress': 0, 'completed': 0})
+        self.assertEqual(plan['omitted'], {'pending': 1, 'in_progress': 0, 'completed': 0})
+
+    def test_stale_in_progress_marks_only_unmatched_old_updates(self):
+        base = self.request['created_at'] + 1.0
+        old, recent = _iso(base - 3700), _iso(base + 2.0)
+        rows = (self._task_rows(old, '200', 'EXIT-7: stuck unit', 'in_progress', 'Running the stuck unit')
+                + self._task_rows(old, '201', 'BARS-9: drifting unit', 'in_progress',
+                                  'Running the drifting unit')
+                + self._task_rows(old, '202', 'stray plain unit', 'in_progress', 'Working the stray unit')
+                + self._task_rows(recent, '203', 'EXIT-8: fresh unit', 'in_progress',
+                                  'Running the fresh unit'))
+        # A launch inside the turn covers BARS-9; every other coded unit stays unmatched.
+        index = self.native_events.index(self.trailing)
+        agent = self._assistant('agent-bars', _iso(base + 0.5),
+                                [self._use('tu-ab', 'Agent', {'description': 'BARS-9: investigating'})])
+        agentr = self._result('agent-bars-r', _iso(base + 0.6), 'tu-ab', 'done')
+        self.native_events[index:index] = [agent, agentr]
+        self.native_events.extend(rows)
+        self._write_transcript()
+        steps = {step['label']: step['stale_in_progress'] for step in self.view()['plan']['steps']}
+        self.assertIs(steps['Running the stuck unit'], True)
+        self.assertIs(steps['Running the drifting unit'], False)
+        self.assertIs(steps['Working the stray unit'], False)
+        self.assertIs(steps['Running the fresh unit'], False)
 
     def test_histogram_keys_are_bounded(self):
         long_name = 'T' * 70
@@ -686,9 +817,14 @@ class TodoWritePlanTests(Fixture):
         view = ao_progress.inspect(self.directory(), self.state())
         self.assertEqual(view['plan'], {
             'source': 'todo_write', 'updated_at': stamp,
-            'steps': [{'label': 'Reading the evidence', 'status': 'in_progress'},
-                      {'label': 'Write the report', 'status': 'pending'}],
-            'counts': {'pending': 1, 'in_progress': 1, 'completed': 0}})
+            'steps': [{'label': 'Reading the evidence', 'status': 'in_progress',
+                       'stale_in_progress': False},
+                      {'label': 'Write the report', 'status': 'pending', 'stale_in_progress': False}],
+            'counts': {'pending': 1, 'in_progress': 1, 'completed': 0},
+            'total': 2, 'shown': 2,
+            'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
+            'groups': [{'key': 'other', 'counts': {'pending': 1, 'in_progress': 1, 'completed': 0},
+                        'completed_of_total': '0/2', 'active': ['Reading the evidence']}]})
 
 
 if __name__ == '__main__':

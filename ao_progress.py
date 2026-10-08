@@ -59,10 +59,14 @@ MAX_LABEL_CHARS = 200
 MAX_DESCRIPTION_CHARS = 120
 MAX_KEY_CHARS = 64
 MAX_HISTOGRAM_KEYS = 32
+MAX_GROUP_ACTIVE = 8
+STALE_IN_PROGRESS_SECONDS = 45 * 60
 GUARD_REFUSAL = "Project Room routing guard"
 EARLY_EXIT = "Agent terminated early"
 _CREATED = re.compile(r"Task #(\S+) created successfully")
 _LIST_LINE = re.compile(r"#(\S+)\s+\[([^\]]+)\]\s*(.*)")
+_GROUP_TOKEN = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)*(?:-[0-9]+[a-z]?)?(?=[:\s]|$)")
+_GROUP_ROUND = re.compile(r"-[0-9]+[a-z]?$")
 _STEP_STATUSES = ("pending", "in_progress", "completed")
 
 
@@ -203,8 +207,69 @@ def _task_list(text):
     return items
 
 
-def _fold_plan(rows, uses, results):
-    steps = {}
+def _group_key(subject):
+    """A task's area: its leading unit code minus one trailing round suffix.
+
+    The code is an uppercase token like EXIT-12, UI-PROOF-2, BARS-1c or P3 at the
+    start of the subject, closed by a colon, whitespace or the end; one trailing
+    -<digits>[a-z]? round suffix folds the unit's own rounds into its area.
+    """
+    if not isinstance(subject, str):
+        return "other"
+    match = _GROUP_TOKEN.match(subject)
+    if match is None:
+        return "other"
+    return _GROUP_ROUND.sub("", match.group(0))
+
+
+def _leading_code(text):
+    """The raw leading unit code (round suffix kept), or None when the text has none."""
+    if not isinstance(text, str):
+        return None
+    match = _GROUP_TOKEN.match(text)
+    return None if match is None else match.group(0)
+
+
+def _new_group(key):
+    return {"key": key, "counts": {status: 0 for status in _STEP_STATUSES}, "total": 0, "active": []}
+
+
+def _step_label(step):
+    label = step.get("activeForm") if step.get("status") == "in_progress" and step.get("activeForm") \
+        else step.get("subject")
+    return _redact(label)[:MAX_LABEL_CHARS] if label is not None else ""
+
+
+def _plan_groups(steps):
+    """Every step folded by area code; groups sort by key and the tail folds into other."""
+    grouped = {}
+    for step in steps:
+        key = _group_key(step.get("subject"))
+        entry = grouped.setdefault(key, _new_group(key))
+        status = step.get("status")
+        if status in entry["counts"]:
+            entry["counts"][status] += 1
+        entry["total"] += 1
+        if status == "in_progress" and len(entry["active"]) < MAX_GROUP_ACTIVE:
+            entry["active"].append(_step_label(step))
+    named = sorted(key for key in grouped if key != "other")
+    for key in named[MAX_HISTOGRAM_KEYS - 1:]:
+        overflow = grouped.pop(key)
+        folded = grouped.setdefault("other", _new_group("other"))
+        for status in _STEP_STATUSES:
+            folded["counts"][status] += overflow["counts"][status]
+        folded["total"] += overflow["total"]
+        room = MAX_GROUP_ACTIVE - len(folded["active"])
+        if room > 0:
+            folded["active"].extend(overflow["active"][:room])
+    return [{"key": entry["key"], "counts": entry["counts"],
+             "completed_of_total": str(entry["counts"]["completed"]) + "/" + str(entry["total"]),
+             "active": entry["active"]}
+            for entry in sorted(grouped.values(), key=lambda item: item["key"])]
+
+
+def _fold_plan(rows, uses, results, launches=None, now=None):
+    steps, step_updated = {}, {}
     source, updated_at = "none", None
     for row in rows:
         stamp = row.get("timestamp")
@@ -215,7 +280,7 @@ def _fold_plan(rows, uses, results):
             if block.get("type") == "tool_use" and block.get("name") == "TodoWrite":
                 todos = (block.get("input") or {}).get("todos") if isinstance(block.get("input"), dict) else None
                 if isinstance(todos, list):
-                    steps = {}
+                    steps, step_updated = {}, {}
                     for index, todo in enumerate(todos):
                         if isinstance(todo, dict):
                             key = "todo-" + str(index)
@@ -230,6 +295,7 @@ def _fold_plan(rows, uses, results):
                 if task_id is not None:
                     steps[task_id] = {"id": task_id, "subject": given.get("subject"),
                                       "activeForm": given.get("activeForm"), "status": "pending"}
+                    step_updated[task_id] = stamp
                     kind = "task_tools"
             elif block.get("type") == "tool_use" and block.get("name") == "TaskUpdate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -239,11 +305,13 @@ def _fold_plan(rows, uses, results):
                     if given.get("status") == "deleted":
                         if key in steps:
                             del steps[key]
+                            step_updated.pop(key, None)
                             kind = "task_tools"
                     elif key in steps:
                         for field in ("subject", "activeForm", "status"):
                             if given.get(field) is not None:
                                 steps[key][field] = given[field]
+                        step_updated[key] = stamp
                         kind = "task_tools"
             elif block.get("type") == "tool_result":
                 use = uses.get(block.get("tool_use_id"))
@@ -251,19 +319,49 @@ def _fold_plan(rows, uses, results):
                     items = _task_list(_result_text(block.get("content")))
                     if items is not None:
                         steps = {item["id"]: item for item in items}
+                        step_updated = {}
                         kind = "task_tools"
             if kind is not None:
                 source, updated_at = kind, stamp
     counts = {status: 0 for status in _STEP_STATUSES}
-    output = []
-    for step in list(steps.values())[:MAX_STEPS]:
+    for step in steps.values():
         status = step.get("status")
         if status in counts:
             counts[status] += 1
-        label = step.get("activeForm") if status == "in_progress" and step.get("activeForm") else step.get("subject")
-        output.append({"label": (_redact(label)[:MAX_LABEL_CHARS] if label is not None else ""),
-                       "status": status if status is not None else "pending"})
-    return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts}
+    total = len(steps)
+    ordered = list(steps.values())
+    if total <= MAX_STEPS:
+        chosen = ordered
+    else:
+        # The bound keeps the units the operator acts on: every in-progress unit,
+        # then the newest pending and newest completed in fold order.
+        active = [step for step in ordered if step.get("status") == "in_progress"]
+        pending = [step for step in ordered if step.get("status") not in ("in_progress", "completed")]
+        completed = [step for step in ordered if step.get("status") == "completed"]
+        chosen = (active + pending[::-1] + completed[::-1])[:MAX_STEPS]
+    launch_codes = {_leading_code(launch.get("description")) for launch in launches or ()}
+    launch_codes.discard(None)
+    output, shown = [], {status: 0 for status in _STEP_STATUSES}
+    for step in chosen:
+        status = step.get("status")
+        if status in shown:
+            shown[status] += 1
+        stale = False
+        code = _leading_code(step.get("subject"))
+        if (status == "in_progress" and launches and code is not None
+                and code not in launch_codes and now is not None):
+            try:
+                updated_epoch = ao_native_outcome.timestamp(step_updated.get(step["id"], updated_at))
+            except RoomError:
+                updated_epoch = None
+            stale = updated_epoch is not None and now - updated_epoch > STALE_IN_PROGRESS_SECONDS
+        output.append({"label": _step_label(step),
+                       "status": status if status is not None else "pending",
+                       "stale_in_progress": stale})
+    return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts,
+            "total": total, "shown": len(output),
+            "omitted": {status: counts[status] - shown[status] for status in _STEP_STATUSES},
+            "groups": _plan_groups(steps.values())}
 
 
 def _turn_window(rows, request, start, end):
@@ -419,7 +517,10 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     view = {"version": VERSION, "room_id": state.get("room_id"), "request": _request_view(request),
             "source": {"available": False}, "turn": {"anchor_found": False},
             "launches": [], "plan": {"source": "none", "updated_at": None, "steps": [],
-                                     "counts": {status: 0 for status in _STEP_STATUSES}},
+                                     "counts": {status: 0 for status in _STEP_STATUSES},
+                                     "total": 0, "shown": 0,
+                                     "omitted": {status: 0 for status in _STEP_STATUSES},
+                                     "groups": []},
             "malformed_rows": 0}
     outcome_source = state.get("native_outcome_source") or {}
     view["rate_limits"] = ao_rate_limits.latest(outcome_source.get("database"), request.get("session_id"))
@@ -452,7 +553,14 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         # Launches belong to the request's own turn; without an anchor nothing is attributable.
         launch_uses, launch_results = _tools(turn_rows)
         view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
-    view["plan"] = _fold_plan(rows, uses, results)
+    # Staleness measures against the transcript's own clock — the turn's last activity —
+    # the same clock the view uses for elapsed_seconds.
+    plan_now = None
+    try:
+        plan_now = ao_native_outcome.timestamp(view["turn"].get("last_activity_at"))
+    except RoomError:
+        plan_now = None
+    view["plan"] = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now)
     if max_text_chars:
         # With an anchor the text belongs to the request's own turn; a turn that has
         # produced only tool calls has no assistant text yet. Without an anchor the

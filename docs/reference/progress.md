@@ -96,6 +96,10 @@ Workers started before this version do not persist `owner_job_id` or `active_sta
 
 Terminal progress is frozen from the job's saved row. A succeeded implementation job therefore keeps `phase: awaiting_review` even after Astra later records acceptance or requests a correction, because those are separate handoff events; read `room_implementation_status` or the later job for the handoff's current state. A queued correction shows `queued`/`starting` with no deadline, gate, or delegates until its own attempt is visible.
 
+## The bounded plan fold
+
+`plan.counts` covers every task in the engineer's list, and `plan.groups` folds every task by the area code at the start of its subject — `EXIT-12:` and `EXIT-13:` are one `EXIT` group, a subject with no leading code falls into `other`, and groups are sorted by key with at most thirty-one named keys before the rest fold into `other`. Only the step list is bounded: when the list holds more than 64 tasks, `plan.steps` keeps every in-progress unit first, then the newest pending and newest completed, and `total`, `shown` and the per-status `omitted` counts report what was cut — AO's own plan panel is unaffected either way. A shown step's `stale_in_progress` flag marks an in-progress unit whose last status update is over forty-five minutes old and whose unit code opens no launch in the turn; it is a hygiene signal for list keeping, not evidence that work stopped.
+
 ## The one-time plan instruction
 
 The one-time `progress_plan_v2` workflow part, delivered once to each retained engineer session, supersedes the list-keeping rules of `progress_plan_v1`: a task is one bounded work unit, never a phase, a spec section or an umbrella; residuals found by a unit's review become a new task instead of reopening the finished one; `in_progress` marks only a unit being worked on now, so the completed count stays a true completion count; and two workers launched together are paired with units of similar expected size. It is delivered text only: it grants no scope, execution permission, recovery or review allowance, changes no snapshot, and the read-only views in this document are unchanged.
