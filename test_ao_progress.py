@@ -168,6 +168,13 @@ class ProgressViewTests(Fixture):
         self.assertEqual(ao.digest(ao_progress.INSTRUCTION.encode()), ao_progress.INSTRUCTION_SHA256)
         self.assertEqual(self.state()['requests']['impl-1']['carried']['parts'], [])
 
+    def test_progress_plan_v2_part_delivered_once_with_pinned_digest(self):
+        carried = self.state()['requests']['spec_review']['carried']
+        self.assertIn(ao_progress.PART_V2, carried['parts'])
+        self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
+        self.assertEqual(ao.digest(ao_progress.INSTRUCTION_V2.encode()), ao_progress.INSTRUCTION_V2_SHA256)
+        self.assertNotIn(ao_progress.PART_V2, self.state()['requests']['impl-1']['carried']['parts'])
+
     def test_trailing_timestampless_metadata_rows_keep_the_last_timestamped_activity(self):
         self.native_events.extend([
             {'type': 'system', 'subtype': 'metadata', 'uuid': _identity(),

@@ -623,7 +623,10 @@ class PreCharterRefreshFramingTests(Fixture):
         texts[DELEGATION_PART] = DELEGATION_INSTRUCTION
         texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
         texts[ao_progress.PART] = ao_progress.INSTRUCTION
+        texts[ao_progress.PART_V2] = ao_progress.INSTRUCTION_V2
         texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
+        import ao_residual_escalation
+        texts[ao_residual_escalation.PART] = ao_residual_escalation.INSTRUCTION
         assembly = ao_prompt_metrics.PromptAssembly('\n')
         for name in request['carried']['parts']:
             assembly.add('workflow', texts[name])

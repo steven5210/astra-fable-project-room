@@ -101,3 +101,11 @@ Confirm upstream model, server window, and reachability before depending on Qwen
 - Where a reference implementation or ground truth exists, include its comparison probe in the plan.
 - After any code change, run the project's usual adversarial review and `/code-review` flow. Use the configured equivalent if that command is unavailable and record the substitution.
 - No tier self-certifies. Fable checks every delegate output and owns engineering verdicts; Astra independently verifies the final product outcome.
+
+## Residual escalation amendment (one-time part `residual_escalation_v1`)
+
+The retained engineer receives this text once:
+
+> Residual escalation (routing default among the room's pinned workers; it changes no model, budget, guard or delegate setting): route concurrency-sensitive, financially precise or security-sensitive units — reservations, cancel/replace, locks, recovery and reconciliation, race and contention proofs, money or quantity arithmetic — to pr-opus from the first round, not after a cheaper attempt. For any one area, after two rounds whose review found correctness defects, route the next round to pr-opus and record the reason in routing_log; mechanical breakage (fixture repair, type or token alignment, a renamed symbol) and a quota cut-off do not count as rounds. Diagnosis before escalation still applies: the packet names the defect class and the exact functions; never resend the same packet to a stronger model without that diagnosis. Quality-first routing is unchanged: route up when in doubt, and record every routing outcome.
+
+The amendment refines routing within the pinned worker ladder only. The POLICY_* texts, models, budgets, guards and every existing room snapshot are unchanged.
