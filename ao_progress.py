@@ -16,6 +16,7 @@ import re
 import stat
 
 import ao_native_outcome
+import ao_rate_limits
 from room import RoomError
 
 VERSION = 1
@@ -420,6 +421,8 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
             "launches": [], "plan": {"source": "none", "updated_at": None, "steps": [],
                                      "counts": {status: 0 for status in _STEP_STATUSES}},
             "malformed_rows": 0}
+    outcome_source = state.get("native_outcome_source") or {}
+    view["rate_limits"] = ao_rate_limits.latest(outcome_source.get("database"), request.get("session_id"))
     try:
         # The bounded tail read in _window needs no file size cap; the dispatch default stays.
         validated = ao_native_outcome.validate_registered_source(directory, state, transcript_size_limit=None)

@@ -28,7 +28,9 @@ Rules for every phase:
 - For a progress update at a breakpoint or when the user asks, call
   `ao_room_progress` (read-only: the engineer's task list, Agent launches,
   served models, errors, last message) and format the checklist from it plus
-  the last report; never read the native transcript yourself.
+  the last report; never read the native transcript yourself. Report the
+  rate-limit window label, its used percent or `not reported`, and its reset
+  time; treat the reading as advisory, never as headroom.
 - Report usage as the attributable native subtotal from status, with delegates
   separate. Unknown is never zero, and it is not quota or billing.
 - Keep room IDs, native IDs, paths and receipts private.

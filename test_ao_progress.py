@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import io
 import json
 import os
+import sqlite3
 import unittest
 import uuid
 from unittest.mock import patch
@@ -174,6 +175,27 @@ class ProgressViewTests(Fixture):
         self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
         self.assertEqual(ao.digest(ao_progress.INSTRUCTION_V2.encode()), ao_progress.INSTRUCTION_V2_SHA256)
         self.assertNotIn(ao_progress.PART_V2, self.state()['requests']['impl-1']['carried']['parts'])
+
+    def test_the_provider_rate_limit_reading_folds_into_the_view(self):
+        session = self.state()['requests']['impl-1']['session_id']
+        database = self.root / 'owner.db'
+        with sqlite3.connect(database) as connection:
+            connection.execute('CREATE TABLE conversation_provider_events '
+                               '(session_id TEXT, method TEXT, received_at TEXT, payload_json TEXT)')
+        payload = {'rateLimits': {'PrimaryUsedPercent': 91, 'SecondaryUsedPercent': -1,
+                                  'PrimaryResetsInSeconds': 1200, 'SecondaryResetsInSeconds': -1,
+                                  'PlanLabel': 'five hour', 'CodexCapacity': None}}
+        with sqlite3.connect(database) as connection:
+            connection.execute('INSERT INTO conversation_provider_events VALUES (?,?,?,?)',
+                               (session, 'account.rateLimits',
+                                '2026-10-07 23:49:24.123456 +0000 UTC', json.dumps(payload)))
+        view = self.view()
+        self.assertTrue(view['rate_limits']['available'])
+        self.assertEqual(view['rate_limits']['source'], 'ao_provider_events')
+        self.assertEqual(view['rate_limits']['window']['label'], 'five hour')
+        self.assertEqual(view['rate_limits']['window']['used_percent'], 91)
+        self.assertEqual(view['rate_limits']['observed_at'],
+                         datetime(2026, 10, 7, 23, 49, 24, 123456, tzinfo=timezone.utc).isoformat())
 
     def test_trailing_timestampless_metadata_rows_keep_the_last_timestamped_activity(self):
         self.native_events.extend([
