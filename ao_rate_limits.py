@@ -14,7 +14,8 @@ not-reported window still carries its reset time; a value of 0 means no window
 is running and reports null, as does any value beyond sixty days (the largest
 real window is seven days). The burn arithmetic summarizes the reported
 readings in the newest row's reset cycle only — rows with a different reset
-instant or a percent that drops toward the present belong to an earlier cycle —
+instant, or reset availability that differs from the newest row's, or a
+percent that drops toward the present belong to an earlier cycle —
 and ``minutes_remaining_at_current_rate`` is arithmetic over those readings,
 not a forecast of the provider's policy.
 """
@@ -109,9 +110,14 @@ def _burn(newest, readings, window_seconds):
                 and row["label"] == newest["label"] and row["primary"] >= 0):
             continue
         row_reset = _reset_seconds(row["primary_seconds"])
-        if (newest_instant is not None and row_reset is not None
-                and abs(newest_instant - (row["moment"].timestamp() + row_reset))
-                > RESET_CYCLE_TOLERANCE_SECONDS):
+        row_instant = None if row_reset is None else row["moment"].timestamp() + row_reset
+        # An inactive-window reading (reset 0 or unusable) never joins an active
+        # window's cycle, and the reverse is just as true; only matching
+        # availability reaches the instant comparison or the monotone fallback.
+        if (newest_instant is None) != (row_instant is None):
+            continue
+        if (newest_instant is not None
+                and abs(newest_instant - row_instant) > RESET_CYCLE_TOLERANCE_SECONDS):
             continue
         # Percent must be non-decreasing toward the present; the first older sample
         # above its newer neighbor belongs to an earlier cycle and ends the set.

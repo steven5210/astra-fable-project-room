@@ -134,6 +134,22 @@ class RateLimitViewTests(unittest.TestCase):
         self.assertEqual(value["burn"]["samples"], 1)
         self.assertIsNone(value["burn"]["percent_per_minute"])
 
+    def test_burn_requires_matching_reset_availability(self):
+        # 11:58: 0% with reset 0 (no window running); 12:00: a fresh-cycle 5%
+        # with reset 3600 — the inactive reading cannot join the new cycle.
+        self.event(0, 120, resets=0)
+        self.event(5, 0, resets=3600)
+        value = self.latest()
+        self.assertEqual(value["burn"]["samples"], 1)
+        self.assertIsNone(value["burn"]["percent_per_minute"])
+        # And the reverse: an inactive newest row keeps active-window rows out.
+        self.event(60, 480, resets=3900, session="other-shape")
+        self.event(80, 300, resets=3720, session="other-shape")
+        self.event(5, 0, resets=0, session="other-shape")
+        value = ao_rate_limits.latest(str(self.database), "other-shape", now=self.now)
+        self.assertEqual(value["burn"]["samples"], 1)
+        self.assertIsNone(value["burn"]["percent_per_minute"])
+
     def test_burn_falls_back_to_the_monotone_rule_without_reset_seconds(self):
         # No reset seconds at all: the newest row is 7%, one minute ago; 3% kept
         # beside it, and 97% seven minutes ago belongs to the previous cycle.
