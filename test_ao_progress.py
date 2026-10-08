@@ -773,6 +773,64 @@ class ProgressViewTests(Fixture):
         self.assertIs(steps['Working the stray unit'], False)
         self.assertIs(steps['Running the fresh unit'], False)
 
+    def test_stale_in_progress_needs_a_found_anchor_even_with_zero_launches(self):
+        spec_request = self.state()['requests']['spec_review']
+        old = _iso(spec_request['created_at'] + 1.0 - 4000)
+        self.native_events.extend(self._task_rows(old, '500', 'EXIT-7: stuck unit', 'in_progress',
+                                                  'Running the stuck unit'))
+        self._write_transcript()
+        # The spec turn anchored and launched nothing: an empty launch list is known
+        # launch data, not missing launch data.
+        view = self.view(request_id='spec_review')
+        self.assertTrue(view['turn']['anchor_found'])
+        self.assertEqual(view['launches'], [])
+        steps = {step['label']: step['stale_in_progress'] for step in view['plan']['steps']}
+        self.assertIs(steps['Running the stuck unit'], True)
+        # Without an anchor the same rows cannot flag anything.
+        state = self.state()
+        state['requests']['spec_review']['text_sha256'] = '0' * 64
+        ao.atomic(self.directory() / 'state.json', state)
+        view = self.view(request_id='spec_review')
+        self.assertFalse(view['turn']['anchor_found'])
+        steps = {step['label']: step['stale_in_progress'] for step in view['plan']['steps']}
+        self.assertIs(steps['Running the stuck unit'], False)
+
+    def test_task_list_reads_keep_update_stamps_and_unknown_is_never_stale(self):
+        base = self.request['created_at'] + 1.0
+        old, listed = _iso(base - 4000), _iso(base + 3.0)
+        rows = self._task_rows(old, '300', 'EXIT-1: long unit', 'in_progress', 'Running EXIT-1')
+        rows += self._task_rows(old, '302', 'EXIT-3: flipped unit')
+        rows += [
+            self._assistant('list-after', listed, [self._use('tu-la', 'TaskList', {})]),
+            self._result('list-after-result', listed, 'tu-la',
+                         '#300 [in_progress] EXIT-1: long unit\n'
+                         '#301 [in_progress] EXIT-2: first seen\n'
+                         '#302 [in_progress] EXIT-3: flipped unit'),
+        ]
+        self.native_events.extend(rows)
+        self._write_transcript()
+        steps = {step['label']: step['stale_in_progress'] for step in self.view()['plan']['steps']}
+        # EXIT-1's unchanged status carries its old stamp forward: still stale.
+        self.assertIs(steps['EXIT-1: long unit'], True)
+        # EXIT-2 first appears in the list read: no stamp means never stale.
+        self.assertIs(steps['EXIT-2: first seen'], False)
+        # EXIT-3's status changed in the read, so the list time is its stamp: recent.
+        self.assertIs(steps['EXIT-3: flipped unit'], False)
+
+    def test_group_keys_truncate_at_the_named_bound(self):
+        self.assertEqual(ao_progress._group_key('T' * 5000 + ': unit'), 'T' * 64)
+        self.assertEqual(ao_progress._leading_code('T' * 5000 + ': unit'), 'T' * 64)
+        stamp = _iso(self.request['created_at'] + 3.0)
+        rows = (self._task_rows(stamp, '400', 'T' * 64 + 'AAA: first', 'completed')
+                + self._task_rows(stamp, '401', 'T' * 64 + 'BBB: second', 'completed'))
+        self.native_events.extend(rows)
+        self._write_transcript()
+        groups = {group['key']: group for group in self.view()['plan']['groups']}
+        self.assertIn('T' * 64, groups)
+        self.assertEqual(groups['T' * 64]['counts'],
+                         {'pending': 0, 'in_progress': 0, 'completed': 2})
+        self.assertEqual(groups['T' * 64]['completed_of_total'], '2/2')
+
     def test_histogram_keys_are_bounded(self):
         long_name = 'T' * 70
         blocks = [self._use('tu-h-long', long_name, {})] + [

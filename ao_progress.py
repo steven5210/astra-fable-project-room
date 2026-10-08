@@ -219,7 +219,7 @@ def _group_key(subject):
     match = _GROUP_TOKEN.match(subject)
     if match is None:
         return "other"
-    return _GROUP_ROUND.sub("", match.group(0))
+    return _GROUP_ROUND.sub("", match.group(0))[:MAX_KEY_CHARS]
 
 
 def _leading_code(text):
@@ -227,7 +227,7 @@ def _leading_code(text):
     if not isinstance(text, str):
         return None
     match = _GROUP_TOKEN.match(text)
-    return None if match is None else match.group(0)
+    return None if match is None else match.group(0)[:MAX_KEY_CHARS]
 
 
 def _new_group(key):
@@ -268,7 +268,7 @@ def _plan_groups(steps):
             for entry in sorted(grouped.values(), key=lambda item: item["key"])]
 
 
-def _fold_plan(rows, uses, results, launches=None, now=None):
+def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=False):
     steps, step_updated = {}, {}
     source, updated_at = "none", None
     for row in rows:
@@ -318,8 +318,18 @@ def _fold_plan(rows, uses, results, launches=None, now=None):
                 if use is not None and use.get("name") == "TaskList":
                     items = _task_list(_result_text(block.get("content")))
                     if items is not None:
+                        previous, previous_updated = steps, step_updated
                         steps = {item["id"]: item for item in items}
                         step_updated = {}
+                        for item in items:
+                            key = item["id"]
+                            before = previous.get(key)
+                            if before is None:
+                                continue  # First seen in the list: its update time is unknown.
+                            if before.get("status") != item.get("status"):
+                                step_updated[key] = stamp
+                            elif key in previous_updated:
+                                step_updated[key] = previous_updated[key]
                         kind = "task_tools"
             if kind is not None:
                 source, updated_at = kind, stamp
@@ -348,10 +358,13 @@ def _fold_plan(rows, uses, results, launches=None, now=None):
             shown[status] += 1
         stale = False
         code = _leading_code(step.get("subject"))
-        if (status == "in_progress" and launches and code is not None
+        if (launches_known and status == "in_progress" and code is not None
                 and code not in launch_codes and now is not None):
+            # Unknown is never stale: a step without a tracked update stamp keeps False.
+            step_stamp = step_updated.get(step["id"])
             try:
-                updated_epoch = ao_native_outcome.timestamp(step_updated.get(step["id"], updated_at))
+                updated_epoch = (ao_native_outcome.timestamp(step_stamp)
+                                 if step_stamp is not None else None)
             except RoomError:
                 updated_epoch = None
             stale = updated_epoch is not None and now - updated_epoch > STALE_IN_PROGRESS_SECONDS
@@ -560,7 +573,8 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         plan_now = ao_native_outcome.timestamp(view["turn"].get("last_activity_at"))
     except RoomError:
         plan_now = None
-    view["plan"] = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now)
+    view["plan"] = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now,
+                              launches_known=bool(view["turn"].get("anchor_found")))
     if max_text_chars:
         # With an anchor the text belongs to the request's own turn; a turn that has
         # produced only tool calls has no assistant text yet. Without an anchor the
