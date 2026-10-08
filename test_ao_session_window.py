@@ -3,9 +3,12 @@
 from datetime import datetime, timezone
 import json
 import unittest
+from unittest.mock import patch
 
+import ao_progress
 import ao_project_room as ao
 import ao_read_admission
+import ao_residual_escalation
 import ao_workflow
 from test_ao_normal import Fixture
 
@@ -61,6 +64,16 @@ class SessionWindowTests(Fixture):
         self.assertEqual(ao.digest(ao_read_admission.INSTRUCTION.encode()),
                          ao_read_admission.INSTRUCTION_SHA256)
         self.assertNotIn(ao_read_admission.PART, self.state()['requests']['impl-1']['carried']['parts'])
+
+    def test_new_parts_arrive_last_in_a_new_session_with_pinned_digests(self):
+        carried = self.state()['requests']['spec_review']['carried']
+        self.assertEqual(carried['parts'][-2:], [ao_progress.PART_V2, ao_residual_escalation.PART])
+        self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
+        self.assertEqual(carried['part_sha256'][ao_residual_escalation.PART],
+                         ao_residual_escalation.INSTRUCTION_SHA256)
+        impl = self.state()['requests']['impl-1']['carried']
+        self.assertNotIn(ao_progress.PART_V2, impl['parts'])
+        self.assertNotIn(ao_residual_escalation.PART, impl['parts'])
 
     def test_a_completed_previous_request_carries_no_notice(self):
         text, carried = self.packet()
@@ -131,6 +144,39 @@ class SessionWindowTests(Fixture):
         text, carried = self.packet(now=moment)
         self.assertIn("session limit (the account's session limit)", text)
         self.assertEqual(carried['session_window_notice']['reset_text'], "the account's session limit")
+
+
+class RetainedSessionPartTests(Fixture):
+    """A retained session whose delivered packets predate the two newest parts."""
+
+    def setUp(self):
+        super().setUp()
+        newest = {ao_progress.PART_V2, ao_residual_escalation.PART}
+        with patch.object(ao_workflow, 'PARTS', tuple(p for p in ao_workflow.PARTS if p not in newest)):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def packet(self, purpose='correction', now=None):
+        return ao_workflow.packet(self.service, self.directory(), self.state(), 'engineer',
+                                  purpose, 'Continue.', now=now)
+
+    def test_the_two_new_parts_deliver_once_to_a_retained_session(self):
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V2, ao_residual_escalation.PART])
+        self.assertEqual(request['carried']['part_sha256'],
+                         {ao_progress.PART_V2: ao_progress.INSTRUCTION_V2_SHA256,
+                          ao_residual_escalation.PART: ao_residual_escalation.INSTRUCTION_SHA256})
+        self.assertIn(ao_progress.INSTRUCTION_V2, request['text'])
+        self.assertIn(ao_residual_escalation.INSTRUCTION, request['text'])
+        _, carried = self.packet()
+        self.assertNotIn(ao_progress.PART_V2, carried['parts'])
+        self.assertNotIn(ao_residual_escalation.PART, carried['parts'])
 
 
 if __name__ == '__main__':

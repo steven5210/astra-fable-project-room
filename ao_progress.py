@@ -35,6 +35,21 @@ INSTRUCTION = (
     "only: the final JSON report keeps its existing format and remains the engineering verdict, and nothing in the "
     "list replaces delegate evidence or review."
 )
+PART_V2 = "progress_plan_v2"
+INSTRUCTION_V2_SHA256 = "3ee80001834443cbdcdf06c15c42692db42e14e5906c46ad2a42249420b78ee0"
+INSTRUCTION_V2 = (
+    "Progress plan v2 (reporting default; supersedes the list-keeping rules of progress plan v1; it grants no "
+    "scope, execution permission, recovery or review allowance): a task is one bounded work unit — the unit one "
+    "worker launch or one Fable step completes — never a phase, a spec section or an umbrella. When a unit's "
+    "review finds residuals, create a new task for the next round (EXIT-5 after EXIT-4) instead of reopening or "
+    "renaming the finished one; a completed task never returns to in_progress. in_progress means a worker is "
+    "running on that unit now or Fable is working on it now; every other unit stays pending, so the in_progress "
+    "rows are the current work and the completed count is a true completion count. Call TaskList once when a "
+    "turn starts and do not re-mark an unchanged status; update only at unit boundaries. When launching two "
+    "workers at once, pair units of similar expected size so neither slot idles while the other finishes. The "
+    "list remains a progress view only: the final JSON report keeps its existing format and remains the "
+    "engineering verdict, and nothing in the list replaces delegate evidence or review."
+)
 MAX_WINDOW_BYTES = 64 * 1024 * 1024
 MAX_TEXT_CHARS = 2000
 MAX_STEPS = 64

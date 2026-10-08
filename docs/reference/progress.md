@@ -96,6 +96,10 @@ Workers started before this version do not persist `owner_job_id` or `active_sta
 
 Terminal progress is frozen from the job's saved row. A succeeded implementation job therefore keeps `phase: awaiting_review` even after Astra later records acceptance or requests a correction, because those are separate handoff events; read `room_implementation_status` or the later job for the handoff's current state. A queued correction shows `queued`/`starting` with no deadline, gate, or delegates until its own attempt is visible.
 
+## The one-time plan instruction
+
+The one-time `progress_plan_v2` workflow part, delivered once to each retained engineer session, supersedes the list-keeping rules of `progress_plan_v1`: a task is one bounded work unit, never a phase, a spec section or an umbrella; residuals found by a unit's review become a new task instead of reopening the finished one; `in_progress` marks only a unit being worked on now, so the completed count stays a true completion count; and two workers launched together are paired with units of similar expected size. It is delivered text only: it grants no scope, execution permission, recovery or review allowance, changes no snapshot, and the read-only views in this document are unchanged.
+
 ## How Astra should use it
 
 During a bounded `room_job_status` wait, summarize `phase`, `phase_detail`, `elapsed_seconds`, `activity` (category, source, time), pending, background, and completed delegates with any attributed child's model and `turn_ended`, and `deadline.remaining_seconds` with its scope. Say "remaining until the pinned timeout", never an estimated finish. A `background` delegate is launched, not finished: report its child's last observed activity instead of claiming completion. If `activity` is null, report the reason code as unavailable evidence rather than concluding that work stalled or finished. Treat `expired: true` as a signal to keep waiting for the worker's own terminal outcome, not as permission to cancel, resubmit, or edit state.
