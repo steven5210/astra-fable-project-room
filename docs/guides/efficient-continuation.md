@@ -67,6 +67,13 @@ assigned operator when no further model judgment is needed. Record a concrete
 quality or capability reason for choosing a model instead; preserve all quality
 checks, provider budgets and data restrictions.
 
+The one-time `residual_escalation_v1` amendment refines routing within the
+pinned worker ladder only: concurrency-, financial- and security-sensitive
+units route to pr-opus from the first round, and an area escalates one tier
+after two same-tier rounds with correctness defects (pr-sonnet to pr-opus,
+pr-opus to Fable with the recorded capability reason). It changes no model,
+budget, guard or delegate setting.
+
 Engineering reports support `operator_requests`, a list of pending handoffs:
 
 ```json
@@ -510,8 +517,8 @@ bounded evidence alone decides identity.
 New preparations and the audited routing refresh also pin
 `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless
 Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools to current
-models only with it, and the `progress_plan_v1` part and AO's plan panel depend
-on them.
+models only with it, and the `progress_plan_v1` part — its list-keeping rules
+superseded by `progress_plan_v2` — and AO's plan panel depend on them.
 
 Keep the existing precedence-only ACP workaround. A stopped, positively quiescent
 retained controller must reload the audited settings and guard before new work;
