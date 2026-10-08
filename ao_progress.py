@@ -219,7 +219,7 @@ def _group_key(subject):
     match = _GROUP_TOKEN.match(subject)
     if match is None:
         return "other"
-    return _GROUP_ROUND.sub("", match.group(0))[:MAX_KEY_CHARS]
+    return _GROUP_ROUND.sub("", match.group(0))
 
 
 def _leading_code(text):
@@ -227,7 +227,14 @@ def _leading_code(text):
     if not isinstance(text, str):
         return None
     match = _GROUP_TOKEN.match(text)
-    return None if match is None else match.group(0)[:MAX_KEY_CHARS]
+    return None if match is None else match.group(0)
+
+
+def _display_key(key):
+    """The bounded group key; a long code keeps a digest suffix so distinct keys stay distinct."""
+    if len(key) <= MAX_KEY_CHARS:
+        return key
+    return key[:MAX_KEY_CHARS - 12] + "…" + hashlib.sha256(key.encode()).hexdigest()[:11]
 
 
 def _new_group(key):
@@ -262,7 +269,7 @@ def _plan_groups(steps):
         room = MAX_GROUP_ACTIVE - len(folded["active"])
         if room > 0:
             folded["active"].extend(overflow["active"][:room])
-    return [{"key": entry["key"], "counts": entry["counts"],
+    return [{"key": _display_key(entry["key"]), "counts": entry["counts"],
              "completed_of_total": str(entry["counts"]["completed"]) + "/" + str(entry["total"]),
              "active": entry["active"]}
             for entry in sorted(grouped.values(), key=lambda item: item["key"])]

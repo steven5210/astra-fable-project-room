@@ -817,19 +817,34 @@ class ProgressViewTests(Fixture):
         # EXIT-3's status changed in the read, so the list time is its stamp: recent.
         self.assertIs(steps['EXIT-3: flipped unit'], False)
 
-    def test_group_keys_truncate_at_the_named_bound(self):
-        self.assertEqual(ao_progress._group_key('T' * 5000 + ': unit'), 'T' * 64)
-        self.assertEqual(ao_progress._leading_code('T' * 5000 + ': unit'), 'T' * 64)
-        stamp = _iso(self.request['created_at'] + 3.0)
+    def test_long_codes_group_and_match_on_full_keys(self):
+        # Grouping and launch matching keep the full code; only the displayed key is bounded.
+        self.assertEqual(ao_progress._group_key('T' * 5000 + ': unit'), 'T' * 5000)
+        self.assertEqual(ao_progress._leading_code('T' * 5000 + ': unit'), 'T' * 5000)
+        base = self.request['created_at'] + 1.0
+        stamp, old = _iso(base + 3.0), _iso(base - 4000)
         rows = (self._task_rows(stamp, '400', 'T' * 64 + 'AAA: first', 'completed')
-                + self._task_rows(stamp, '401', 'T' * 64 + 'BBB: second', 'completed'))
+                + self._task_rows(stamp, '401', 'T' * 64 + 'BBB: second', 'completed')
+                + self._task_rows(old, '402', 'A' * 64 + '-TWO: unit', 'in_progress', 'Running A-TWO'))
+        # A launch for a different long code does not cover the in-progress unit.
+        index = self.native_events.index(self.trailing)
+        agent = self._assistant('agent-one', _iso(base + 0.5),
+                                [self._use('tu-one', 'Agent',
+                                           {'description': 'A' * 64 + '-ONE: launched work'})])
+        agentr = self._result('agent-one-r', _iso(base + 0.6), 'tu-one', 'done')
+        self.native_events[index:index] = [agent, agentr]
         self.native_events.extend(rows)
         self._write_transcript()
-        groups = {group['key']: group for group in self.view()['plan']['groups']}
-        self.assertIn('T' * 64, groups)
-        self.assertEqual(groups['T' * 64]['counts'],
-                         {'pending': 0, 'in_progress': 0, 'completed': 2})
-        self.assertEqual(groups['T' * 64]['completed_of_total'], '2/2')
+        plan = self.view()['plan']
+        keys = [group['key'] for group in plan['groups']]
+        self.assertTrue(all(len(key) <= 64 for key in keys))
+        self.assertEqual(len(keys), len(set(keys)))
+        # 'T'*64+'AAA' and 'T'*64+'BBB' share the first 64 chars but are different codes:
+        # two groups whose displayed keys differ only in the digest suffix.
+        long_keys = sorted(key for key in keys if key.startswith('T' * 52 + '…'))
+        self.assertEqual(len(long_keys), 2)
+        steps = {step['label']: step['stale_in_progress'] for step in plan['steps']}
+        self.assertIs(steps['Running A-TWO'], True)
 
     def test_histogram_keys_are_bounded(self):
         long_name = 'T' * 70
