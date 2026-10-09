@@ -390,10 +390,11 @@ def _display_id(raw):
 
 
 def _resolve_unit(entry):
-    """One task id's bounded req/kind/from/blocker/reason, merged, validated and redacted, plus its raw successor.
+    """One task's raw requirement/successor identities and bounded, redacted lineage fields.
 
     Description tokens supply the base; metadata overrides them key by key for the same name.
     A missing entry (never created or updated inside the observed window) resolves unmapped.
+    A nonblank requirement stays raw for grouping; only emitted labels are redacted and clipped.
     The successor stays raw (surrounding whitespace stripped, exactly one leading '#' removed) so
     identity compares it with raw task ids; it is absent for ""/"false" (any case), which also
     covers metadata False after its str conversion, and for an empty description token. The
@@ -403,7 +404,10 @@ def _resolve_unit(entry):
     metadata = (entry or {}).get("metadata") or {}
     merged = _description_tokens((entry or {}).get("description"))
     merged.update(metadata)
-    req, req_clipped = _bounded_text(merged.get("req"), MAX_REQ_CHARS)
+    req = merged.get("req")
+    if not isinstance(req, str) or not req.strip():
+        req = None
+    _, req_clipped = _bounded_text(req, MAX_REQ_CHARS)
     kind_value = merged.get("kind")
     kind_raw_clipped = False
     if not kind_value:
@@ -785,7 +789,7 @@ def _deliverable_status(value):
 
 def _new_requirement_accumulator():
     # units_by_status holds (unit record, shown clipped field names) pairs; req_clipped is set when
-    # any row's req was shortened into this bucket's label. Neither private form reaches the view.
+    # this raw requirement's display label was shortened. Neither private form reaches the view.
     return {"counts": {status: 0 for status in _DELIVERABLE_STATUSES}, "superseded": 0,
             "required_open": 0, "enhancement_open": 0, "blockers": 0,
             "kinds": {kind: 0 for kind in DELIVERABLE_KINDS + ("invalid",)},
@@ -820,10 +824,11 @@ def _finalize_requirement(label, declared, accum):
     ordered = by_status["in_progress"][::-1] + by_status["pending"][::-1] + by_status["completed"][::-1]
     clips = _new_clip_counts()
     units = _shown(ordered, MAX_UNIT_LIST, clips)
-    # Rows with different raw reqs can share one bounded label: it counts once if any was shortened.
+    # The requirement label appears once, regardless of how many units belong to it.
     if accum["req_clipped"]:
         clips["req"] += 1
-    return ({"label": label, "declared": declared, "folded": False, "counts": accum["counts"],
+    return ({"label": _bounded_text(label, MAX_REQ_CHARS)[0],
+             "declared": declared, "folded": False, "counts": accum["counts"],
              "superseded": accum["superseded"], "required_open": accum["required_open"],
              "enhancement_open": accum["enhancement_open"], "blockers": accum["blockers"],
              "kinds": accum["kinds"], "units": units, "units_total": len(ordered)}, clips)
@@ -832,6 +837,7 @@ def _finalize_requirement(label, declared, accum):
 def _fold_requirement_labels(buckets, declared_labels):
     """Sorted requirement entries bounded to MAX_REQUIREMENT_LABELS; overflow folds into "other".
 
+    Keys are raw identities: requirements whose display labels collide remain separate entries.
     The folded overflow entry is distinguished by "folded": True rather than by its "other"
     label, so a genuine requirement literally named "other" keeps its own entry (folded False).
     The third value is the clip counts of the kept entries; the folded entry shows no units and a
@@ -904,6 +910,7 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
     for task_id, step in steps.items():
         entry = lineage.get(task_id)
         resolved = _resolve_unit(entry)
+        displayed_req = _bounded_text(resolved["req"], MAX_REQ_CHARS)[0]
         verdict = verdicts[task_id]
         status = _deliverable_status(step.get("status"))
         is_open = status in _OPEN_STATUSES
@@ -962,7 +969,7 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         elif is_superseded and status == "completed":
             conflict = "completed_and_superseded"
         if conflict is not None:
-            conflicts_full.append(({"id": display_id, "req": resolved["req"], "reason": conflict,
+            conflicts_full.append(({"id": display_id, "req": displayed_req, "reason": conflict,
                                     "successor": successor},
                                    _among(row_clipped, ("id", "req", "superseded_by"))))
         if is_blocker:
@@ -971,7 +978,7 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
             # shown text counts under the field it came from.
             carries_blocker_text = resolved["blocker"].strip().lower() != "true"
             blocker_reason = resolved["blocker"] if carries_blocker_text else resolved["reason"]
-            blockers_full.append(({"id": display_id, "req": resolved["req"], "label": unit_record["label"],
+            blockers_full.append(({"id": display_id, "req": displayed_req, "label": unit_record["label"],
                                    "reason": blocker_reason},
                                   _among(row_clipped, ("id", "req", "label",
                                                        "blocker" if carries_blocker_text else "reason"))))

@@ -243,6 +243,15 @@ window; `closure.window.completed` counts distinct tasks observed being set to
 per-row supersession verdict as `closure.superseded` (successor observed and
 tracked, and the chain never cycles back) to tasks tracked at the end of the
 window, so the two `superseded` counts never disagree on which rows qualify.
+
+The window's `created` and `completed` counts retain those observed events even
+when a task is later deleted or omitted by `TaskList`. Current requirement and
+closure totals include only tasks still tracked. For example, creating a task,
+completing it, and then removing it leaves `window.created = 1` and
+`window.completed = 1`, while current `closure.completed = 0`. That difference
+alone does not indicate missing work; compare current totals with current tasks,
+and use the window counts to describe activity during the observed window.
+
 `stale_in_progress` reuses exactly the staleness rule the `plan` steps above
 already use (over forty-five minutes since the last update on the turn's own
 clock, and only once a turn anchor is found).

@@ -180,6 +180,70 @@ class DeliverablesFixture(Fixture):
 
 
 class LineageTests(DeliverablesFixture):
+    def test_requirements_with_the_same_clipped_label_keep_separate_accounting(self):
+        first, second = 'R123456789012345A', 'R123456789012345B'
+        self.create('1', 'First unit', metadata={'req': first})
+        self.create('2', 'Same requirement', metadata={'req': first})
+        self.create('3', 'Different requirement', metadata={'req': second, 'blocker': 'true'})
+        self.update('1', status='completed')
+        self.update('2', status='completed')
+        deliverables = self.view()['deliverables']
+        requirements = deliverables['requirements']
+        self.assertEqual(len(requirements), 2)
+        self.assertEqual([entry['label'] for entry in requirements], [first[:16], second[:16]])
+        self.assertEqual([entry['units_total'] for entry in requirements], [2, 1])
+        self.assertEqual([entry['counts']['completed'] for entry in requirements], [2, 0])
+        self.assertEqual([entry['required_open'] for entry in requirements], [0, 1])
+        self.assertEqual([entry['blockers'] for entry in requirements], [0, 1])
+        self.assertEqual([{unit['id'] for unit in entry['units']} for entry in requirements],
+                         [{'1', '2'}, {'3'}])
+        self.assertEqual(deliverables['limits']['notes'], ['character bounds clipped: req 3'])
+        self.assert_reconciles(deliverables)
+
+    def test_redacted_requirement_labels_do_not_merge_or_leak_raw_identity(self):
+        self.create('1', 'First unit', metadata={'req': '/leakprobe/first', 'blocker': 'true'})
+        self.create('2', 'Second unit', metadata={'req': '/leakprobe/second', 'superseded_by': '#missing'})
+        view = self.view()
+        deliverables = view['deliverables']
+        self.assertEqual([entry['label'] for entry in deliverables['requirements']], ['<path>', '<path>'])
+        self.assertEqual([entry['units_total'] for entry in deliverables['requirements']], [1, 1])
+        self.assertEqual(deliverables['blockers'][0]['req'], '<path>')
+        self.assertEqual(deliverables['conflicts'][0]['req'], '<path>')
+        self.assertNotIn('/leakprobe', json.dumps(view))
+        self.assert_reconciles(deliverables)
+
+    def test_whitespace_only_requirements_keep_enhancements_required_and_blocking(self):
+        for task_id, blank in [('1', '   '), ('2', '\t\n'), ('3', '\u2003')]:
+            self.create(task_id, 'Unmapped work', metadata={'req': blank, 'kind': 'enhancement',
+                                                         'blocker': 'true'}, description='req=R1')
+        self.create('4', 'Completed unmapped work', metadata={'req': ' ', 'kind': 'enhancement'})
+        self.update('4', status='completed')
+        self.create('5', 'Nonblank label unchanged', metadata={'req': ' R1 ', 'kind': 'enhancement'})
+        deliverables = self.view()['deliverables']
+        self.assertEqual([entry['label'] for entry in deliverables['requirements']], [' R1 '])
+        self.assertEqual(deliverables['unmapped'], {**EMPTY_UNMAPPED, 'count': 4, 'ids': ['1', '2', '3', '4'],
+                                                   'required_open': 3, 'completed': 1, 'blockers': 3})
+        self.assertEqual(deliverables['closure']['required_open'], 3)
+        self.assertEqual(deliverables['closure']['enhancement_open'], 1)
+        self.assertEqual(deliverables['closure']['enhancement_completed'], 0)
+        self.assertEqual(deliverables['closure']['blockers'], 3)
+        self.assertEqual([entry['req'] for entry in deliverables['blockers']], [None, None, None])
+        self.assert_reconciles(deliverables)
+
+    def test_colliding_display_labels_still_obey_the_requirement_count_bound(self):
+        for index in range(33):
+            self.create(str(index), 'Separate requirement', metadata={'req': 'R' * 16 + f'{index:02d}'})
+        deliverables = self.view()['deliverables']
+        kept = [entry for entry in deliverables['requirements'] if not entry['folded']]
+        folded = [entry for entry in deliverables['requirements'] if entry['folded']]
+        self.assertEqual(len(kept), 32)
+        self.assertEqual([entry['units_total'] for entry in kept], [1] * 32)
+        self.assertEqual(len(folded), 1)
+        self.assertEqual(folded[0]['units_total'], 1)
+        self.assertEqual(deliverables['limits']['notes'],
+                         ['requirement labels bounded to 32', 'character bounds clipped: req 32'])
+        self.assert_reconciles(deliverables)
+
     def test_metadata_and_description_tokens_with_metadata_precedence(self):
         self.create('1', 'R1-1: build the parser', metadata={'req': 'R1', 'kind': 'defect', 'from': 'R0'},
                     description='req=R9 note text')
@@ -641,6 +705,22 @@ class LineageTests(DeliverablesFixture):
         self.assertEqual(view['plan']['total'], 0)
         self.assertEqual(view['deliverables']['requirements'], [])
         self.assertEqual(view['deliverables']['unmapped']['count'], 0)
+
+    def test_removed_completed_tasks_remain_in_window_events_only(self):
+        self.create('1', 'Deleted task', metadata={'req': 'R1'})
+        self.create('2', 'Omitted task', metadata={'req': 'R1'})
+        self.create('3', 'Retained task', metadata={'req': 'R1'})
+        self.update('1', status='completed')
+        self.update('2', status='completed')
+        self.update('1', status='deleted')
+        self.task_list(['#3 [pending] Retained task'])
+        deliverables = self.view()['deliverables']
+        self.assertEqual(deliverables['closure']['window'], {'created': 3, 'completed': 2, 'superseded': 0})
+        self.assertEqual(deliverables['closure']['completed'], 0)
+        self.assertEqual(deliverables['closure']['required_open'], 1)
+        self.assertEqual(deliverables['requirements'][0]['units_total'], 1)
+        self.assertEqual(deliverables['requirements'][0]['units'][0]['id'], '3')
+        self.assert_reconciles(deliverables)
 
     def test_tasklist_omitting_an_id_drops_it_while_keeping_preserves_lineage(self):
         self.create('1', 'R1-1: unit', metadata={'req': 'R1', 'kind': 'defect'})
