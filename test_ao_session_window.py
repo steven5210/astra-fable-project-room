@@ -10,6 +10,7 @@ import ao_project_room as ao
 import ao_read_admission
 import ao_residual_escalation
 import ao_workflow
+import lifecycle_closure
 from test_ao_normal import Fixture
 
 
@@ -67,13 +68,16 @@ class SessionWindowTests(Fixture):
 
     def test_new_parts_arrive_last_in_a_new_session_with_pinned_digests(self):
         carried = self.state()['requests']['spec_review']['carried']
-        self.assertEqual(carried['parts'][-2:], [ao_progress.PART_V2, ao_residual_escalation.PART])
+        self.assertEqual(carried['parts'][-3:],
+                         [ao_progress.PART_V2, ao_residual_escalation.PART, lifecycle_closure.PART])
         self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
         self.assertEqual(carried['part_sha256'][ao_residual_escalation.PART],
                          ao_residual_escalation.INSTRUCTION_SHA256)
+        self.assertEqual(carried['part_sha256'][lifecycle_closure.PART], lifecycle_closure.INSTRUCTION_SHA256)
         impl = self.state()['requests']['impl-1']['carried']
         self.assertNotIn(ao_progress.PART_V2, impl['parts'])
         self.assertNotIn(ao_residual_escalation.PART, impl['parts'])
+        self.assertNotIn(lifecycle_closure.PART, impl['parts'])
 
     def test_a_completed_previous_request_carries_no_notice(self):
         text, carried = self.packet()

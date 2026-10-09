@@ -20,7 +20,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
          "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
-         "read_admission_v1", "progress_plan_v2", "residual_escalation_v1")
+         "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -745,6 +745,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
     import ao_residual_escalation
     texts[ao_residual_escalation.PART] = ao_residual_escalation.INSTRUCTION
+    import lifecycle_closure
+    texts[lifecycle_closure.PART] = lifecycle_closure.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)

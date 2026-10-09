@@ -31,7 +31,7 @@ RUNTIME_FILES = (
     "ao_usage_audit.py", "ao_worker_identity.py", "ao_workflow.py", "changeset_core.py", "changeset_faults.py", "changeset_fs.py",
     "changeset_journal.py", "changeset_ops.py", "changeset_plan.py", "changeset_receipts.py", "changeset_tool.py",
     "deepseek_adapter.py", "handoff_status.py", "heartbeat.py", "text_delegate.py",
-    "implementation.py", "progress.py", "project_room.py", "project_room_mcp.py",
+    "implementation.py", "lifecycle_closure.py", "progress.py", "project_room.py", "project_room_mcp.py",
     "project_room_runtime.py", "qwen_guard.py", "recovery.py", "room.py",
     "session_paths.py", "transcript_audit.py", "verification.py",
 )
