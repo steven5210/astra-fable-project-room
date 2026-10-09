@@ -201,13 +201,21 @@ from TaskCreate/TaskUpdate/TaskList/TodoWrite with pending, in-progress and
 completed counts, and the last assistant text. An additive, read-only
 `deliverables` object folds the same task rows into a lineage and closure
 projection (see [deliverables](../../../docs/reference/progress.md#deliverables-lineage-and-closure)).
+Additive `provenance` and `stages` objects, computed before the transcript is read
+so an unavailable source keeps them, state that the plan and last text are the
+engineer's own and whether the selected request can refresh them, and report the
+saved engineering, verification and acceptance records with closed statuses and
+identity matches — saved identities only, never the live worktree (see
+[provenance](../../../docs/reference/progress.md#provenance-and-stage-evidence)).
 An unregistered or unreadable source reports `source.available: false` with the
 reason instead of failing. The same task list drives AO's plan panel in the
-session view; the `progress_plan_v1`
-workflow part, delivered once per engineer session, asks Fable to keep it current
-per bounded work unit — `progress_plan_v2` supersedes its list-keeping rules (a
-task is one bounded unit, not a phase; residuals become new tasks; `in_progress`
-means active now). The view never changes room state, never releases a hold
+session view; the `progress_plan_v3` workflow part, the consolidated successor
+delivered once per engineer session, asks Fable to keep it current per bounded
+work unit (a task is one bounded unit, not a phase; residuals become new tasks;
+`in_progress` means active now) and to record in each unit's wording which
+handoff evidence level exists, from a received result to independent acceptance.
+`progress_plan_v1` and `progress_plan_v2` are frozen superseded history that is
+never re-sent or backfilled. The view never changes room state, never releases a hold
 and never replaces the receipts, the outcome audit or the report.
 
 If the current task still has an older tool inventory, use the installed plugin's
@@ -514,7 +522,7 @@ browser skill inside an event whose `agent_type` is exactly `pr-opus`, and any
 inside a native worker. New routing preparations use version 3, source-qualified to exact enabled worker models with their family intents and configured `max` effort, and match every tool (`.*`); retained version 1 and version 2 preparations keep their own historical readers and bytes. The root engineer may inspect with Read/Grep/Glob, plan, use the explicitly listed DeepSeek tools and launch the pinned workers. Shell commands, edits, tests, browser tools, controller calls and unknown execution routes are denied at the root. Only a nonempty subagent-only `agent_id` together with a pinned `agent_type` retains execution tools; type alone can also describe a main session started with `--agent` and is refused as ambiguous. It never
 grants a permission; a guard error, a missing interpreter or a missing script
 exits 2, so the call is blocked.
-The one-time `read_admission_v1` part tells Fable to issue Read calls one per message: parallel Reads are mostly refused by the admission correlation and each refusal costs a turn. New preparations and the audited routing refresh also pin `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools for current models only with it, and the `progress_plan_v1` part — its list-keeping rules superseded by `progress_plan_v2` — and AO's plan panel depend on them.
+The one-time `read_admission_v1` part tells Fable to issue Read calls one per message: parallel Reads are mostly refused by the admission correlation and each refusal costs a turn. New preparations and the audited routing refresh also pin `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools for current models only with it, and the `progress_plan_v3` part — which consolidates and supersedes the frozen `progress_plan_v1`/`progress_plan_v2` list-keeping rules, never resent once delivered — and AO's plan panel depend on them.
 
 New AO routing preparations enforce `execution_policy: "orchestrator"`: Fable retains read-only inspection, planning, pinned DeepSeek tools and pinned native delegation; root shell commands, edits, tests, browser actions and other execution tools are denied. The assigned operator or native worker runs probes and gates, including checks Fable requests for its verdict. Fable does not duplicate work assigned to Astra. A capability gap is reported for resolution, never worked around through another tool. This keeps necessary Fable judgment and final review while requiring execution to remain delegated; it does not change MAX or delegate budgets. Older preparations retain their original guard and report `historical_unrestricted_root` instead of claiming this protection.
 

@@ -1,7 +1,9 @@
 """Read-only progress view of one owned request: bounded transcript fold, one-time part and surface registration."""
 
 import contextlib
+import copy
 from datetime import datetime, timezone
+import hashlib
 import io
 import json
 import os
@@ -13,6 +15,7 @@ from unittest.mock import patch
 import ao_native_outcome
 import ao_progress
 import ao_project_room as ao
+import ao_workflow
 import project_room
 import project_room_mcp
 from test_ao_normal import Fixture
@@ -162,18 +165,22 @@ class ProgressViewTests(Fixture):
     def view(self, **kwargs):
         return ao_progress.inspect(self.directory(), self.state(), **kwargs)
 
-    def test_progress_part_delivered_once_with_pinned_digest(self):
-        carried = self.state()['requests']['spec_review']['carried']
-        self.assertIn(ao_progress.PART, carried['parts'])
-        self.assertEqual(carried['part_sha256'][ao_progress.PART], ao_progress.INSTRUCTION_SHA256)
+    def test_progress_part_is_superseded_by_v3_and_never_delivered_with_its_pinned_digest_preserved(self):
+        # Re-pinned for progress_plan_v3 (see SuccessorDigestAndSupersessionTests in this module):
+        # progress_plan_v1's frozen text and digest stay exactly pinned forever, but it is superseded
+        # and is no longer delivered to any session, old or new -- progress_plan_v3 is sent instead.
         self.assertEqual(ao.digest(ao_progress.INSTRUCTION.encode()), ao_progress.INSTRUCTION_SHA256)
+        carried = self.state()['requests']['spec_review']['carried']
+        self.assertNotIn(ao_progress.PART, carried['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION, self.state()['requests']['spec_review']['text'])
+        self.assertIn(ao_progress.PART_V3, carried['parts'])
         self.assertEqual(self.state()['requests']['impl-1']['carried']['parts'], [])
 
-    def test_progress_plan_v2_part_delivered_once_with_pinned_digest(self):
-        carried = self.state()['requests']['spec_review']['carried']
-        self.assertIn(ao_progress.PART_V2, carried['parts'])
-        self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
+    def test_progress_plan_v2_part_is_superseded_by_v3_and_never_delivered_with_its_pinned_digest_preserved(self):
         self.assertEqual(ao.digest(ao_progress.INSTRUCTION_V2.encode()), ao_progress.INSTRUCTION_V2_SHA256)
+        carried = self.state()['requests']['spec_review']['carried']
+        self.assertNotIn(ao_progress.PART_V2, carried['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION_V2, self.state()['requests']['spec_review']['text'])
         self.assertNotIn(ao_progress.PART_V2, self.state()['requests']['impl-1']['carried']['parts'])
 
     def test_the_provider_rate_limit_reading_folds_into_the_view(self):
@@ -898,6 +905,486 @@ class TodoWritePlanTests(Fixture):
             'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
             'groups': [{'key': 'other', 'counts': {'pending': 1, 'in_progress': 1, 'completed': 0},
                         'completed_of_total': '0/2', 'active': ['Reading the evidence']}]})
+
+
+class SuccessorDigestAndSupersessionTests(unittest.TestCase):
+    """progress_plan_v3: pinned digest, SUPERSEDED_PARTS, and frozen v1/v2 history stay valid forever."""
+
+    # Independently copied pin: a change to either the frozen text or its digest is caught, not just one.
+    INSTRUCTION_V3_SHA256 = "9e559c9b963f8a883a979f1f97e3936aba0d2df5c7f7b5c682634da3380b665b"
+
+    def test_instruction_v3_digest_matches_its_pin_and_part_name(self):
+        self.assertEqual(ao_progress.PART_V3, "progress_plan_v3")
+        self.assertEqual(hashlib.sha256(ao_progress.INSTRUCTION_V3.encode()).hexdigest(), self.INSTRUCTION_V3_SHA256)
+        self.assertEqual(ao_progress.INSTRUCTION_V3_SHA256, self.INSTRUCTION_V3_SHA256)
+        self.assertEqual(ao.digest(ao_progress.INSTRUCTION_V3.encode()), ao_progress.INSTRUCTION_V3_SHA256)
+        self.assertTrue(ao_progress.INSTRUCTION_V3.startswith("Progress plan v3"))
+        self.assertTrue(ao_progress.INSTRUCTION_V3.endswith("delegate evidence or review."))
+        self.assertNotIn("\n", ao_progress.INSTRUCTION_V3)
+
+    def test_superseded_parts_names_exactly_v1_and_v2(self):
+        self.assertEqual(ao_progress.SUPERSEDED_PARTS, (ao_progress.PART, ao_progress.PART_V2))
+
+    def test_v3_is_appended_last_and_v1_v2_keep_their_historical_positions_in_parts(self):
+        # ao_workflow.PARTS' exact order/length is independently pinned in test_lifecycle_closure.py;
+        # this only checks the three facts this unit's own correctness depends on.
+        self.assertEqual(ao_workflow.PARTS[-1], ao_progress.PART_V3)
+        self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART), 10)
+        self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART_V2), 12)
+        self.assertEqual(len(ao_workflow.PARTS), len(set(ao_workflow.PARTS)))
+
+    def test_historical_v1_v2_carried_record_still_validates_through_carried_by(self):
+        # A completed request recorded before this unit existed, naming only progress_plan_v1/v2 in its
+        # carried record: frozen history stays valid forever, even though no future packet resends it.
+        request = {'carried': {'parts': [ao_progress.PART, ao_progress.PART_V2],
+                                'part_sha256': {ao_progress.PART: ao_progress.INSTRUCTION_SHA256,
+                                                ao_progress.PART_V2: ao_progress.INSTRUCTION_V2_SHA256},
+                                'spec_record_sha256': None, 'spec_delivery': None}}
+        record, names = ao_workflow.carried_by(request)
+        self.assertIsNone(record)
+        self.assertEqual(set(names), {ao_progress.PART, ao_progress.PART_V2})
+
+
+class NewSessionSuccessorDeliveryTests(Fixture):
+    """A brand-new session receives progress_plan_v3 only; v1/v2 text is never sent to it."""
+
+    def setUp(self):
+        super().setUp()
+        self.room = self.open(); self.spec(); self.bind(); self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation', 'impl-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+
+    def test_new_session_receives_only_the_successor_part(self):
+        request = self.state()['requests']['spec_review']
+        carried = request['carried']
+        self.assertIn(ao_progress.PART_V3, carried['parts'])
+        self.assertEqual(carried['part_sha256'][ao_progress.PART_V3], ao_progress.INSTRUCTION_V3_SHA256)
+        self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
+        # Superseded parts are never sent to a brand-new session either -- not merely "already delivered".
+        self.assertNotIn(ao_progress.PART, carried['parts'])
+        self.assertNotIn(ao_progress.PART_V2, carried['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION, request['text'])
+        self.assertNotIn(ao_progress.INSTRUCTION_V2, request['text'])
+        # Already delivered with the first packet; a later packet in the same session omits it.
+        self.assertNotIn(ao_progress.PART_V3, self.state()['requests']['impl-1']['carried']['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION_V3, self.state()['requests']['impl-1']['text'])
+
+    def test_context_summary_reports_the_successor_as_verified_delivered(self):
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertEqual(summary['progress_plan']['successor'], ao_progress.PART_V3)
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'verified_delivered')
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'receipt_verified')
+        self.assertIsInstance(summary['progress_plan']['meaning'], str)
+        for part in (ao_progress.PART, ao_progress.PART_V2):
+            # Never actually delivered to this session (superseded before its first packet), yet
+            # truthfully satisfied because the receipt-verified successor now covers it.
+            self.assertFalse(summary['progress_plan']['superseded'][part]['delivered'])
+            self.assertTrue(summary['progress_plan']['superseded'][part]['satisfied'])
+        self.assertNotIn(ao_progress.PART, summary['undelivered_parts'])
+        self.assertNotIn(ao_progress.PART_V2, summary['undelivered_parts'])
+        self.assertNotIn(ao_progress.PART_V3, summary['undelivered_parts'])
+
+    def test_context_summary_without_a_directory_is_metadata_only_and_never_satisfied(self):
+        # Fail-closed by design: with no directory to verify receipts against, the successor's
+        # delivery is "unverified" (not "verified_delivered") and satisfied is always False.
+        summary = ao_workflow.context_summary(self.state(), directory=None)
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'unverified')
+        # No directory at all means no authenticated chain to read it from, so the delivered/satisfied
+        # fields above are metadata-only, even though this same session's successor is in fact verified
+        # (see test_context_summary_reports_the_successor_as_verified_delivered with a directory).
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'metadata_only')
+        for part in (ao_progress.PART, ao_progress.PART_V2):
+            self.assertFalse(summary['progress_plan']['superseded'][part]['satisfied'])
+
+    def test_context_summary_without_a_directory_is_unverified_even_when_v3_is_absent_from_metadata(self):
+        # Regression for a fixed code defect: with no directory, successor_delivery must stay "unverified"
+        # even when the metadata-only parts genuinely lack progress_plan_v3 -- never "undelivered", which
+        # would misreport an unauthenticated read as a verified absence.
+        state = copy.deepcopy(self.state())
+        request = state['requests']['spec_review']
+        request['carried']['parts'].remove(ao_progress.PART_V3)
+        request['carried']['part_sha256'].pop(ao_progress.PART_V3)
+        held = ao_workflow.delivered(state, state['bindings']['engineer']['session_id'])
+        self.assertNotIn(ao_progress.PART_V3, held['parts'])
+        summary = ao_workflow.context_summary(state, directory=None)
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'unverified')
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'metadata_only')
+        for part in (ao_progress.PART, ao_progress.PART_V2):
+            self.assertFalse(summary['progress_plan']['superseded'][part]['satisfied'])
+
+    def test_ao_room_status_engineer_context_exposes_the_same_accounting(self):
+        status = self.service.ao_room_status(self.room)
+        progress_plan = status['engineer_context']['progress_plan']
+        self.assertEqual(progress_plan['successor'], ao_progress.PART_V3)
+        self.assertEqual(progress_plan['successor_delivery'], 'verified_delivered')
+        self.assertEqual(progress_plan['delivered_history'], 'receipt_verified')
+        self.assertTrue(progress_plan['superseded'][ao_progress.PART]['satisfied'])
+        self.assertTrue(progress_plan['superseded'][ao_progress.PART_V2]['satisfied'])
+
+
+class RetainedV1OnlySuccessorDeliveryTests(Fixture):
+    """A session retained from when only progress_plan_v1 existed (not yet v2) gets v3 once, never v1/v2
+    text again -- even though this exact session genuinely never received progress_plan_v2."""
+
+    # Real historical prefix of PARTS ending at progress_plan_v1, before read_admission_v1/progress_plan_v2
+    # existed. Relies on test_lifecycle_closure.py's own pin of PARTS' order and length.
+    V1_ONLY_PARTS = ao_workflow.PARTS[:11]
+
+    def setUp(self):
+        super().setUp()
+        # Supersession is also disabled while building this simulated-historical first packet: the
+        # real (current) ao_progress.SUPERSEDED_PARTS would otherwise skip progress_plan_v1 too, since
+        # packet()'s skip is unconditional and does not look at the patched PARTS tuple's own content.
+        with patch.object(ao_workflow, 'PARTS', self.V1_ONLY_PARTS), patch.object(ao_progress, 'SUPERSEDED_PARTS', ()):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def test_correction_carries_the_successor_once_never_v1_or_v2_text(self):
+        held_before = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'],
+                                            self.directory())
+        self.assertIn(ao_progress.PART, held_before['parts'])        # genuinely delivered under V1_ONLY_PARTS
+        self.assertNotIn(ao_progress.PART_V2, held_before['parts'])  # did not exist yet at that point
+        self.assertNotIn(ao_progress.PART_V3, held_before['parts'])
+
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['carried']['parts'].count(ao_progress.PART_V3), 1)
+        self.assertNotIn(ao_progress.PART, request['carried']['parts'])     # already delivered, not resent
+        self.assertNotIn(ao_progress.PART_V2, request['carried']['parts'])  # superseded, never backfilled
+        self.assertNotIn(ao_progress.INSTRUCTION, request['text'])
+        self.assertNotIn(ao_progress.INSTRUCTION_V2, request['text'])
+        self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
+
+
+class RetainedV2OnlySuccessorDeliveryTests(Fixture):
+    """A synthetic retained session that has progress_plan_v2 recorded but never progress_plan_v1: proves
+    the supersession skip is unconditional per-part, never "whichever superseded part came first"."""
+
+    # Synthetic, not a real historical PARTS value -- constructed only to prove the point above.
+    V2_ONLY_PARTS = ao_workflow.PARTS[:10] + (ao_progress.PART_V2,)
+
+    def setUp(self):
+        super().setUp()
+        # Supersession is also disabled while building this simulated first packet; see the matching
+        # comment in RetainedV1OnlySuccessorDeliveryTests.setUp for why both patches are needed together.
+        with patch.object(ao_workflow, 'PARTS', self.V2_ONLY_PARTS), patch.object(ao_progress, 'SUPERSEDED_PARTS', ()):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def test_progress_plan_v1_is_never_backfilled_even_though_genuinely_undelivered(self):
+        held = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'],
+                                     self.directory())
+        self.assertNotIn(ao_progress.PART, held['parts'])  # genuinely never delivered to this session
+        self.assertIn(ao_progress.PART_V2, held['parts'])  # genuinely delivered
+
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertNotIn(ao_progress.PART, request['carried']['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION, request['text'])
+        self.assertEqual(request['carried']['parts'].count(ao_progress.PART_V3), 1)
+
+        # undelivered_parts never lists a superseded part, even one this exact session truly lacks.
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertNotIn(ao_progress.PART, summary['undelivered_parts'])
+        self.assertFalse(summary['progress_plan']['superseded'][ao_progress.PART]['delivered'])
+        self.assertTrue(summary['progress_plan']['superseded'][ao_progress.PART]['satisfied'])
+
+
+class RetainedPreV1SuccessorDeliveryTests(Fixture):
+    """A retained session whose first completed turn predates progress_plan_v1 itself: neither superseded
+    part was ever delivered to it, yet the successor still delivers once and both are reported satisfied."""
+
+    # Real historical prefix of PARTS ending before progress_plan_v1 ever existed.
+    PRE_V1_PARTS = ao_workflow.PARTS[:10]
+
+    def setUp(self):
+        super().setUp()
+        # This historical prefix predates progress_plan_v1 itself, so no superseded part can be
+        # carried and no SUPERSEDED_PARTS patch is needed.
+        with patch.object(ao_workflow, 'PARTS', self.PRE_V1_PARTS):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def test_successor_delivers_once_and_both_superseded_parts_report_satisfied_though_never_delivered(self):
+        held_before = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'],
+                                            self.directory())
+        self.assertNotIn(ao_progress.PART, held_before['parts'])     # genuinely never existed for this session
+        self.assertNotIn(ao_progress.PART_V2, held_before['parts'])  # genuinely never existed for this session
+        self.assertNotIn(ao_progress.PART_V3, held_before['parts'])
+
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        # This historical prefix also predates read_admission_v1/residual_escalation_v1/lifecycle_closure_v1,
+        # so the correction legitimately carries those too; the point here is only that progress_plan_v3
+        # is carried exactly once and neither superseded name is ever carried.
+        self.assertEqual(request['carried']['parts'].count(ao_progress.PART_V3), 1)
+        self.assertNotIn(ao_progress.PART, request['carried']['parts'])
+        self.assertNotIn(ao_progress.PART_V2, request['carried']['parts'])
+        self.assertNotIn(ao_progress.INSTRUCTION, request['text'])
+        self.assertNotIn(ao_progress.INSTRUCTION_V2, request['text'])
+        self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
+
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'verified_delivered')
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'receipt_verified')
+        for part in (ao_progress.PART, ao_progress.PART_V2):
+            self.assertFalse(summary['progress_plan']['superseded'][part]['delivered'])
+            self.assertTrue(summary['progress_plan']['superseded'][part]['satisfied'])
+
+        # ao_room_status exposes the identical accounting through engineer_context.
+        status = self.service.ao_room_status(self.room)
+        progress_plan = status['engineer_context']['progress_plan']
+        self.assertEqual(progress_plan['successor_delivery'], 'verified_delivered')
+        self.assertEqual(progress_plan['delivered_history'], 'receipt_verified')
+        self.assertTrue(progress_plan['superseded'][ao_progress.PART]['satisfied'])
+        self.assertTrue(progress_plan['superseded'][ao_progress.PART_V2]['satisfied'])
+
+
+class UpgradingSessionSuccessorDeliveryTests(Fixture):
+    """A session retained with both v1 and v2 already delivered, fully caught up through
+    lifecycle_closure_v1, gets only the new successor once, then nothing further (already-upgraded)."""
+
+    # The real 15-name PARTS tuple immediately before this unit (everything except progress_plan_v3).
+    PARTS_BEFORE_V3 = ao_workflow.PARTS[:15]
+
+    def setUp(self):
+        super().setUp()
+        # Supersession is also disabled while building this simulated first packet; see the matching
+        # comment in RetainedV1OnlySuccessorDeliveryTests.setUp for why both patches are needed together.
+        with patch.object(ao_workflow, 'PARTS', self.PARTS_BEFORE_V3), patch.object(ao_progress, 'SUPERSEDED_PARTS', ()):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def packet(self):
+        return ao_workflow.packet(self.service, self.directory(), self.state(), 'engineer',
+                                  'correction', 'Continue.')
+
+    def test_successor_delivers_once_then_an_already_upgraded_session_carries_nothing(self):
+        held_before = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'],
+                                            self.directory())
+        self.assertIn(ao_progress.PART, held_before['parts'])
+        self.assertIn(ao_progress.PART_V2, held_before['parts'])
+        self.assertNotIn(ao_progress.PART_V3, held_before['parts'])
+
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3])
+        self.assertEqual(request['carried']['part_sha256'], {ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256})
+        self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
+
+        # Already upgraded: a further completed request leaves nothing left to send.
+        text2, carried2 = self.packet()
+        self.assertEqual(carried2['parts'], [])
+        self.assertNotIn(ao_progress.INSTRUCTION_V3, text2)
+
+
+class UncertainSuccessorDeliveryTests(Fixture):
+    """A lost native acknowledgement leaves the successor carried-but-uncertain; the controller withholds
+    credit (and 'satisfied') until a verified completion, matching the lifecycle_closure_v1 pattern."""
+
+    PARTS_BEFORE_V3 = ao_workflow.PARTS[:15]
+
+    def setUp(self):
+        super().setUp()
+        # Supersession is also disabled while building this simulated first packet; see the matching
+        # comment in RetainedV1OnlySuccessorDeliveryTests.setUp for why both patches are needed together.
+        with patch.object(ao_workflow, 'PARTS', self.PARTS_BEFORE_V3), patch.object(ao_progress, 'SUPERSEDED_PARTS', ()):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def test_uncertain_carried_successor_is_undelivered_and_unsatisfied_until_verified(self):
+        session_id = self.state()['bindings']['engineer']['session_id']
+        self.fake.lose_ack = True
+        result = self.send('correction', 'corr-uncertain')
+        self.assertEqual(result['state'], 'uncertain')
+        request = self.state()['requests']['corr-uncertain']
+        self.assertEqual(request['state'], 'uncertain')
+        self.assertNotIn('receipt', request)
+        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3])
+
+        held = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertNotIn(ao_progress.PART_V3, held['parts'])
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertIn(ao_progress.PART_V3, summary['undelivered_parts'])
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'undelivered')
+        # A directory was given and its own receipt chain authenticated cleanly, so this "undelivered"
+        # (unlike the no-directory case) is still receipt-verified history, just not yet satisfied.
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'receipt_verified')
+        self.assertFalse(summary['progress_plan']['superseded'][ao_progress.PART]['satisfied'])
+        self.assertFalse(summary['progress_plan']['superseded'][ao_progress.PART_V2]['satisfied'])
+        # ao_room_status exposes the identical accounting through engineer_context.
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['engineer_context']['progress_plan']['successor_delivery'], 'undelivered')
+        self.assertEqual(status['engineer_context']['progress_plan']['delivered_history'], 'receipt_verified')
+
+        # The completed-request pattern: resolve the identical request (no replay) to a
+        # completed, verified turn, then confirm the successor is delivered and satisfied.
+        self.fake.lose_ack = False
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['corr-uncertain']['state'], 'completed')
+
+        held2 = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertIn(ao_progress.PART_V3, held2['parts'])
+        summary2 = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertNotIn(ao_progress.PART_V3, summary2['undelivered_parts'])
+        self.assertEqual(summary2['progress_plan']['successor_delivery'], 'verified_delivered')
+        self.assertEqual(summary2['progress_plan']['delivered_history'], 'receipt_verified')
+        self.assertTrue(summary2['progress_plan']['superseded'][ao_progress.PART]['satisfied'])
+        self.assertTrue(summary2['progress_plan']['superseded'][ao_progress.PART_V2]['satisfied'])
+        status2 = self.service.ao_room_status(self.room)
+        self.assertEqual(status2['engineer_context']['progress_plan']['successor_delivery'], 'verified_delivered')
+        self.assertEqual(status2['engineer_context']['progress_plan']['delivered_history'], 'receipt_verified')
+
+
+class TamperedSuccessorDeliveryTests(Fixture):
+    """Fail-closed tampering: a shape-valid but receipt-inconsistent carried record never reports the
+    successor as delivered or the superseded parts as satisfied -- and is reported through its own
+    "unavailable_integrity" status, never "undelivered" (which would misread tampering as a verified
+    absence)."""
+
+    def setUp(self):
+        super().setUp()
+        self.room = self.open(); self.spec(); self.bind(); self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+
+    def test_tampered_carried_record_fails_closed_never_satisfied(self):
+        state = self.state()
+        session_id = state['bindings']['engineer']['session_id']
+        summary = ao_workflow.context_summary(state, self.directory())
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'verified_delivered')
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'receipt_verified')
+        self.assertTrue(summary['progress_plan']['superseded'][ao_progress.PART]['satisfied'])
+        self.assertTrue(summary['progress_plan']['superseded'][ao_progress.PART_V2]['satisfied'])
+
+        original = copy.deepcopy(state)
+        req = state['requests']['spec_review']
+        # Self-consistent (shape-valid) removal: carried_by()'s own shape check still passes, but this
+        # no longer matches the immutable receipt's carried_sha256 recorded at dispatch time.
+        req['carried']['parts'].remove(ao_progress.PART_V3)
+        req['carried']['part_sha256'].pop(ao_progress.PART_V3)
+        self.service.save(self.directory(), state)
+        try:
+            tampered = self.state()
+            with self.assertRaises(ao.RoomError):
+                ao_workflow.delivered(tampered, session_id, self.directory())
+            summary2 = ao_workflow.context_summary(tampered, self.directory())
+            # Design correction: a broken receipt chain is its own distinct status, never "undelivered".
+            self.assertEqual(summary2['progress_plan']['successor_delivery'], 'unavailable_integrity')
+            self.assertEqual(summary2['progress_plan']['delivered_history'], 'metadata_only')
+            self.assertFalse(summary2['progress_plan']['superseded'][ao_progress.PART]['satisfied'])
+            self.assertFalse(summary2['progress_plan']['superseded'][ao_progress.PART_V2]['satisfied'])
+            # The read-only status projection never raises even though the evidence beneath it is broken.
+            status = self.service.ao_room_status(self.room)
+            self.assertEqual(status['engineer_context']['progress_plan']['successor_delivery'],
+                             'unavailable_integrity')
+            self.assertEqual(status['engineer_context']['progress_plan']['delivered_history'], 'metadata_only')
+        finally:
+            self.service.save(self.directory(), original)
+
+
+class DamagedReceiptSuccessorDeliveryTests(Fixture):
+    """Unrelated damage to a different completed request's own receipt (missing from disk, or
+    unparsable bytes) must never be misread as a verified-absent successor: delivered() raises while
+    scanning that unrelated request, so context_summary reports the distinct "unavailable_integrity"
+    status. The superseded parts' literal delivered-from-metadata history stays truthful (v1/v2 really
+    were delivered before progress_plan_v3 existed) and only their receipt-authenticated "satisfied"
+    flag withdraws."""
+
+    PARTS_BEFORE_V3 = ao_workflow.PARTS[:15]
+
+    def setUp(self):
+        super().setUp()
+        # A retained session with v1/v2 genuinely delivered, like UpgradingSessionSuccessorDeliveryTests.
+        with patch.object(ao_workflow, 'PARTS', self.PARTS_BEFORE_V3), patch.object(ao_progress, 'SUPERSEDED_PARTS', ()):
+            self.room = self.open(); self.spec(); self.bind(); self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+        # Deliver the successor through a correction, with the real (unpatched) PARTS/SUPERSEDED_PARTS;
+        # impl-1's own receipt (above, already completed) carries no progress part and is unrelated to
+        # this delivery.
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.assertIn(ao_progress.PART_V3, self.state()['requests']['corr-1']['carried']['parts'])
+
+    def _assert_unavailable_integrity(self):
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertEqual(summary['progress_plan']['successor_delivery'], 'unavailable_integrity')
+        # The delivered/satisfied fields above fall back to metadata-only: this request's own carried
+        # record is untouched, but the chain-wide authentication scan failed on unrelated evidence, so
+        # nothing from this read can be called receipt-verified.
+        self.assertEqual(summary['progress_plan']['delivered_history'], 'metadata_only')
+        for part in (ao_progress.PART, ao_progress.PART_V2):
+            self.assertTrue(summary['progress_plan']['superseded'][part]['delivered'])
+            self.assertFalse(summary['progress_plan']['superseded'][part]['satisfied'])
+        # The read-only status projection never raises even though the evidence beneath it is broken.
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['engineer_context']['progress_plan']['successor_delivery'],
+                         'unavailable_integrity')
+        self.assertEqual(status['engineer_context']['progress_plan']['delivered_history'], 'metadata_only')
+
+    def test_missing_receipt_on_an_unrelated_request_reports_unavailable_integrity(self):
+        path = self.directory() / self.state()['requests']['impl-1']['receipt']
+        original = path.read_bytes()
+        path.unlink()
+        try:
+            self._assert_unavailable_integrity()
+        finally:
+            path.write_bytes(original)
+
+    def test_corrupt_receipt_on_an_unrelated_request_reports_unavailable_integrity(self):
+        path = self.directory() / self.state()['requests']['impl-1']['receipt']
+        original = path.read_bytes()
+        path.write_text('{')
+        try:
+            self._assert_unavailable_integrity()
+        finally:
+            path.write_bytes(original)
+
+    def test_receipt_replaced_by_different_valid_json_on_an_unrelated_request_reports_unavailable_integrity(self):
+        # Distinct from the corrupt-bytes case above: this receipt is syntactically valid JSON (read()
+        # parses it cleanly) with the same shape, but the rewritten receipt bytes no longer match the
+        # request's recorded receipt_sha256 digest, so completed_receipt() refuses ("Native result
+        # receipt was modified"), the authenticated delivered() call raises, and status reports
+        # unavailable_integrity.
+        path = self.directory() / self.state()['requests']['impl-1']['receipt']
+        original = path.read_bytes()
+        receipt = json.loads(original.decode('utf-8'))
+        self.assertIn('carried_sha256', receipt)
+        receipt['carried_sha256'] = hashlib.sha256(b'a different, syntactically valid receipt').hexdigest()
+        path.write_text(json.dumps(receipt))
+        try:
+            self._assert_unavailable_integrity()
+        finally:
+            path.write_bytes(original)
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import ao_delegates
 import ao_model_boundaries
+import ao_progress
 import ao_project_room as ao
 import ao_workflow
 import deepseek_adapter as ds
@@ -49,7 +50,10 @@ class ContinuationTests(Fixture):
         spec = self.service.spec(self.directory(), self.state())
         self.assertIn(spec['content'], initial['text'])
         self.assertIn(spec['sha256'], initial['text'])
-        self.assertEqual(initial['carried']['parts'], list(ao_workflow.PARTS))
+        # progress_plan_v1/v2 are permanently superseded by progress_plan_v3 and are never carried,
+        # even on this brand-new session's first packet, so they are excluded from the expectation.
+        self.assertEqual(initial['carried']['parts'],
+                         [p for p in ao_workflow.PARTS if p not in ao_progress.SUPERSEDED_PARTS])
         text = 'Implement the agreed plan.\n\nKeep these exact bytes.  '
         self.message('implementation', 'implementation', text)
         request = self.state()['requests']['implementation']
