@@ -112,6 +112,233 @@ The top-level `rate_limits` block in `ao_room_progress`, and the small `rate_lim
 
 The block is advisory only: it grants nothing, changes no state, and a stale or absent reading is a reason to report "not reported" or the unavailability reason, not to infer headroom.
 
+## Deliverables (lineage and closure)
+
+`ao_room_progress` also carries an additive, read-only `deliverables` object,
+folded from the same native task-tool rows as `plan` above; it performs no state
+mutation, hold release, receipt or report replacement. Shape, version 1:
+
+```json
+{
+  "version": 1, "available": true,
+  "anchor": {"spec_record_sha256": "...", "spec_revision": 3, "spec_sha256": "...",
+             "declared_labels": ["R1", "R2"]},
+  "requirements": [{
+    "label": "R1", "declared": true, "folded": false,
+    "counts": {"pending": 1, "in_progress": 0, "completed": 2, "unknown": 0},
+    "superseded": 0, "required_open": 1, "enhancement_open": 0, "blockers": 0,
+    "kinds": {"planned": 2, "defect": 1, "proof_gap": 0, "dependency": 0, "enhancement": 0, "invalid": 0},
+    "units": [{"id": "...", "label": "...", "status": "pending", "kind": "defect", "kind_raw": null,
+               "from": "...", "superseded_by": null, "blocker": null, "stale_in_progress": false}],
+    "units_total": 3
+  }],
+  "unmapped": {"count": 0, "metadata_unavailable": 0, "superseded": 0, "required_open": 0,
+               "completed": 0, "blockers": 0, "ids": []},
+  "superseded": [], "superseded_total": 0,
+  "blockers": [], "blockers_total": 0,
+  "conflicts": [{"id": "...", "req": "...", "successor": "...",
+                 "reason": "successor_unobserved | superseded_cycle | completed_and_superseded"}],
+  "conflicts_total": 1,
+  "closure": {"completed": 2, "enhancement_completed": 0, "required_open": 1, "enhancement_open": 0,
+              "superseded": 0, "blockers": 0, "conflicts": 1, "stale_in_progress": 0,
+              "window": {"created": 3, "completed": 2, "superseded": 0}},
+  "limits": {"truncated": false, "notes": []}
+}
+```
+
+**Lineage source.** Each task's `req`, `kind`, `from`, `blocker`, `superseded_by`
+and `reason` come from the native `TaskCreate`/`TaskUpdate` `metadata` (merged key
+by key across calls — a `null` value deletes that key, and only string/bool/number
+values are kept) or from `key=value` tokens in the task description: one
+whitespace-free token per key, except `reason=` which consumes the rest of its
+line and so must be last on that line. Metadata wins over a description token for
+the same key; the two sources disagreeing is not itself reported, only the merged
+(metadata-wins) result. The merged `superseded_by` value is then normalized:
+surrounding whitespace and exactly one leading `#` are stripped, and a value of
+`None`, `false`, an empty string, or the literal text `false` in any letter case
+— or an empty `superseded_by=` description token — is treated as absent,
+meaning no supersession and no conflict for that row.
+
+**Kind.** An empty or absent `kind` is `planned`; `defect`, `proof_gap`,
+`dependency` and `enhancement` are kept as given; any other value is reported as
+`invalid` with the raw value (bounded) in `kind_raw`.
+
+**Unmapped work.** A unit with no usable `req` is unmapped — never inferred from
+its label — and an open unmapped unit still counts as required work. Among
+unmapped units, `metadata_unavailable` further counts those whose task id this
+window never created or updated (seen only through `TaskList`), so their lineage
+is unobservable rather than merely missing a `req` token. `unmapped.superseded`,
+`.required_open` and `.completed` partition `unmapped.count` by the same
+per-row disposition as the per-requirement `counts` — superseded identity
+first (below), then open or completed by the row's own status; `unmapped.blockers`
+counts the subset of `unmapped.required_open` rows carrying a blocker, exactly
+like the per-requirement blockers rule. Unmapped rows are never enhancements,
+so there is no `unmapped.enhancement_*` split.
+
+**Superseded and conflicts.** Identity for supersession is compared on the
+normalized `superseded_by` id above against the window's tracked task ids,
+never on a redacted or bounded display value; `units[].superseded_by`,
+`superseded[].successor` and `conflicts[].successor` show that id after
+redaction and bounding like every other id (see Redaction and bounds below). A
+row is superseded only when its successor is an observed tracked task **and**
+the successor chain starting from that row never leads back to the row itself;
+this depends only on that, never on the unit's own open/closed status. A
+superseded row keeps its own status but is excluded from completed, open and
+blocker counts. A self-reference or a longer cycle is not a valid supersession:
+the row stays open (or completed, by its own status), is never counted under
+`superseded`, and is reported instead as a conflict with reason
+`superseded_cycle`. Chains are dispositions resolved along the whole chain, not
+a rule applied to one row in isolation: for 1 → 2 → 3, rows 1 and 2 are
+superseded and 3 stays open; for 1 → 2 → 3 → 2, row 1 is superseded while rows
+2 and 3 are cycle conflicts (2 closes the cycle back to itself, and 3's chain
+also returns to 2). One shared predicate feeds both `closure.superseded` and
+`closure.window.superseded`, so the two counts never disagree on which rows
+qualify.
+
+Each row gets at most one conflict reason, chosen in this precedence:
+`successor_unobserved` when `superseded_by` names an id the window never
+observed as a tracked task (for example, never created, or later deleted);
+`superseded_cycle` for the self-reference/cycle case above; then
+`completed_and_superseded` when a completed row also has a currently-tracked,
+non-cyclic successor — that row is counted under `superseded`, never under
+`completed`.
+
+**Enhancements.** `kind: "enhancement"` paired with a usable `req` is counted
+separately (`enhancement_open`/`enhancement_completed`) and never counts toward
+required work or blockers.
+
+**Blockers.** An open, non-superseded, non-enhancement unit with a `blocker`
+value other than `false` is a blocker; a bare `true` borrows the unit's own
+`reason` text as the explanation shown in the `blockers` list.
+
+**Requirement anchor.** `declared_labels` are the requirement labels the room's
+immutable spec body declares — a line starting with a label such as `R1` followed
+by whitespace and a hyphen, colon, en dash or em dash, then whitespace — read
+independently of the transcript and bounded to 32; `declared` marks whether a
+requirement entry's label was one of them. An unreadable or malformed spec record
+yields the `"spec record unavailable"` note instead of a crash. Requirement
+entries are sorted by label and bounded to 32; overflow folds into one
+`label: "other"` entry with `folded: true` (a requirement literally named `other`
+keeps its own entry with `folded: false`).
+
+**Closure counts.** Every number in `closure` is a measured count, never a
+percentage or an invented denominator. The frozen rule "a superseded row is
+never counted as completed" applies at every level: each requirement's
+`counts` (`pending`, `in_progress`, `completed`, `unknown`) counts only its
+non-superseded rows; the requirement's own `superseded` counts its superseded
+rows of any status; and `units_total == sum(counts) + superseded` for every
+requirement, including the folded `other` entry. The same five identities hold
+on every available view:
+
+- (a) `closure.superseded == Σ requirements[].superseded` (the folded `other`
+  entry included) `+ unmapped.superseded`.
+- (b) `closure.required_open + closure.enhancement_open == Σ requirements[].(counts.pending + counts.in_progress + counts.unknown) + unmapped.required_open`.
+- (c) `closure.completed + closure.enhancement_completed == Σ requirements[].counts.completed + unmapped.completed`.
+- (d) `closure.blockers == Σ requirements[].blockers + unmapped.blockers`.
+- (e) `closure.conflicts == conflicts_total`.
+
+`closure.window.created` counts successful `TaskCreate` calls observed in the
+window; `closure.window.completed` counts distinct tasks observed being set to
+`completed` through `TaskUpdate`; `closure.window.superseded` applies the same
+per-row supersession verdict as `closure.superseded` (successor observed and
+tracked, and the chain never cycles back) to tasks tracked at the end of the
+window, so the two `superseded` counts never disagree on which rows qualify.
+
+The window's `created` and `completed` counts retain those observed events even
+when a task is later deleted or omitted by `TaskList`. Current requirement and
+closure totals include only tasks still tracked. For example, creating a task,
+completing it, and then removing it leaves `window.created = 1` and
+`window.completed = 1`, while current `closure.completed = 0`. That difference
+alone does not indicate missing work; compare current totals with current tasks,
+and use the window counts to describe activity during the observed window.
+
+`stale_in_progress` reuses exactly the staleness rule the `plan` steps above
+already use (over forty-five minutes since the last update on the turn's own
+clock, and only once a turn anchor is found).
+
+**Availability.** `available` is false whenever the transcript is unavailable or
+no task tool activity was observed; then every count is zero, every list is
+empty, and `limits.notes` states why.
+
+**Redaction and bounds.** A single shared `_redact` helper is the one path
+redactor used across the view: the plan's step and group labels, `last_text`,
+and every string inside `deliverables` all run through it. It rewrites every
+absolute POSIX path — a `/`-rooted run, including one that starts with a
+second `/` — and every `file://` URL to `<path>`, wherever that path starts: at
+the start of the string, after whitespace, or after any non-path character
+such as a backtick, a straight or smart quote, `<`, `[`, `{`, `(`, `@`, `|`,
+`*`, `=`, `:`, `,` or `;`. A `/` immediately preceded by a word character, `.`
+or `~` is not a path start, so relative paths, numeric ratios and `and/or` are
+left intact. Any other `scheme://` URL keeps its scheme and authority and the
+rest of it is scanned like other text, so `https://example.com/a/b` stays
+intact while an absolute path embedded later, for example after `?next=`, is
+still redacted; `file://` URLs are always redacted whole. Two gaps are
+known and pre-existing (tracked as backlog, not claimed as covered): `~/`
+home-relative paths and Windows-style paths are not redacted. This redaction
+claim is scoped to the shared redactor's callers and to every string inside
+`deliverables`; it is not a claim that every string the whole progress view
+emits is redacted — outside `deliverables`, `plan.steps[].status`,
+`launches[].subagent_type` and the turn histogram keys are emitted exactly as
+observed.
+
+Every id-valued field in `deliverables` — `units[].id`, `units[].superseded_by`,
+`superseded[].id` and `.successor`, `blockers[].id`, `conflicts[].id` and
+`.successor`, and `unmapped.ids[]` — is redacted and then bounded to 64
+characters (`MAX_ID_CHARS`); the former 32-character bound that applied only to
+`superseded_by` is now this same 64. The other per-key bounds are `req` 16
+characters (shown as `requirements[].label`, `blockers[].req` and
+`conflicts[].req`), `label` 200 (`units[].label` and `blockers[].label`),
+`from` 64, `blocker` 120, `reason` 200 and `kind_raw` 32. Each requirement's
+`units` list, the top-level `superseded`, `blockers` and `conflicts` lists, and
+`unmapped.ids` hold at most 16 entries (the true count is in the matching
+`_total`/`count` field); `declared_labels` and the requirement list are each
+bounded to 32; `limits.notes` holds at most 8 strings.
+
+Every exceeded bound is disclosed in `limits`. A list or label bound sets
+`limits.truncated` and adds that bound's own note
+(`requirement units bounded to 16`, `requirement labels bounded to 32`,
+`unmapped ids bounded to 16`, `superseded list bounded to 16`,
+`blockers list bounded to 16`, `conflicts list bounded to 16`,
+`declared labels bounded to 32`). A character bound that shortened a value the
+view shows also sets `limits.truncated` and adds exactly one note,
+`character bounds clipped: <field> <count>, ...`, listing in a fixed order
+(`id`, `label`, `req`, `kind_raw`, `from`, `blocker`, `reason`, `superseded_by`)
+each per-key field with the number of shown values that were shortened. A
+value shown in two places counts in each: a 121-character `blocker` on an open
+blocker row counts once in `units[].blocker` and once as the `blockers[].reason`
+echo of that text (`blocker 2`); `superseded_by` covers `units[].superseded_by`,
+`superseded[].successor` and `conflicts[].successor`; `reason` covers
+`superseded[].reason` and the `blockers[].reason` that a bare `true` blocker
+borrows; `req` counts a kept requirement entry's label once plus each
+`blockers[].req` and `conflicts[].req`. Redaction never counts as clipping:
+bounding is measured on the redacted text, so a path rewritten to `<path>` is
+not a shortened value. Values the view does not show are not counted — a
+row's `reason` when the row is neither superseded nor a bare-`true` blocker,
+unit records beyond the 16-unit bound, entries beyond a list bound, and
+requirement labels folded into `other` — because the list and label notes
+already disclose those. With at most one anchor note, six list/label notes and
+this one clip note, the eight-string `limits.notes` budget is never exceeded.
+The view's `plan.steps[].label`, `plan.groups[].active[]` and top-level
+`launches[].description` are pre-existing outputs outside `deliverables` and
+carry no clip accounting.
+
+**Status vocabulary.** Inside `deliverables`, a unit's `status` is one of
+`pending`, `in_progress`, `completed` or `unknown`; any other observed value is
+shown as `unknown`, listed under the pending bucket, counted as open (never as
+completed), and folded into that requirement's `counts.unknown`.
+`plan.steps[].status` above is a separate field and is unchanged by this.
+
+**Engineer reports.** The lineage labels, classifications and dispositions this
+view folds are the same ones Fable records inside the existing engineering report
+string-list fields (`changes`, `remaining_gaps`, `backlog`, `review_findings`,
+`routing_log` entries); no report field was added for this. The one-time
+`lifecycle_closure_v1` workflow part (see
+[lifecycle-closure delivery](../guides/efficient-continuation.md#lifecycle-closure-delivery-ao-rooms))
+is what asks Fable to record this lineage going forward; the `deliverables`
+projection itself is always computed read-only from whatever task metadata and
+description tokens are actually present, independently of whether that part has
+been delivered yet.
+
 ## How Astra should use it
 
 During a bounded `room_job_status` wait, summarize `phase`, `phase_detail`, `elapsed_seconds`, `activity` (category, source, time), pending, background, and completed delegates with any attributed child's model and `turn_ended`, and `deadline.remaining_seconds` with its scope. Say "remaining until the pinned timeout", never an estimated finish. A `background` delegate is launched, not finished: report its child's last observed activity instead of claiming completion. If `activity` is null, report the reason code as unavailable evidence rather than concluding that work stalled or finished. Treat `expired: true` as a signal to keep waiting for the worker's own terminal outcome, not as permission to cancel, resubmit, or edit state.

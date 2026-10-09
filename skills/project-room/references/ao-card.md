@@ -31,6 +31,18 @@ Rules for every phase:
   the last report; never read the native transcript yourself. Report the
   rate-limit window label, its used percent or `not reported`, and its reset
   time; treat the reading as advisory, never as headroom.
+- `ao_room_progress.deliverables` (additive, read-only) folds the same task list
+  into requirement labels, lineage and closure. Read `closure` for measured
+  counts and deltas (never a percentage), `blockers`/`blockers_total` for named
+  acceptance blockers, `conflicts`/`conflicts_total` for a dangling, cyclic or
+  double-dispositioned `superseded_by`, and `unmapped`/`requirements[].units`
+  for work with no parent requirement. `available: false` means the transcript
+  was unavailable or no task-tool activity was observed yet (`limits.notes`
+  says which), not that the work is empty. This is a progress
+  reading, never a review substitute. The one-time `lifecycle_closure_v1`
+  amendment that asks Fable to record this lineage reaches a retained engineer
+  session only on its next engineer send (`spec_review`/`implementation`/
+  `correction`), never through `ao_room_status` or `ao_room_progress` itself.
 - Report usage as the attributable native subtotal from status, with delegates
   separate. Unknown is never zero, and it is not quota or billing.
 - Keep room IDs, native IDs, paths and receipts private.

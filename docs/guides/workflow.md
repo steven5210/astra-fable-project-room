@@ -16,6 +16,65 @@ Use the room from the Astra task where the feature is being shaped. That task re
 
 Astra need not read every delegate transcript. It inspects the code, behavior, engineering verdict, gate output, and remaining risks, then drills into routing or delegate details when a concern requires it. For progress between syncs in an AO room, the read-only `ao_room_progress` view folds one request's task list, Agent launches and error counts from the registered native transcript; AO's plan panel is driven by the same engineer task list, which the one-time `progress_plan_v1` workflow part asks Fable to keep current at unit boundaries — `progress_plan_v2` supersedes its list-keeping rules (a task is one bounded unit, not a phase; residuals become new tasks; `in_progress` means active now). Fable remains accountable for every engineering verdict.
 
+## Lifecycle execution and closure (AO rooms)
+
+AO engineer sessions also receive the one-time `lifecycle_closure_v1` workflow
+part (a new session in its first packet, a retained session once on its next
+engineer send — see [lifecycle-closure delivery](efficient-continuation.md#lifecycle-closure-delivery-ao-rooms)
+for exactly when). It is a reusable engineering default for how Fable executes
+and closes lifecycle-sensitive work in an AO room; delivered text only, it grants
+no scope, execution permission, recovery or review allowance and changes no
+model, tier policy, guard, review budget or authority. The default, in summary:
+
+- Every coupled lifecycle or invariant — a state machine, marker, lock, counter,
+  ledger or delivery record together with all of its writers — has one
+  accountable owner for the current work, with self-contained context, explicit
+  interfaces and uncontested file ownership for any independently assigned slice.
+- Before fixing a defect, Fable identifies every production entry point, writer
+  and caller of the affected path, then defines a failing proof on the real
+  production path the fix changes and shows that same proof passing afterward. A
+  required concurrency, restart or unknown-delivery integration proof is never
+  silently replaced by helper-level, mocked, constructed-state or
+  expected-failure coverage; when a reproduction is unavailable, the proof gap
+  and its limits are reported rather than invented or called closed.
+- Before closing a bounded slice, the dependent changes are integrated and the
+  meaningful combined checks affected by the final bytes are run — evidence that
+  predates a later edit is stale for that edit — and failures, skips, partial
+  handbacks and residuals stay visible.
+- A repeated correctness defect on the same invariant is a root-cause and
+  lifecycle-design question routed through the [residual escalation
+  default](../../skills/project-room/references/fable-policy.md#residual-escalation-amendment-one-time-part-residual_escalation_v1)
+  with every writer named, not another unexplained local patch.
+- A minimal scope or contract decision is surfaced as soon as it is identified,
+  with the behavior, affected paths, compatibility implications, evidence and a
+  recommendation, feeding the existing resolution step above rather than
+  replacing it.
+- The agreed specification's stable requirement labels anchor the work. Each
+  unit discovered during the work records its parent requirement and is
+  classified as defect, proof_gap, dependency or enhancement with its source
+  finding, carried as task lineage (see [deliverables](../reference/progress.md#deliverables-lineage-and-closure)
+  for the exact grammar). Absent lineage is reported as unmapped, never inferred
+  from labels. An obsolete unit is dispositioned superseded by naming an observed
+  successor task and the reason, while its own status and history stay in place;
+  a superseded row is never counted as completed, residual work gets a new unit
+  carrying its own lineage, and completed rows are never reopened or bulk-deleted.
+  Optional enhancements stay outside acceptance unless approved in a revised
+  specification.
+- Closure is reported as measured counts and deltas — required and enhancement
+  units counted separately — together with the actual acceptance blockers, never
+  as a task-based percentage or an invented denominator. Applied code,
+  worker-reported checks, operator or formal candidate verification and
+  independent acceptance remain distinct kinds of evidence.
+
+This default is scoped to AO rooms; legacy `room_*` rooms are unchanged by it.
+Its lineage labels, classifications and dispositions ride inside the *existing*
+engineering report string-list fields (`changes`, `remaining_gaps`, `backlog`,
+`review_findings`, `routing_log` entries) — no report field was added. Like the
+other reusable instructions this guide and the Fable policy reference describe,
+it is a global default that takes effect in a room only after the updated plugin
+has been installed or resynced (see [Install and authenticate](../../README.md#install-and-authenticate));
+existing room snapshots and historical records already saved are not rewritten.
+
 ## Enhancement issue handoff
 
 Under the user's existing filing authorization, Astra opens or links a GitHub issue for each worthwhile enhancement in the feature project's repository. Check both open and closed issues and the current implementation first; reuse an existing issue and record completed or superseded proposals rather than opening stale duplicates. A local backlog entry alone is not a filed issue.

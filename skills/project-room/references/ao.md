@@ -198,9 +198,12 @@ turn's elapsed time, assistant rows, served-model and stop-reason histograms,
 tool-call counts, API errors, compactions and guard refusals, each Agent launch
 with its type, description, status and duration, the engineer's task list folded
 from TaskCreate/TaskUpdate/TaskList/TodoWrite with pending, in-progress and
-completed counts, and the last assistant text. An unregistered or unreadable
-source reports `source.available: false` with the reason instead of failing. The
-same task list drives AO's plan panel in the session view; the `progress_plan_v1`
+completed counts, and the last assistant text. An additive, read-only
+`deliverables` object folds the same task rows into a lineage and closure
+projection (see [deliverables](../../../docs/reference/progress.md#deliverables-lineage-and-closure)).
+An unregistered or unreadable source reports `source.available: false` with the
+reason instead of failing. The same task list drives AO's plan panel in the
+session view; the `progress_plan_v1`
 workflow part, delivered once per engineer session, asks Fable to keep it current
 per bounded work unit — `progress_plan_v2` supersedes its list-keeping rules (a
 task is one bounded unit, not a phase; residuals become new tasks; `in_progress`

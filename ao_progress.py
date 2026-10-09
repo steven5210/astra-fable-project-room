@@ -69,10 +69,73 @@ _GROUP_TOKEN = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)*(?:-[0-9]+[a-z]?)?(?=[:\s]|$
 _GROUP_ROUND = re.compile(r"-[0-9]+[a-z]?$")
 _STEP_STATUSES = ("pending", "in_progress", "completed")
 
+# Deliverables projection (additive, read-only): lineage bounds and the description-token grammar.
+MAX_DECLARED_LABELS = 32
+MAX_REQUIREMENT_LABELS = 32
+MAX_UNIT_LIST = 16
+MAX_ID_LIST = 16
+# The limits.notes budget: at most 1 anchor note + 6 list/label notes + 1 character-clip note = 8, so
+# no note is ever dropped. Anyone adding a note must raise this bound.
+MAX_LIMIT_NOTES = 8
+MAX_REQ_CHARS = 16
+MAX_FROM_CHARS = 64
+MAX_BLOCKER_CHARS = 120
+# Every id-valued deliverables field is bounded to this many characters after redaction; identity
+# (supersession, lookups) always compares the raw ids. MAX_SUPERSEDED_CHARS is the historical alias.
+MAX_ID_CHARS = 64
+MAX_SUPERSEDED_CHARS = MAX_ID_CHARS
+MAX_REASON_CHARS = 200
+MAX_KIND_RAW_CHARS = 32
+DELIVERABLE_KINDS = ("planned", "defect", "proof_gap", "dependency", "enhancement")
+# The deliverables status vocabulary: any other observed task status is reported as "unknown",
+# counted open and never completed. The native plan keeps its own three-status counts.
+_DELIVERABLE_STATUSES = _STEP_STATUSES + ("unknown",)
+_OPEN_STATUSES = ("pending", "in_progress", "unknown")
+# The per-key field names the character-clip note counts, in its fixed order, and the subset that
+# _resolve_unit reports for one row (in the same relative order).
+_CLIP_FIELDS = ("id", "label", "req", "kind_raw", "from", "blocker", "reason", "superseded_by")
+_UNIT_CLIP_FIELDS = ("req", "kind_raw", "from", "blocker", "reason")
+_DESC_TOKEN = re.compile(r"(?:^|\s)(req|kind|from|blocker|superseded_by)=(\S*)")
+# reason= consumes the rest of its line as free text, so it must be the last token on that
+# line; every other key (including blocker) is a single whitespace-delimited key=value token.
+_DESC_LINE_REST = re.compile(r"(?:^|\s)reason=(.*)")
+_DECLARED_LABEL = re.compile(r"^([A-Z]{1,4}[0-9]{1,3})\s+[—–:-]\s", re.MULTILINE)
+# A path or URL run ends at whitespace, an ASCII or typographic quote, a backtick or a bracket-like
+# delimiter; every other character (including ')', ',', ':', ';', '=' and '*') stays inside the run.
+_RUN_END = "\\s'\"`<>\\[\\]{}|\u201c\u201d\u2018\u2019"
+_REDACTION = re.compile(
+    # A file:// URL names a local path: always redacted whole, whatever its host part.
+    "(?i:file)://[^" + _RUN_END + "]*"
+    # Any other scheme://authority is kept; the rest of that URL is scanned like any other text, so a
+    # path segment inside its query ("?next=/x") is still redacted while "/a/b" after the host is not.
+    # The scheme is tried only where a scheme-character run starts, which keeps the scan linear.
+    "|(?P<url>(?<![A-Za-z0-9+.\\-])[A-Za-z][A-Za-z0-9+.\\-]*://[^/?#" + _RUN_END + "]+)"
+    # An absolute path run: a '/' that no word character, '.' or '~' precedes, plus one or more
+    # run characters (so "//x" is one run and a lone " / " is not a path). A '-' does not protect the
+    # '/' after it, so a pasted diff line's "-/x" loses its path just as "+/x" does.
+    "|(?<![\\w.~])/[^" + _RUN_END + "]+")
+
 
 def _redact(text):
-    """Absolute paths never leave the view; a slash inside a word keeps relative paths intact."""
-    return re.sub(r"(?<![^\s'\"(])/[^\s'\"]+", "<path>", str(text))
+    """Absolute paths and file:// URLs never leave the view; relative paths and other URLs stay intact.
+
+    A path run starts at the string start, after whitespace or after any non-path character (quote,
+    backtick, bracket, '@', '|', '*', '=', ':', ',', ';', ...), including runs that begin with "//".
+    A '/' after a word character, '.' or '~' is not a path start, so "src/x.py", "3/4", "and/or"
+    and "R1/R2" stay intact, as do "https://host/a/b", "ssh://git@host/r.git" and "git@host:org/r.git";
+    a '/' after '-' does start one, so a diff line's "-/x" becomes "-<path>" just as "+/x" becomes "+<path>".
+    """
+    return _REDACTION.sub(lambda match: match.group("url") or "<path>", str(text))
+
+
+def _clip(value, limit):
+    """Redacted, then bounded; the flag says whether bounding removed characters (redaction never counts).
+
+    This is the one bounding primitive for plan labels and every deliverables string. The flag is
+    measured on the redacted text, so a path rewritten to "<path>" is never a shortened value.
+    """
+    redacted = _redact(value)
+    return redacted[:limit], len(redacted) > limit
 
 
 def _window(path, native_session_id):
@@ -241,10 +304,15 @@ def _new_group(key):
     return {"key": key, "counts": {status: 0 for status in _STEP_STATUSES}, "total": 0, "active": []}
 
 
-def _step_label(step):
-    label = step.get("activeForm") if step.get("status") == "in_progress" and step.get("activeForm") \
+def _label_text(step):
+    """The raw label choice: activeForm while in progress (when given), else subject; may be None."""
+    return step.get("activeForm") if step.get("status") == "in_progress" and step.get("activeForm") \
         else step.get("subject")
-    return _redact(label)[:MAX_LABEL_CHARS] if label is not None else ""
+
+
+def _step_label(step):
+    label = _label_text(step)
+    return _clip(label, MAX_LABEL_CHARS)[0] if label is not None else ""
 
 
 def _plan_groups(steps):
@@ -275,8 +343,142 @@ def _plan_groups(steps):
             for entry in sorted(grouped.values(), key=lambda item: item["key"])]
 
 
+def _merge_metadata(target, given_metadata):
+    """TaskCreate/TaskUpdate metadata merged key by key; a None value deletes that key.
+
+    Only str/bool/int/float values are kept (converted to str); any other value type
+    contributes nothing to the merge (neither set nor deleted).
+    """
+    if not isinstance(given_metadata, dict):
+        return
+    for key, value in given_metadata.items():
+        if not isinstance(key, str):
+            continue
+        if value is None:
+            target.pop(key, None)
+        elif isinstance(value, (str, bool, int, float)):
+            target[key] = str(value)
+
+
+def _description_tokens(description):
+    """Whitespace-separated key=value tokens from a task description.
+
+    req/kind/from/blocker/superseded_by are each a single non-whitespace token; reason=
+    consumes the rest of its line as its own value, so it must be the last token on that line.
+    """
+    tokens = {}
+    if not isinstance(description, str):
+        return tokens
+    for line in description.splitlines():
+        rest_match = _DESC_LINE_REST.search(line)
+        scanned = line[:rest_match.start()] if rest_match else line
+        for match in _DESC_TOKEN.finditer(scanned):
+            tokens[match.group(1)] = match.group(2)
+        if rest_match:
+            tokens["reason"] = rest_match.group(1)
+    return tokens
+
+
+def _bounded_text(value, limit):
+    """_clip's (text, clipped) pair for a lineage string; a non-string or empty value is (None, False)."""
+    return _clip(value, limit) if isinstance(value, str) and value else (None, False)
+
+
+def _display_id(raw):
+    """An emitted id-valued field and its clip flag: redacted, then bounded. Identity never uses this form."""
+    return _clip(raw, MAX_ID_CHARS)
+
+
+def _resolve_unit(entry):
+    """One task's raw requirement/successor identities and bounded, redacted lineage fields.
+
+    Description tokens supply the base; metadata overrides them key by key for the same name.
+    A missing entry (never created or updated inside the observed window) resolves unmapped.
+    A nonblank requirement stays raw for grouping; only emitted labels are redacted and clipped.
+    The successor stays raw (surrounding whitespace stripped, exactly one leading '#' removed) so
+    identity compares it with raw task ids; it is absent for ""/"false" (any case), which also
+    covers metadata False after its str conversion, and for an empty description token. The
+    successor is never bounded here. "clipped" names, in _UNIT_CLIP_FIELDS order, each of
+    req/kind_raw/from/blocker/reason whose value its character bound shortened.
+    """
+    metadata = (entry or {}).get("metadata") or {}
+    merged = _description_tokens((entry or {}).get("description"))
+    merged.update(metadata)
+    req = merged.get("req")
+    if not isinstance(req, str) or not req.strip():
+        req = None
+    _, req_clipped = _bounded_text(req, MAX_REQ_CHARS)
+    kind_value = merged.get("kind")
+    kind_raw_clipped = False
+    if not kind_value:
+        kind, kind_raw = "planned", None
+    elif kind_value in DELIVERABLE_KINDS:
+        kind, kind_raw = kind_value, None
+    else:
+        kind = "invalid"
+        kind_raw, kind_raw_clipped = _clip(kind_value, MAX_KIND_RAW_CHARS)
+    blocker_value = merged.get("blocker")
+    blocker, blocker_clipped = (_clip(blocker_value, MAX_BLOCKER_CHARS)
+                                if blocker_value and blocker_value.strip().lower() != "false" else (None, False))
+    superseded_value = merged.get("superseded_by")
+    successor = superseded_value.strip() if isinstance(superseded_value, str) else ""
+    if successor.lower() == "false":
+        successor = ""
+    if successor.startswith("#"):
+        successor = successor[1:]
+    from_text, from_clipped = _bounded_text(merged.get("from"), MAX_FROM_CHARS)
+    reason, reason_clipped = _bounded_text(merged.get("reason"), MAX_REASON_CHARS)
+    flags = (req_clipped, kind_raw_clipped, from_clipped, blocker_clipped, reason_clipped)
+    return {"req": req, "kind": kind, "kind_raw": kind_raw, "from": from_text,
+            "blocker": blocker, "successor": successor or None, "reason": reason,
+            "clipped": tuple(field for field, clipped in zip(_UNIT_CLIP_FIELDS, flags) if clipped)}
+
+
+def _supersession(steps, lineage):
+    """The one supersession verdict per tracked id, shared by closure.window and every deliverables row.
+
+    successor is the raw named id (None when absent); observed means it names a currently tracked
+    raw id; cycle means following the observed-successor chain from the row returns to the row (a
+    self-reference is a cycle of length one); superseded is observed and not cycle. A chain that runs
+    into a cycle elsewhere still supersedes the rows outside that cycle (1->2->3->2 supersedes 1 only).
+    """
+    successors = {task_id: _resolve_unit(lineage.get(task_id))["successor"] for task_id in steps}
+    edges = {task_id: successor for task_id, successor in successors.items()
+             if successor is not None and successor in steps}
+    on_cycle, finished = set(), set()
+    for start in edges:
+        path, position, node = [], {}, start
+        while node in edges and node not in finished and node not in position:
+            position[node] = len(path)
+            path.append(node)
+            node = edges[node]
+        if node in position:  # this walk closed a loop: exactly the nodes from there on form the cycle
+            on_cycle.update(path[position[node]:])
+        finished.update(path)
+    return {task_id: {"successor": successors[task_id], "observed": task_id in edges,
+                      "cycle": task_id in on_cycle, "superseded": task_id in edges and task_id not in on_cycle}
+            for task_id in steps}
+
+
+def _stale(step, step_updated, launch_codes, now, launches_known):
+    """in_progress, its leading code unmatched by a launch, last update older than the stale bound."""
+    status = step.get("status")
+    code = _leading_code(step.get("subject"))
+    if not (launches_known and status == "in_progress" and code is not None
+            and code not in launch_codes and now is not None):
+        return False
+    step_stamp = step_updated.get(step["id"])
+    try:
+        updated_epoch = ao_native_outcome.timestamp(step_stamp) if step_stamp is not None else None
+    except RoomError:
+        updated_epoch = None
+    return updated_epoch is not None and now - updated_epoch > STALE_IN_PROGRESS_SECONDS
+
+
 def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=False):
     steps, step_updated = {}, {}
+    lineage, window = {}, {"created": 0, "completed": 0, "superseded": 0}
+    completed_seen = set()
     source, updated_at = "none", None
     for row in rows:
         stamp = row.get("timestamp")
@@ -287,7 +489,7 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             if block.get("type") == "tool_use" and block.get("name") == "TodoWrite":
                 todos = (block.get("input") or {}).get("todos") if isinstance(block.get("input"), dict) else None
                 if isinstance(todos, list):
-                    steps, step_updated = {}, {}
+                    steps, step_updated, lineage = {}, {}, {}
                     for index, todo in enumerate(todos):
                         if isinstance(todo, dict):
                             key = "todo-" + str(index)
@@ -303,6 +505,12 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                     steps[task_id] = {"id": task_id, "subject": given.get("subject"),
                                       "activeForm": given.get("activeForm"), "status": "pending"}
                     step_updated[task_id] = stamp
+                    window["created"] += 1
+                    entry = {"metadata": {}, "description": None}
+                    _merge_metadata(entry["metadata"], given.get("metadata"))
+                    if isinstance(given.get("description"), str):
+                        entry["description"] = given["description"]
+                    lineage[task_id] = entry
                     kind = "task_tools"
             elif block.get("type") == "tool_use" and block.get("name") == "TaskUpdate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -313,12 +521,19 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                         if key in steps:
                             del steps[key]
                             step_updated.pop(key, None)
+                            lineage.pop(key, None)
                             kind = "task_tools"
                     elif key in steps:
                         for field in ("subject", "activeForm", "status"):
                             if given.get(field) is not None:
                                 steps[key][field] = given[field]
                         step_updated[key] = stamp
+                        if given.get("status") == "completed":
+                            completed_seen.add(key)
+                        entry = lineage.setdefault(key, {"metadata": {}, "description": None})
+                        _merge_metadata(entry["metadata"], given.get("metadata"))
+                        if isinstance(given.get("description"), str):
+                            entry["description"] = given["description"]
                         kind = "task_tools"
             elif block.get("type") == "tool_result":
                 use = uses.get(block.get("tool_use_id"))
@@ -337,6 +552,7 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                                 step_updated[key] = stamp
                             elif key in previous_updated:
                                 step_updated[key] = previous_updated[key]
+                        lineage = {key: value for key, value in lineage.items() if key in steps}
                         kind = "task_tools"
             if kind is not None:
                 source, updated_at = kind, stamp
@@ -358,30 +574,32 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
         chosen = (active + pending[::-1] + completed[::-1])[:MAX_STEPS]
     launch_codes = {_leading_code(launch.get("description")) for launch in launches or ()}
     launch_codes.discard(None)
+    # Computed once for every tracked step (not just the shown ones) so the deliverables
+    # projection can reuse the exact same staleness the operator sees in the shown steps.
+    stale_by_id = {step["id"]: _stale(step, step_updated, launch_codes, now, launches_known)
+                   for step in steps.values()}
     output, shown = [], {status: 0 for status in _STEP_STATUSES}
     for step in chosen:
         status = step.get("status")
         if status in shown:
             shown[status] += 1
-        stale = False
-        code = _leading_code(step.get("subject"))
-        if (launches_known and status == "in_progress" and code is not None
-                and code not in launch_codes and now is not None):
-            # Unknown is never stale: a step without a tracked update stamp keeps False.
-            step_stamp = step_updated.get(step["id"])
-            try:
-                updated_epoch = (ao_native_outcome.timestamp(step_stamp)
-                                 if step_stamp is not None else None)
-            except RoomError:
-                updated_epoch = None
-            stale = updated_epoch is not None and now - updated_epoch > STALE_IN_PROGRESS_SECONDS
         output.append({"label": _step_label(step),
                        "status": status if status is not None else "pending",
-                       "stale_in_progress": stale})
-    return {"source": source, "updated_at": updated_at, "steps": output, "counts": counts,
+                       "stale_in_progress": stale_by_id[step["id"]]})
+    window["completed"] = len(completed_seen)
+    # closure.window.created/completed count transitions seen anywhere in the bounded transcript
+    # tail; closure.window.superseded is the final evaluation over the currently tracked ids. Lineage
+    # is only observable (pruned by TaskList/TodoWrite/deletion) inside this window, so a dangling
+    # successor or a cycle contributes nothing to it (F2). The verdicts are computed once here and
+    # handed to the deliverables rows, so both counts read the same per-row verdict.
+    supersession = _supersession(steps, lineage)
+    window["superseded"] = sum(1 for verdict in supersession.values() if verdict["superseded"])
+    plan = {"source": source, "updated_at": updated_at, "steps": output, "counts": counts,
             "total": total, "shown": len(output),
             "omitted": {status: counts[status] - shown[status] for status in _STEP_STATUSES},
             "groups": _plan_groups(steps.values())}
+    return plan, {"steps": steps, "lineage": lineage, "stale": stale_by_id, "window": window,
+                  "supersession": supersession}
 
 
 def _turn_window(rows, request, start, end):
@@ -519,6 +737,326 @@ def _request_view(request):
             "semantic_status": request.get("semantic_status")}
 
 
+def _declared_labels(content):
+    """Unique req-style labels the spec body declares, in order of appearance, bounded."""
+    labels = []
+    for match in _DECLARED_LABEL.finditer(content if isinstance(content, str) else ""):
+        label = match.group(1)
+        if label not in labels:
+            labels.append(label)
+    return labels[:MAX_DECLARED_LABELS], len(labels) > MAX_DECLARED_LABELS
+
+
+def _spec_anchor(directory, state):
+    """The room's immutable spec record identity and declared labels; independent of the transcript."""
+    notes = []
+    record_sha = state.get("spec_record_sha256")
+    anchor = {"spec_record_sha256": record_sha if isinstance(record_sha, str) else None,
+              "spec_revision": None, "spec_sha256": None, "declared_labels": []}
+    truncated = False
+    if isinstance(record_sha, str):
+        import ao_workflow
+        try:
+            spec = ao_workflow.spec_record_file(directory, record_sha)
+            if not isinstance(spec, dict):
+                # A malformed on-disk record (e.g. a JSON array or scalar) whose digest still
+                # matches is unavailable exactly like a missing or unreadable record, never a
+                # crash from calling .get on a non-mapping.
+                notes.append("spec record unavailable")
+            else:
+                anchor["spec_revision"] = spec.get("revision")
+                anchor["spec_sha256"] = spec.get("sha256")
+                anchor["declared_labels"], truncated = _declared_labels(spec.get("content"))
+                if truncated:
+                    notes.append("declared labels bounded to " + str(MAX_DECLARED_LABELS))
+        except (RoomError, OSError, ValueError, KeyError, TypeError):
+            notes.append("spec record unavailable")
+    else:
+        notes.append("spec record unavailable")
+    return anchor, notes, truncated
+
+
+def _empty_unit_bucket():
+    return {"in_progress": [], "pending": [], "completed": []}
+
+
+def _deliverable_status(value):
+    """The deliverables status: a missing status is pending, any value outside the vocabulary unknown."""
+    if not value:
+        return "pending"
+    return value if value in _STEP_STATUSES else "unknown"
+
+
+def _new_requirement_accumulator():
+    # units_by_status holds (unit record, shown clipped field names) pairs; req_clipped is set when
+    # this raw requirement's display label was shortened. Neither private form reaches the view.
+    return {"counts": {status: 0 for status in _DELIVERABLE_STATUSES}, "superseded": 0,
+            "required_open": 0, "enhancement_open": 0, "blockers": 0,
+            "kinds": {kind: 0 for kind in DELIVERABLE_KINDS + ("invalid",)},
+            "units_by_status": _empty_unit_bucket(), "req_clipped": False}
+
+
+def _new_clip_counts():
+    return {field: 0 for field in _CLIP_FIELDS}
+
+
+def _among(row_clipped, shown_fields):
+    """The clipped field names one record shows: shown_fields (in order) that the row's set holds."""
+    return tuple(field for field in shown_fields if field in row_clipped)
+
+
+def _shown(pairs, bound, clips):
+    """The first bound (value, clipped field names) pairs as plain values, tallying only those kept.
+
+    A value beyond the bound is not shown, so its clipped fields never count; the bound's own
+    list note already discloses it.
+    """
+    kept = pairs[:bound]
+    for _, fields in kept:
+        for field in fields:
+            clips[field] += 1
+    return [value for value, _ in kept]
+
+
+def _finalize_requirement(label, declared, accum):
+    """One requirement entry plus the clip counts of the values it shows: its kept units and its label."""
+    by_status = accum["units_by_status"]
+    ordered = by_status["in_progress"][::-1] + by_status["pending"][::-1] + by_status["completed"][::-1]
+    clips = _new_clip_counts()
+    units = _shown(ordered, MAX_UNIT_LIST, clips)
+    # The requirement label appears once, regardless of how many units belong to it.
+    if accum["req_clipped"]:
+        clips["req"] += 1
+    return ({"label": _bounded_text(label, MAX_REQ_CHARS)[0],
+             "declared": declared, "folded": False, "counts": accum["counts"],
+             "superseded": accum["superseded"], "required_open": accum["required_open"],
+             "enhancement_open": accum["enhancement_open"], "blockers": accum["blockers"],
+             "kinds": accum["kinds"], "units": units, "units_total": len(ordered)}, clips)
+
+
+def _fold_requirement_labels(buckets, declared_labels):
+    """Sorted requirement entries bounded to MAX_REQUIREMENT_LABELS; overflow folds into "other".
+
+    Keys are raw identities: requirements whose display labels collide remain separate entries.
+    The folded overflow entry is distinguished by "folded": True rather than by its "other"
+    label, so a genuine requirement literally named "other" keeps its own entry (folded False).
+    The third value is the clip counts of the kept entries; the folded entry shows no units and a
+    fixed label, so the requirements folded into it contribute nothing.
+    """
+    finalized = {label: _finalize_requirement(label, label in declared_labels, accum)
+                 for label, accum in buckets.items()}
+    labels = sorted(finalized)
+    kept, overflow = labels[:MAX_REQUIREMENT_LABELS], labels[MAX_REQUIREMENT_LABELS:]
+    entries = [finalized[label][0] for label in kept]
+    clips = _new_clip_counts()
+    for label in kept:
+        for field, count in finalized[label][1].items():
+            clips[field] += count
+    if overflow:
+        folded = {"label": "other", "declared": False, "folded": True,
+                  "counts": {status: 0 for status in _DELIVERABLE_STATUSES},
+                  "superseded": 0, "required_open": 0, "enhancement_open": 0, "blockers": 0,
+                  "kinds": {kind: 0 for kind in DELIVERABLE_KINDS + ("invalid",)},
+                  "units": [], "units_total": 0}
+        for label in overflow:
+            source = finalized[label][0]
+            for status in _DELIVERABLE_STATUSES:
+                folded["counts"][status] += source["counts"][status]
+            for key in ("superseded", "required_open", "enhancement_open", "blockers", "units_total"):
+                folded[key] += source[key]
+            for kind_key in folded["kinds"]:
+                folded["kinds"][kind_key] += source["kinds"][kind_key]
+        entries.append(folded)
+    return entries, bool(overflow), clips
+
+
+def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unavailable_reason=None):
+    """Additive, read-only lineage/closure projection folded from the same transcript rows as plan."""
+    notes, truncated = list(anchor_notes), anchor_truncated
+    result = {"version": 1, "available": available, "anchor": anchor, "requirements": [],
+              "unmapped": {"count": 0, "metadata_unavailable": 0, "ids": [], "superseded": 0, "required_open": 0,
+                           "completed": 0, "blockers": 0},
+              "superseded": [], "superseded_total": 0, "blockers": [], "blockers_total": 0,
+              "conflicts": [], "conflicts_total": 0,
+              "closure": {"completed": 0, "enhancement_completed": 0, "required_open": 0, "enhancement_open": 0,
+                          "superseded": 0, "blockers": 0, "conflicts": 0, "stale_in_progress": 0,
+                          "window": {"created": 0, "completed": 0, "superseded": 0}},
+              "limits": {"truncated": truncated, "notes": notes}}
+    if not available:
+        # closure, closure.window and every list are forced to their zero/empty state regardless
+        # of what extra carries: unavailable is a hard contract, not an incidental side effect of
+        # an empty transcript (F6).
+        if unavailable_reason:
+            notes.append(unavailable_reason)
+        elif not notes:
+            notes.append("no task tool activity observed")
+        result["limits"] = {"truncated": truncated, "notes": notes[:MAX_LIMIT_NOTES]}
+        return result
+    window = extra.get("window") or {"created": 0, "completed": 0, "superseded": 0}
+    result["closure"]["window"] = {"created": window.get("created", 0), "completed": window.get("completed", 0),
+                                   "superseded": window.get("superseded", 0)}
+    steps, lineage, stale = extra["steps"], extra["lineage"], extra["stale"]
+    # The verdicts _fold_plan already computed for closure.window (one shared helper either way).
+    verdicts = extra.get("supersession")
+    if verdicts is None:
+        verdicts = _supersession(steps, lineage)
+    closure = result["closure"]
+    buckets, declared_labels = {}, set(anchor.get("declared_labels") or ())
+    # Each of these holds (record or id, clipped field names it shows) pairs until _shown applies
+    # its bound, so only values the view shows count toward the character-clip note (C8).
+    superseded_full, blockers_full, conflicts_full, unmapped_ids = [], [], [], []
+    unmapped_count = unmapped_unavailable = 0
+    unmapped_totals = {"superseded": 0, "required_open": 0, "completed": 0, "blockers": 0}
+    for task_id, step in steps.items():
+        entry = lineage.get(task_id)
+        resolved = _resolve_unit(entry)
+        displayed_req = _bounded_text(resolved["req"], MAX_REQ_CHARS)[0]
+        verdict = verdicts[task_id]
+        status = _deliverable_status(step.get("status"))
+        is_open = status in _OPEN_STATUSES
+        # superseded(u) depends only on whether its named successor is itself a currently tracked
+        # raw task id and on u not lying on a successor cycle, never on u's own open/closed status
+        # (B2); a dangling reference or a cycle is a conflict, not a disposition, and such a row
+        # keeps its own open/completed counting.
+        is_superseded = verdict["superseded"]
+        successor, successor_clipped = ((None, False) if verdict["successor"] is None
+                                        else _display_id(verdict["successor"]))
+        # Unmapped work (no usable req) is always required, regardless of a parsed kind=
+        # enhancement token: unknown work is never optional.
+        is_enhancement = resolved["req"] is not None and resolved["kind"] == "enhancement"
+        is_blocker = is_open and not is_superseded and not is_enhancement and resolved["blocker"] is not None
+        is_stale = bool(stale.get(task_id, False))
+        if is_stale:
+            closure["stale_in_progress"] += 1
+        if status == "completed" and not is_superseded:
+            if is_enhancement:
+                closure["enhancement_completed"] += 1
+            else:
+                closure["completed"] += 1
+        if is_open and not is_superseded and not is_enhancement:
+            closure["required_open"] += 1
+        if is_open and not is_superseded and is_enhancement:
+            closure["enhancement_open"] += 1
+        if is_superseded:
+            closure["superseded"] += 1
+        if is_blocker:
+            closure["blockers"] += 1
+        # Every id the view emits is redacted and bounded (F1, C4); task_id itself keeps its raw
+        # value for the internal steps/lineage lookups and the supersession identity above.
+        display_id, id_clipped = _display_id(task_id)
+        label_text = _label_text(step)
+        label, label_clipped = _clip(label_text, MAX_LABEL_CHARS) if label_text is not None else ("", False)
+        # Every per-key field of this row that its bound shortened; each record below counts only
+        # the fields it shows, once per shown value (C8).
+        row_clipped = set(resolved["clipped"])
+        for field, clipped in (("id", id_clipped), ("label", label_clipped), ("superseded_by", successor_clipped)):
+            if clipped:
+                row_clipped.add(field)
+        unit_record = {"id": display_id, "label": label, "status": status,
+                       "kind": resolved["kind"], "kind_raw": resolved["kind_raw"], "from": resolved["from"],
+                       "superseded_by": successor, "blocker": resolved["blocker"],
+                       "stale_in_progress": is_stale}
+        if is_superseded:
+            superseded_full.append(({"id": display_id, "successor": successor,
+                                     "reason": resolved["reason"], "status": status},
+                                    _among(row_clipped, ("id", "superseded_by", "reason"))))
+        # At most one conflict per row, in this precedence.
+        conflict = None
+        if verdict["successor"] is not None and not verdict["observed"]:
+            conflict = "successor_unobserved"
+        elif verdict["cycle"]:
+            conflict = "superseded_cycle"
+        elif is_superseded and status == "completed":
+            conflict = "completed_and_superseded"
+        if conflict is not None:
+            conflicts_full.append(({"id": display_id, "req": displayed_req, "reason": conflict,
+                                    "successor": successor},
+                                   _among(row_clipped, ("id", "req", "superseded_by"))))
+        if is_blocker:
+            # A bare "true" marker carries no explanation of its own; the blocker's own reason
+            # text (when given) stands in for it, otherwise the list shows no reason text. The
+            # shown text counts under the field it came from.
+            carries_blocker_text = resolved["blocker"].strip().lower() != "true"
+            blocker_reason = resolved["blocker"] if carries_blocker_text else resolved["reason"]
+            blockers_full.append(({"id": display_id, "req": displayed_req, "label": unit_record["label"],
+                                   "reason": blocker_reason},
+                                  _among(row_clipped, ("id", "req", "label",
+                                                       "blocker" if carries_blocker_text else "reason"))))
+        if resolved["req"] is None:
+            unmapped_count += 1
+            unmapped_unavailable += 1 if entry is None else 0
+            # An unmapped row has no unit record: only its id (and the list entries above) can show.
+            unmapped_ids.append((display_id, _among(row_clipped, ("id",))))
+            # The same per-row predicates as closure (an unmapped row is never an enhancement).
+            if is_superseded:
+                unmapped_totals["superseded"] += 1
+            elif is_open:
+                unmapped_totals["required_open"] += 1
+            elif status == "completed":
+                unmapped_totals["completed"] += 1
+            if is_blocker:
+                unmapped_totals["blockers"] += 1
+            continue
+        accum = buckets.setdefault(resolved["req"], _new_requirement_accumulator())
+        accum["req_clipped"] = accum["req_clipped"] or "req" in row_clipped
+        # A superseded row is never counted under its status (never as completed): counts hold the
+        # non-superseded rows, superseded the rest, so units_total == sum(counts) + superseded.
+        if is_superseded:
+            accum["superseded"] += 1
+        else:
+            accum["counts"][status] += 1
+        if is_open and not is_superseded and not is_enhancement:
+            accum["required_open"] += 1
+        if is_open and not is_superseded and is_enhancement:
+            accum["enhancement_open"] += 1
+        if is_blocker:
+            accum["blockers"] += 1
+        if resolved["kind"] in accum["kinds"]:
+            accum["kinds"][resolved["kind"]] += 1
+        bucket_status = status if status in accum["units_by_status"] else "pending"
+        accum["units_by_status"][bucket_status].append(
+            (unit_record, _among(row_clipped, ("id", "label", "kind_raw", "from", "blocker", "superseded_by"))))
+    clips = _new_clip_counts()
+    requirements, labels_truncated, requirement_clips = _fold_requirement_labels(buckets, declared_labels)
+    for field, count in requirement_clips.items():
+        clips[field] += count
+    result["requirements"] = requirements
+    if any(entry["units_total"] > MAX_UNIT_LIST for entry in requirements if not entry["folded"]):
+        truncated = True
+        notes.append("requirement units bounded to " + str(MAX_UNIT_LIST))
+    if labels_truncated:
+        truncated = True
+        notes.append("requirement labels bounded to " + str(MAX_REQUIREMENT_LABELS))
+    result["unmapped"] = {"count": unmapped_count, "metadata_unavailable": unmapped_unavailable,
+                          "ids": _shown(unmapped_ids, MAX_ID_LIST, clips), **unmapped_totals}
+    if len(unmapped_ids) > MAX_ID_LIST:
+        truncated = True
+        notes.append("unmapped ids bounded to " + str(MAX_ID_LIST))
+    result["superseded"] = _shown(superseded_full, MAX_UNIT_LIST, clips)
+    result["superseded_total"] = len(superseded_full)
+    if len(superseded_full) > MAX_UNIT_LIST:
+        truncated = True
+        notes.append("superseded list bounded to " + str(MAX_UNIT_LIST))
+    result["blockers"], result["blockers_total"] = _shown(blockers_full, MAX_UNIT_LIST, clips), len(blockers_full)
+    if len(blockers_full) > MAX_UNIT_LIST:
+        truncated = True
+        notes.append("blockers list bounded to " + str(MAX_UNIT_LIST))
+    result["conflicts"] = _shown(conflicts_full, MAX_UNIT_LIST, clips)
+    result["conflicts_total"] = len(conflicts_full)
+    closure["conflicts"] = len(conflicts_full)
+    if len(conflicts_full) > MAX_UNIT_LIST:
+        truncated = True
+        notes.append("conflicts list bounded to " + str(MAX_UNIT_LIST))
+    # A character bound that shortened a value the view shows is disclosed like any other bound: one
+    # note, appended last, counting each shown shortened value under its per-key field (C8).
+    if any(clips.values()):
+        truncated = True
+        notes.append("character bounds clipped: " + ", ".join(
+            field + " " + str(clips[field]) for field in _CLIP_FIELDS if clips[field]))
+    result["limits"] = {"truncated": truncated, "notes": notes[:MAX_LIMIT_NOTES]}
+    return result
+
+
 def inspect(directory, state, request_id=None, max_text_chars=400):
     """One request's bounded progress view; a validation failure yields controller facts only."""
     if (not isinstance(max_text_chars, int) or isinstance(max_text_chars, bool)
@@ -544,6 +1082,10 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
             "malformed_rows": 0}
     outcome_source = state.get("native_outcome_source") or {}
     view["rate_limits"] = ao_rate_limits.latest(outcome_source.get("database"), request.get("session_id"))
+    anchor, anchor_notes, anchor_truncated = _spec_anchor(directory, state)
+    empty_extra = {"steps": {}, "lineage": {}, "stale": {}, "window": {"created": 0, "completed": 0, "superseded": 0}}
+    view["deliverables"] = _deliverables(False, empty_extra, anchor, anchor_notes, anchor_truncated,
+                                         unavailable_reason="transcript unavailable")
     try:
         # The bounded tail read in _window needs no file size cap; the dispatch default stays.
         validated = ao_native_outcome.validate_registered_source(directory, state, transcript_size_limit=None)
@@ -556,8 +1098,16 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     # texts then correlate by when they were delivered rather than by matching order.
     observed = request.get("observed_turn")
     started = observed.get("startedAt") if isinstance(observed, dict) else None
-    start = (ao_native_outcome.timestamp(started) if isinstance(started, str)
-             else request.get("created_at"))
+    # A malformed anchor degrades to the request's own created_at (or None), like every other
+    # timestamp read in this module, rather than raising.
+    start = None
+    if isinstance(started, str):
+        try:
+            start = ao_native_outcome.timestamp(started)
+        except RoomError:
+            start = None
+    if start is None:
+        start = request.get("created_at")
     order = _request_order(request)
     later = [other["created_at"] for other in requests.values()
              if isinstance(other, dict) and other.get("session_id") == request.get("session_id")
@@ -580,8 +1130,12 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         plan_now = ao_native_outcome.timestamp(view["turn"].get("last_activity_at"))
     except RoomError:
         plan_now = None
-    view["plan"] = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now,
-                              launches_known=bool(view["turn"].get("anchor_found")))
+    view["plan"], fold_extra = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now,
+                                          launches_known=bool(view["turn"].get("anchor_found")))
+    available = bool(view["source"].get("available")) and view["plan"]["source"] != "none"
+    reason = None if available else "no task tool activity observed"
+    view["deliverables"] = _deliverables(available, fold_extra, anchor, anchor_notes, anchor_truncated,
+                                         unavailable_reason=reason)
     if max_text_chars:
         # With an anchor the text belongs to the request's own turn; a turn that has
         # produced only tool calls has no assistant text yet. Without an anchor the

@@ -150,6 +150,31 @@ access; a path alone is insufficient. Do not retry a denied resume through anoth
 tool or weaken the guard. This amendment does not wake work, clear quota/uncertainty
 holds, renew reviews, modify native configuration or prove live usage savings.
 
+## Lifecycle-closure delivery (AO rooms)
+
+The one-time `lifecycle_closure_v1` amendment is carried through `ao_workflow.PARTS`
+exactly like the other one-time parts above, and only in AO rooms: a new AO engineer
+session receives it in its first packet, and a retained AO engineer session receives
+it once, carried on its next engineer send (`spec_review`, `implementation`, or
+`correction`). Saved `context_summary`/status lists it under `undelivered_parts`
+until a `completed` or `settled_failure` engineer turn's verified immutable receipt
+shows it was actually carried; an `uncertain`, `failed`, `interrupted` or otherwise
+unsettled turn never counts as delivery, so the part is carried again on the next
+send rather than assumed sent (fail closed, like the rest of `delivered()`). This
+delivery mechanism adds no repeated consent step: an ordinary continuation remains
+exactly `Continue.` or the caller's actual new instruction, and the controller —
+not the human turn — appends the undelivered part. The instruction itself is text
+only: it grants no scope, execution permission, recovery or review allowance and
+changes no model, tier policy, guard, review budget or authority. See
+[lifecycle execution and closure](workflow.md#lifecycle-execution-and-closure-ao-rooms)
+for the default it states, and the [Fable policy reference's matching
+section](../../skills/project-room/references/fable-policy.md#lifecycle-execution-and-closure-ao-rooms)
+for the exact delivered text and the native task-lineage grammar. Like the other
+reusable instructions in this document, it is a global default that takes effect
+in a room only after the updated plugin has been installed or resynced (see
+[Install and authenticate](../../README.md#install-and-authenticate)); existing
+room snapshots and already-delivered workflow-part records are not rewritten.
+
 ## Compact engineering reports
 
 The additional `delegation_efficiency_v2` amendment is delivered once to new or
