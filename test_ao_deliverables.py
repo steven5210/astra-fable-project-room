@@ -602,6 +602,10 @@ class LineageTests(DeliverablesFixture):
         self.assertEqual(unit2['superseded_by'], 'T' * 64)
         conflict = next(c for c in view['conflicts'] if c['id'] == '2')
         self.assertEqual(conflict['successor'], 'T' * 64)
+        # Row 1 is superseded, so it is not a blocker: its blocker counts only in its unit record and its
+        # reason only in superseded[]; row 2's dangling successor shows in its unit record and its conflict.
+        self.assertEqual(view['limits'], {'truncated': True, 'notes': [
+            'character bounds clipped: req 1, from 1, blocker 1, reason 1, superseded_by 2']})
 
     def test_null_metadata_value_deletes_a_previously_set_key(self):
         self.create('1', 'R1-1: unit', metadata={'req': 'R1', 'superseded_by': '#9'})
@@ -1115,6 +1119,206 @@ class ClosureCountingTests(DeliverablesFixture):
         self.assertEqual((closure['completed'], closure['required_open'], closure['blockers']), (0, 2, 1))
         self.assertNotIn('/leakprobe', json.dumps(deliverables))
         self.assert_reconciles(deliverables)
+
+
+class ClipAccountingTests(DeliverablesFixture):
+    """C8: a character bound that shortens a value the view shows is disclosed in limits, through inspect()."""
+
+    # Only the note-budget test binds a spec declaring more than 32 labels, so its anchor note is the real one.
+    NOTE_BUDGET_TEST = 'test_every_bound_tripped_at_once_fills_exactly_the_eight_note_budget'
+
+    def spec(self, revision=1):
+        if self._testMethodName != self.NOTE_BUDGET_TEST:
+            return super().spec(revision)
+        content = '\n'.join('R' + str(index) + ' - Label ' + str(index) for index in range(1, 34)) + '\n'
+        return self.service.ao_room_spec_put(self.room, revision, content, self.gates, 'Astra approves this scope')
+
+    def _seventeen_units(self, key, clipped_value, clipped_index, other_value):
+        """17 pending R1 rows created in order; only row clipped_index carries clipped_value for key."""
+        for index in range(17):
+            self.create(str(index), 'R1-' + str(index) + ': unit',
+                        metadata={'req': 'R1', key: clipped_value if index == clipped_index else other_value})
+        return self.view()['deliverables']
+
+    def test_reviewer_probe_a_long_from_and_blocker_are_disclosed_in_limits(self):  # T1
+        self.create('1', 'R1-1: unit', metadata={'req': 'R1', 'from': 'F' * 65, 'blocker': 'B' * 121})
+        deliverables = self.view()['deliverables']
+        unit = deliverables['requirements'][0]['units'][0]
+        self.assertEqual(unit['from'], 'F' * 64)
+        self.assertEqual(unit['blocker'], 'B' * 120)
+        self.assertEqual(deliverables['blockers'][0]['reason'], 'B' * 120)
+        # The private clip accounting never reaches the view: records keep exactly their output keys.
+        self.assertEqual(set(unit), {'id', 'label', 'status', 'kind', 'kind_raw', 'from', 'superseded_by', 'blocker',
+                                     'stale_in_progress'})
+        self.assertEqual(set(deliverables['requirements'][0]),
+                         {'label', 'declared', 'folded', 'counts', 'superseded', 'required_open', 'enhancement_open',
+                          'blockers', 'kinds', 'units', 'units_total'})
+        # The blocker text shows twice (units[].blocker and its blockers[].reason echo), so it counts twice.
+        self.assertEqual(deliverables['limits'],
+                         {'truncated': True, 'notes': ['character bounds clipped: from 1, blocker 2']})
+        self.assert_reconciles(deliverables)
+
+    def test_values_exactly_at_their_bounds_are_shown_whole_and_not_counted(self):  # T2
+        long_id = 'I' * 64
+        self.create(long_id, 'S' * 200, metadata={'req': 'Q' * 16, 'from': 'F' * 64, 'blocker': 'B' * 120,
+                                                  'kind': 'k' * 32})
+        self.create('2', 'R1-2: split', metadata={'req': 'R1', 'superseded_by': '#' + long_id,
+                                                   'reason': 'X' * 200})
+        deliverables = self.view()['deliverables']
+        requirements = {entry['label']: entry for entry in deliverables['requirements']}
+        self.assertEqual(set(requirements), {'Q' * 16, 'R1'})
+        unit = requirements['Q' * 16]['units'][0]
+        self.assertEqual((unit['id'], unit['label'], unit['kind_raw'], unit['from'], unit['blocker']),
+                         (long_id, 'S' * 200, 'k' * 32, 'F' * 64, 'B' * 120))
+        self.assertEqual(deliverables['blockers'],
+                         [{'id': long_id, 'req': 'Q' * 16, 'label': 'S' * 200, 'reason': 'B' * 120}])
+        self.assertEqual(requirements['R1']['units'][0]['superseded_by'], long_id)
+        self.assertEqual(deliverables['superseded'],
+                         [{'id': '2', 'successor': long_id, 'reason': 'X' * 200, 'status': 'pending'}])
+        self.assertEqual(deliverables['limits'], {'truncated': False, 'notes': []})
+        self.assert_reconciles(deliverables)
+
+    def test_long_ids_count_in_every_place_the_view_shows_them(self):  # T3
+        long_a = 'A' * 65
+        self.create(long_a, 'R1-1: long id blocker', metadata={'req': 'R1', 'blocker': 'true', 'reason': 'why'})
+        self.create('2', 'R1-2: superseded by the long id', metadata={'req': 'R1', 'superseded_by': '#' + long_a})
+        self.create('3', 'R1-3: dangling long successor', metadata={'req': 'R1', 'superseded_by': 'Z' * 65})
+        deliverables = self.view()['deliverables']
+        units = {unit['id']: unit for unit in deliverables['requirements'][0]['units']}
+        self.assertEqual(set(units), {'A' * 64, '2', '3'})
+        self.assertEqual(units['2']['superseded_by'], 'A' * 64)
+        self.assertEqual(units['3']['superseded_by'], 'Z' * 64)
+        self.assertEqual(deliverables['blockers'],
+                         [{'id': 'A' * 64, 'req': 'R1', 'label': 'R1-1: long id blocker', 'reason': 'why'}])
+        self.assertEqual(deliverables['superseded'],
+                         [{'id': '2', 'successor': 'A' * 64, 'reason': None, 'status': 'pending'}])
+        self.assertEqual(deliverables['conflicts'],
+                         [{'id': '3', 'req': 'R1', 'reason': 'successor_unobserved', 'successor': 'Z' * 64}])
+        self.assertEqual(deliverables['closure']['superseded'], 1)  # identity used the raw 65-character id
+        # id: units[] and blockers[] for the long row; superseded_by: units[] and superseded[] for row 2,
+        # units[] and conflicts[] for row 3.
+        self.assertEqual(deliverables['limits'],
+                         {'truncated': True, 'notes': ['character bounds clipped: id 2, superseded_by 4']})
+        self.assert_reconciles(deliverables)
+
+    def test_a_long_unmapped_id_counts_once_in_unmapped_ids(self):  # T4
+        self.create('D' * 65, 'UNIT-4: unmapped')
+        deliverables = self.view()['deliverables']
+        self.assertEqual(deliverables['unmapped']['ids'], ['D' * 64])
+        self.assertEqual(deliverables['limits'], {'truncated': True, 'notes': ['character bounds clipped: id 1']})
+        self.assert_reconciles(deliverables)
+
+    def test_a_long_reason_counts_only_where_the_view_shows_it(self):  # T5
+        self.create('1', 'R1-1: unit', metadata={'req': 'R1', 'reason': 'X' * 201})
+        hidden = self.view()['deliverables']
+        self.assertEqual((hidden['superseded'], hidden['blockers']), ([], []))
+        self.assertEqual(hidden['limits'], {'truncated': False, 'notes': []})  # the view shows no reason
+        self.create('s', 'R1-S: successor', metadata={'req': 'R1'})
+        self.update('1', metadata={'superseded_by': '#s'})
+        superseded = self.view()['deliverables']
+        self.assertEqual(superseded['superseded'],
+                         [{'id': '1', 'successor': 's', 'reason': 'X' * 200, 'status': 'pending'}])
+        self.assertEqual(superseded['limits'],
+                         {'truncated': True, 'notes': ['character bounds clipped: reason 1']})
+        self.assert_reconciles(superseded)
+        self.update('1', metadata={'superseded_by': None, 'blocker': 'true'})
+        blocking = self.view()['deliverables']
+        self.assertEqual(blocking['superseded'], [])
+        self.assertEqual(blocking['blockers'],
+                         [{'id': '1', 'req': 'R1', 'label': 'R1-1: unit', 'reason': 'X' * 200}])
+        self.assertEqual(blocking['limits'], {'truncated': True, 'notes': ['character bounds clipped: reason 1']})
+        self.assert_reconciles(blocking)
+
+    def test_req_kind_raw_and_label_count_per_shown_value(self):  # T6
+        subject = 'R1-1: ' + 'L' * 195
+        self.assertEqual(len(subject), 201)
+        self.create('1', subject, metadata={'req': 'R' * 17, 'blocker': 'true', 'reason': 'waiting'})
+        self.create('2', 'R1-2: unit', metadata={'req': 'R' * 17, 'kind': 'not_a_real_kind_' + 'x' * 40})
+        deliverables = self.view()['deliverables']
+        self.assertEqual([entry['label'] for entry in deliverables['requirements']], ['R' * 16])
+        units = {unit['id']: unit for unit in deliverables['requirements'][0]['units']}
+        self.assertEqual(units['1']['label'], subject[:200])
+        self.assertEqual(units['2']['kind_raw'], ('not_a_real_kind_' + 'x' * 40)[:32])
+        self.assertEqual(deliverables['blockers'],
+                         [{'id': '1', 'req': 'R' * 16, 'label': subject[:200], 'reason': 'waiting'}])
+        # label: units[] and blockers[]; req: the one requirement label plus blockers[].req; kind_raw: units[].
+        self.assertEqual(deliverables['limits'], {'truncated': True, 'notes': [
+            'character bounds clipped: label 2, req 2, kind_raw 1']})
+        self.assert_reconciles(deliverables)
+
+    def test_a_clipped_value_on_a_unit_record_past_the_unit_bound_is_not_counted(self):  # T7 (a)
+        deliverables = self._seventeen_units('from', 'F' * 65, 0, 'f')
+        units = deliverables['requirements'][0]['units']
+        self.assertEqual([unit['id'] for unit in units], [str(index) for index in range(16, 0, -1)])
+        self.assertEqual(deliverables['limits'], {'truncated': True, 'notes': ['requirement units bounded to 16']})
+
+    def test_a_clipped_value_on_a_shown_unit_record_counts_beside_the_unit_bound(self):  # T7 (b)
+        deliverables = self._seventeen_units('from', 'F' * 65, 16, 'f')
+        units = deliverables['requirements'][0]['units']
+        self.assertEqual((units[0]['id'], units[0]['from']), ('16', 'F' * 64))
+        self.assertEqual(deliverables['limits'], {'truncated': True, 'notes': [
+            'requirement units bounded to 16', 'character bounds clipped: from 1']})
+
+    def test_a_blocker_shown_in_its_unit_but_past_the_blockers_list_bound_counts_once(self):  # T7 (c)
+        deliverables = self._seventeen_units('blocker', 'B' * 121, 16, 'b')
+        units = deliverables['requirements'][0]['units']
+        self.assertEqual((units[0]['id'], units[0]['blocker']), ('16', 'B' * 120))
+        self.assertEqual([entry['id'] for entry in deliverables['blockers']], [str(index) for index in range(16)])
+        self.assertEqual(deliverables['blockers_total'], 17)
+        self.assertEqual(deliverables['limits'], {'truncated': True, 'notes': [
+            'requirement units bounded to 16', 'blockers list bounded to 16', 'character bounds clipped: blocker 1']})
+        self.assert_reconciles(deliverables)
+
+    def test_redaction_never_counts_as_clipping(self):  # T8
+        self.create('1', 'R1-1: unit', metadata={'req': 'R1', 'from': '/leakprobe/' + 'x' * 70})
+        view = self.view()
+        deliverables = view['deliverables']
+        self.assertEqual(deliverables['requirements'][0]['units'][0]['from'], '<path>')
+        self.assertEqual(deliverables['limits'], {'truncated': False, 'notes': []})
+        self.assertNotIn('/leakprobe', json.dumps(view))
+
+    def test_every_bound_tripped_at_once_fills_exactly_the_eight_note_budget(self):  # T9
+        # 17 open A1 blockers, each naming an untracked successor: one requirement passes the unit bound
+        # and the blockers and conflicts lists pass theirs.
+        for index in range(17):
+            self.create('a' + str(index), 'A1-' + str(index) + ': unit',
+                        metadata={'req': 'A1', 'blocker': 'true', 'superseded_by': '#missing'})
+        # 32 more requirement labels (33 in all; Z31 sorts last and folds). The shown Z00 unit carries the
+        # one clipped value and is the tracked successor of the unmapped rows below.
+        self.create('s', 'Z00-1: successor', metadata={'req': 'Z00', 'from': 'F' * 65})
+        for index in range(1, 32):
+            label = 'Z%02d' % index
+            self.create('z' + str(index), label + '-1: unit', metadata={'req': label})
+        # 17 unmapped rows superseded by s pass the unmapped-ids and superseded-list bounds.
+        for index in range(17):
+            self.create('u' + str(index), 'UNIT-' + str(index) + ': split', metadata={'superseded_by': '#s'})
+        deliverables = self.view()['deliverables']
+        self.assertEqual(len(deliverables['anchor']['declared_labels']), 32)
+        notes = deliverables['limits']['notes']
+        self.assertEqual(notes, ['declared labels bounded to 32', 'requirement units bounded to 16',
+                                 'requirement labels bounded to 32', 'unmapped ids bounded to 16',
+                                 'superseded list bounded to 16', 'blockers list bounded to 16',
+                                 'conflicts list bounded to 16', 'character bounds clipped: from 1'])
+        self.assertEqual(len(notes), 8)
+        self.assertEqual(len(notes), ao_progress.MAX_LIMIT_NOTES)
+        self.assertTrue(notes[-1].startswith('character bounds clipped: '))
+        self.assertTrue(deliverables['limits']['truncated'])
+        self.assert_reconciles(deliverables)
+
+    def test_clip_helpers_flag_only_characters_removed_by_bounding(self):  # T10
+        self.assertEqual(ao_progress._clip('x' * 65, 64), ('x' * 64, True))
+        self.assertEqual(ao_progress._clip('x' * 64, 64), ('x' * 64, False))
+        self.assertEqual(ao_progress._clip('/leakprobe/' + 'x' * 100, 64), ('<path>', False))
+        self.assertEqual(ao_progress._bounded_text('', 10), (None, False))
+        self.assertEqual(ao_progress._bounded_text(None, 10), (None, False))
+        self.assertEqual(ao_progress._bounded_text('y' * 11, 10), ('y' * 10, True))
+        resolved = ao_progress._resolve_unit({'metadata': {
+            'req': 'R' * 17, 'from': 'F' * 65, 'blocker': 'B' * 121, 'reason': 'X' * 201, 'kind': 'k' * 33},
+            'description': None})
+        self.assertEqual(resolved['clipped'], ('req', 'kind_raw', 'from', 'blocker', 'reason'))
+        self.assertEqual(set(resolved), {'req', 'kind', 'kind_raw', 'from', 'blocker', 'successor', 'reason',
+                                         'clipped'})
+        self.assertEqual(ao_progress._resolve_unit(None)['clipped'], ())
 
 
 class AnchorTests(Fixture):

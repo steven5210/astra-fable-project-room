@@ -74,6 +74,8 @@ MAX_DECLARED_LABELS = 32
 MAX_REQUIREMENT_LABELS = 32
 MAX_UNIT_LIST = 16
 MAX_ID_LIST = 16
+# The limits.notes budget: at most 1 anchor note + 6 list/label notes + 1 character-clip note = 8, so
+# no note is ever dropped. Anyone adding a note must raise this bound.
 MAX_LIMIT_NOTES = 8
 MAX_REQ_CHARS = 16
 MAX_FROM_CHARS = 64
@@ -89,6 +91,10 @@ DELIVERABLE_KINDS = ("planned", "defect", "proof_gap", "dependency", "enhancemen
 # counted open and never completed. The native plan keeps its own three-status counts.
 _DELIVERABLE_STATUSES = _STEP_STATUSES + ("unknown",)
 _OPEN_STATUSES = ("pending", "in_progress", "unknown")
+# The per-key field names the character-clip note counts, in its fixed order, and the subset that
+# _resolve_unit reports for one row (in the same relative order).
+_CLIP_FIELDS = ("id", "label", "req", "kind_raw", "from", "blocker", "reason", "superseded_by")
+_UNIT_CLIP_FIELDS = ("req", "kind_raw", "from", "blocker", "reason")
 _DESC_TOKEN = re.compile(r"(?:^|\s)(req|kind|from|blocker|superseded_by)=(\S*)")
 # reason= consumes the rest of its line as free text, so it must be the last token on that
 # line; every other key (including blocker) is a single whitespace-delimited key=value token.
@@ -120,6 +126,16 @@ def _redact(text):
     a '/' after '-' does start one, so a diff line's "-/x" becomes "-<path>" just as "+/x" becomes "+<path>".
     """
     return _REDACTION.sub(lambda match: match.group("url") or "<path>", str(text))
+
+
+def _clip(value, limit):
+    """Redacted, then bounded; the flag says whether bounding removed characters (redaction never counts).
+
+    This is the one bounding primitive for plan labels and every deliverables string. The flag is
+    measured on the redacted text, so a path rewritten to "<path>" is never a shortened value.
+    """
+    redacted = _redact(value)
+    return redacted[:limit], len(redacted) > limit
 
 
 def _window(path, native_session_id):
@@ -288,10 +304,15 @@ def _new_group(key):
     return {"key": key, "counts": {status: 0 for status in _STEP_STATUSES}, "total": 0, "active": []}
 
 
-def _step_label(step):
-    label = step.get("activeForm") if step.get("status") == "in_progress" and step.get("activeForm") \
+def _label_text(step):
+    """The raw label choice: activeForm while in progress (when given), else subject; may be None."""
+    return step.get("activeForm") if step.get("status") == "in_progress" and step.get("activeForm") \
         else step.get("subject")
-    return _redact(label)[:MAX_LABEL_CHARS] if label is not None else ""
+
+
+def _step_label(step):
+    label = _label_text(step)
+    return _clip(label, MAX_LABEL_CHARS)[0] if label is not None else ""
 
 
 def _plan_groups(steps):
@@ -359,13 +380,13 @@ def _description_tokens(description):
 
 
 def _bounded_text(value, limit):
-    """Redacted (no absolute path leaves the view) and bounded; every lineage string uses this."""
-    return _redact(value)[:limit] if isinstance(value, str) and value else None
+    """_clip's (text, clipped) pair for a lineage string; a non-string or empty value is (None, False)."""
+    return _clip(value, limit) if isinstance(value, str) and value else (None, False)
 
 
 def _display_id(raw):
-    """An emitted id-valued field: redacted, then bounded. Identity never uses this form."""
-    return _redact(raw)[:MAX_ID_CHARS]
+    """An emitted id-valued field and its clip flag: redacted, then bounded. Identity never uses this form."""
+    return _clip(raw, MAX_ID_CHARS)
 
 
 def _resolve_unit(entry):
@@ -375,32 +396,38 @@ def _resolve_unit(entry):
     A missing entry (never created or updated inside the observed window) resolves unmapped.
     The successor stays raw (surrounding whitespace stripped, exactly one leading '#' removed) so
     identity compares it with raw task ids; it is absent for ""/"false" (any case), which also
-    covers metadata False after its str conversion, and for an empty description token.
+    covers metadata False after its str conversion, and for an empty description token. The
+    successor is never bounded here. "clipped" names, in _UNIT_CLIP_FIELDS order, each of
+    req/kind_raw/from/blocker/reason whose value its character bound shortened.
     """
     metadata = (entry or {}).get("metadata") or {}
     merged = _description_tokens((entry or {}).get("description"))
     merged.update(metadata)
-    req = _bounded_text(merged.get("req"), MAX_REQ_CHARS)
+    req, req_clipped = _bounded_text(merged.get("req"), MAX_REQ_CHARS)
     kind_value = merged.get("kind")
+    kind_raw_clipped = False
     if not kind_value:
         kind, kind_raw = "planned", None
     elif kind_value in DELIVERABLE_KINDS:
         kind, kind_raw = kind_value, None
     else:
-        kind, kind_raw = "invalid", _redact(kind_value)[:MAX_KIND_RAW_CHARS]
+        kind = "invalid"
+        kind_raw, kind_raw_clipped = _clip(kind_value, MAX_KIND_RAW_CHARS)
     blocker_value = merged.get("blocker")
-    blocker = (_redact(blocker_value)[:MAX_BLOCKER_CHARS]
-               if blocker_value and blocker_value.strip().lower() != "false" else None)
+    blocker, blocker_clipped = (_clip(blocker_value, MAX_BLOCKER_CHARS)
+                                if blocker_value and blocker_value.strip().lower() != "false" else (None, False))
     superseded_value = merged.get("superseded_by")
     successor = superseded_value.strip() if isinstance(superseded_value, str) else ""
     if successor.lower() == "false":
         successor = ""
     if successor.startswith("#"):
         successor = successor[1:]
-    return {"req": req, "kind": kind, "kind_raw": kind_raw,
-            "from": _bounded_text(merged.get("from"), MAX_FROM_CHARS),
-            "blocker": blocker, "successor": successor or None,
-            "reason": _bounded_text(merged.get("reason"), MAX_REASON_CHARS)}
+    from_text, from_clipped = _bounded_text(merged.get("from"), MAX_FROM_CHARS)
+    reason, reason_clipped = _bounded_text(merged.get("reason"), MAX_REASON_CHARS)
+    flags = (req_clipped, kind_raw_clipped, from_clipped, blocker_clipped, reason_clipped)
+    return {"req": req, "kind": kind, "kind_raw": kind_raw, "from": from_text,
+            "blocker": blocker, "successor": successor or None, "reason": reason,
+            "clipped": tuple(field for field, clipped in zip(_UNIT_CLIP_FIELDS, flags) if clipped)}
 
 
 def _supersession(steps, lineage):
@@ -757,19 +784,49 @@ def _deliverable_status(value):
 
 
 def _new_requirement_accumulator():
+    # units_by_status holds (unit record, shown clipped field names) pairs; req_clipped is set when
+    # any row's req was shortened into this bucket's label. Neither private form reaches the view.
     return {"counts": {status: 0 for status in _DELIVERABLE_STATUSES}, "superseded": 0,
             "required_open": 0, "enhancement_open": 0, "blockers": 0,
             "kinds": {kind: 0 for kind in DELIVERABLE_KINDS + ("invalid",)},
-            "units_by_status": _empty_unit_bucket()}
+            "units_by_status": _empty_unit_bucket(), "req_clipped": False}
+
+
+def _new_clip_counts():
+    return {field: 0 for field in _CLIP_FIELDS}
+
+
+def _among(row_clipped, shown_fields):
+    """The clipped field names one record shows: shown_fields (in order) that the row's set holds."""
+    return tuple(field for field in shown_fields if field in row_clipped)
+
+
+def _shown(pairs, bound, clips):
+    """The first bound (value, clipped field names) pairs as plain values, tallying only those kept.
+
+    A value beyond the bound is not shown, so its clipped fields never count; the bound's own
+    list note already discloses it.
+    """
+    kept = pairs[:bound]
+    for _, fields in kept:
+        for field in fields:
+            clips[field] += 1
+    return [value for value, _ in kept]
 
 
 def _finalize_requirement(label, declared, accum):
+    """One requirement entry plus the clip counts of the values it shows: its kept units and its label."""
     by_status = accum["units_by_status"]
     ordered = by_status["in_progress"][::-1] + by_status["pending"][::-1] + by_status["completed"][::-1]
-    return {"label": label, "declared": declared, "folded": False, "counts": accum["counts"],
-            "superseded": accum["superseded"], "required_open": accum["required_open"],
-            "enhancement_open": accum["enhancement_open"], "blockers": accum["blockers"],
-            "kinds": accum["kinds"], "units": ordered[:MAX_UNIT_LIST], "units_total": len(ordered)}
+    clips = _new_clip_counts()
+    units = _shown(ordered, MAX_UNIT_LIST, clips)
+    # Rows with different raw reqs can share one bounded label: it counts once if any was shortened.
+    if accum["req_clipped"]:
+        clips["req"] += 1
+    return ({"label": label, "declared": declared, "folded": False, "counts": accum["counts"],
+             "superseded": accum["superseded"], "required_open": accum["required_open"],
+             "enhancement_open": accum["enhancement_open"], "blockers": accum["blockers"],
+             "kinds": accum["kinds"], "units": units, "units_total": len(ordered)}, clips)
 
 
 def _fold_requirement_labels(buckets, declared_labels):
@@ -777,12 +834,18 @@ def _fold_requirement_labels(buckets, declared_labels):
 
     The folded overflow entry is distinguished by "folded": True rather than by its "other"
     label, so a genuine requirement literally named "other" keeps its own entry (folded False).
+    The third value is the clip counts of the kept entries; the folded entry shows no units and a
+    fixed label, so the requirements folded into it contribute nothing.
     """
     finalized = {label: _finalize_requirement(label, label in declared_labels, accum)
                  for label, accum in buckets.items()}
     labels = sorted(finalized)
     kept, overflow = labels[:MAX_REQUIREMENT_LABELS], labels[MAX_REQUIREMENT_LABELS:]
-    entries = [finalized[label] for label in kept]
+    entries = [finalized[label][0] for label in kept]
+    clips = _new_clip_counts()
+    for label in kept:
+        for field, count in finalized[label][1].items():
+            clips[field] += count
     if overflow:
         folded = {"label": "other", "declared": False, "folded": True,
                   "counts": {status: 0 for status in _DELIVERABLE_STATUSES},
@@ -790,7 +853,7 @@ def _fold_requirement_labels(buckets, declared_labels):
                   "kinds": {kind: 0 for kind in DELIVERABLE_KINDS + ("invalid",)},
                   "units": [], "units_total": 0}
         for label in overflow:
-            source = finalized[label]
+            source = finalized[label][0]
             for status in _DELIVERABLE_STATUSES:
                 folded["counts"][status] += source["counts"][status]
             for key in ("superseded", "required_open", "enhancement_open", "blockers", "units_total"):
@@ -798,7 +861,7 @@ def _fold_requirement_labels(buckets, declared_labels):
             for kind_key in folded["kinds"]:
                 folded["kinds"][kind_key] += source["kinds"][kind_key]
         entries.append(folded)
-    return entries, bool(overflow)
+    return entries, bool(overflow), clips
 
 
 def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unavailable_reason=None):
@@ -833,6 +896,8 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         verdicts = _supersession(steps, lineage)
     closure = result["closure"]
     buckets, declared_labels = {}, set(anchor.get("declared_labels") or ())
+    # Each of these holds (record or id, clipped field names it shows) pairs until _shown applies
+    # its bound, so only values the view shows count toward the character-clip note (C8).
     superseded_full, blockers_full, conflicts_full, unmapped_ids = [], [], [], []
     unmapped_count = unmapped_unavailable = 0
     unmapped_totals = {"superseded": 0, "required_open": 0, "completed": 0, "blockers": 0}
@@ -847,7 +912,8 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         # (B2); a dangling reference or a cycle is a conflict, not a disposition, and such a row
         # keeps its own open/completed counting.
         is_superseded = verdict["superseded"]
-        successor = None if verdict["successor"] is None else _display_id(verdict["successor"])
+        successor, successor_clipped = ((None, False) if verdict["successor"] is None
+                                        else _display_id(verdict["successor"]))
         # Unmapped work (no usable req) is always required, regardless of a parsed kind=
         # enhancement token: unknown work is never optional.
         is_enhancement = resolved["req"] is not None and resolved["kind"] == "enhancement"
@@ -870,14 +936,23 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
             closure["blockers"] += 1
         # Every id the view emits is redacted and bounded (F1, C4); task_id itself keeps its raw
         # value for the internal steps/lineage lookups and the supersession identity above.
-        display_id = _display_id(task_id)
-        unit_record = {"id": display_id, "label": _step_label(step), "status": status,
+        display_id, id_clipped = _display_id(task_id)
+        label_text = _label_text(step)
+        label, label_clipped = _clip(label_text, MAX_LABEL_CHARS) if label_text is not None else ("", False)
+        # Every per-key field of this row that its bound shortened; each record below counts only
+        # the fields it shows, once per shown value (C8).
+        row_clipped = set(resolved["clipped"])
+        for field, clipped in (("id", id_clipped), ("label", label_clipped), ("superseded_by", successor_clipped)):
+            if clipped:
+                row_clipped.add(field)
+        unit_record = {"id": display_id, "label": label, "status": status,
                        "kind": resolved["kind"], "kind_raw": resolved["kind_raw"], "from": resolved["from"],
                        "superseded_by": successor, "blocker": resolved["blocker"],
                        "stale_in_progress": is_stale}
         if is_superseded:
-            superseded_full.append({"id": display_id, "successor": successor,
-                                    "reason": resolved["reason"], "status": status})
+            superseded_full.append(({"id": display_id, "successor": successor,
+                                     "reason": resolved["reason"], "status": status},
+                                    _among(row_clipped, ("id", "superseded_by", "reason"))))
         # At most one conflict per row, in this precedence.
         conflict = None
         if verdict["successor"] is not None and not verdict["observed"]:
@@ -887,19 +962,24 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         elif is_superseded and status == "completed":
             conflict = "completed_and_superseded"
         if conflict is not None:
-            conflicts_full.append({"id": display_id, "req": resolved["req"], "reason": conflict,
-                                   "successor": successor})
+            conflicts_full.append(({"id": display_id, "req": resolved["req"], "reason": conflict,
+                                    "successor": successor},
+                                   _among(row_clipped, ("id", "req", "superseded_by"))))
         if is_blocker:
             # A bare "true" marker carries no explanation of its own; the blocker's own reason
-            # text (when given) stands in for it, otherwise the list shows no reason text.
-            blocker_reason = (resolved["blocker"] if resolved["blocker"].strip().lower() != "true"
-                              else resolved["reason"])
-            blockers_full.append({"id": display_id, "req": resolved["req"], "label": unit_record["label"],
-                                  "reason": blocker_reason})
+            # text (when given) stands in for it, otherwise the list shows no reason text. The
+            # shown text counts under the field it came from.
+            carries_blocker_text = resolved["blocker"].strip().lower() != "true"
+            blocker_reason = resolved["blocker"] if carries_blocker_text else resolved["reason"]
+            blockers_full.append(({"id": display_id, "req": resolved["req"], "label": unit_record["label"],
+                                   "reason": blocker_reason},
+                                  _among(row_clipped, ("id", "req", "label",
+                                                       "blocker" if carries_blocker_text else "reason"))))
         if resolved["req"] is None:
             unmapped_count += 1
             unmapped_unavailable += 1 if entry is None else 0
-            unmapped_ids.append(display_id)
+            # An unmapped row has no unit record: only its id (and the list entries above) can show.
+            unmapped_ids.append((display_id, _among(row_clipped, ("id",))))
             # The same per-row predicates as closure (an unmapped row is never an enhancement).
             if is_superseded:
                 unmapped_totals["superseded"] += 1
@@ -911,6 +991,7 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
                 unmapped_totals["blockers"] += 1
             continue
         accum = buckets.setdefault(resolved["req"], _new_requirement_accumulator())
+        accum["req_clipped"] = accum["req_clipped"] or "req" in row_clipped
         # A superseded row is never counted under its status (never as completed): counts hold the
         # non-superseded rows, superseded the rest, so units_total == sum(counts) + superseded.
         if is_superseded:
@@ -926,8 +1007,12 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         if resolved["kind"] in accum["kinds"]:
             accum["kinds"][resolved["kind"]] += 1
         bucket_status = status if status in accum["units_by_status"] else "pending"
-        accum["units_by_status"][bucket_status].append(unit_record)
-    requirements, labels_truncated = _fold_requirement_labels(buckets, declared_labels)
+        accum["units_by_status"][bucket_status].append(
+            (unit_record, _among(row_clipped, ("id", "label", "kind_raw", "from", "blocker", "superseded_by"))))
+    clips = _new_clip_counts()
+    requirements, labels_truncated, requirement_clips = _fold_requirement_labels(buckets, declared_labels)
+    for field, count in requirement_clips.items():
+        clips[field] += count
     result["requirements"] = requirements
     if any(entry["units_total"] > MAX_UNIT_LIST for entry in requirements if not entry["folded"]):
         truncated = True
@@ -936,23 +1021,31 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
         truncated = True
         notes.append("requirement labels bounded to " + str(MAX_REQUIREMENT_LABELS))
     result["unmapped"] = {"count": unmapped_count, "metadata_unavailable": unmapped_unavailable,
-                          "ids": unmapped_ids[:MAX_ID_LIST], **unmapped_totals}
+                          "ids": _shown(unmapped_ids, MAX_ID_LIST, clips), **unmapped_totals}
     if len(unmapped_ids) > MAX_ID_LIST:
         truncated = True
         notes.append("unmapped ids bounded to " + str(MAX_ID_LIST))
-    result["superseded"], result["superseded_total"] = superseded_full[:MAX_UNIT_LIST], len(superseded_full)
+    result["superseded"] = _shown(superseded_full, MAX_UNIT_LIST, clips)
+    result["superseded_total"] = len(superseded_full)
     if len(superseded_full) > MAX_UNIT_LIST:
         truncated = True
         notes.append("superseded list bounded to " + str(MAX_UNIT_LIST))
-    result["blockers"], result["blockers_total"] = blockers_full[:MAX_UNIT_LIST], len(blockers_full)
+    result["blockers"], result["blockers_total"] = _shown(blockers_full, MAX_UNIT_LIST, clips), len(blockers_full)
     if len(blockers_full) > MAX_UNIT_LIST:
         truncated = True
         notes.append("blockers list bounded to " + str(MAX_UNIT_LIST))
-    result["conflicts"], result["conflicts_total"] = conflicts_full[:MAX_UNIT_LIST], len(conflicts_full)
+    result["conflicts"] = _shown(conflicts_full, MAX_UNIT_LIST, clips)
+    result["conflicts_total"] = len(conflicts_full)
     closure["conflicts"] = len(conflicts_full)
     if len(conflicts_full) > MAX_UNIT_LIST:
         truncated = True
         notes.append("conflicts list bounded to " + str(MAX_UNIT_LIST))
+    # A character bound that shortened a value the view shows is disclosed like any other bound: one
+    # note, appended last, counting each shown shortened value under its per-key field (C8).
+    if any(clips.values()):
+        truncated = True
+        notes.append("character bounds clipped: " + ", ".join(
+            field + " " + str(clips[field]) for field in _CLIP_FIELDS if clips[field]))
     result["limits"] = {"truncated": truncated, "notes": notes[:MAX_LIMIT_NOTES]}
     return result
 

@@ -276,13 +276,42 @@ Every id-valued field in `deliverables` — `units[].id`, `units[].superseded_by
 `superseded[].id` and `.successor`, `blockers[].id`, `conflicts[].id` and
 `.successor`, and `unmapped.ids[]` — is redacted and then bounded to 64
 characters (`MAX_ID_CHARS`); the former 32-character bound that applied only to
-`superseded_by` is now this same 64. Other per-key bounds are unchanged: `req`
-16 characters, `from` 64, `blocker` 120, `reason` 200, `kind_raw` 32. Each
-requirement's `units` list, the top-level `superseded`, `blockers` and `conflicts`
-lists, and `unmapped.ids` hold at most 16 entries (the true count is in the
-matching `_total`/`count` field); `declared_labels` and the requirement list are
-each bounded to 32; `limits.notes` holds at most 8 strings. Any of these bounds
-being exceeded is reported in `limits.truncated` and `limits.notes`.
+`superseded_by` is now this same 64. The other per-key bounds are `req` 16
+characters (shown as `requirements[].label`, `blockers[].req` and
+`conflicts[].req`), `label` 200 (`units[].label` and `blockers[].label`),
+`from` 64, `blocker` 120, `reason` 200 and `kind_raw` 32. Each requirement's
+`units` list, the top-level `superseded`, `blockers` and `conflicts` lists, and
+`unmapped.ids` hold at most 16 entries (the true count is in the matching
+`_total`/`count` field); `declared_labels` and the requirement list are each
+bounded to 32; `limits.notes` holds at most 8 strings.
+
+Every exceeded bound is disclosed in `limits`. A list or label bound sets
+`limits.truncated` and adds that bound's own note
+(`requirement units bounded to 16`, `requirement labels bounded to 32`,
+`unmapped ids bounded to 16`, `superseded list bounded to 16`,
+`blockers list bounded to 16`, `conflicts list bounded to 16`,
+`declared labels bounded to 32`). A character bound that shortened a value the
+view shows also sets `limits.truncated` and adds exactly one note,
+`character bounds clipped: <field> <count>, ...`, listing in a fixed order
+(`id`, `label`, `req`, `kind_raw`, `from`, `blocker`, `reason`, `superseded_by`)
+each per-key field with the number of shown values that were shortened. A
+value shown in two places counts in each: a 121-character `blocker` on an open
+blocker row counts once in `units[].blocker` and once as the `blockers[].reason`
+echo of that text (`blocker 2`); `superseded_by` covers `units[].superseded_by`,
+`superseded[].successor` and `conflicts[].successor`; `reason` covers
+`superseded[].reason` and the `blockers[].reason` that a bare `true` blocker
+borrows; `req` counts a kept requirement entry's label once plus each
+`blockers[].req` and `conflicts[].req`. Redaction never counts as clipping:
+bounding is measured on the redacted text, so a path rewritten to `<path>` is
+not a shortened value. Values the view does not show are not counted — a
+row's `reason` when the row is neither superseded nor a bare-`true` blocker,
+unit records beyond the 16-unit bound, entries beyond a list bound, and
+requirement labels folded into `other` — because the list and label notes
+already disclose those. With at most one anchor note, six list/label notes and
+this one clip note, the eight-string `limits.notes` budget is never exceeded.
+The view's `plan.steps[].label`, `plan.groups[].active[]` and top-level
+`launches[].description` are pre-existing outputs outside `deliverables` and
+carry no clip accounting.
 
 **Status vocabulary.** Inside `deliverables`, a unit's `status` is one of
 `pending`, `in_progress`, `completed` or `unknown`; any other observed value is
