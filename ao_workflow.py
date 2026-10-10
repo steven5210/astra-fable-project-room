@@ -508,6 +508,22 @@ def delivered(state, session_id, directory=None):
             "notices": notices}
 
 
+def _progress_plan(successor_delivery, delivered_history, part_delivered, part_v2_delivered, satisfied):
+    """The one progress_plan shape and meaning text every context_summary branch returns, so the key
+    set and meaning cannot drift between the healthy and the early-error return."""
+    import ao_progress
+    return {
+        "successor": ao_progress.PART_V3, "successor_delivery": successor_delivery, "delivered_history": delivered_history,
+        "superseded": {
+            ao_progress.PART: {"delivered": part_delivered, "satisfied": satisfied},
+            ao_progress.PART_V2: {"delivered": part_v2_delivered, "satisfied": satisfied},
+        },
+        "meaning": "Superseded progress parts are never re-sent; delivered is their literal carried-part history, "
+                   "receipt-verified only when delivered_history is receipt_verified, and satisfied is true only "
+                   "when the receipt-verified successor delivery covers their requirements; delivered is null and "
+                   "delivered_history is unavailable when the session's own carried-part history cannot be read"}
+
+
 def context_summary(state, directory=None):
     """Offline status of what the bound engineer session has been sent; never an agent claim."""
     binding = state.get("bindings", {}).get("engineer")
@@ -518,7 +534,14 @@ def context_summary(state, directory=None):
     try:
         held = delivered(state, binding["session_id"])
     except RoomError as exc:
-        return {"session_id": binding["session_id"], "error": str(exc), **quality}
+        # The session's own carried-part history cannot be read at all (for example, a malformed saved
+        # carried record such as a duplicated part name). Like every other delivered() integrity failure
+        # below this reports successor_delivery "unavailable_integrity", never a verified absence; unlike
+        # them, delivered_history is "unavailable" rather than "metadata_only": no metadata was readable,
+        # so each superseded part's delivered history is null and nothing is claimed or satisfied,
+        # instead of dropping progress_plan entirely.
+        return {"session_id": binding["session_id"], "error": str(exc), **quality,
+                "progress_plan": _progress_plan("unavailable_integrity", "unavailable", None, None, False)}
     import ao_progress
     # The successor's own delivery check is receipt-authenticated whenever a directory is given, by
     # calling delivered() a second time with it; this never changes the (pre-existing, unauthenticated)
@@ -548,15 +571,8 @@ def context_summary(state, directory=None):
     # the branch that can set successor_delivery to "verified_delivered" or "undelivered" above. This checks
     # directory/integrity_failure directly rather than matching successor_delivery's string value.
     delivered_history = "metadata_only" if (directory is None or integrity_failure) else "receipt_verified"
-    progress_plan = {
-        "successor": ao_progress.PART_V3, "successor_delivery": successor_delivery, "delivered_history": delivered_history,
-        "superseded": {
-            ao_progress.PART: {"delivered": ao_progress.PART in held["parts"], "satisfied": satisfied},
-            ao_progress.PART_V2: {"delivered": ao_progress.PART_V2 in held["parts"], "satisfied": satisfied},
-        },
-        "meaning": "Superseded progress parts are never re-sent; delivered is their literal carried-part history, "
-                   "receipt-verified only when delivered_history is receipt_verified, and satisfied is true only "
-                   "when the receipt-verified successor delivery covers their requirements"}
+    progress_plan = _progress_plan(successor_delivery, delivered_history, ao_progress.PART in held["parts"],
+                                   ao_progress.PART_V2 in held["parts"], satisfied)
     return {"session_id": binding["session_id"], "spec_record_sha256": held["spec_record_sha256"], **quality,
             "spec_current": held["spec_record_sha256"] == state.get("spec_record_sha256"),
             "parts": held["parts"],

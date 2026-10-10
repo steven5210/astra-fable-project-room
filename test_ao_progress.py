@@ -1387,5 +1387,68 @@ class DamagedReceiptSuccessorDeliveryTests(Fixture):
             path.write_bytes(original)
 
 
+class MalformedCarriedRecordSuccessorDeliveryTests(Fixture):
+    """A completed engineer request's own saved carried record can be malformed independently of its
+    receipt -- the PR reviewer's example: a duplicated name in carried.parts. carried_by() rejects this
+    shape (len(set(names)) != len(names)) before any receipt is even considered, so the metadata-only
+    delivered() call that context_summary's *first*, unauthenticated read makes raises RoomError. That
+    early error return must still carry a full "unavailable_integrity"/"unavailable" progress_plan with
+    the healthy branch's exact key set, never drop the key entirely."""
+
+    def setUp(self):
+        super().setUp()
+        self.room = self.open(); self.spec(); self.bind(); self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+
+    def test_duplicated_carried_part_name_reports_unavailable_integrity_progress_plan(self):
+        session_id = self.state()['bindings']['engineer']['session_id']
+        healthy_keys = set(ao_workflow.context_summary(self.state(), self.directory())['progress_plan'].keys())
+
+        state = self.state()
+        original = copy.deepcopy(state)
+        req = state['requests']['implementation']
+        # Shape-invalid (unlike TamperedSuccessorDeliveryTests' shape-valid-but-receipt-inconsistent
+        # removal): a duplicated name in carried.parts, left otherwise consistent with part_sha256, so
+        # only carried_by()'s own duplicate check fires. The receipt is left untouched -- irrelevant here,
+        # since the unauthenticated delivered(state, session_id) call below never reads it.
+        req['carried']['parts'] = [ao_progress.PART_V3, ao_progress.PART_V3]
+        req['carried']['part_sha256'] = {ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256}
+        self.service.save(self.directory(), state)
+        try:
+            tampered = self.state()
+            # Positive control: the identical record with the name listed once is accepted, so the
+            # duplicate-name check alone is what rejects the tampered record below.
+            control = copy.deepcopy(tampered['requests']['implementation'])
+            control['carried']['parts'] = [ao_progress.PART_V3]
+            self.assertEqual(ao_workflow.carried_by(control)[1], (ao_progress.PART_V3,))
+            with self.assertRaises(ao.RoomError):
+                ao_workflow.carried_by(tampered['requests']['implementation'])
+            with self.assertRaises(ao.RoomError):
+                ao_workflow.delivered(tampered, session_id)
+
+            # The read-only status projection never raises even though the evidence beneath it is broken.
+            status = self.service.ao_room_status(self.room)
+            context = status['engineer_context']
+            self.assertIsInstance(context['error'], str)
+            self.assertTrue(context['error'])
+            plan = context['progress_plan']
+            self.assertEqual(plan['successor'], ao_progress.PART_V3)
+            self.assertEqual(plan['successor_delivery'], 'unavailable_integrity')
+            self.assertEqual(plan['delivered_history'], 'unavailable')
+            for part in (ao_progress.PART, ao_progress.PART_V2):
+                self.assertIsNone(plan['superseded'][part]['delivered'])
+                self.assertFalse(plan['superseded'][part]['satisfied'])
+            self.assertEqual(set(plan.keys()), healthy_keys)
+
+            # Both the receipt-authenticated and the unverified callers land on the identical plan.
+            self.assertEqual(ao_workflow.context_summary(tampered, self.directory())['progress_plan'], plan)
+            self.assertEqual(ao_workflow.context_summary(tampered, None)['progress_plan'], plan)
+        finally:
+            self.service.save(self.directory(), original)
+
+
 if __name__ == '__main__':
     unittest.main()

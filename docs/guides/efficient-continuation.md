@@ -199,20 +199,34 @@ directory is given but that receipt chain itself cannot be authenticated — a
 missing or corrupt receipt on any of the session's completed engineer turns, or
 a tampered carried record, for example — so a broken chain is reported through
 its own status and never misread as a verified absence ("undelivered") or
-trusted into a successor claim. `unverified`: status is read without this
+trusted into a successor claim. It is also reported, regardless of whether a
+directory is given, when the session's own saved carried-part history cannot
+be read at all; see the `unavailable` value of `delivered_history` below for
+that case. `unverified`: status is read without this
 room's own directory to verify receipts against (metadata-only; never treated
-as satisfied). Beside these four sits `delivered_history`, one of two values:
+as satisfied). Beside these four sits `delivered_history`, one of three values:
 `receipt_verified` when a directory was given and its own receipt chain
 authenticated cleanly (exactly the `verified_delivered`/`undelivered` cases
-above), or `metadata_only` when no directory was given at all or that chain's
-own authentication failed (`unverified`/`unavailable_integrity`). And `superseded`
+above), `metadata_only` when the carried-part history itself was readable but no
+directory was given at all or that chain's own authentication failed
+(`unverified`, or `unavailable_integrity` with readable history), or
+`unavailable` when the session's own saved carried-part history cannot be
+read at all (malformed saved metadata, for example a duplicated carried part
+name). In the `unavailable` case, status keeps its existing `error` field, reports
+no `parts`, `undelivered_parts`, `spec_record_sha256` or `spec_current` (as
+before), `successor_delivery` is `unavailable_integrity`, each superseded part's
+`delivered` is null rather than a true or false claim, `satisfied` is `false`, and
+nothing is inferred or repaired. And `superseded`
 lists `progress_plan_v1` and `progress_plan_v2`, each with `delivered` (that
 session's own literal carried-part history for the older part: `true` for a
 retained session whose recorded carried parts include it, `false` for a session
-that never received it, which includes every new session; receipt-verified only
-when `delivered_history` is `receipt_verified`, metadata-only otherwise) and
-`satisfied` (`true` only when `successor_delivery` is `verified_delivered`; always
-`false` without a directory). Neither field ever causes a superseded part to be
+that never received it, which includes every new session, or null when
+`delivered_history` is `unavailable`; receipt-verified only when
+`delivered_history` is `receipt_verified`, metadata-only when it is
+`metadata_only`, and null with no claim when it is `unavailable`) and `satisfied`
+(`true` only when `successor_delivery` is `verified_delivered`; always `false`
+without a directory or when `delivered_history` is `unavailable`).
+Neither field ever causes a superseded part to be
 re-sent. The existing `undelivered_parts` list also excludes both superseded
 names, so it never reports a gap that no future packet will ever fill. This
 delivery mechanism adds no repeated consent step: an ordinary continuation remains
