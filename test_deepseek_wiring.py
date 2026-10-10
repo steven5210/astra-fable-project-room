@@ -1,6 +1,7 @@
 """Controller wiring for the DeepSeek provider: setup, room snapshots, policy selection, inventory refusal before launch,
 status/doctor surfaces and progress categories. Fake Claude and fake adapters only; no network, no key reads."""
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -375,6 +376,20 @@ class InventoryRefusalTests(WiringFixture):
         job = self.service.room_implementation_submit(self.deepseek_room, self.handoff["handoff_id"], request_id, recovery_id)
         return self.service.room_job_status(job["id"], 40)
 
+    def wait_worker_finished(self, job_id):
+        # Terminal registry results precede projection finalization. The exact
+        # worker holds this lease until both are done; observing it is read-only.
+        deadline = time.monotonic() + 10
+        with (self.service._job_path(job_id) / "worker.lock").open("rb") as lease:
+            while True:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail("Fixture worker did not finish finalization: " + job_id)
+                    time.sleep(.05)
+
     def test_tampered_snapshot_is_refused_before_launch_in_initial_and_correction_lanes(self):
         original = self.adapter_copy.read_bytes()
         self.adapter_copy.write_bytes(original + b"\n# tampered\n")
@@ -527,6 +542,7 @@ class InventoryRefusalTests(WiringFixture):
         self.assertEqual(refused["status"], "failed", refused)
         self.assertEqual(refused["result"]["reason"], "provider_inventory_mismatch")
         self.assertEqual(refused["result"]["recovery_id"], prepared["recovery_id"])
+        self.wait_worker_finished(refused["id"])
         recoveries = {row["id"]: row for row in self.service.room_status(self.deepseek_room)["recoveries"]}
         self.assertEqual((recoveries[prepared["recovery_id"]]["status"], recoveries[prepared["recovery_id"]]["reason"]), ("invalidated", "provider_inventory_mismatch"))
         self.assertEqual(self.state()["phase"], "blocked")
