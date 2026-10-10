@@ -6,6 +6,12 @@ Fable charter review after a normal AO room has consumed exactly three
 not renew source-review or independent acceptance allowances, release provider
 holds, reset counters, replace a room/session, or dispatch a model.
 
+This is the lane used when the room already holds a retained independent
+acceptance. A room with zero acceptances whose latest completed engineering
+turn proposed a scope change instead uses the
+[pre-acceptance exact-spec review extension](pre-acceptance-review-extension.md),
+which shares this same one-ever grant and every mechanic described below.
+
 The operator first registers the approved next charter with `ao_room_spec_put`.
 Registration preserves the historical acceptance and consumes no review. The
 registered revision must be exactly one greater than the highest previously

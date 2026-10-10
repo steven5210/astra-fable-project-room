@@ -123,7 +123,13 @@ def workspace(service, directory, state, check_routing=True):
     return actual
 
 
-def handoff_record(directory, state):
+def retained_handoff(directory, state, current_spec=False):
+    """The authenticated retained handoff record, by its saved pointer and digest.
+
+    A later registered charter revision moves spec_record_sha256 while the room still names the
+    original agreed handoff. Without current_spec this authenticates that original handoff only; it
+    never admits implementation against a newer specification. handoff_record requires current_spec.
+    """
     from ao_project_room import read, digest
     if not state.get("handoff"):
         raise RoomError("Create the agreed engineering handoff first")
@@ -139,10 +145,15 @@ def handoff_record(directory, state):
                 expected = transition["original_preparation_sha256"]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise RoomError("Provider epoch handoff reference is unreadable or inconsistent") from exc
-    if (digest(value) != state.get("handoff_sha256") or value["spec_record_sha256"] != state["spec_record_sha256"]
+    if (digest(value) != state.get("handoff_sha256")
+            or (current_spec and value["spec_record_sha256"] != state["spec_record_sha256"])
             or value["preparation_sha256"] != expected):
         raise RoomError("Engineering handoff is stale or changed")
     return value
+
+
+def handoff_record(directory, state):
+    return retained_handoff(directory, state, current_spec=True)
 
 
 def handoff(service, directory, state, worktree_path):

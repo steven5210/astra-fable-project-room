@@ -98,7 +98,10 @@ the first engineer response. Then `ao_room_send` role `engineer`, purpose
 Dispose of each finding with evidence; a behavior change needs a newer revision.
 There are 3 spec-review attempts across revisions, with no automatic renewal.
 **Stop:** attempts exhausted → bring the product tradeoff to the user; an
-extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md).
+extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md)
+(a room with zero acceptances and a completed `scope_change` report instead uses
+[pre-acceptance review extension](../../../docs/guides/pre-acceptance-review-extension.md);
+both share the room's one grant).
 Prose around the final JSON → [formatting recovery](ao.md#completed-response-formatting-recovery).
 
 ## 3. Handoff and implementation
@@ -112,7 +115,15 @@ spec, baseline and SHA fields. Read full receipts, not previews. In status,
 inspect `review_followups`, `enhancement_proposals` and `operator_requests`.
 Pending operator requests block acceptance: do only the authorized execution,
 return the evidence, then get Fable's next judgment.
-**Stop:** `scope_change` → a revised, agreed spec first. Enhancement proposals →
+**Stop:** `scope_change` → a revised, agreed spec first: register the exact next
+charter revision and reach Fable's renewed exact-spec agreement on it before any
+new handoff or implementation. With the room's three charter reviews already
+consumed and zero independent acceptances, the user may instead authorize the
+[pre-acceptance review extension](../../../docs/guides/pre-acceptance-review-extension.md)
+for that exact proposal, which grants exactly one additional exact-spec review
+of the registered revision; that fourth review's own agreement **is** the
+renewed agreement, never a substitute for it or for implementation authority.
+Enhancement proposals →
 [enhancement issue handoff](../../../docs/guides/workflow.md#enhancement-issue-handoff).
 Delegate ledger or routing refusal → [usage, context and delegates](ao.md#usage-context-and-delegates).
 

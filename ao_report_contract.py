@@ -18,8 +18,12 @@ For implementation/correction replies, use this compact JSON contract instead of
 This illustrates field types, not your verdict. outcome must be completed, changes_required or scope_change. Only completed/true with no remaining_gaps is eligible for independent acceptance. Each routing_log entry retains delegate_job_ids as a list naming only relevant room-owned jobs. Fill the judgment fields truthfully; do not repeat the artifact's full findings in multiple fields. The controller separately attaches the exact bound spec_revision, spec_sha256 and baseline_commit and labels that metadata as controller-authored. Never use partial as an outcome. Return one complete JSON object without surrounding prose. Existing full reports remain supported; neither raw receipts nor prior verdicts are rewritten. This update is delivered once; routine continuation remains only Continue. or actual new requirements.'''
 
 
-def project(directory, state, request, report):
-    """Never repair syntax, alter judgment fields, infer verdicts, or override identities."""
+def project(directory, state, request, report, handoff=None):
+    """Never repair syntax, alter judgment fields, infer verdicts, or override identities.
+
+    A caller that already authenticated the retained handoff may supply it; otherwise the current
+    handoff record is read exactly as before.
+    """
     from ao_project_room import digest
     import ao_workflow
     if 'report_format' not in report:
@@ -30,7 +34,8 @@ def project(directory, state, request, report):
         raise RoomError('Compact report contract was not delivered to this native session')
     if 'controller_metadata' in report:
         raise RoomError('The model cannot supply controller-owned report provenance')
-    handoff = ao_workflow.handoff_record(directory, state)
+    if handoff is None:
+        handoff = ao_workflow.handoff_record(directory, state)
     metadata = {key: handoff[key] for key in ('spec_revision', 'spec_sha256', 'baseline_commit')}
     if any(key in report and (report[key] != value or type(report[key]) is not type(value)) for key, value in metadata.items()):
         raise RoomError('Native report contradicts the exact bound metadata')
