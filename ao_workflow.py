@@ -20,7 +20,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
          "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
-         "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1")
+         "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1", "progress_plan_v3")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -508,6 +508,22 @@ def delivered(state, session_id, directory=None):
             "notices": notices}
 
 
+def _progress_plan(successor_delivery, delivered_history, part_delivered, part_v2_delivered, satisfied):
+    """The one progress_plan shape and meaning text every context_summary branch returns, so the key
+    set and meaning cannot drift between the healthy and the early-error return."""
+    import ao_progress
+    return {
+        "successor": ao_progress.PART_V3, "successor_delivery": successor_delivery, "delivered_history": delivered_history,
+        "superseded": {
+            ao_progress.PART: {"delivered": part_delivered, "satisfied": satisfied},
+            ao_progress.PART_V2: {"delivered": part_v2_delivered, "satisfied": satisfied},
+        },
+        "meaning": "Superseded progress parts are never re-sent; delivered is their literal carried-part history, "
+                   "receipt-verified only when delivered_history is receipt_verified, and satisfied is true only "
+                   "when the receipt-verified successor delivery covers their requirements; delivered is null and "
+                   "delivered_history is unavailable when the session's own carried-part history cannot be read"}
+
+
 def context_summary(state, directory=None):
     """Offline status of what the bound engineer session has been sent; never an agent claim."""
     binding = state.get("bindings", {}).get("engineer")
@@ -518,10 +534,50 @@ def context_summary(state, directory=None):
     try:
         held = delivered(state, binding["session_id"])
     except RoomError as exc:
-        return {"session_id": binding["session_id"], "error": str(exc), **quality}
+        # The session's own carried-part history cannot be read at all (for example, a malformed saved
+        # carried record such as a duplicated part name). Like every other delivered() integrity failure
+        # below this reports successor_delivery "unavailable_integrity", never a verified absence; unlike
+        # them, delivered_history is "unavailable" rather than "metadata_only": no metadata was readable,
+        # so each superseded part's delivered history is null and nothing is claimed or satisfied,
+        # instead of dropping progress_plan entirely.
+        return {"session_id": binding["session_id"], "error": str(exc), **quality,
+                "progress_plan": _progress_plan("unavailable_integrity", "unavailable", None, None, False)}
+    import ao_progress
+    # The successor's own delivery check is receipt-authenticated whenever a directory is given, by
+    # calling delivered() a second time with it; this never changes the (pre-existing, unauthenticated)
+    # `held` above that parts/undelivered_parts already used. A failed authentication never reports
+    # "undelivered" (that would misread a broken chain as a verified absence) and never "satisfied" --
+    # it reports the distinct "unavailable_integrity" status instead, exactly like any other delivered()
+    # integrity failure, never trusted into a successor claim.
+    verified_v3, integrity_failure = False, False
+    if directory is not None:
+        try:
+            verified_v3 = ao_progress.PART_V3 in delivered(state, binding["session_id"], directory)["parts"]
+        except (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError, RecursionError):
+            # Unrelated damage to another request's evidence (a missing or corrupt receipt, or a
+            # tampered carried record, for example) must not crash this read-only status projection;
+            # it withholds the claim and is reported below as "unavailable_integrity".
+            integrity_failure = True
+    if directory is None:
+        successor_delivery = "unverified"
+    elif integrity_failure:
+        successor_delivery = "unavailable_integrity"
+    else:
+        successor_delivery = "verified_delivered" if verified_v3 else "undelivered"
+    satisfied = successor_delivery == "verified_delivered"
+    # Metadata-only exactly when there is no authenticated chain to read it from: no directory was given at
+    # all, or one was given but its own receipt chain could not be authenticated (integrity_failure). Only the
+    # remaining case -- a directory given with its chain intact -- is receipt-verified; that is also exactly
+    # the branch that can set successor_delivery to "verified_delivered" or "undelivered" above. This checks
+    # directory/integrity_failure directly rather than matching successor_delivery's string value.
+    delivered_history = "metadata_only" if (directory is None or integrity_failure) else "receipt_verified"
+    progress_plan = _progress_plan(successor_delivery, delivered_history, ao_progress.PART in held["parts"],
+                                   ao_progress.PART_V2 in held["parts"], satisfied)
     return {"session_id": binding["session_id"], "spec_record_sha256": held["spec_record_sha256"], **quality,
             "spec_current": held["spec_record_sha256"] == state.get("spec_record_sha256"),
-            "parts": held["parts"], "undelivered_parts": [p for p in PARTS if p not in held["parts"]],
+            "parts": held["parts"],
+            "undelivered_parts": [p for p in PARTS if p not in held["parts"] and p not in ao_progress.SUPERSEDED_PARTS],
+            "progress_plan": progress_plan,
             "meaning": "Derived from the controller's completed observed turns, never from agent claims; later engineer turns carry "
                        "only the caller's bytes plus undelivered parts"}
 
@@ -741,6 +797,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     import ao_progress
     texts[ao_progress.PART] = ao_progress.INSTRUCTION
     texts[ao_progress.PART_V2] = ao_progress.INSTRUCTION_V2
+    texts[ao_progress.PART_V3] = ao_progress.INSTRUCTION_V3
     import ao_read_admission
     texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
     import ao_residual_escalation
@@ -760,6 +817,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     for name in PARTS:
         if name == ao_quality_review.PART and quality["source"] is not None:
             continue  # Verified immutable amendment roots also satisfy this new part.
+        if name in ao_progress.SUPERSEDED_PARTS:
+            continue  # progress_plan_v3 consolidates and supersedes v1/v2; never sent to a new session, never backfilled to a retained one.
         if name not in held["parts"]:
             assembly.add("workflow", texts[name])
             carried["parts"].append(name)

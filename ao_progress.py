@@ -51,6 +51,43 @@ INSTRUCTION_V2 = (
     "list remains a progress view only: the final JSON report keeps its existing format and remains the "
     "engineering verdict, and nothing in the list replaces delegate evidence or review."
 )
+PART_V3 = "progress_plan_v3"
+INSTRUCTION_V3_SHA256 = "9e559c9b963f8a883a979f1f97e3936aba0d2df5c7f7b5c682634da3380b665b"
+INSTRUCTION_V3 = (
+    "Progress plan v3 (reporting default; consolidates and supersedes progress plan v1 and progress plan v2, whose frozen "
+    "text is never re-sent; it grants no scope, execution permission, recovery or review allowance and changes no model, "
+    "guard, budget or authority): keep the native task list current with TaskCreate and TaskUpdate (TodoWrite is "
+    "equivalent) so the session host and the operator can follow the work without reading the transcript. When an "
+    "implementation or correction turn starts, call TaskList once and create one task per bounded work unit of the "
+    "current request — the unit one worker launch or one Fable step completes, never a phase, a spec section or an "
+    "umbrella — with a short stable subject reused across turns for the same unit and an activeForm for the in-progress "
+    "wording. in_progress means a worker is running on that unit now or Fable is working on it now; every other unit "
+    "stays pending, so the in_progress rows are the current work and the completed count is a true completion count. A "
+    "unit waiting for an operator, a decision, a quota hold or another unit is waiting, not implementing: leave it "
+    "pending, and keep a blocker, an unresolved quota failure or an operator decision as its own pending task with the "
+    "reason in its subject. When control returns from a worker, a delegate job or the operator with its result, update "
+    "that unit before launching further work or writing the final handback, and say in its wording which evidence exists: "
+    "result received, result inspected, changes applied, worker-reported tests, formal candidate verification or "
+    "independent acceptance. A received result or an exited process never shows a feature complete; mark a unit completed "
+    "only when its evidence exists — the applied change, the inspected handback or the gate output — and leave a failed, "
+    "missing or partial handback unfinished with its reason: in_progress only while Fable or a worker is working on it now, "
+    "otherwise back to pending, and never completed. Residual "
+    "work found by a unit's review is a new task carrying its lineage (EXIT-5 after EXIT-4), never a reopened or renamed "
+    "one; a completed task never returns to in_progress, and a superseded row keeps its lineage and is never newly "
+    "completed. Lineage keys, dispositions and closure counts follow the lifecycle execution and closure default; this "
+    "plan adds no key. Update at unit boundaries, not per tool call, do not re-mark an unchanged status, and keep the "
+    "list to the current request's units rather than a history. When two workers run at once, pairing units of similar "
+    "expected size is a slot-utilisation preference only: never predict sizes or serialize work to keep rows aligned. "
+    "Only the engineer writes this list, and only during its own turns: no instruction, operator or controller can "
+    "refresh it while the engineer is blocked, idle or waiting, so a row left stale after a turn ends is a disclosed "
+    "reporting limit, not evidence of activity, and the controller never wakes the session, edits the list or a "
+    "transcript in the background, interrupts a worker or patches the host's plan panel to repair it. The list remains a "
+    "progress view only: the final JSON report keeps its existing format and remains the engineering verdict, and nothing "
+    "in the list replaces delegate evidence or review."
+)
+# Superseded one-time progress-plan parts: their frozen text, digests and carried records stay valid for
+# historical sessions, but no packet ever carries them again -- progress_plan_v3 consolidates and supersedes both.
+SUPERSEDED_PARTS = (PART, PART_V2)
 MAX_WINDOW_BYTES = 64 * 1024 * 1024
 MAX_TEXT_CHARS = 2000
 MAX_STEPS = 64
@@ -480,6 +517,9 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
     lineage, window = {}, {"created": 0, "completed": 0, "superseded": 0}
     completed_seen = set()
     source, updated_at = "none", None
+    # The row of the last plan change: provenance scopes the plan to the selected turn only when
+    # this exact row lies inside that turn. It is internal and never emitted.
+    updated_row = None
     for row in rows:
         stamp = row.get("timestamp")
         for block in _blocks(row):
@@ -555,7 +595,7 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                         lineage = {key: value for key, value in lineage.items() if key in steps}
                         kind = "task_tools"
             if kind is not None:
-                source, updated_at = kind, stamp
+                source, updated_at, updated_row = kind, stamp, row
     counts = {status: 0 for status in _STEP_STATUSES}
     for step in steps.values():
         status = step.get("status")
@@ -599,7 +639,7 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             "omitted": {status: counts[status] - shown[status] for status in _STEP_STATUSES},
             "groups": _plan_groups(steps.values())}
     return plan, {"steps": steps, "lineage": lineage, "stale": stale_by_id, "window": window,
-                  "supersession": supersession}
+                  "supersession": supersession, "updated_row": updated_row}
 
 
 def _turn_window(rows, request, start, end):
@@ -1057,6 +1097,336 @@ def _deliverables(available, extra, anchor, anchor_notes, anchor_truncated, unav
     return result
 
 
+# Provenance and stage evidence (additive, read-only). Both objects are computed from controller state and
+# the room's own saved records before the transcript is opened, so a source-unavailable view still carries
+# them; only provenance's transcript-derived fields are filled in after a successful read. Neither names a
+# path, a session id, transcript content or a credential, and a stage "error" status carries no detail; the
+# only free text in either object is provenance.latest_engineer_request.semantic_status.reason, the
+# controller's saved semantic-status reason for that request (the saved error summary for an unclassified
+# failure), redacted and bounded like the rest of the view. Nothing in them is inferred, completed or
+# rewritten.
+_ENGINEERING_PURPOSES = ("implementation", "correction")
+_LIVE_REQUEST_STATES = ("submitted", "running")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# Saved engineering records and verification checkpoints embed a full candidate snapshot. A record above
+# this bound cannot be confirmed and reports its stage as an error; it is never read without a bound.
+MAX_STAGE_RECORD_BYTES = 64 * 1024 * 1024
+# Any failure reading or checking saved stage evidence maps to the stage's "error" status, never its text.
+_STAGE_ERRORS = (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError)
+PROVENANCE_MEANING = (
+    "The plan and last_text are authored only by the engineer during its own turns in its registered native "
+    "session, so when the selected request is not that engineer's turn they describe the engineer's work rather "
+    "than the selected request, and the controller never refreshes, infers or rewrites them.")
+STAGES_MEANING = (
+    "Each stage reports the controller's saved records checked only against their recorded digests, and "
+    "identity_match compares saved identities without reading the live worktree, so no stage is inferred, "
+    "completed or rewritten.")
+CURRENTNESS = {"checked": False, "worktree": "unknown", "basis": "saved_identities_only"}
+
+
+def _sha256_or_none(value):
+    """A recorded digest in its exact lowercase-hex form; any other value is never shown as an identity."""
+    return value if isinstance(value, str) and _SHA256_HEX.fullmatch(value) else None
+
+
+def _finite_or_none(value):
+    """A recorded number such as created_at; a bool, NaN, an infinity or a non-number is None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if value == value and abs(value) != float("inf") else None
+
+
+def _revision_or_none(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _identity_match(saved, current):
+    """matches or mismatched for two known saved identities; unknown when either is unknown."""
+    if saved is None or current is None:
+        return "unknown"
+    return "matches" if saved == current else "mismatched"
+
+
+def _stage_identity_match(state, anchor, engineering_candidate, candidate, record_sha256, spec_sha256):
+    """The three-way rule shared by the verification and acceptance stages.
+
+    The stage's candidate is compared with the latest captured engineering candidate, its recorded spec record
+    digest with the room's current spec record digest, and its recorded spec digest with the current spec digest:
+    mismatched when any known pair differs, matches only when all three are known and equal, otherwise unknown.
+    """
+    checks = (_identity_match(candidate, engineering_candidate),
+              _identity_match(record_sha256, _sha256_or_none(state.get("spec_record_sha256"))),
+              _identity_match(spec_sha256, _sha256_or_none(anchor.get("spec_sha256"))))
+    if "mismatched" in checks:
+        return "mismatched"
+    return "matches" if all(check == "matches" for check in checks) else "unknown"
+
+
+def _binding_role(state, request):
+    """The single binding role whose bound session sent the request; the session id is never emitted."""
+    session = request.get("session_id")
+    bindings = state.get("bindings") if isinstance(state.get("bindings"), dict) else {}
+    roles = [role for role in ("engineer", "reviewer")
+             if isinstance(session, str) and session and isinstance(bindings.get(role), dict)
+             and bindings[role].get("session_id") == session]
+    return roles[0] if len(roles) == 1 else "unknown"
+
+
+def _semantic_status_view(value):
+    """The saved semantic status as bounded, redacted {kind, hold, reason} and whether a bound clipped it.
+
+    A legacy bare status string is shown as its kind; any other non-mapping is None.
+    """
+    if isinstance(value, str):
+        value = {"kind": value}
+    if not isinstance(value, dict):
+        return None, False
+    kind, kind_clipped = _bounded_text(value.get("kind"), MAX_KEY_CHARS)
+    reason, reason_clipped = _bounded_text(value.get("reason"), MAX_REASON_CHARS)
+    hold = value.get("hold") if isinstance(value.get("hold"), bool) else None
+    return {"kind": kind, "hold": hold, "reason": reason}, kind_clipped or reason_clipped
+
+
+def _provenance(state, requests, request, explicit):
+    """Who authored the plan and last_text and how they relate to the selected request, before any read.
+
+    The transcript-derived fields start unavailable; _observe_provenance fills them after a read.
+    """
+    role = _binding_role(state, request)
+    engineer_turn = role == "engineer"
+    engineer = [item for item in requests.values()
+                if isinstance(item, dict) and _binding_role(state, item) == "engineer"]
+    latest = max(engineer, key=_request_order) if engineer else None
+    latest_view, truncated = None, False
+    if latest is not None:
+        latest_id, id_clipped = _bounded_text(latest.get("request_id"), MAX_ID_CHARS)
+        purpose, purpose_clipped = _bounded_text(latest.get("purpose"), MAX_KEY_CHARS)
+        recorded, state_clipped = _bounded_text(latest.get("state"), MAX_KEY_CHARS)
+        semantic, semantic_clipped = _semantic_status_view(latest.get("semantic_status"))
+        latest_view = {"request_id": latest_id, "purpose": purpose, "state": recorded,
+                       "created_at": _finite_or_none(latest.get("created_at")), "semantic_status": semantic}
+        truncated = id_clipped or purpose_clipped or state_clipped or semantic_clipped
+    return {"request_selection": "explicit" if explicit else "latest",
+            "selected_request_role": role,
+            "selected_request_is_engineer_turn": engineer_turn,
+            "selected_request_created_at": _finite_or_none(request.get("created_at")),
+            "latest_engineer_request": latest_view,
+            "selected_is_latest_engineer_request": latest is not None and latest is request,
+            "plan": {"author": "engineer", "source": "unavailable", "updated_at": None, "scope": None,
+                     "refreshable_by_selected_request": engineer_turn and request.get("state") in _LIVE_REQUEST_STATES,
+                     "activity": "unknown"},
+            "turn_anchor_reason": "source_unavailable" if engineer_turn else "selected_request_not_engineer_turn",
+            "last_text": {"author": "engineer", "scope": None},
+            "meaning": PROVENANCE_MEANING,
+            "truncated": truncated}
+
+
+def _observe_provenance(provenance, plan, updated_row, anchor_row, turn_rows, last_text):
+    """Fill provenance's transcript-derived fields after the registered engineer source was read.
+
+    The plan scope is "turn" only when the row of its last change lies inside the selected request's own
+    turn; no ordering between plan.updated_at and any request timestamp is computed.
+    """
+    observed = plan.get("source") != "none"
+    updated_at, clipped = _bounded_text(plan.get("updated_at"), MAX_KEY_CHARS) if observed else (None, False)
+    in_turn = anchor_row is not None and any(row is updated_row for row in turn_rows or ())
+    provenance["plan"].update(source="registered_engineer_native_source", updated_at=updated_at,
+                              scope=("turn" if in_turn else "window") if observed else None,
+                              activity="observed" if observed else "unknown")
+    if anchor_row is not None:
+        provenance["turn_anchor_reason"] = None
+    elif provenance["selected_request_is_engineer_turn"]:
+        provenance["turn_anchor_reason"] = "anchor_not_found"
+    provenance["last_text"]["scope"] = None if last_text is None else "turn" if anchor_row is not None else "window"
+    provenance["truncated"] = provenance["truncated"] or clipped
+
+
+def _saved_record(directory, relative):
+    """One room-owned JSON record named by a relative path inside the room, read with the owned-file discipline."""
+    from ao_delegate_launcher import owned_bytes
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise RoomError("Saved stage record is unavailable")
+    return json.loads(owned_bytes(Path(directory) / relative, MAX_STAGE_RECORD_BYTES))
+
+
+def _record_digest(value):
+    from ao_project_room import digest
+    return digest(value)
+
+
+def _engineering_record(directory, request):
+    """(record, digest_valid) for a request's captured engineering record.
+
+    digest_valid is None when the request names no record, and False when the named record is missing,
+    unreadable, oversized or differs from its recorded digest; the record is then withheld.
+    """
+    if request is None or (request.get("engineering_record") is None
+                           and request.get("engineering_record_sha256") is None):
+        return None, None
+    try:
+        record = _saved_record(directory, request.get("engineering_record"))
+        valid = _record_digest(record) == request.get("engineering_record_sha256")
+    except _STAGE_ERRORS:
+        return None, False
+    return (record if valid else None), valid
+
+
+def _engineering_stage(directory, requests, request):
+    """The latest implementation or correction request's captured record, plus its confirmed candidate."""
+    engineering = [item for item in requests.values()
+                   if isinstance(item, dict) and item.get("purpose") in _ENGINEERING_PURPOSES]
+    latest = max(engineering, key=_request_order) if engineering else None
+    stage = {"status": "missing", "request_id": None, "candidate_sha256": None, "report_sha256": None,
+             "selected_request_has_record": False, "digest_valid": None}
+    clipped = False
+    if latest is not None:
+        stage["request_id"], clipped = _bounded_text(latest.get("request_id"), MAX_ID_CHARS)
+        record, stage["digest_valid"] = _engineering_record(directory, latest)
+        if stage["digest_valid"] is not None:
+            candidate = _sha256_or_none(latest.get("result_candidate_sha256"))
+            saved = record.get("candidate") if isinstance(record, dict) else None
+            report = _sha256_or_none(record.get("report_sha256")) if isinstance(record, dict) else None
+            if candidate is not None and report is not None and isinstance(saved, dict) \
+                    and saved.get("sha256") == candidate:
+                stage.update(status="captured", candidate_sha256=candidate, report_sha256=report)
+            else:
+                stage["status"] = "error"
+        elif latest.get("engineering_error") or latest.get("normalization_capture_error"):
+            stage["status"] = "error"  # A recorded capture failure; its text is never shown.
+    if request is latest:
+        stage["selected_request_has_record"] = stage["digest_valid"] is True
+    else:
+        stage["selected_request_has_record"] = _engineering_record(directory, request)[1] is True
+    return stage, clipped, stage["candidate_sha256"]
+
+
+def _verification_stage(directory, state, engineering_candidate, anchor):
+    """The latest recorded verification attempt and its saved checkpoint.
+
+    A drifted spec keeps the recorded status and identities and reports identity_match as mismatched; a pending
+    attempt has no checkpoint yet, so its spec identities are unknown and it never matches.
+    """
+    stage = {"status": "missing", "recorded_status": None, "request_id": None, "candidate_sha256": None,
+             "spec_sha256": None, "spec_record_sha256": None, "gates": None, "identity_match": "unknown",
+             "digest_valid": None}
+    entries = state.get("verifications")
+    if not isinstance(entries, list) or not entries:
+        return stage, False
+    entry = entries[-1] if isinstance(entries[-1], dict) else {}
+    recorded = entry.get("state")
+    stage["recorded_status"], clipped = _bounded_text(recorded, MAX_KEY_CHARS)
+    candidate = _sha256_or_none(entry.get("candidate_sha256"))
+    stage["status"] = "error"
+    if recorded == "running" and candidate is not None:
+        stage.update(status="pending", candidate_sha256=candidate)
+    elif recorded in ("passed", "failed"):
+        passed = recorded == "passed"
+        try:
+            checkpoint = _saved_record(directory, entry.get("path"))
+            # Only a passed checkpoint has a recorded digest; a failed one is read but has none to confirm.
+            valid = _record_digest(checkpoint) == state.get("checkpoint_sha256") if passed else None
+        except _STAGE_ERRORS:
+            checkpoint, valid = None, (False if passed else None)
+        stage["digest_valid"] = valid
+        gates = checkpoint.get("gates") if isinstance(checkpoint, dict) else None
+        if (valid is not False and isinstance(gates, list) and checkpoint.get("passed") is passed
+                and checkpoint.get("id") == entry.get("id") and candidate is not None
+                and checkpoint.get("candidate_sha256") == candidate
+                and (not passed or state.get("checkpoint") in (None, entry.get("path")))):
+            stage.update(status=recorded, candidate_sha256=candidate, gates=len(gates),
+                         spec_sha256=_sha256_or_none(checkpoint.get("spec_sha256")),
+                         spec_record_sha256=_sha256_or_none(checkpoint.get("spec_record_sha256")))
+    if stage["status"] != "error":
+        stage["identity_match"] = _stage_identity_match(state, anchor, engineering_candidate, candidate,
+                                                        stage["spec_record_sha256"], stage["spec_sha256"])
+    return stage, clipped
+
+
+def _spec_identity(directory, record_sha256, anchor):
+    """(revision, spec_sha256) of the saved spec record with this exact digest; (None, None) if unavailable."""
+    if record_sha256 is None:
+        return None, None
+    if record_sha256 == anchor.get("spec_record_sha256"):
+        return _revision_or_none(anchor.get("spec_revision")), _sha256_or_none(anchor.get("spec_sha256"))
+    import ao_workflow
+    try:
+        spec = ao_workflow.spec_record_file(directory, record_sha256)
+    except _STAGE_ERRORS:
+        return None, None
+    if not isinstance(spec, dict):
+        return None, None
+    return _revision_or_none(spec.get("revision")), _sha256_or_none(spec.get("sha256"))
+
+
+def _review_status(directory, review):
+    """An acceptance review without a recorded acceptance, from its recorded state and saved verdict."""
+    recorded = review.get("state")
+    if recorded == "uncertain":
+        return "uncertain"
+    if recorded in _LIVE_REQUEST_STATES:
+        return "pending"
+    if recorded != "completed":
+        return "error"
+    import ao_workflow
+    try:
+        # The controller's own receipt-digest, native-identity and verdict-format checks; read-only.
+        verdict = ao_workflow.final_json(directory, review)
+    except _STAGE_ERRORS:
+        return "error"
+    decision = verdict.get("decision") if isinstance(verdict, dict) else None
+    # An approving verdict still awaits the recorded acceptance, so the stage stays pending.
+    return "rejected" if decision == "rejected" else "pending" if decision == "approved" else "error"
+
+
+def _acceptance_stage(directory, state, requests, engineering_candidate, anchor):
+    """The latest recorded acceptance, or the newer acceptance review that has none yet."""
+    stage = {"status": "missing", "recorded_status": None, "request_id": None, "candidate_sha256": None,
+             "spec_revision": None, "spec_sha256": None, "identity_match": "unknown"}
+    accepted = state.get("acceptances")
+    accepted = accepted[-1] if isinstance(accepted, list) and accepted else None
+    reviews = [item for item in requests.values() if isinstance(item, dict) and item.get("role") == "reviewer"
+               and item.get("purpose") in (None, "acceptance_review")]
+    review = max(reviews, key=_request_order) if reviews else None
+    if accepted is None and review is None:
+        return stage, False
+    if accepted is not None and (review is None or (isinstance(accepted, dict)
+                                                    and accepted.get("request_id") == review.get("request_id"))):
+        if not isinstance(accepted, dict):
+            stage["status"] = "error"
+            return stage, False
+        status, identities, request_id = "approved", accepted, accepted.get("request_id")
+    else:
+        status = _review_status(directory, review)
+        identities = review.get("review") if isinstance(review.get("review"), dict) else {}
+        request_id = review.get("request_id")
+    stage["status"] = status
+    stage["request_id"], id_clipped = _bounded_text(request_id, MAX_ID_CHARS)
+    stage["recorded_status"], state_clipped = (_bounded_text(review.get("state"), MAX_KEY_CHARS)
+                                               if review is not None else (None, False))
+    if status != "error":
+        candidate = _sha256_or_none(identities.get("candidate_sha256"))
+        spec_sha256 = _sha256_or_none(identities.get("spec_sha256"))
+        record_sha256 = _sha256_or_none(review.get("spec_record_sha256")) if review is not None else None
+        revision, record_spec_sha256 = _spec_identity(directory, record_sha256, anchor)
+        # A revision is attributed only when the reviewed spec record names the same spec bytes.
+        stage.update(candidate_sha256=candidate, spec_sha256=spec_sha256,
+                     spec_revision=revision if record_spec_sha256 is not None and record_spec_sha256 == spec_sha256
+                     else None)
+        stage["identity_match"] = _stage_identity_match(state, anchor, engineering_candidate, candidate,
+                                                        record_sha256, spec_sha256)
+    return stage, id_clipped or state_clipped
+
+
+def _stages(directory, state, requests, request, anchor):
+    """Saved engineering, verification and acceptance evidence, each checked only against recorded digests."""
+    engineering, engineering_clipped, candidate = _engineering_stage(directory, requests, request)
+    verification, verification_clipped = _verification_stage(directory, state, candidate, anchor)
+    acceptance, acceptance_clipped = _acceptance_stage(directory, state, requests, candidate, anchor)
+    return {"engineering": engineering, "verification": verification, "acceptance": acceptance,
+            "currentness": dict(CURRENTNESS), "meaning": STAGES_MEANING,
+            "truncated": engineering_clipped or verification_clipped or acceptance_clipped}
+
+
 def inspect(directory, state, request_id=None, max_text_chars=400):
     """One request's bounded progress view; a validation failure yields controller facts only."""
     if (not isinstance(max_text_chars, int) or isinstance(max_text_chars, bool)
@@ -1086,6 +1456,9 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     empty_extra = {"steps": {}, "lineage": {}, "stale": {}, "window": {"created": 0, "completed": 0, "superseded": 0}}
     view["deliverables"] = _deliverables(False, empty_extra, anchor, anchor_notes, anchor_truncated,
                                          unavailable_reason="transcript unavailable")
+    # Controller facts only, computed before the transcript is opened so an unavailable source keeps them.
+    view["provenance"] = _provenance(state, requests, request, explicit=request_id is not None)
+    view["stages"] = _stages(directory, state, requests, request, anchor)
     try:
         # The bounded tail read in _window needs no file size cap; the dispatch default stays.
         validated = ao_native_outcome.validate_registered_source(directory, state, transcript_size_limit=None)
@@ -1142,4 +1515,6 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         # whole-window tail remains the only view available.
         text = _last_text(turn_rows if anchor_row is not None else rows)
         view["last_text"] = _redact(text)[:max_text_chars] if text is not None else None
+    _observe_provenance(view["provenance"], view["plan"], fold_extra.get("updated_row"), anchor_row, turn_rows,
+                        view.get("last_text"))
     return view

@@ -624,6 +624,9 @@ class PreCharterRefreshFramingTests(Fixture):
         texts[FOLLOWUPS_PART] = FOLLOWUPS_INSTRUCTION
         texts[ao_progress.PART] = ao_progress.INSTRUCTION
         texts[ao_progress.PART_V2] = ao_progress.INSTRUCTION_V2
+        # progress_plan_v3 now supersedes v1/v2 and is carried on the first packet; without this entry
+        # the dict lookup below raises KeyError('progress_plan_v3') for a brand-new session.
+        texts[ao_progress.PART_V3] = ao_progress.INSTRUCTION_V3
         texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
         import ao_residual_escalation
         texts[ao_residual_escalation.PART] = ao_residual_escalation.INSTRUCTION

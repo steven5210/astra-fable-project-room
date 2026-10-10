@@ -175,6 +175,73 @@ in a room only after the updated plugin has been installed or resynced (see
 [Install and authenticate](../../README.md#install-and-authenticate)); existing
 room snapshots and already-delivered workflow-part records are not rewritten.
 
+## Progress-plan successor delivery (AO rooms)
+
+The one-time `progress_plan_v3` part is carried through `ao_workflow.PARTS`
+exactly like the other one-time parts above: a new AO engineer session receives
+it in its first packet, and a retained AO engineer session receives it once,
+carried on its next engineer send (`spec_review`, `implementation`, or
+`correction`). It consolidates and supersedes the earlier `progress_plan_v1` and
+`progress_plan_v2` parts — their frozen text, pinned digests and historical
+carried records stay valid forever, but `ao_workflow.PARTS`'s delivery loop
+skips both names unconditionally, so no future packet ever sends either again,
+to any session, retained or new, regardless of what that exact session actually
+received before.
+
+Saved `context_summary`/status adds a bounded `progress_plan` object: `successor`
+names the current part (`progress_plan_v3`); `successor_delivery` is one of four
+values. `verified_delivered`: a `completed` or `settled_failure` engineer turn's
+verified immutable receipt shows it was actually carried. `undelivered`: a given
+directory's receipt-authenticated chain is intact but that is not yet true
+(including an `uncertain`, `failed`, `interrupted` or otherwise unsettled turn —
+fail closed, like the rest of `delivered()`). `unavailable_integrity`: a
+directory is given but that receipt chain itself cannot be authenticated — a
+missing or corrupt receipt on any of the session's completed engineer turns, or
+a tampered carried record, for example — so a broken chain is reported through
+its own status and never misread as a verified absence ("undelivered") or
+trusted into a successor claim. It is also reported, regardless of whether a
+directory is given, when the session's own saved carried-part history cannot
+be read at all; see the `unavailable` value of `delivered_history` below for
+that case. `unverified`: status is read without this
+room's own directory to verify receipts against (metadata-only; never treated
+as satisfied). Beside these four sits `delivered_history`, one of three values:
+`receipt_verified` when a directory was given and its own receipt chain
+authenticated cleanly (exactly the `verified_delivered`/`undelivered` cases
+above), `metadata_only` when the carried-part history itself was readable but no
+directory was given at all or that chain's own authentication failed
+(`unverified`, or `unavailable_integrity` with readable history), or
+`unavailable` when the session's own saved carried-part history cannot be
+read at all (malformed saved metadata, for example a duplicated carried part
+name). In the `unavailable` case, status keeps its existing `error` field, reports
+no `parts`, `undelivered_parts`, `spec_record_sha256` or `spec_current` (as
+before), `successor_delivery` is `unavailable_integrity`, each superseded part's
+`delivered` is null rather than a true or false claim, `satisfied` is `false`, and
+nothing is inferred or repaired. And `superseded`
+lists `progress_plan_v1` and `progress_plan_v2`, each with `delivered` (that
+session's own literal carried-part history for the older part: `true` for a
+retained session whose recorded carried parts include it, `false` for a session
+that never received it, which includes every new session, or null when
+`delivered_history` is `unavailable`; receipt-verified only when
+`delivered_history` is `receipt_verified`, metadata-only when it is
+`metadata_only`, and null with no claim when it is `unavailable`) and `satisfied`
+(`true` only when `successor_delivery` is `verified_delivered`; always `false`
+without a directory or when `delivered_history` is `unavailable`).
+Neither field ever causes a superseded part to be
+re-sent. The existing `undelivered_parts` list also excludes both superseded
+names, so it never reports a gap that no future packet will ever fill. This
+delivery mechanism adds no repeated consent step: an ordinary continuation remains
+exactly `Continue.` or the caller's actual new instruction, and the controller —
+not the human turn — appends the undelivered part.
+The instruction itself is text
+only: it grants no scope, execution permission, recovery or review allowance
+and changes no model, guard, budget or authority. See [the one-time plan
+instruction](../reference/progress.md#the-one-time-plan-instruction) for the
+exact delivered text and list-keeping rules it states. Like the other reusable
+instructions in this document, it is a global default that takes effect in a
+room only after the updated plugin has been installed or resynced (see
+[Install and authenticate](../../README.md#install-and-authenticate)); existing
+room snapshots and already-delivered workflow-part records are not rewritten.
+
 ## Compact engineering reports
 
 The additional `delegation_efficiency_v2` amendment is delivered once to new or
@@ -542,8 +609,9 @@ bounded evidence alone decides identity.
 New preparations and the audited routing refresh also pin
 `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless
 Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools to current
-models only with it, and the `progress_plan_v1` part — its list-keeping rules
-superseded by `progress_plan_v2` — and AO's plan panel depend on them.
+models only with it, and the `progress_plan_v3` part — which consolidates and
+supersedes the frozen `progress_plan_v1`/`progress_plan_v2` list-keeping rules,
+never resent once delivered — and AO's plan panel depend on them.
 
 Keep the existing precedence-only ACP workaround. A stopped, positively quiescent
 retained controller must reload the audited settings and guard before new work;

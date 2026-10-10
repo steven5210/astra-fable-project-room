@@ -185,6 +185,9 @@ class NormalSendProjectionTests(NormalProjectionFixture):
         import ao_progress
         texts[ao_progress.PART] = ao_progress.INSTRUCTION
         texts[ao_progress.PART_V2] = ao_progress.INSTRUCTION_V2
+        # progress_plan_v3 now supersedes v1/v2 and is carried on the first packet; without this entry
+        # the `sections = [texts[name] for name in ...]` lookup below raises KeyError('progress_plan_v3').
+        texts[ao_progress.PART_V3] = ao_progress.INSTRUCTION_V3
         import ao_read_admission
         texts[ao_read_admission.PART] = ao_read_admission.INSTRUCTION
         import ao_residual_escalation

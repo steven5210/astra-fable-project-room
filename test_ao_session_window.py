@@ -68,14 +68,18 @@ class SessionWindowTests(Fixture):
 
     def test_new_parts_arrive_last_in_a_new_session_with_pinned_digests(self):
         carried = self.state()['requests']['spec_review']['carried']
+        # progress_plan_v2 is now superseded by progress_plan_v3 and is never carried to any session;
+        # the last three delivered parts are residual_escalation_v1, lifecycle_closure_v1, then the
+        # new successor (which consolidates v1/v2 and is appended last in ao_workflow.PARTS).
         self.assertEqual(carried['parts'][-3:],
-                         [ao_progress.PART_V2, ao_residual_escalation.PART, lifecycle_closure.PART])
-        self.assertEqual(carried['part_sha256'][ao_progress.PART_V2], ao_progress.INSTRUCTION_V2_SHA256)
+                         [ao_residual_escalation.PART, lifecycle_closure.PART, ao_progress.PART_V3])
+        self.assertNotIn(ao_progress.PART_V2, carried['parts'])
+        self.assertEqual(carried['part_sha256'][ao_progress.PART_V3], ao_progress.INSTRUCTION_V3_SHA256)
         self.assertEqual(carried['part_sha256'][ao_residual_escalation.PART],
                          ao_residual_escalation.INSTRUCTION_SHA256)
         self.assertEqual(carried['part_sha256'][lifecycle_closure.PART], lifecycle_closure.INSTRUCTION_SHA256)
         impl = self.state()['requests']['impl-1']['carried']
-        self.assertNotIn(ao_progress.PART_V2, impl['parts'])
+        self.assertNotIn(ao_progress.PART_V3, impl['parts'])
         self.assertNotIn(ao_residual_escalation.PART, impl['parts'])
         self.assertNotIn(lifecycle_closure.PART, impl['parts'])
 
@@ -151,10 +155,15 @@ class SessionWindowTests(Fixture):
 
 
 class RetainedSessionPartTests(Fixture):
-    """A retained session whose delivered packets predate the two newest parts."""
+    """A retained session whose simulated first packet predates residual_escalation_v1: that one part, the
+    only part genuinely new to it, is carried exactly once on its next completed engineer send."""
 
     def setUp(self):
         super().setUp()
+        # progress_plan_v2's own exclusion here has no observable effect below: ao_progress.SUPERSEDED_PARTS
+        # is not patched, so it is skipped unconditionally regardless of whether it is excluded from the
+        # iterated PARTS here. Only excluding ao_residual_escalation.PART simulates a session that genuinely
+        # predates it.
         newest = {ao_progress.PART_V2, ao_residual_escalation.PART}
         with patch.object(ao_workflow, 'PARTS', tuple(p for p in ao_workflow.PARTS if p not in newest)):
             self.room = self.open(); self.spec(); self.bind(); self.agree()
@@ -167,16 +176,20 @@ class RetainedSessionPartTests(Fixture):
         return ao_workflow.packet(self.service, self.directory(), self.state(), 'engineer',
                                   purpose, 'Continue.', now=now)
 
-    def test_the_two_new_parts_deliver_once_to_a_retained_session(self):
+    def test_residual_escalation_v1_delivers_once_to_a_retained_session_that_predates_it(self):
+        # progress_plan_v2 is unconditionally superseded by progress_plan_v3 (ao_progress.SUPERSEDED_PARTS
+        # is not patched above), and progress_plan_v3/lifecycle_closure_v1 were already delivered in
+        # setUp's first packet since `newest` above only excludes progress_plan_v2 and residual_escalation_v1;
+        # so residual_escalation_v1 is the only part genuinely new for this retained session.
+        self.assertIn(ao_progress.PART_V3, self.state()['requests']['spec_review']['carried']['parts'])
         self.send('correction', 'corr-1')
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
-        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V2, ao_residual_escalation.PART])
+        self.assertEqual(request['carried']['parts'], [ao_residual_escalation.PART])
         self.assertEqual(request['carried']['part_sha256'],
-                         {ao_progress.PART_V2: ao_progress.INSTRUCTION_V2_SHA256,
-                          ao_residual_escalation.PART: ao_residual_escalation.INSTRUCTION_SHA256})
-        self.assertIn(ao_progress.INSTRUCTION_V2, request['text'])
+                         {ao_residual_escalation.PART: ao_residual_escalation.INSTRUCTION_SHA256})
+        self.assertNotIn(ao_progress.INSTRUCTION_V2, request['text'])
         self.assertIn(ao_residual_escalation.INSTRUCTION, request['text'])
         _, carried = self.packet()
         self.assertNotIn(ao_progress.PART_V2, carried['parts'])
