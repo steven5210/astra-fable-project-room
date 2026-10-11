@@ -115,6 +115,23 @@ reference) carry no `lane` field under an accepted-candidate grant, for
 backward compatibility with historical rooms. A pre-acceptance grant's stored
 receipt and reference always carry it.
 
+This lane also re-authenticates the live pinned routing configuration through
+the ordinary routing validation that delegating sends already use
+(`ao_routing.validate_local`): the ignored routing files
+(`.claude/settings.local.json` and the pinned `.claude/agents/` definitions)
+and the private routing guard bytes must still match their pins. The audit,
+both grant inspections, pending-receipt reconciliation, the identical replay
+of a committed grant and the fourth send — before its consumption record,
+request intent or POST — refuse with that validation's own message, for
+example "Private routing guard changed" or "Pinned routing file changed:
+.claude/agents/pr-sonnet.md", and save no audit, grant receipt, grant
+reference or consumption record; restoring the pinned bytes allows the same
+call. `ao_room_status` stays offline and does not re-validate routing.
+Committed executable repairs and routing refreshes remain valid: the same
+validation checks the repaired executable, and after a committed refresh it
+compares the files and guard with that refresh's committed target. The
+accepted-candidate lane is unchanged and keeps its read-only routing behavior.
+
 ## After the fourth review
 
 Reaching agreement on the fourth review does not itself finish anything: the

@@ -528,6 +528,15 @@ def _native_evidence(directory, state, binding, snapshot):
             'activities_sha256': ao.digest(snapshot['activities'])}
 
 
+def _live_routing(directory, state):
+    """Pre-acceptance lane only: today's pinned routing files and private guard, by the ordinary check.
+
+    ``ao_routing.validate_local`` reads only; it honours committed executable repairs and routing
+    refreshes and refuses with its own message. The accepted-candidate lane keeps its read-only path.
+    """
+    ao_delegates.validate_preparation(directory, state, state['bindings']['engineer']['session_id'])
+
+
 def _inspect(service, directory, state, target, reconcile=False):
     service.settled(state, pending_review_extension=reconcile)
     if not ao_workflow.normal(state) or state.get('spec_review_extension') is not None:
@@ -554,7 +563,9 @@ def _inspect(service, directory, state, target, reconcile=False):
         import ao_executable_binding
         # A grant cannot change the state needed to reconcile a pending repair.
         ao_executable_binding._chain(directory, state, _read(directory / state['preparation']))
-    actual = ao_workflow.workspace(service, directory, state, check_routing=False)
+    pre_acceptance = target.get('lane') == PRE
+    # Pre-acceptance audit, both grant inspections and pending reconciliation: live routing (_live_routing).
+    actual = ao_workflow.workspace(service, directory, state, check_routing=pre_acceptance)
     ao_delegates.validate_provider(directory, state)
     ao_delegates.assert_settled(service.root.parent, copy.deepcopy(state), directory)
     from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity
@@ -563,7 +574,6 @@ def _inspect(service, directory, state, target, reconcile=False):
     native = {role: _native_evidence(directory, state, state['bindings'][role], snapshot)
               for role, snapshot in snapshots.items()}
     owner = _owner(state, target['native_owner_database'], target['native_session_id'], actual)
-    pre_acceptance = target.get('lane') == PRE
     if pre_acceptance:
         retained = _scope_proposal(directory, state, target, actual)
     else:
@@ -1001,6 +1011,8 @@ def _extend(service, room_id, inputs, lane):
                 raise RoomError('The one review extension already belongs to the other lane; it cannot renew or renumber')
             if record['inputs'] != inputs:
                 raise RoomError('The one review extension already belongs to another payload; it cannot renew or renumber')
+            if lane == PRE:
+                _live_routing(directory, state)
             return _result(state, record)
         pending = _pending(directory)
         if len(pending) > 1:
@@ -1064,8 +1076,10 @@ def admission(service, directory, state):
     if (state['spec_record_sha256'] != evidence['spec_record_sha256']
             or spec['revision'] != target['spec_revision'] or spec['sha256'] != target['spec_sha256']):
         raise RoomError('The review extension belongs only to its exact audited next charter')
-    actual = ao_workflow.workspace(service, directory, state, check_routing=False)
-    if evidence.get('lane') == PRE:
+    pre_acceptance = evidence.get('lane') == PRE
+    # Pre-acceptance: live routing (_live_routing) before the evidence comparison, so before consume().
+    actual = ao_workflow.workspace(service, directory, state, check_routing=pre_acceptance)
+    if pre_acceptance:
         if _admission_view(_scope_proposal(directory, state, target, actual)) != _admission_view(evidence['retained']):
             raise RoomError('The unaccepted candidate or scope-proposal evidence changed after the pre-acceptance '
                             'review extension')

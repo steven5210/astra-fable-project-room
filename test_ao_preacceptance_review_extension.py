@@ -1574,5 +1574,280 @@ class PreAcceptanceReportGapTests(PreAcceptanceFixture):
                 ao.atomic(self.directory() / 'state.json', original)
 
 
+class PreAcceptanceLiveRoutingFixture(PreAcceptanceFixture):
+    """P1: the pre-acceptance lane re-authenticates the live pinned routing files and private guard.
+
+    Each test changes one real pinned path -- the private guard under the service's launchers, or the
+    ignored ``.claude/agents/pr-sonnet.md`` in the prepared worktree -- and expects the ordinary
+    ``ao_routing.validate_local`` refusal message, unchanged, from the lane's own production entries.
+    """
+
+    GUARD = 'Private routing guard changed'
+    AGENT = r'Pinned routing file changed: \.claude/agents/pr-sonnet\.md'
+
+    def guard_path(self):
+        return Path(self.prepared_routing()['guard_path'])
+
+    def agent_path(self):
+        return self.repo / '.claude' / 'agents' / 'pr-sonnet.md'
+
+    def drift(self, path):
+        """Append bytes to one real pinned path; return its exact restore, also registered as a cleanup."""
+        original = path.read_bytes()
+        path.write_bytes(original + b'\n# synthetic pinned-byte drift\n')
+
+        def restore():
+            path.write_bytes(original)
+
+        self.addCleanup(restore)
+        return restore
+
+    def consumptions(self):
+        folder = self.directory() / extension.BASE / 'consumption'
+        return sorted(folder.glob('*')) if folder.exists() else []
+
+    def service_files(self):
+        """Every file under the private service home and the ignored routing directory, by path."""
+        roots = (self.home, self.repo / '.claude')
+        return {str(p): p.read_bytes() for root in roots for p in root.rglob('*') if p.is_file()}
+
+
+class PreAcceptanceLiveRoutingAuditGrantTests(PreAcceptanceLiveRoutingFixture):
+    """P1 (a)/(b): guard drift refuses the audit; agent-file drift refuses the grant; restoring allows both."""
+
+    def test_guard_drift_before_the_audit_refuses_with_the_ordinary_message_and_writes_no_audit(self):
+        self.propose_scope_change()
+        self.register()
+        audits = self.directory() / extension.BASE / 'audits'
+        restore = self.drift(self.guard_path())
+        self.assert_refuses_without_mutation(self.GUARD, self.audit)
+        self.assertEqual(sorted(audits.glob('*.json')) if audits.exists() else [], [])
+        restore()
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        self.assertEqual(sorted(audits.glob('*.json')), [audits / (audited['audit_sha256'] + '.json')])
+
+    def test_agent_file_drift_between_audit_and_grant_refuses_without_a_receipt_until_restored(self):
+        self.propose_scope_change()
+        inputs = self.grant_inputs(self.audit())
+        restore = self.drift(self.agent_path())
+        self.assert_refuses_without_mutation(
+            self.AGENT, lambda: self.service.ao_room_preacceptance_review_extend(**inputs))
+        self.assertEqual(extension._pending(self.directory()), [])
+        self.assertNotIn('spec_review_extension', self.state())
+        restore()
+        granted = self.service.ao_room_preacceptance_review_extend(**inputs)
+        self.assertEqual((granted['lane'], granted['remaining_spec_reviews']), (extension.PRE, 1))
+        self.assertEqual(len(extension._pending(self.directory())), 1)
+
+
+class PreAcceptanceLiveRoutingAfterGrantTests(PreAcceptanceLiveRoutingFixture):
+    """P1 (c): drift after a committed grant blocks its identical replay and the fourth send before consumption."""
+
+    def assert_replay_blocks_until_restored(self, path, pattern):
+        self.propose_scope_change()
+        granted = self.grant()
+        restore = self.drift(path)
+        self.assert_refuses_without_mutation(
+            pattern, lambda: self.service.ao_room_preacceptance_review_extend(**self.inputs))
+        # Status stays an offline projection of saved evidence; it neither refuses nor re-validates routing.
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+        restore()
+        self.assertEqual(self.service.ao_room_preacceptance_review_extend(**self.inputs), granted)
+
+    def assert_fourth_send_blocks_before_consumption_until_restored(self, path, pattern):
+        self.propose_scope_change()
+        granted = self.grant()
+        restore = self.drift(path)
+        self.assert_refuses_without_mutation(pattern, lambda: self.send('spec_review', 'fourth'))
+        self.assertEqual(self.consumptions(), [])
+        self.assertNotIn('fourth', self.state()['requests'])
+        restore()
+        self.assertEqual(self.service.ao_room_preacceptance_review_extend(**self.inputs), granted)
+        posts = len(self.fake.posts)
+        self.assertEqual(self.send('spec_review', 'fourth')['state'], 'submitted')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        intent = self.state()['requests']['fourth']
+        self.assertEqual(intent['carried']['spec_review_extension_sha256'], granted['receipt_sha256'])
+        self.assertEqual([p.name for p in self.consumptions()], [intent['review_extension_consumption_sha256'] + '.json'])
+        status = self.finish_fourth()
+        self.assertTrue(status['agreement']['agreed'])
+        self.assertEqual(status['spec_review_extension']['consumed_by'], 'fourth')
+
+    def test_guard_drift_after_a_committed_grant_refuses_the_identical_replay_until_restored(self):
+        self.assert_replay_blocks_until_restored(self.guard_path(), self.GUARD)
+
+    def test_agent_file_drift_after_a_committed_grant_refuses_the_identical_replay_until_restored(self):
+        self.assert_replay_blocks_until_restored(self.agent_path(), self.AGENT)
+
+    def test_guard_drift_after_a_committed_grant_refuses_the_fourth_send_before_consumption(self):
+        self.assert_fourth_send_blocks_before_consumption_until_restored(self.guard_path(), self.GUARD)
+
+    def test_agent_file_drift_after_a_committed_grant_refuses_the_fourth_send_before_consumption(self):
+        self.assert_fourth_send_blocks_before_consumption_until_restored(self.agent_path(), self.AGENT)
+
+
+class PreAcceptanceLiveRoutingPendingTests(PreAcceptanceLiveRoutingFixture):
+    """P1 (d): drift while the grant receipt is durable but uncommitted refuses its identical reconciliation."""
+
+    def assert_pending_reconciliation_blocks_until_restored(self, path, pattern):
+        self.propose_scope_change()
+        inputs = self.grant_inputs()
+        with patch.object(self.service, 'save', side_effect=OSError('synthetic state write interruption')):
+            with self.assertRaises(OSError):
+                self.service.ao_room_preacceptance_review_extend(**inputs)
+        pending = extension._pending(self.directory())
+        self.assertEqual(len(pending), 1)
+        receipt = pending[0].read_bytes()
+        restore = self.drift(path)
+        self.assert_refuses_without_mutation(pattern, lambda: self.service.ao_room_preacceptance_review_extend(**inputs))
+        self.assertNotIn('spec_review_extension', self.state())
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['state'], 'pending_uncommitted')
+        restore()
+        result = self.service.ao_room_preacceptance_review_extend(**inputs)
+        self.assertEqual((result['lane'], result['remaining_spec_reviews']), (extension.PRE, 1))
+        self.assertEqual(extension._pending(self.directory()), pending)
+        self.assertEqual(pending[0].read_bytes(), receipt)
+
+    def test_guard_drift_refuses_the_pending_grant_reconciliation_until_restored(self):
+        self.assert_pending_reconciliation_blocks_until_restored(self.guard_path(), self.GUARD)
+
+    def test_agent_file_drift_refuses_the_pending_grant_reconciliation_until_restored(self):
+        self.assert_pending_reconciliation_blocks_until_restored(self.agent_path(), self.AGENT)
+
+
+class PreAcceptanceLiveRoutingRepairTests(PreAcceptanceLiveRoutingFixture):
+    """P1 (e): an authorized executable repair between the grant and the fourth send keeps routing valid."""
+
+    def configure_runtime(self):
+        # Mirrors ``test_ao_review_extension.ExtensionExecutableEvolutionTests.configure_runtime``.
+        self.original_executable = self.root / 'original-claude'
+        self.original_executable.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
+        self.original_executable.chmod(0o700)
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(self.original_executable),
+                                               'claude_config_dir': str(self.claude_env)})
+
+    def test_executable_repair_between_grant_and_fourth_send_keeps_the_lane_dispatchable(self):
+        import ao_delegates
+        import ao_executable_binding as executable
+        self.propose_scope_change()
+        granted = self.grant()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        target = self.root / 'repair-target'
+        target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n'); target.chmod(0o700)
+        launch = self.root / 'repair-launch'; launch.symlink_to(target)
+        self.original_executable.unlink()
+        repaired = executable.bind(self.service, self.room, 'repair-1', str(target), str(launch), str(self.database),
+                                   'Actual authorization for retained executable repair', 'Original executable was removed')
+        self.assertEqual(repaired['lane'], 'repair')
+        self.service.quiet(self.state())
+        state = self.state()
+        # The ordinary validation substitutes the committed repair's executable for the removed original.
+        ao_delegates.validate_preparation(self.directory(), state, state['bindings']['engineer']['session_id'])
+        self.assertEqual(self.service.ao_room_preacceptance_review_extend(**self.inputs), granted)
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        posts = len(self.fake.posts)
+        self.assertEqual(self.send('spec_review', 'fourth')['state'], 'submitted')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(self.consumptions()), 1)
+        status = self.finish_fourth()
+        self.assertTrue(status['agreement']['agreed'])
+        self.assertEqual(status['spec_review_extension']['consumed_by'], 'fourth')
+
+
+class PreAcceptanceLiveRoutingRefreshTests(PreAcceptanceLiveRoutingFixture):
+    """P1 (e): a routing refresh after the consumed, agreed fourth review keeps the lane valid.
+
+    Mirrors ``test_ao_routing_refresh.AcceptedFourthReviewRefreshTests``: the preparation pins a synthetic
+    historical guard, so the refresh has real guard bytes to change.
+    """
+
+    def configure_runtime(self):
+        import sys
+        cli = self.root / 'fake-refresh-claude'
+        cli.write_text('#!' + sys.executable + '\nprint("2.1.282 (Claude Code)")\n'); cli.chmod(0o700)
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(cli), 'claude_config_dir': str(self.claude_env)})
+
+    def bind(self):
+        import ao_routing_guard
+        from test_ao_routing_refresh import OLD_GUARD
+        original = Path.read_bytes
+        source = Path(ao_routing_guard.__file__)
+        with patch.object(Path, 'read_bytes', lambda path: OLD_GUARD if path == source else original(path)):
+            return super().bind()
+
+    def refresh_after_fourth(self):
+        import ao_routing_refresh as refresh
+        self.propose_scope_change()
+        self.grant()
+        self.send('spec_review', 'fourth')
+        self.finish_fourth()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        original_guard = self.guard_path()
+        result = refresh.refresh(self.service, self.room, 'consumed-fourth-refresh', str(self.database), self.NATIVE,
+                                 'User authorizes the retained routing correction.',
+                                 'The quota guard predates the consumed pre-acceptance fourth review.')
+        record = refresh._read(self.directory(), self.state()['routing_refresh'])
+        self.assertEqual(record['evidence']['review_extension']['consumed_by'], 'fourth')
+        target_guard = Path(record['target']['guard_path'])
+        self.assertEqual(record['target']['guard_sha256'], result['guard_sha256'])
+        self.assertNotEqual(target_guard, original_guard)
+        return target_guard
+
+    def test_routing_refresh_after_the_consumed_agreed_fourth_review_keeps_the_lane_valid(self):
+        import ao_delegates
+        self.refresh_after_fourth()
+        state = self.state()
+        ao_delegates.validate_preparation(self.directory(), state, state['bindings']['engineer']['session_id'])
+        replay = self.service.ao_room_preacceptance_review_extend(**self.inputs)
+        self.assertEqual((replay['lane'], replay['consumed_by'], replay['remaining_spec_reviews']),
+                         (extension.PRE, 'fourth', 0))
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        self.implement_after_fourth()
+        self.assertEqual(self.state()['requests']['post-fourth-implementation']['state'], 'completed')
+
+    def test_after_a_routing_refresh_the_lane_authenticates_the_committed_target_bytes(self):
+        target_guard = self.refresh_after_fourth()
+        replay = self.service.ao_room_preacceptance_review_extend(**self.inputs)
+        # The committed refresh journal already authenticates its retained guards offline (``_chain``).
+        restore = self.drift(target_guard)
+        self.assert_refuses_without_mutation('Retained routing refresh guard was modified',
+                                             lambda: self.service.ao_room_preacceptance_review_extend(**self.inputs))
+        restore()
+        # The live check compares today's routing files with the committed refresh target, not the original pin.
+        restore = self.drift(self.agent_path())
+        self.assert_refuses_without_mutation(
+            r'Current routing refresh file differs from its committed target: \.claude/agents/pr-sonnet\.md',
+            lambda: self.service.ao_room_preacceptance_review_extend(**self.inputs))
+        restore()
+        self.assertEqual(self.service.ao_room_preacceptance_review_extend(**self.inputs), replay)
+
+
+class PreAcceptanceOrdinaryRoutingValidationTests(PreAcceptanceLiveRoutingFixture):
+    """P1: ordinary ``ao_routing.validate_local`` rejects both mutations, reads only, and accepts restored bytes."""
+
+    def test_ordinary_validation_rejects_both_mutations_without_side_effects(self):
+        import ao_delegates
+        import ao_routing
+        self.propose_scope_change()
+        self.grant()
+        directory, state = self.directory(), self.state()
+        prepared = ao_delegates.preparation(directory, state)
+        session_id = state['bindings']['engineer']['session_id']
+        for path, pattern in ((self.guard_path(), self.GUARD), (self.agent_path(), self.AGENT)):
+            with self.subTest(path=path.name):
+                restore = self.drift(path)
+                before = self.service_files()
+                with self.assertRaisesRegex(ao.RoomError, pattern):
+                    ao_routing.validate_local(prepared, state, directory)
+                with self.assertRaisesRegex(ao.RoomError, pattern):
+                    ao_delegates.validate_preparation(directory, state, session_id)
+                self.assertEqual(self.service_files(), before)
+                restore()
+        before = self.service_files()
+        self.assertEqual(ao_routing.validate_local(prepared, state, directory), prepared['routing'])
+        self.assertEqual(self.service_files(), before)
+
+
 if __name__ == '__main__':
     unittest.main()
