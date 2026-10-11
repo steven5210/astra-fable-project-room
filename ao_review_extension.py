@@ -642,6 +642,14 @@ def audit_preacceptance(service, room_id, spec_revision, spec_sha256, scope_requ
 
 # The only pinned fields ao_reviewer_recovery.recover writes; one state save commits both.
 RECOVERY_FIELDS = ('bindings', 'reviewer_recovery')
+# ao_reviewer_recovery._target refuses a replacement session id equal to any currently
+# claimed binding's -- the engineer's included -- ("Replacement reviewer is already claimed,
+# including retired reviewer identities") and separately refuses a replacement whose freshly
+# observed conversation id equals any claimed binding's ("Replacement native conversation is
+# already claimed"); _claimed_bindings lists every bound role, the engineer's included.
+# Comparing these same two fields against the engineer binding here is therefore pure
+# defense-in-depth: a legitimate recovery can never match, so this can never refuse one.
+NATIVE_IDENTITY_FIELDS = ('session_id', 'conversation_id')
 
 
 def _recovered_reviewer(service, state, baseline):
@@ -651,7 +659,11 @@ def _recovered_reviewer(service, state, baseline):
     acceptance. Only its own writes are accepted: the baseline recorded no recovery; every other binding,
     the engineer's included, and every other pinned field is unchanged; the committed record authenticates
     through ao_reviewer_recovery.validate, recovered exactly the baseline reviewer and names the current
-    binding as its replacement. A record failing its own validation raises its own error. Read-only.
+    binding as its replacement. A record failing its own validation raises its own error. Two further local
+    invariants hold defense-in-depth only, since ao_reviewer_recovery's own legitimate recovery path already
+    guarantees both: the tolerated replacement is never the original reviewer binding, and its native
+    session identity never equals the bound engineer's, so neither check can ever refuse a legitimate
+    recovery. Read-only.
     """
     original, current = baseline.get('bindings'), state.get('bindings')
     if (baseline.get('reviewer_recovery') is not None or state.get('reviewer_recovery') is None
@@ -662,8 +674,15 @@ def _recovered_reviewer(service, state, baseline):
         return False
     import ao_reviewer_recovery
     record = ao_reviewer_recovery.validate(service, state)  # Receipt, key, binding and audit chain.
-    return (isinstance(record, dict) and record.get('original') == original['reviewer']
-            and current.get('reviewer') == record.get('replacement'))
+    if not isinstance(record, dict):
+        return False
+    replacement, engineer = record.get('replacement'), original.get('engineer')
+    if (replacement == record.get('original')
+            or (isinstance(replacement, dict) and isinstance(engineer, dict)
+                and any(replacement.get(k) is not None and replacement.get(k) == engineer.get(k)
+                        for k in NATIVE_IDENTITY_FIELDS))):
+        return False
+    return record.get('original') == original['reviewer'] and current.get('reviewer') == replacement
 
 
 def _retained(service, directory, state, evidence, lane):

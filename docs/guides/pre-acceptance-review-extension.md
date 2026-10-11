@@ -142,9 +142,13 @@ unchanged, including a passed verification checkpoint. The grant's validation
 authenticates exactly that one committed recovery: the record must pass the
 recovery lane's own validation, must have recovered the reviewer bound at grant
 time and must name the current reviewer binding as its replacement, with the
-engineer binding and every other pinned field unchanged. Any other reviewer
-binding change, a modified recovery record or a recovery of a different
-reviewer still refuses ("Review-extension room, native binding, authorization
-or pinned metadata changed", or the recovery lane's own error). The
+engineer binding and every other pinned field unchanged. The tolerated
+successor must also differ from the original reviewer binding and from the
+engineer's own bound native session -- cheap local checks that the recovery
+lane's own legitimate-recovery guarantees mean can never refuse a genuine
+recovery. Any other reviewer binding change, a modified recovery record or a
+recovery of a different reviewer still refuses ("Review-extension room,
+native binding, authorization or pinned metadata changed", or the recovery
+lane's own error). The
 accepted-candidate lane is unchanged: its grant always retains an independent
 acceptance, which keeps reviewer recovery ineligible.

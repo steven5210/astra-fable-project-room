@@ -1205,6 +1205,74 @@ class PreAcceptanceReviewerRecoveryTests(PreAcceptanceReviewerRecoveryFixture):
             forged_audit_path.unlink()
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
 
+    def test_recovery_replacement_matching_the_engineer_session_refuses_without_mutation(self):
+        """A self-consistent forged chain cannot launder the engineer's own session as the reviewer.
+
+        ``original`` is the real grant-time reviewer (passes the extension's own anchor check);
+        ``replacement`` is the engineer binding itself, named in both the receipt and ``bindings.reviewer``.
+        ``ao_reviewer_recovery.validate`` has no cross-room claim check of its own, so it authenticates this
+        chain; only the extension's own added native-identity invariant refuses it.
+        """
+        self.verified_after_fourth()
+        self.recover_reviewer()
+        original = self.state()
+        reference = original['reviewer_recovery']
+        receipt = self.directory() / reference['receipt']
+        receipt_bytes = receipt.read_bytes()
+        record = ao.read(receipt)
+        forged = copy.deepcopy(original)
+        engineer_binding = forged['bindings']['engineer']
+        forged_inputs = {**record['inputs'], 'replacement_session_id': engineer_binding['session_id']}
+        forged_record = {**record, 'inputs': forged_inputs, 'replacement': engineer_binding}
+        forged['reviewer_recovery'] = {**reference, 'key': ao.digest(forged_inputs),
+                                       'receipt_sha256': ao.digest(forged_record)}
+        forged['bindings']['reviewer'] = engineer_binding
+        ao.atomic(receipt, forged_record)
+        ao.atomic(self.directory() / 'state.json', forged)
+        try:
+            self.assertEqual(recovery.validate(self.service, forged), forged_record)
+            self.refuses_status_and_sends(PINNED)
+            with self.assertRaisesRegex(ao.RoomError, PINNED):
+                extension.validate(self.service, forged)
+        finally:
+            ao.atomic(self.directory() / 'state.json', original)
+            receipt.write_bytes(receipt_bytes)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+
+    def test_recovery_replacement_equal_to_the_original_reviewer_refuses_without_mutation(self):
+        """A self-consistent forged chain cannot claim a no-op ``replacement`` as an authenticated recovery.
+
+        ``original`` and ``replacement`` are both the real grant-time reviewer binding, with
+        ``reviewer_recovery`` present and ``bindings.reviewer`` unchanged; ``ao_reviewer_recovery.validate``
+        still authenticates this chain, so only the extension's own added replacement-equals-original
+        invariant refuses it.
+        """
+        self.verified_after_fourth()
+        baseline_reviewer = self.state()['bindings']['reviewer']
+        self.recover_reviewer()
+        original = self.state()
+        reference = original['reviewer_recovery']
+        receipt = self.directory() / reference['receipt']
+        receipt_bytes = receipt.read_bytes()
+        record = ao.read(receipt)
+        forged = copy.deepcopy(original)
+        forged_inputs = {**record['inputs'], 'replacement_session_id': baseline_reviewer['session_id']}
+        forged_record = {**record, 'inputs': forged_inputs, 'replacement': baseline_reviewer}
+        forged['reviewer_recovery'] = {**reference, 'key': ao.digest(forged_inputs),
+                                       'receipt_sha256': ao.digest(forged_record)}
+        forged['bindings']['reviewer'] = baseline_reviewer
+        ao.atomic(receipt, forged_record)
+        ao.atomic(self.directory() / 'state.json', forged)
+        try:
+            self.assertEqual(recovery.validate(self.service, forged), forged_record)
+            self.refuses_status_and_sends(PINNED)
+            with self.assertRaisesRegex(ao.RoomError, PINNED):
+                extension.validate(self.service, forged)
+        finally:
+            ao.atomic(self.directory() / 'state.json', original)
+            receipt.write_bytes(receipt_bytes)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
+
 
 class AcceptedLaneReviewerRecoveryUnchangedTests(ReviewExtensionFixture):
     """F1 (accepted side): that lane's grant always retains an acceptance, so recovery stays ineligible."""
