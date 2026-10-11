@@ -264,7 +264,13 @@ Codex task discovers updated MCP tools after plugin installation.
    `spec_sha256`. Findings prefixed `BLOCKER:` prevent agreement. Sync the completed
    turn before another send. Agreement binds that actual receipt to Astra's exact
    approved spec. Three spec-review attempts are available across revisions; no
-   automatic renewal.
+   automatic renewal. An actual new user approval can grant one further review
+   as the room's one-ever extension: see
+   [one additional AO charter review](../../../docs/guides/one-charter-review-extension.md)
+   for a room with a retained acceptance, or
+   [pre-acceptance exact-spec review extension](../../../docs/guides/pre-acceptance-review-extension.md)
+   for a room with zero acceptances whose latest completed engineering turn
+   proposed a scope change; the two lanes share the one grant.
 5. Call `ao_room_handoff` for the actual bound engineer worktree. It pins the exact
    agreement, baseline, candidate, authorization, delegate preparation and gates.
    Send engineer purpose `implementation` once for that handoff. Once the session
@@ -304,8 +310,13 @@ Codex task discovers updated MCP tools after plugin installation.
    message is exactly the caller's new instruction, `Continue.` when there is
    nothing else; three or more consecutive identical corrections still reconcile
    normally, one turn each. Preserve the previous receipt; this is a new focused
-   turn, never a replay. A `scope_change` report requires a revised agreed spec
-   first. Unknown delivery stays blocked. Commit, if needed, before the final
+   turn, never a replay. A `scope_change` report blocks further implementation and
+   correction turns until a revised charter is registered as the exact next
+   revision and Fable reaches a renewed exact-spec agreement on it. The room's
+   one-ever extension (above) can instead grant one additional exact-spec review
+   of that registered revision for that exact proposal; that fourth review's own
+   agreement is the renewed agreement itself, never a substitute for it or for
+   implementation authority. Unknown delivery stays blocked. Commit, if needed, before the final
    engineering response is captured: later changes to HEAD/index/files invalidate
    its candidate and need a correction.
    A completed epoch-2 partial report that incorrectly names audited epoch-1

@@ -17,6 +17,19 @@ from room import RoomError
 
 BASE = 'spec-review-extension'
 LIMIT = 3
+# Two lanes share the one extension. The original lane is implicit: its existing audits,
+# receipts and state references never carry a lane field and stay byte-identical.
+ACCEPTED = 'accepted_candidate'
+PRE = 'pre_acceptance'
+MEANINGS = {
+    ACCEPTED: 'One fourth charter-review intent only; source-review and acceptance allowances and all holds stay unchanged',
+    PRE: ('One fourth charter-review intent only, granted before any independent acceptance on an unaccepted, '
+          'unverified candidate; source-review, acceptance and implementation allowances and all holds stay unchanged'),
+}
+SCOPE_HANDOFF = 'Pre-acceptance review extension requires the retained agreed handoff of the latest accepted review'
+SCOPE_REQUEST = ('Pre-acceptance review extension requires the latest completed scope-change proposal for the '
+                 'retained handoff')
+SCOPE_EVIDENCE = 'Pre-acceptance scope proposal evidence is missing, modified or contradicts its identity'
 MAX_RECORD_BYTES = 96_000_000
 PIN_FIELDS = ('room_id', 'project_path', 'git_common_dir', 'ao_project_id', 'ao_url', 'workflow',
               'authorization', 'exception_authorization', 'bindings', 'delegate', 'preparation',
@@ -252,7 +265,19 @@ def _consumption(directory, state, reference):
 
 def _audit(directory, sha256):
     value = _read(directory / BASE / 'audits' / (_hash(sha256, 'review-extension audit') + '.json'))
-    if ao.digest(value) != sha256 or value.get('version') not in (1, 2, 3):
+    if ao.digest(value) != sha256 or value.get('version') not in (1, 2, 3, 4):
+        raise RoomError('Review-extension audit was modified')
+    evidence = value.get('evidence')
+    target = evidence.get('target') if isinstance(evidence, dict) else None
+    if value['version'] == 4:
+        # Only the pre-acceptance lane writes version 4, and it names that lane at every level.
+        consistent = (value.get('lane') == PRE and isinstance(evidence, dict) and evidence.get('lane') == PRE
+                      and isinstance(target, dict) and target.get('lane') == PRE)
+    else:
+        # Versions 1-3 belong to the accepted-candidate lane and never carry a lane field.
+        consistent = ('lane' not in value and not (isinstance(evidence, dict) and 'lane' in evidence)
+                      and not (isinstance(target, dict) and 'lane' in target))
+    if not consistent:
         raise RoomError('Review-extension audit was modified')
     return value
 
@@ -340,6 +365,146 @@ def _acceptance(directory, state, candidate_sha256, actual):
     return {'candidate_sha256': candidate_sha256, 'checkpoint': path, 'acceptance': accepted}
 
 
+def _scope_proposal(directory, state, target, actual):
+    """The retained agreed handoff, its latest scope-change proposal and the unaccepted candidate.
+
+    Registering the next charter moves spec_record_sha256 while the room still names the original
+    agreed handoff, so that handoff is authenticated by its saved pointer and digest only. A rejected
+    report's delegate claim stays recorded evidence: it is never verified, normalized or accepted here.
+    A response normalization keeps the original strict-JSON diagnostic beside the engineering record
+    captured after its verified delegation; that diagnostic is preserved verbatim, never used to refuse.
+    The request's response_normalization, response_normalization_sha256 and normalization_capture_error
+    are retained verbatim (None when absent); they are frozen after capture, so admission compares them
+    exactly. Every call requires a settled final_available outcome. The result is deterministic and
+    JSON-serializable; admission requires exact equality apart from the outcome pointer.
+    """
+    import ao_engineering_model
+    import ao_outcomes
+    from ao_report_contract import project
+    if state['acceptances'] != []:
+        raise RoomError('Pre-acceptance review extension requires zero retained independent acceptances')
+    handoff = ao_workflow.retained_handoff(directory, state)
+    agreed_spec = ao_workflow.spec_record_file(directory, handoff['spec_record_sha256'])
+    engineer = state['bindings']['engineer']
+    reviews = _reviews(state)
+    if not reviews or reviews[-1].get('spec_record_sha256') != handoff['spec_record_sha256']:
+        raise RoomError(SCOPE_HANDOFF)
+    last = reviews[-1]
+    ao_outcomes.usable(directory, last)
+    ao_engineering_model.check_request(directory, state, last)
+    verdict = ao_workflow.final_json(directory, last)
+    findings = verdict.get('findings')
+    agreement = handoff.get('agreement')
+    prior_revision = max(ao_workflow.spec_record_file(directory, r['spec_record_sha256'])['revision'] for r in reviews)
+    if (last.get('role') != 'engineer' or last.get('harness') != 'claude-code'
+            or last.get('reasoning_effort') != 'max' or last.get('session_id') != engineer['session_id']
+            or verdict.get('decision') != 'accept'
+            or not isinstance(verdict.get('interpretation'), str) or not verdict['interpretation'].strip()
+            or not isinstance(findings, list) or not all(isinstance(f, str) for f in findings)
+            or any(f.startswith('BLOCKER:') for f in findings)
+            or type(verdict.get('spec_revision')) is not int or verdict['spec_revision'] != agreed_spec['revision']
+            or verdict.get('spec_sha256') != agreed_spec['sha256']
+            or handoff['spec_revision'] != agreed_spec['revision'] or handoff['spec_sha256'] != agreed_spec['sha256']
+            or not isinstance(agreement, dict) or agreement.get('request_id') != last['request_id']
+            or agreement.get('receipt_sha256') != last['receipt_sha256']
+            or prior_revision != agreed_spec['revision']):
+        raise RoomError(SCOPE_HANDOFF)
+    request = state['requests'].get(target['scope_request_id'])
+    if (request is None or ao_workflow.latest(state, {'implementation', 'correction'}) is not request
+            or request.get('state') != 'completed' or request.get('role') != 'engineer'
+            or request.get('session_id') != engineer['session_id'] or request.get('harness') != 'claude-code'
+            or request.get('reasoning_effort') != 'max' or request.get('handoff_sha256') != state['handoff_sha256']
+            or request.get('spec_record_sha256') != handoff['spec_record_sha256']):
+        raise RoomError(SCOPE_REQUEST)
+    ao_engineering_model.check_request(directory, state, request)
+    ao_outcomes.usable(directory, request)
+    outcome = ao_outcomes.load(directory, request)
+    status = outcome.get('outcome') if isinstance(outcome, dict) else None
+    if (outcome is None or ao_outcomes.inconclusive(outcome) or not isinstance(status, dict)
+            or status.get('kind') != 'final_available' or status.get('hold') is not False):
+        raise RoomError('Pre-acceptance scope proposal lacks settled final_available outcome evidence')
+    ao_workflow.completed_receipt(directory, request)
+    raw = ao_workflow.final_json(directory, request)
+    # The supplied handoff replaces only the current-spec read; delegate attribution is never verified here.
+    report = project(directory, state, request, raw, handoff=handoff)
+    if (report.get('outcome') != 'scope_change'
+            or any(report.get(key) != handoff[key] or type(report.get(key)) is not type(handoff[key])
+                   for key in ('spec_revision', 'spec_sha256', 'baseline_commit'))):
+        raise RoomError(SCOPE_REQUEST)
+    try:
+        saved = _read(_relative(directory, request.get('completion_candidate')))
+    except RoomError as exc:
+        raise RoomError(SCOPE_EVIDENCE) from exc
+    candidate = saved.get('candidate') if isinstance(saved, dict) else None
+    if (not isinstance(candidate, dict) or ao.digest(saved) != request.get('completion_candidate_sha256')
+            or saved.get('receipt_sha256') != request['receipt_sha256']
+            or saved.get('handoff_sha256') != request['handoff_sha256']
+            or saved.get('handoff_sha256') != state['handoff_sha256']):
+        raise RoomError(SCOPE_EVIDENCE)
+    if candidate.get('sha256') != target['candidate_sha256']:
+        raise RoomError('Use the exact immutable candidate-at-completion identity')
+    if candidate_snapshot(actual) != candidate or str(actual) != handoff['worktree']:
+        raise RoomError('The unaccepted candidate changed since the scope-change proposal completed')
+    error = request.get('engineering_error')
+    if request.get('engineering_record'):
+        try:
+            record = _read(_relative(directory, request['engineering_record']))
+        except RoomError as exc:
+            raise RoomError(SCOPE_EVIDENCE) from exc
+        if (('engineering_error' in request and not (isinstance(error, str) and error.strip()))
+                or not isinstance(record, dict)
+                or ao.digest(record) != request.get('engineering_record_sha256')
+                or record.get('receipt_sha256') != request['receipt_sha256']
+                or record.get('report_sha256') != ao.digest(report) or record.get('candidate') != candidate
+                or request.get('result_candidate_sha256') != candidate['sha256']):
+            raise RoomError(SCOPE_EVIDENCE)
+        kind = 'engineering_record'
+    elif request.get('engineering_record_sha256') is None and isinstance(error, str) and error.strip():
+        kind = 'rejected_report_diagnostic'
+    else:
+        raise RoomError(SCOPE_EVIDENCE)
+    return {'lane': PRE, 'acceptances': 0, 'candidate_status': 'unaccepted_unverified',
+            'candidate_sha256': candidate['sha256'], 'candidate': copy.deepcopy(candidate),
+            'handoff': state['handoff'], 'handoff_sha256': state['handoff_sha256'],
+            'agreement': {'request_id': last['request_id'], 'receipt_sha256': last['receipt_sha256'],
+                          'spec_revision': agreed_spec['revision'], 'spec_sha256': agreed_spec['sha256'],
+                          'spec_record_sha256': handoff['spec_record_sha256']},
+            'scope_proposal': {
+                'request_id': request['request_id'], 'purpose': request['purpose'],
+                'receipt_sha256': request['receipt_sha256'], 'text_sha256': request['text_sha256'],
+                'native_report_sha256': ao.digest(raw), 'report_sha256': ao.digest(report), 'outcome': 'scope_change',
+                'spec_revision': handoff['spec_revision'], 'spec_sha256': handoff['spec_sha256'],
+                'baseline_commit': handoff['baseline_commit'],
+                'completion_candidate': request['completion_candidate'],
+                'completion_candidate_sha256': request['completion_candidate_sha256'],
+                'semantic_outcome': request['semantic_outcome'],
+                'semantic_outcome_sha256': request['semantic_outcome_sha256'],
+                'semantic_kind': 'final_available', 'evidence': kind,
+                'engineering_record': request.get('engineering_record'),
+                'engineering_record_sha256': request.get('engineering_record_sha256'),
+                'engineering_error': copy.deepcopy(error),
+                'response_normalization': request.get('response_normalization'),
+                'response_normalization_sha256': request.get('response_normalization_sha256'),
+                'normalization_capture_error': request.get('normalization_capture_error'),
+                'reported_delegate_job_ids': copy.deepcopy(request.get('reported_delegate_job_ids')),
+                'delegate_job_ids': copy.deepcopy(request.get('delegate_job_ids'))}}
+
+
+# An explicit, authorized ao_room_outcome_audit (for example after a native source relocation) may
+# re-record the scope request's settled outcome under a new pointer. Admission ignores exactly this
+# pointer; _scope_proposal still requires a conclusive final_available outcome without a hold.
+OUTCOME_POINTER = ('semantic_outcome', 'semantic_outcome_sha256')
+
+
+def _admission_view(retained):
+    """Retained pre-acceptance evidence as admission compares it; saved audits and grants keep the pointer."""
+    proposal = retained.get('scope_proposal') if isinstance(retained, dict) else None
+    if not isinstance(proposal, dict):
+        return retained
+    return {**retained, 'scope_proposal': {key: value for key, value in proposal.items()
+                                           if key not in OUTCOME_POINTER}}
+
+
 def _owner(state, database, native_session_id, workspace):
     try:
         owner = ao_native_identity.read_owner(database, state['bindings']['engineer']['session_id'])
@@ -361,6 +526,15 @@ def _native_evidence(directory, state, binding, snapshot):
     from ao_provider_transition import _native
     return {**_native(state, binding, snapshot, directory),
             'activities_sha256': ao.digest(snapshot['activities'])}
+
+
+def _live_routing(directory, state):
+    """Pre-acceptance lane only: today's pinned routing files and private guard, by the ordinary check.
+
+    ``ao_routing.validate_local`` reads only; it honours committed executable repairs and routing
+    refreshes and refuses with its own message. The accepted-candidate lane keeps its read-only path.
+    """
+    ao_delegates.validate_preparation(directory, state, state['bindings']['engineer']['session_id'])
 
 
 def _inspect(service, directory, state, target, reconcile=False):
@@ -389,7 +563,9 @@ def _inspect(service, directory, state, target, reconcile=False):
         import ao_executable_binding
         # A grant cannot change the state needed to reconcile a pending repair.
         ao_executable_binding._chain(directory, state, _read(directory / state['preparation']))
-    actual = ao_workflow.workspace(service, directory, state, check_routing=False)
+    pre_acceptance = target.get('lane') == PRE
+    # Pre-acceptance audit, both grant inspections and pending reconciliation: live routing (_live_routing).
+    actual = ao_workflow.workspace(service, directory, state, check_routing=pre_acceptance)
     ao_delegates.validate_provider(directory, state)
     ao_delegates.assert_settled(service.root.parent, copy.deepcopy(state), directory)
     from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity
@@ -398,10 +574,15 @@ def _inspect(service, directory, state, target, reconcile=False):
     native = {role: _native_evidence(directory, state, state['bindings'][role], snapshot)
               for role, snapshot in snapshots.items()}
     owner = _owner(state, target['native_owner_database'], target['native_session_id'], actual)
-    retained = _acceptance(directory, state, target['retained_candidate_sha256'], actual)
+    if pre_acceptance:
+        retained = _scope_proposal(directory, state, target, actual)
+    else:
+        retained = _acceptance(directory, state, target['retained_candidate_sha256'], actual)
     evidence = {'state_sha256': ao.digest(state), 'state': copy.deepcopy(state), 'target': target,
                 'spec_record_sha256': state['spec_record_sha256'], 'retained': retained,
                 'native': native, 'native_owner': owner, 'manifest': _grant_manifest(directory, state, target['native_session_id'])}
+    if pre_acceptance:
+        evidence['lane'] = PRE  # The accepted-candidate lane keeps its original evidence bytes.
     return evidence, snapshots
 
 
@@ -420,23 +601,106 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
         from ao_provider_transition import projected_snapshot
         value = {'version': 3, 'evidence': evidence, 'observed_at': time.time(),
                  'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
-        sha256 = ao.digest(value)
-        # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
-        # Keep the projected snapshots; an oversized audit is never published.
-        serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
-        if len(serialized) > MAX_RECORD_BYTES:
-            raise RoomError('Complete review-extension audit exceeds its readable size bound; no audit was published')
-        _store_once(directory / BASE / 'audits' / (sha256 + '.json'), value)
+        sha256 = _store_audit(directory, value)
         return {'eligible': True, 'audit_sha256': sha256, 'room_id': room_id, **target,
                 'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': LIMIT,
                 'additional_spec_reviews': 1, 'model_dispatch': False}
 
 
-def _retained(directory, state, evidence):
+def _store_audit(directory, value):
+    sha256 = ao.digest(value)
+    # Match _store_once's JSON formatting, UTF-8 bytes and trailing newline.
+    # Keep the projected snapshots; an oversized audit is never published.
+    serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
+    if len(serialized) > MAX_RECORD_BYTES:
+        raise RoomError('Complete review-extension audit exceeds its readable size bound; no audit was published')
+    _store_once(directory / BASE / 'audits' / (sha256 + '.json'), value)
+    return sha256
+
+
+def audit_preacceptance(service, room_id, spec_revision, spec_sha256, scope_request_id, candidate_sha256,
+                        native_session_id, native_owner_database):
+    """Audit the one extension for an unaccepted candidate whose latest engineering turn proposed a scope change.
+
+    The same single extension, history and native-owner evidence as the accepted-candidate lane, with the
+    retained agreed handoff and immutable candidate-at-completion in place of an acceptance. Saves audit
+    evidence only: no state change, request, model dispatch or POST.
+    """
+    if type(spec_revision) is not int or spec_revision < 2:
+        raise RoomError('Use the exact next charter revision')
+    _hash(spec_sha256, 'charter'); _hash(candidate_sha256, 'candidate-at-completion')
+    ao.identifier(scope_request_id)
+    ao.nonempty(native_session_id, 'native_session_id', 160)
+    ao.nonempty(native_owner_database, 'native_owner_database')
+    target = {'lane': PRE, 'spec_revision': spec_revision, 'spec_sha256': spec_sha256,
+              'scope_request_id': scope_request_id, 'candidate_sha256': candidate_sha256,
+              'native_session_id': native_session_id, 'native_owner_database': native_owner_database}
+    with service.locked(room_id) as (directory, state):
+        evidence, snapshots = _inspect(service, directory, state, target)
+        from ao_provider_transition import projected_snapshot
+        value = {'version': 4, 'lane': PRE, 'evidence': evidence, 'observed_at': time.time(),
+                 'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
+        sha256 = _store_audit(directory, value)
+        proposal = evidence['retained']['scope_proposal']
+        return {'eligible': True, 'lane': PRE, 'audit_sha256': sha256, 'room_id': room_id, **target,
+                'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': LIMIT,
+                'additional_spec_reviews': 1, 'acceptances': 0, 'candidate_status': 'unaccepted_unverified',
+                'scope_proposal': {'request_id': proposal['request_id'], 'outcome': 'scope_change',
+                                   'evidence': proposal['evidence'], 'engineering_error': proposal['engineering_error']},
+                'model_dispatch': False}
+
+
+# The only pinned fields ao_reviewer_recovery.recover writes; one state save commits both.
+RECOVERY_FIELDS = ('bindings', 'reviewer_recovery')
+# ao_reviewer_recovery._target refuses a replacement session id equal to any currently
+# claimed binding's -- the engineer's included -- ("Replacement reviewer is already claimed,
+# including retired reviewer identities") and separately refuses a replacement whose freshly
+# observed conversation id equals any claimed binding's ("Replacement native conversation is
+# already claimed"); _claimed_bindings lists every bound role, the engineer's included.
+# Comparing these same two fields against the engineer binding here is therefore pure
+# defense-in-depth: a legitimate recovery can never match, so this can never refuse one.
+NATIVE_IDENTITY_FIELDS = ('session_id', 'conversation_id')
+
+
+def _recovered_reviewer(service, state, baseline):
+    """Whether pinned drift is exactly the one committed unused-reviewer recovery after a pre-acceptance grant.
+
+    That lane leaves the bound reviewer unused, so the existing recovery may still replace it before
+    acceptance. Only its own writes are accepted: the baseline recorded no recovery; every other binding,
+    the engineer's included, and every other pinned field is unchanged; the committed record authenticates
+    through ao_reviewer_recovery.validate, recovered exactly the baseline reviewer and names the current
+    binding as its replacement. A record failing its own validation raises its own error. Two further local
+    invariants hold defense-in-depth only, since ao_reviewer_recovery's own legitimate recovery path already
+    guarantees both: the tolerated replacement is never the original reviewer binding, and its native
+    session identity never equals the bound engineer's, so neither check can ever refuse a legitimate
+    recovery. Read-only.
+    """
+    original, current = baseline.get('bindings'), state.get('bindings')
+    if (baseline.get('reviewer_recovery') is not None or state.get('reviewer_recovery') is None
+            or not isinstance(original, dict) or not isinstance(current, dict) or 'reviewer' not in original
+            or ({k: v for k, v in original.items() if k != 'reviewer'}
+                != {k: v for k, v in current.items() if k != 'reviewer'})
+            or any(state.get(k) != baseline.get(k) for k in PIN_FIELDS if k not in RECOVERY_FIELDS)):
+        return False
+    import ao_reviewer_recovery
+    record = ao_reviewer_recovery.validate(service, state)  # Receipt, key, binding and audit chain.
+    if not isinstance(record, dict):
+        return False
+    replacement, engineer = record.get('replacement'), original.get('engineer')
+    if (replacement == record.get('original')
+            or (isinstance(replacement, dict) and isinstance(engineer, dict)
+                and any(replacement.get(k) is not None and replacement.get(k) == engineer.get(k)
+                        for k in NATIVE_IDENTITY_FIELDS))):
+        return False
+    return record.get('original') == original['reviewer'] and current.get('reviewer') == replacement
+
+
+def _retained(service, directory, state, evidence, lane):
     baseline = evidence['state']
     if ao.digest(baseline) != evidence['state_sha256']:
         raise RoomError('Review-extension original state evidence was modified')
-    if any(state.get(k) != baseline.get(k) for k in PIN_FIELDS):
+    if (any(state.get(k) != baseline.get(k) for k in PIN_FIELDS)
+            and not (lane == PRE and _recovered_reviewer(service, state, baseline))):
         raise RoomError('Review-extension room, native binding, authorization or pinned metadata changed')
     original_amendments = baseline.get('instruction_amendments', [])
     current_amendments = state.get('instruction_amendments', [])
@@ -625,12 +889,17 @@ def validate(service, state, allow_pending=False):
                 or record['inputs']['request_id'] != request_id or ao.digest(record['inputs']) != reference['key']
                 or record.get('additional_spec_reviews') != 1 or record.get('maximum_spec_review_attempts') != LIMIT + 1):
             raise RoomError('Committed review-extension grant was modified')
+        # Only the pre-acceptance lane writes a lane field; the receipt and its state reference agree.
+        lane = record.get('lane', ACCEPTED)
+        if (('lane' in record) != (lane == PRE) or ('lane' in reference) != (lane == PRE)
+                or reference.get('lane', ACCEPTED) != lane):
+            raise RoomError('Committed review-extension grant was modified')
         saved = _audit(directory, record['inputs']['audit_sha256'])
         evidence = saved['evidence']
         if (record['evidence_sha256'] != ao.digest(evidence) or record['before_state_sha256'] != evidence['state_sha256']
-                or len(_reviews(evidence['state'])) != LIMIT):
+                or len(_reviews(evidence['state'])) != LIMIT or saved.get('lane', ACCEPTED) != lane):
             raise RoomError('Review-extension audit chain changed')
-        _retained(directory, state, evidence)
+        _retained(service, directory, state, evidence, lane)
         consumed = _consumption(directory, state, reference)
         reviews = _reviews(state)
         if not LIMIT <= len(reviews) <= LIMIT + 1:
@@ -655,13 +924,14 @@ def validate(service, state, allow_pending=False):
 
 def _result(state, record):
     reviews = _reviews(state)
-    return {'extended': True, 'request_id': record['inputs']['request_id'], 'additional_spec_reviews': 1,
+    lane = state['spec_review_extension'].get('lane', ACCEPTED)
+    return {'extended': True, 'lane': lane, 'request_id': record['inputs']['request_id'], 'additional_spec_reviews': 1,
             'maximum_spec_review_attempts': LIMIT + 1, 'remaining_spec_reviews': int(len(reviews) == LIMIT),
             'consumed_by': reviews[-1]['request_id'] if len(reviews) > LIMIT else None,
             'audit_sha256': record['inputs']['audit_sha256'],
             'receipt': state['spec_review_extension']['receipt'],
             'receipt_sha256': state['spec_review_extension']['receipt_sha256'], 'model_dispatch': False,
-            'meaning': 'One fourth charter-review intent only; source-review and acceptance allowances and all holds stay unchanged'}
+            'meaning': MEANINGS[lane]}
 
 
 def consume(service, directory, state, request):
@@ -691,14 +961,14 @@ def consume(service, directory, state, request):
 
 
 def _audit_history_unchanged(saved, snapshots):
-    """A v2/v3 audit binds every role's activity rows by digest; the action re-observes them.
+    """A v2/v3/v4 audit binds every role's activity rows by digest; the action re-observes them.
 
     A v2 audit predates the history projection and digested the raw rows. It can still
     match when none of them carried a projected payload, so its refusal names the
     incompatibility rather than reporting a changed history.
     """
     version = saved.get('version')
-    if version not in (2, 3):
+    if version not in (2, 3, 4):
         return
     saved_snapshots = saved.get('observed_snapshots')
     if not isinstance(saved_snapshots, dict) or set(saved_snapshots) != set(snapshots):
@@ -714,18 +984,35 @@ def _audit_history_unchanged(saved, snapshots):
     raise RoomError('Review extension audit observed history changed; audit again')
 
 
-def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id):
+def _grant_inputs(audit_sha256, authorization, diagnosis, request_id):
     ao.identifier(request_id); _hash(audit_sha256, 'review-extension audit')
     ao.nonempty(authorization, 'authorization: actual new user answer and its approval context')
     ao.nonempty(diagnosis, 'diagnosis')
-    inputs = {'request_id': request_id, 'audit_sha256': audit_sha256,
-              'authorization': authorization, 'diagnosis': diagnosis}
+    return {'request_id': request_id, 'audit_sha256': audit_sha256,
+            'authorization': authorization, 'diagnosis': diagnosis}
+
+
+def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id):
+    return _extend(service, room_id, _grant_inputs(audit_sha256, authorization, diagnosis, request_id), ACCEPTED)
+
+
+def extend_preacceptance(service, room_id, audit_sha256, authorization, diagnosis, request_id):
+    """Commit the room's one extension from its exact pre-acceptance audit; identical calls replay it."""
+    return _extend(service, room_id, _grant_inputs(audit_sha256, authorization, diagnosis, request_id), PRE)
+
+
+def _extend(service, room_id, inputs, lane):
+    request_id, audit_sha256 = inputs['request_id'], inputs['audit_sha256']
     with service.locked(room_id) as (directory, state):
         committed = validate(service, state, allow_pending=True)
         if committed:
             record, _ = committed
+            if record.get('lane', ACCEPTED) != lane:
+                raise RoomError('The one review extension already belongs to the other lane; it cannot renew or renumber')
             if record['inputs'] != inputs:
                 raise RoomError('The one review extension already belongs to another payload; it cannot renew or renumber')
+            if lane == PRE:
+                _live_routing(directory, state)
             return _result(state, record)
         pending = _pending(directory)
         if len(pending) > 1:
@@ -734,6 +1021,8 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
         if prior and (pending[0].name != request_id + '.json' or prior.get('inputs') != inputs):
             raise RoomError('An uncommitted review extension belongs to another payload')
         saved = _audit(directory, audit_sha256)
+        if saved.get('lane', ACCEPTED) != lane:
+            raise RoomError('Review-extension audit belongs to the other lane; use its own grant operation')
         full_evidence, snapshots = _inspect(service, directory, state, saved['evidence']['target'], reconcile=bool(prior))
         _audit_history_unchanged(saved, snapshots)
         evidence = full_evidence
@@ -744,12 +1033,16 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
             # any difference outside those additive history entries.
             legacy = {**evidence, 'manifest': {path: sha for path, sha in evidence['manifest'].items()
                 if not path.startswith(('history-reconciliations/', 'history-reconciliation-invalidations/'))}}
-            if not prior or legacy == evidence or ao.digest(legacy) != ao.digest(saved['evidence']):
+            # The pre-acceptance lane has no legacy receipts; it always requires exact equality.
+            if (lane != ACCEPTED or not prior or legacy == evidence
+                    or ao.digest(legacy) != ao.digest(saved['evidence'])):
                 raise RoomError('Review-extension audit is stale; charter, retained evidence or native metadata changed')
             evidence = saved['evidence']
         record = {'version': 1, 'room_id': room_id, 'inputs': inputs, 'additional_spec_reviews': 1,
                   'maximum_spec_review_attempts': LIMIT + 1, 'before_state_sha256': evidence['state_sha256'],
                   'evidence_sha256': ao.digest(evidence), 'recorded_at': prior['recorded_at'] if prior else time.time()}
+        if lane == PRE:
+            record['lane'] = PRE
         if prior and ao.digest(prior) != ao.digest(record):
             raise RoomError('Pending review-extension receipt differs from the recomputed grant')
         repeated, snapshots_again = _inspect(service, directory, state, evidence['target'], reconcile=bool(prior))
@@ -759,8 +1052,11 @@ def extend(service, room_id, audit_sha256, authorization, diagnosis, request_id)
         relative = BASE + '/requests/' + request_id + '.json'
         if not prior:
             _store_once(directory / relative, record)
-        state['spec_review_extension'] = {'request_id': request_id, 'key': ao.digest(inputs),
-                                          'receipt': relative, 'receipt_sha256': ao.digest(record)}
+        reference = {'request_id': request_id, 'key': ao.digest(inputs),
+                     'receipt': relative, 'receipt_sha256': ao.digest(record)}
+        if lane == PRE:
+            reference['lane'] = PRE
+        state['spec_review_extension'] = reference
         service.save(directory, state)
         return _result(state, record)
 
@@ -780,8 +1076,15 @@ def admission(service, directory, state):
     if (state['spec_record_sha256'] != evidence['spec_record_sha256']
             or spec['revision'] != target['spec_revision'] or spec['sha256'] != target['spec_sha256']):
         raise RoomError('The review extension belongs only to its exact audited next charter')
-    actual = ao_workflow.workspace(service, directory, state, check_routing=False)
-    _acceptance(directory, state, target['retained_candidate_sha256'], actual)
+    pre_acceptance = evidence.get('lane') == PRE
+    # Pre-acceptance: live routing (_live_routing) before the evidence comparison, so before consume().
+    actual = ao_workflow.workspace(service, directory, state, check_routing=pre_acceptance)
+    if pre_acceptance:
+        if _admission_view(_scope_proposal(directory, state, target, actual)) != _admission_view(evidence['retained']):
+            raise RoomError('The unaccepted candidate or scope-proposal evidence changed after the pre-acceptance '
+                            'review extension')
+    else:
+        _acceptance(directory, state, target['retained_candidate_sha256'], actual)
     database = (state.get('native_outcome_source') or {}).get('database', target['native_owner_database'])
     if _owner(state, database, target['native_session_id'], actual) != evidence['native_owner']:
         raise RoomError('The retained native owner changed after the review extension')
@@ -798,7 +1101,17 @@ def summary(service, state):
     committed = validate(service, state, allow_pending=True)
     if committed:
         return _result(state, committed[0])
-    if _pending(service.root / 'rooms' / state['room_id']):
-        return {'state': 'pending_uncommitted', 'model_dispatch': False,
-                'meaning': 'A durable grant receipt exists; only the identical extend request may reconcile it'}
+    pending = _pending(service.root / 'rooms' / state['room_id'])
+    if pending:
+        value = {'state': 'pending_uncommitted', 'model_dispatch': False,
+                 'meaning': 'A durable grant receipt exists; only the identical extend request may reconcile it'}
+        if len(pending) == 1:
+            try:
+                receipt = _read(pending[0])
+            except RoomError:
+                receipt = None
+            lane = receipt.get('lane', ACCEPTED) if isinstance(receipt, dict) else None
+            if isinstance(lane, str) and lane in MEANINGS:
+                value['lane'] = lane  # Reported only; the identical extend request still verifies it.
+        return value
     return None
