@@ -488,6 +488,29 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
         with self.assertRaisesRegex(ao.RoomError, 'Use the exact immutable candidate-at-completion identity'):
             self.audit(candidate_sha256='0' * 64)
 
+    def test_modified_scope_request_receipt_refuses_the_audit_without_mutation(self):
+        self.propose_scope_change()
+        self.register()  # Prime self.target_spec so the audit-without-mutation check below is not
+                          # attributed to this unrelated, one-time-per-test next-charter registration.
+        candidate_sha256 = self.candidate_sha256()
+        request = self.state()['requests']['implementation']
+        path = self.directory() / request['receipt']
+        original = path.read_bytes()
+        try:
+            path.write_text('{}')
+            self.assert_refuses_without_mutation(
+                'Native result receipt was modified', lambda: self.audit(candidate_sha256=candidate_sha256))
+        finally:
+            path.write_bytes(original)
+
+    def test_changes_required_outcome_report_refuses_with_the_request_message(self):
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation')
+        self.fake.finish('engineer', json.dumps(self.report(outcome='changes_required', implementation_complete=False)))
+        self.service.ao_room_sync(self.room)
+        with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
+            self.audit(candidate_sha256=self.candidate_sha256())
+
 
 class PreAcceptanceCandidateDriftTests(PreAcceptanceFixture):
     """Coverage item 7: live-candidate equality at audit, at grant and at send, plus restore-and-retry."""
@@ -744,6 +767,32 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
         finally:
             ao.atomic(self.directory() / 'state.json', original)
 
+    def test_completion_candidate_and_engineering_record_tampering_block_the_fourth_send_without_mutation(self):
+        """Unlike the pre-grant ``SCOPE_EVIDENCE`` checks in ``PreAcceptanceScopeRequestTests`` (which
+        read and digest these same two files' parsed *content*), after a committed grant
+        ``_retained``'s own manifest-digest loop runs first, on raw bytes, and refuses with its own
+        message before the lane-specific scope-proposal re-check is ever reached."""
+        self.propose_scope_change()
+        self.grant()
+        request = self.state()['requests']['implementation']
+        paths = [self.directory() / request['completion_candidate'], self.directory() / request['engineering_record']]
+        for index, path in enumerate(paths):
+            original = path.read_bytes()
+            try:
+                path.write_text('{}')
+                state_bytes = (self.directory() / 'state.json').read_bytes()
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(ao.RoomError,
+                            'Review-extension retained evidence is missing or modified'):
+                        self.service.ao_room_status(self.room)
+                    with self.assertRaisesRegex(ao.RoomError,
+                            'Review-extension retained evidence is missing or modified'):
+                        self.send('spec_review', 'blocked-retained-' + str(index))
+                self.assertEqual((self.directory() / 'state.json').read_bytes(), state_bytes)
+                self.assertNotIn('blocked-retained-' + str(index), self.state()['requests'])
+            finally:
+                path.write_bytes(original)
+
 
 class PreAcceptanceOutcomeSourceTests(PreAcceptanceFixture):
     """Coverage item 11: a moved outcome-source pointer without a hold; a held outcome with one."""
@@ -934,6 +983,85 @@ class PreAcceptanceNativeSettingsDriftTests(PreAcceptanceFixture):
         finally:
             ao.atomic(self.directory() / 'state.json', original)
         self.assertNotIn('blocked-reasoning-effort', self.state()['requests'])
+
+
+class PreAcceptancePinnedModelDriftTests(PreAcceptanceFixture):
+    """The pinned engineer *model* identity, not just its reasoning effort, plus the real behavior of
+    the supported engineer-model-transition entry points after a committed grant (operator
+    continuation follow-up to ``PreAcceptanceNativeSettingsDriftTests``'s docstring note above).
+
+    (a) mirrors ``test_tampered_pinned_reasoning_effort_refuses_the_fourth_send`` exactly for
+    ``bindings.engineer.model``: the same ``PIN_FIELDS`` membership (the whole ``bindings`` dict)
+    makes this refuse identically.
+    (b) ``ao_room_engineer_model_audit`` and ``ao_room_engineer_model_transition`` both reach
+    ``ao_engineering_transition._inspect``, which calls the shared ``ao_review_extension.guard_replacement``
+    unconditionally, before reading the supplied target model or transcript path and before any write;
+    there is no wedge allowing either entry point to proceed after the grant.
+    ``ao_room_engineer_model_policy``'s ``set`` action has no such guard at all, but this fixture's
+    engineer is bound to a family-alias selector, so it refuses first for its own unrelated,
+    pre-existing reason (an exact-identifier selector is required); that reason fires with or without
+    any grant, so it is not a grant-interaction boundary and is not asserted here as one.
+    (c) tampering the same pinned model between a committed audit and the grant attempt does not
+    surface the generic "stale audit" message: ``ao_engineering_model.effective_binding`` (read by
+    ``ao_review_extension._inspect`` before any evidence comparison) refuses first, since the
+    tampered value now contradicts this room's one recorded initial engineering epoch.
+    """
+
+    def test_tampered_pinned_engineer_model_refuses_status_and_the_fourth_send_until_restored(self):
+        self.propose_scope_change()
+        self.grant()
+        original = self.state()
+        tampered = copy.deepcopy(original)
+        tampered['bindings']['engineer']['model'] = 'claude-pinned-model-tampered-for-test'
+        ao.atomic(self.directory() / 'state.json', tampered)
+        try:
+            self.assert_refuses_without_mutation(PINNED, lambda: self.service.ao_room_status(self.room))
+            self.assert_refuses_without_mutation(PINNED, lambda: self.send('spec_review', 'blocked-pinned-model'))
+        finally:
+            ao.atomic(self.directory() / 'state.json', original)
+        self.assertNotIn('blocked-pinned-model', self.state()['requests'])
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+
+    def test_engineer_model_transition_and_audit_refuse_after_the_grant_with_no_wedge(self):
+        self.propose_scope_change()
+        self.grant()
+        before_files = self.room_files()
+        posts = len(self.fake.posts)
+        audited = self.service.ao_room_engineer_model_audit(
+            self.room, 'claude-some-other-model', str(self.database), str(self.root / 'nonexistent-transition.jsonl'))
+        guard = ('The committed fourth-review grant pins provider and routing identity; engineering model '
+                 'transition is unsupported after that grant. No transition intent was written')
+        self.assertFalse(audited['eligible'])
+        self.assertEqual(audited['reason'], guard)
+        self.assertIsNone(audited['audit_sha256'])
+        self.assert_refuses_without_mutation(
+            'unsupported after that grant',
+            lambda: self.service.ao_room_engineer_model_transition(
+                room_id=self.room, request_id='model-transition-after-grant',
+                source_model='claude-source-model', target_model='claude-target-model',
+                audit_sha256='1' * 64, spec_record_sha256='2' * 64, candidate_sha256='3' * 64,
+                native_history_sha256='4' * 64, native_owner_database=str(self.database),
+                native_transcript_path=str(self.root / 'nonexistent-transition.jsonl'),
+                authorization='User approves a synthetic model transition probe.', reason='Probe reason.'))
+        self.assertEqual(self.room_files(), before_files)
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
+
+    def test_pinned_model_drift_between_audit_and_grant_refuses_the_grant(self):
+        self.propose_scope_change()
+        audited = self.audit()
+        original = self.state()
+        tampered = copy.deepcopy(original)
+        tampered['bindings']['engineer']['model'] = 'claude-pinned-model-tampered-between-audit-and-grant'
+        ao.atomic(self.directory() / 'state.json', tampered)
+        try:
+            with self.assertRaisesRegex(ao.RoomError,
+                    "Stored engineer binding contradicts this room's initial engineering model"):
+                self.service.ao_room_preacceptance_review_extend(**self.grant_inputs(
+                    audit=audited, request_id='drifted-model-grant'))
+        finally:
+            ao.atomic(self.directory() / 'state.json', original)
+        self.assertNotIn('spec_review_extension', self.state())
 
 
 class PreAcceptanceHistoryBoundsTests(PreAcceptanceFixture):
@@ -1355,6 +1483,49 @@ class PreAcceptanceNormalizedProposalTests(PreAcceptanceFixture):
         self.assertTrue(status['agreement']['agreed'])
         self.assertEqual(status['spec_review_extension']['consumed_by'], 'fourth')
         self.assertEqual(status['spec_review_extension']['remaining_spec_reviews'], 0)
+
+    def test_normalizing_a_malformed_delegate_attribution_refuses_without_promoting_the_claim(self):
+        """A response that needs normalization *and* carries a malformed delegate attribution.
+
+        Unlike the normal completion path (``PreAcceptanceAttributionTests``, where
+        ``ao_workflow.capture_engineering`` sets ``reported_delegate_job_ids`` before calling
+        ``verify_delegation`` and its caller catches the resulting ``MalformedDelegateAttributionError``
+        to store a diagnostic), ``ao_response_normalization.validate_current`` calls
+        ``ao_delegates.verify_delegation`` directly and uncaught for this same purpose. So
+        ``ao_room_response_normalize`` itself refuses here -- before writing the normalization record
+        or updating the request at all -- rather than ever promoting the malformed claim into
+        ``engineering_record`` evidence; the request keeps its original not-strict-JSON diagnostic
+        verbatim, and a later audit of this same, still-unnormalized report fails the same way it did
+        before the normalize attempt, never reaching ``rejected_report_diagnostic`` evidence.
+        """
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation')
+        self.fake.finish('engineer', self.PROSE + json.dumps(
+            self.scope_change_report(routing_log=[{'delegate_job_ids': ['not-a-provider-job']}])))
+        self.service.ao_room_sync(self.room)
+        before = self.state()['requests']['implementation']
+        diagnostic = before['engineering_error']
+        self.assertEqual(diagnostic, NOT_STRICT_JSON)
+        self.assertNotIn('engineering_record', before)
+        self.assertIsNone(before.get('reported_delegate_job_ids'))
+        self.assertIsNone(before.get('delegate_job_ids'))
+        raw = ao_workflow.raw_final_text(self.directory(), before)
+        start = raw.find('{')
+        _, end = json.JSONDecoder().raw_decode(raw, start)
+        self.assert_refuses_without_mutation(
+            'malformed delegate job identifier',
+            lambda: self.service.ao_room_response_normalize(
+                self.room, 'implementation', before['receipt_sha256'],
+                ao.digest(raw.encode()), start, end, self.REVIEW, True))
+        request = self.state()['requests']['implementation']
+        self.assertEqual(request['engineering_error'], diagnostic)
+        self.assertNotIn('engineering_record', request)
+        self.assertNotIn('response_normalization', request)
+        self.assertNotIn('response_normalization_sha256', request)
+        self.assertIsNone(request.get('reported_delegate_job_ids'))
+        self.assertIsNone(request.get('delegate_job_ids'))
+        with self.assertRaisesRegex(ao.RoomError, NOT_STRICT_JSON):
+            self.audit()
 
 
 class PreAcceptanceReportGapTests(PreAcceptanceFixture):
