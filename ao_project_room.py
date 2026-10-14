@@ -769,7 +769,7 @@ class Service:
         nonempty(message, "message", 6000)
         import ao_spec_verdict_recovery
         with self.locked(room_id) as (directory, state):
-            recovery_chain = ao_spec_verdict_recovery.before_send(directory, state, role, purpose, request_id, message)
+            ao_spec_verdict_recovery.before_send(directory, state, role, purpose, request_id, message)
         standing = None
         if role == "engineer" and purpose != ao_spec_verdict_recovery.PURPOSE:
             # The standing family-member policy runs its own short lock windows at this dispatch
@@ -788,7 +788,10 @@ class Service:
                     raise RoomError("request_id already belongs to another payload")
                 return self.request_summary(previous)
             ao_prompt_metrics.assert_dispatch_projections(state)  # Fail closed before any new dispatch.
-            self.quiet(state, pending_spec_verdict_recovery=purpose == ao_spec_verdict_recovery.PURPOSE)
+            if purpose == ao_spec_verdict_recovery.PURPOSE:
+                self.quiet(state, pending_spec_verdict_recovery=True)
+            else:
+                self.quiet(state)
             if role not in state["bindings"]:
                 raise RoomError("Bind the requested role first")
             # W2 request boundary: new-dispatch readiness and the independently qualified workers are
