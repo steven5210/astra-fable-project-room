@@ -464,7 +464,9 @@ For a completed specification verdict that is prose only and cannot be normalize
 see [one-use spec-verdict format recovery](../../../docs/guides/spec-verdict-format-recovery.md).
 That separate, specifically authorized operation requires a new native format-only
 response and an explicit comparison of both complete texts. It does not renew the
-ordinary review budget or relax the normalization rules below.
+ordinary review budget or relax the normalization rules below. A completed result
+that cannot be affirmed closes with `ao_room_spec_verdict_recovery_close`; a failed
+recovery turn settles through the ordinary outcome audit and resume.
 
 Prefer one final JSON object with no surrounding prose. If a known completed result
 contains one otherwise valid object surrounded by prose, the Astra operator may use

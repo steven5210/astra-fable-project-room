@@ -36,6 +36,15 @@ malformed recovery consumes that intent. There is no automatic second attempt.
 Keep the original final response, rejected format diagnostic and every original
 review request unchanged.
 
+The lane applies only to the room's ordinary three-review budget. A prose-only
+verdict from a fourth-charter extension review is out of scope; that review's
+result must be used or preserved as it stands.
+
+The recovery turn is read-only except for the native task-list tools. TaskList,
+TaskGet, TaskCreate and TaskUpdate are permitted because the room's own progress
+parts instruct them. Any other tool, a delegate call, a launch or a malformed
+native row refuses the recovery at commit.
+
 ## Operator sequence
 
 1. Read the complete original final response and exact current specification.
@@ -72,6 +81,30 @@ review request unchanged.
    revalidates the retained recovery chain. Missing or altered evidence cannot
    fall back to an older agreement.
 
+## Lane closure
+
+A consumed lane that cannot produce agreement does not freeze the room.
+
+If the recovery turn failed natively, the ordinary outcome path settles it. Run
+`ao_room_outcome_audit`, then `ao_room_outcome_resume` with the recorded
+authorization; the request becomes a settled failure. The lane then reports
+`settled_failure` and the room returns to its prior state: no agreement, ordinary
+limits apply, and no second recovery is possible. The failed turn's receipt and
+failure stay immutable.
+
+If the recovery turn completed but Astra cannot truthfully affirm the same
+verdict, call `ao_room_spec_verdict_recovery_close` with the recovery request,
+its exact receipt and final-text digests, and a substantive `astra_review`. The
+call stores an immutable closure record with the controller's own verdict-parse
+error for the result, closes the lane without agreement, and makes a later commit
+refuse. The closure is one-use and idempotent; different inputs refuse. A
+rejected, malformed or ambiguous recovery result therefore no longer locks the
+room: the room continues with no agreement.
+
+`ao_room_status` carries the lane's state under `spec_verdict_recovery`: `none`,
+`granted`, `dispatched`, `completed`, `agreed`, `closed`, `settled_failure` or
+`damaged`, with the pending flag, request and record identities.
+
 ## Guarantees and limits
 
 The recovery request is separately accounted. It does not remove or relabel any
@@ -96,10 +129,12 @@ state and evidence is outside this guarantee. No external journal or migration
 is introduced. Installing this capability and authorizing a live recovery remain
 separate from developing or reviewing its patch.
 
-A storage failure between writing an immutable grant, intent or comparison record
-and saving its state reference can leave an unclaimed record. This release stops
-for diagnosis in that case; it does not silently adopt the record, delete it or
-recreate an allowance. Thus no-replay safety does not guarantee automatic progress
-after every filesystem failure. A fully saved request can be synced after a lost
-acknowledgement without resending. Preserve any unclaimed-record refusal for a
-supported recovery decision.
+Each durable record — `grant.json`, `intent.json`, `completion.json`,
+`agreement.json` and `closure.json` — is written before the state pointer that
+claims it is saved. A storage failure in between leaves an unclaimed record; the
+next read then fails closed with a damaged-evidence refusal and waits for
+supported diagnosis. The controller does not silently adopt the record, delete it
+or recreate an allowance. Thus no-replay safety does not guarantee automatic
+progress after every filesystem failure. A fully saved request can be synced
+after a lost acknowledgement without resending. Preserve any unclaimed-record
+refusal for a supported recovery decision.
