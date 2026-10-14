@@ -24,6 +24,9 @@ DAMAGED = "Specification verdict recovery evidence is missing, changed or unclai
 PENDING = "The one-use specification verdict recovery is pending; only its exact named format request and explicit comparison may proceed"
 RESULT_FIELDS = {"interpretation", "findings", "decision", "spec_revision", "spec_sha256", "source_request_id",
                  "source_receipt_sha256", "source_final_text_sha256", "meaning_unchanged"}
+ALLOWED_TOOLS = ("TaskCreate", "TaskGet", "TaskList", "TaskUpdate")
+TOOL_REFUSAL = ("The format-recovery turn used tools other than the native task list, or launched work; "
+                "the one-use recovery is refused")
 
 
 def _hash(value):
@@ -106,12 +109,14 @@ def _preserved(directory, state, evidence):
 def journal(directory, state, allow_pending=False):
     """Local evidence only. An orphan record is a blocker, never fresh authority."""
     pointer = state.get(KEY)
-    present = {name for name in ("grant", "intent", "completion", "agreement") if _present(directory, name)}
+    present = {name for name in ("grant", "intent", "completion", "agreement", "closure") if _present(directory, name)}
     if pointer is None:
         if present or any(r.get("purpose") == PURPOSE for r in state.get("requests", {}).values()):
             raise RoomError(DAMAGED)
         return None
-    if not isinstance(pointer, dict) or set(pointer) - {"grant_sha256", "intent_sha256", "agreement_sha256"}:
+    if (not isinstance(pointer, dict)
+            or set(pointer) - {"grant_sha256", "intent_sha256", "agreement_sha256", "closure_sha256"}
+            or (pointer.get("agreement_sha256") is not None and pointer.get("closure_sha256") is not None)):
         raise RoomError(DAMAGED)
     grant = _read(directory, "grant", pointer.get("grant_sha256"))
     audit = _read(directory, "audits/" + _hash(grant.get("audit_sha256")), grant["audit_sha256"])
@@ -143,6 +148,19 @@ def journal(directory, state, allow_pending=False):
                 or any(recovery.get(k) != v for k, v in original.items() if k != "state")):
             raise RoomError(DAMAGED)
         result.update(intent=intent, request=recovery)
+        if recovery.get("state") == "settled_failure":
+            # A consumed-and-unsuccessful lane closes through the supported outcome
+            # settlement alone; no completion, agreement or closure may coexist.
+            try:
+                ao_outcomes.validate_settlement(directory, recovery)
+            except RoomError as exc:
+                raise RoomError(DAMAGED) from exc
+            if (pointer.get("agreement_sha256") is not None or pointer.get("closure_sha256") is not None
+                    or recovery.get("spec_verdict_recovery_completion_sha256") is not None
+                    or present != {"grant", "intent"}):
+                raise RoomError(DAMAGED)
+            result.update(status="settled_failure", pending=False)
+            return result
         completion_sha = recovery.get("spec_verdict_recovery_completion_sha256")
         if completion_sha is not None:
             completion = _read(directory, "completion", completion_sha)
@@ -171,7 +189,42 @@ def journal(directory, state, allow_pending=False):
         result.update(agreement=record, verdict=verdict)
     elif "agreement" in present:
         raise RoomError(DAMAGED)
-    if "agreement" not in result and not allow_pending:
+    if pointer.get("closure_sha256") is not None:
+        record = _read(directory, "closure", pointer["closure_sha256"])
+        closed_raw = ao_workflow.raw_final_text(directory, recovery, allow_missing=True)
+        try:
+            _verdict(closed_raw, evidence)
+            check_verdict_error = None
+        except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+            check_verdict_error = str(exc)
+        check = record.get("controller_check") or {}
+        inputs = record.get("inputs") or {}
+        if (record.get("version") != 1 or record.get("room_id") != state["room_id"]
+                or record.get("grant_sha256") != pointer["grant_sha256"]
+                or record.get("intent_sha256") != pointer["intent_sha256"]
+                or record.get("completion_sha256") != recovery.get("spec_verdict_recovery_completion_sha256")
+                or record.get("request_state") != "completed" or recovery.get("state") != "completed"
+                or inputs.get("recovery_request_id") != request_id
+                or inputs.get("receipt_sha256") != recovery.get("receipt_sha256")
+                or inputs.get("final_text_sha256") != ao.digest(closed_raw.encode())
+                or not isinstance(inputs.get("astra_review"), str) or not inputs["astra_review"].strip()
+                or check.get("verdict_error") != check_verdict_error
+                or check.get("capture_error") != recovery.get("spec_verdict_recovery_error")):
+            raise RoomError(DAMAGED)
+        result.update(closure=record)
+    elif "closure" in present:
+        raise RoomError(DAMAGED)
+    if "agreement" in result:
+        status = "agreed"
+    elif "closure" in result:
+        status = "closed"
+    elif "intent" in result:
+        status = "completed" if result["request"].get("state") == "completed" else "dispatched"
+    else:
+        status = "granted"
+    result["status"] = status
+    result["pending"] = status in ("granted", "dispatched", "completed")
+    if result["pending"] and not allow_pending:
         raise RoomError(PENDING)
     return result
 
@@ -308,10 +361,16 @@ def grant(service, directory, state, audit_sha256, authorization, authorization_
 
 def before_send(directory, state, role, purpose, request_id, message):
     chain = journal(directory, state, allow_pending=True)
-    if purpose == PURPOSE or (chain is not None and "agreement" not in chain):
-        if (chain is None or role != "engineer" or purpose != PURPOSE or message != MESSAGE
+    if purpose == PURPOSE:
+        if chain is None:
+            raise RoomError("The one format-recovery request is absent or already consumed; never replay")
+        if (role != "engineer" or message != MESSAGE
                 or request_id != chain["evidence"]["target"]["recovery_request_id"]):
+            if "intent" in chain:
+                raise RoomError("The one format-recovery request is absent or already consumed; never replay")
             raise RoomError(PENDING)
+    elif chain is not None and chain["pending"]:
+        raise RoomError(PENDING)
     return chain
 
 
@@ -326,8 +385,11 @@ def packet(service, directory, state, message, assembly):
     contract = {"source_request_id": identity["request_id"], "source_receipt_sha256": identity["receipt_sha256"],
                 "source_final_text_sha256": identity["final_text_sha256"],
                 "spec_revision": evidence["spec"]["revision"], "spec_sha256": evidence["spec"]["sha256"]}
-    assembly.add("workflow", "One-use verdict FORMAT RECOVERY ONLY. Stay read-only; do not delegate, execute tools, "
-                 "implement, re-review the specification or add scope. Re-express your complete retained verdict below "
+    assembly.add("workflow", "One-use verdict FORMAT RECOVERY ONLY. Stay read-only. Do not delegate, launch Agent/Task "
+                 "workers, call delegate tools, run or edit anything, re-review the specification or add scope. "
+                 "The only tools permitted on this turn are the native task-list tools (TaskList, TaskGet, "
+                 "TaskCreate, TaskUpdate); any other tool use refuses this one-use recovery, and no second attempt "
+                 "exists. Re-express your complete retained verdict below "
                  "without changing its meaning. Return exactly one JSON object, without fences/prose, with exactly: "
                  "interpretation (nonempty string preserving all original nonblocking observations), findings (array of strings), "
                  "decision (accept or changes_required), meaning_unchanged (boolean), and these exact identities: "
@@ -358,12 +420,51 @@ def capture(directory, state, request):
     chain = journal(directory, state, allow_pending=True)
     if chain is None or chain.get("request") is not request:
         raise RoomError(DAMAGED)
-    if "completion" in chain:
+    if "completion" in chain or "agreement" in chain or "closure" in chain:
         return
     _, identity = _source(directory, request)
     record = {"version": 1, "room_id": state["room_id"], "intent_sha256": chain["pointer"]["intent_sha256"],
               "source": identity, "candidate": candidate_snapshot(chain["evidence"]["worktree"])}
     request["spec_verdict_recovery_completion_sha256"] = _store(directory, "completion", record)
+
+
+def _allowed_tool_uses(native_raw, prior):
+    """Distinct tool-use block identities the recovery turn added after the retained prefix.
+
+    Only the native task-list tools may appear; any other tool, a malformed row or a
+    sidechain/agent row refuses the one-use recovery. Rows whose uuid already exists in the
+    retained prefix are earlier evidence, not new tool use.
+    """
+    prefix_rows = set()
+    for line in native_raw[:prior["bytes"]].splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict) and isinstance(row.get("uuid"), str):
+            prefix_rows.add(row["uuid"])
+    allowed = set()
+    for line in native_raw[prior["bytes"]:].splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise RoomError(TOOL_REFUSAL) from exc
+        if (not isinstance(row, dict) or row.get("isSidechain") is True
+                or row.get("agentId") is not None or row.get("agent_id") is not None):
+            raise RoomError(TOOL_REFUSAL)
+        if row.get("uuid") in prefix_rows or row.get("type") != "assistant":
+            continue
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_id = block.get("id")
+            if block.get("name") not in ALLOWED_TOOLS or not isinstance(tool_id, str) or not tool_id:
+                raise RoomError(TOOL_REFUSAL)
+            allowed.add(tool_id)
+    return allowed
 
 
 def _verdict(raw, evidence):
@@ -392,6 +493,8 @@ def commit(service, directory, state, recovery_request_id, receipt_sha256, final
     chain = journal(directory, state, allow_pending=True)
     if chain is None or "completion" not in chain or chain["request"]["request_id"] != recovery_request_id:
         raise RoomError("Format recovery needs its exact completed captured native result")
+    if "closure" in chain:
+        raise RoomError("This format recovery was closed without agreement")
     inputs = dict(recovery_request_id=recovery_request_id, receipt_sha256=receipt_sha256,
                   final_text_sha256=final_text_sha256, astra_review=astra_review, confirm_same_verdict=True)
     if "agreement" in chain:
@@ -411,8 +514,12 @@ def commit(service, directory, state, recovery_request_id, receipt_sha256, final
     native_raw, children = _children(directory, state)
     prior_native = evidence["native_transcript"]
     if (len(native_raw) < prior_native["bytes"] or ao.digest(native_raw[:prior_native["bytes"]]) != prior_native["sha256"]
-            or children != prior_native["children"]):
+            or {k: v for k, v in children.items() if k != "parent_tool_uses"}
+               != {k: v for k, v in prior_native["children"].items() if k != "parent_tool_uses"}):
         raise RoomError("Retained native transcript prefix or read-only delegate/tool history changed")
+    if (children["parent_tool_uses"] - prior_native["children"]["parent_tool_uses"]
+            != len(_allowed_tool_uses(native_raw, prior_native))):
+        raise RoomError(TOOL_REFUSAL)
     from ao_provider_transition import _CompleteClient, _native, _ledger_rows, _ledger_check
     client = _CompleteClient(service.client(state))
     for role, binding in state["bindings"].items():
@@ -445,9 +552,50 @@ def commit(service, directory, state, recovery_request_id, receipt_sha256, final
     return {"agreed": True, "agreement_sha256": sha, "model_dispatch": False}
 
 
+def close(service, directory, state, recovery_request_id, receipt_sha256, final_text_sha256, astra_review):
+    """Astra's explicit negative comparison closes a completed lane without agreement."""
+    ao.nonempty(astra_review, "astra_review", 6000)
+    chain = journal(directory, state, allow_pending=True)
+    if chain is None or "intent" not in chain or chain["request"]["request_id"] != recovery_request_id:
+        raise RoomError("Closure needs the completed native result; a failed turn settles through the outcome audit")
+    if "agreement" in chain:
+        raise RoomError("This format recovery already agreed; closure is impossible")
+    request = chain["request"]
+    if request.get("state") != "completed":
+        raise RoomError("Closure needs the completed native result; a failed turn settles through the outcome audit")
+    inputs = dict(recovery_request_id=recovery_request_id, receipt_sha256=receipt_sha256,
+                  final_text_sha256=final_text_sha256, astra_review=astra_review)
+    if "closure" in chain:
+        if chain["closure"]["inputs"] != inputs:
+            raise RoomError("The immutable format-recovery closure already has different inputs")
+        return {"closed": True, "closure_sha256": chain["pointer"]["closure_sha256"],
+                "agreed": False, "model_dispatch": False}
+    service.quiet(state, pending_spec_verdict_recovery=True)
+    raw, identity = _source(directory, request)
+    if identity["receipt_sha256"] != receipt_sha256 or identity["final_text_sha256"] != final_text_sha256:
+        raise RoomError("The closure does not name the complete exact native response")
+    try:
+        _verdict(raw, chain["evidence"])
+        verdict_error = None
+    except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+        verdict_error = str(exc)
+    record = {"version": 1, "room_id": state["room_id"], "grant_sha256": chain["pointer"]["grant_sha256"],
+              "intent_sha256": chain["pointer"]["intent_sha256"],
+              "completion_sha256": request.get("spec_verdict_recovery_completion_sha256"),
+              "request_state": "completed",
+              "controller_check": {"verdict_error": verdict_error,
+                                   "capture_error": request.get("spec_verdict_recovery_error")},
+              "inputs": inputs}
+    sha = _store(directory, "closure", record)
+    state[KEY]["closure_sha256"] = sha
+    service.save(directory, state)
+    return {"closed": True, "closure_sha256": sha, "agreed": False, "model_dispatch": False}
+
+
 def agreement(service, directory, state, request):
     chain = journal(directory, state)
-    if chain is None or request["request_id"] != chain["evidence"]["target"]["source_request_id"]:
+    if (chain is None or "agreement" not in chain
+            or request["request_id"] != chain["evidence"]["target"]["source_request_id"]):
         return None
     if request["spec_record_sha256"] != state["spec_record_sha256"]:
         raise RoomError("Recovered agreement belongs to a different specification")
@@ -457,7 +605,8 @@ def agreement(service, directory, state, request):
 
 def check_handoff(service, directory, state, actual):
     chain = journal(directory, state)
-    if chain is None or state["spec_record_sha256"] != chain["evidence"]["spec_record_sha256"]:
+    if (chain is None or "agreement" not in chain
+            or state["spec_record_sha256"] != chain["evidence"]["spec_record_sha256"]):
         return
     # Before the first recovered handoff, the audited candidate remains frozen.
     # Later engineering keeps validating ancestry without freezing future edits.
@@ -466,3 +615,28 @@ def check_handoff(service, directory, state, actual):
         return
     if candidate_snapshot(actual) != chain["evidence"]["candidate"]:
         raise RoomError("Candidate changed before the recovered-spec handoff")
+
+
+def summary(directory, state):
+    """Never-raising status projection: missing, changed or unclaimed evidence reports damaged."""
+    pointer = state.get(KEY)
+    result = {"status": "none", "pending": False, "used": False, "grant_sha256": None,
+              "recovery_request_id": None, "agreement_sha256": None, "closure_sha256": None, "error": None}
+    try:
+        chain = journal(directory, state, allow_pending=True)
+    except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+        result.update(status="damaged", error=str(exc)[:500])
+        if isinstance(pointer, dict):
+            result.update(grant_sha256=pointer.get("grant_sha256"),
+                          agreement_sha256=pointer.get("agreement_sha256"),
+                          closure_sha256=pointer.get("closure_sha256"),
+                          used=bool(pointer.get("intent_sha256")))
+        return result
+    if chain is None:
+        return result
+    result.update(status=chain["status"], pending=chain["pending"], used="intent" in chain,
+                  grant_sha256=chain["pointer"].get("grant_sha256"),
+                  recovery_request_id=chain["evidence"]["target"]["recovery_request_id"],
+                  agreement_sha256=chain["pointer"].get("agreement_sha256"),
+                  closure_sha256=chain["pointer"].get("closure_sha256"))
+    return result

@@ -592,7 +592,8 @@ def audit_quiet(service, directory, state, request):
     failed = request.get('state') == 'uncertain' and (request.get('observed_turn') or {}).get('state') == 'failed'
     if failed:
         receipt(directory, request, explicit_audit=True)
-    service.quiet(state, outcome_request_id=request['request_id'] if failed else None)
+    service.quiet(state, outcome_request_id=request['request_id'] if failed else None,
+                  pending_spec_verdict_recovery=True)
 
 
 def latest_for_role(state, role):

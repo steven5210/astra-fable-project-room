@@ -89,6 +89,225 @@ class RecoveryFixture(Fixture):
 
 
 class SpecVerdictRecoveryTests(RecoveryFixture):
+    def close_args(self, **changes):
+        request = self.state()['requests']['format1']
+        raw = ao_workflow.raw_final_text(self.directory(), request)
+        return {'room_id': self.room, 'recovery_request_id': 'format1',
+                'receipt_sha256': request['receipt_sha256'], 'final_text_sha256': ao.digest(raw.encode()),
+                'astra_review': 'I read both complete responses and cannot affirm the same verdict; the lane closes without agreement.',
+                **changes}
+
+    def close(self, **changes):
+        return self.service.ao_room_spec_verdict_recovery_close(**self.close_args(**changes))
+
+    def test_quota_failed_recovery_turn_settles_and_the_room_continues(self):
+        grant = self.grant()
+        self.service.ao_room_send(**grant['send_args'])
+        request = self.state()['requests']['format1']
+        stamp = lambda offset: min(datetime.fromtimestamp(request['created_at'] + offset, timezone.utc), datetime.now(timezone.utc)).isoformat()
+        self.native_events.extend([
+            {'type': 'user', 'uuid': 'format1-caller', 'sessionId': self.NATIVE,
+             'timestamp': stamp(.001), 'cwd': str(self.repo), 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': 'format1-error', 'sessionId': self.NATIVE,
+             'timestamp': stamp(.002), 'cwd': str(self.repo), 'isSidechain': False,
+             'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>',
+                         'content': [{'type': 'text', 'text': 'Synthetic native session limit'}]}}])
+        self.transcript.write_text(''.join(json.dumps(row) + chr(10) for row in self.native_events))
+        self.native_requests.add('format1')
+        self.fake.finish('engineer', state='failed')
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['format1']['state'], 'uncertain')
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.assertTrue(audit['resume_eligible'])
+        # The released successor is named review4 so the semantic hold admits it and the
+        # ordinary three-review cap, not the recovery lane, refuses it.
+        self.service.ao_room_outcome_resume(self.room, 'format1', audit['outcome_sha256'], 'review4',
+            'Actual standing human quota continuation authority; synthetic reset checked', 'Continue once')
+        self.assertEqual(self.state()['requests']['format1']['state'], 'settled_failure')
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'settled_failure')
+        self.assertFalse(status['spec_verdict_recovery']['pending'])
+        self.assertFalse(status['agreement']['agreed'])
+        self.assertIn('one unambiguous JSON object', status['agreement']['reason'])
+        self.spec(revision=2)
+        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+            self.audit(recovery_request_id='format2')
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format-resume', recovery.PURPOSE)
+        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
+            self.send('spec_review', 'review4')
+        self.assertEqual(len(self.fake.posts), 4)
+
+    def test_rejected_recovery_result_closes_explicitly_and_the_room_continues(self):
+        self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
+        with self.assertRaisesRegex(ao.RoomError, 'changed meaning'):
+            self.commit()
+        closed = self.close()
+        self.assertTrue(closed['closed'])
+        self.assertFalse(closed['agreed'])
+        self.assertFalse(closed['model_dispatch'])
+        with self.assertRaisesRegex(ao.RoomError, 'closed without agreement'):
+            self.commit()
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+        self.assertFalse(status['spec_verdict_recovery']['pending'])
+        self.assertEqual(status['spec_verdict_recovery']['closure_sha256'], closed['closure_sha256'])
+        record = ao.read(self.directory() / 'spec-verdict-recovery' / 'closure.json')
+        self.assertIsNotNone(record['controller_check']['verdict_error'])
+        self.assertEqual(record['request_state'], 'completed')
+        self.spec(revision=2)
+        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
+            self.send('spec_review', 'review4')
+        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+            self.audit(recovery_request_id='format2')
+        self.assertEqual(self.close(), closed)
+        with self.assertRaises(ao.RoomError):
+            self.close(astra_review='A different judgment')
+        self.assertEqual(len(self.fake.posts), 4)
+
+    def test_close_refuses_every_unfinished_or_misidentified_lane(self):
+        grant = self.grant()
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_spec_verdict_recovery_close(self.room, 'format1', '0' * 64, '0' * 64,
+                                                           'Astra closes the granted but unsent lane')
+        self.service.ao_room_send(**grant['send_args'])
+        self.note_native_turn('format1')
+        with self.assertRaisesRegex(ao.RoomError, 'completed native result'):
+            self.service.ao_room_spec_verdict_recovery_close(self.room, 'format1', '0' * 64, '0' * 64,
+                                                             'Astra closes the unanswered lane')
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        self.service.ao_room_sync(self.room)
+        for changes in ({'receipt_sha256': '0' * 64}, {'final_text_sha256': '0' * 64},
+                        {'astra_review': ''}, {'recovery_request_id': 'format9'}):
+            with self.subTest(changes=changes), self.assertRaises(ao.RoomError):
+                self.close(**changes)
+        self.commit()
+        with self.assertRaisesRegex(ao.RoomError, 'agreed'):
+            self.close()
+        self.assertEqual(len(self.fake.posts), 4)
+
+    def recovery_tool_rows(self, blocks, results=True):
+        """Append one synthetic assistant tool-use row (and its result row) to the recovery turn."""
+        request = self.state()['requests']['format1']
+        stamp = lambda offset: min(datetime.fromtimestamp(request['created_at'] + offset, timezone.utc), datetime.now(timezone.utc)).isoformat()
+        model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+        self.native_events.append(
+            {'type': 'assistant', 'uuid': 'format1-tools', 'sessionId': self.NATIVE,
+             'timestamp': stamp(.0015), 'cwd': str(self.repo), 'isSidechain': False,
+             'message': {'role': 'assistant', 'model': model, 'id': 'format1-tools-message', 'content': blocks}})
+        if results:
+            self.native_events.append(
+                {'type': 'user', 'uuid': 'format1-tools-results', 'sessionId': self.NATIVE,
+                 'timestamp': stamp(.0025), 'cwd': str(self.repo), 'isSidechain': False,
+                 'sourceToolAssistantUUID': 'format1-tools',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': block['id'], 'content': 'ok'} for block in blocks]}})
+        self.transcript.write_text(''.join(json.dumps(row) + chr(10) for row in self.native_events))
+
+    def test_native_task_list_tools_on_the_recovery_turn_do_not_burn_the_lane(self):
+        self.dispatch()
+        self.recovery_tool_rows([
+            {'type': 'tool_use', 'id': 'toolu-tasklist-1', 'name': 'TaskList', 'input': {}},
+            {'type': 'tool_use', 'id': 'toolu-taskupdate-1', 'name': 'TaskUpdate',
+             'input': {'taskId': '3', 'status': 'completed'}}])
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        self.service.ao_room_sync(self.room)
+        self.assertTrue(self.commit()['agreed'])
+
+    def test_a_read_tool_on_the_recovery_turn_refuses_commit(self):
+        self.dispatch()
+        self.recovery_tool_rows([{'type': 'tool_use', 'id': 'toolu-read-1', 'name': 'Read',
+                                  'input': {'file_path': '/tmp/anything'}}])
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        self.service.ao_room_sync(self.room)
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'task list'):
+            self.commit()
+        self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_an_agent_launch_on_the_recovery_turn_refuses_commit(self):
+        self.dispatch()
+        self.recovery_tool_rows([{'type': 'tool_use', 'id': 'toolu-agent-1', 'name': 'Agent',
+                                  'input': {'prompt': 'Do background work'}}], results=False)
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        self.service.ao_room_sync(self.room)
+        with self.assertRaises(ao.RoomError):
+            self.commit()
+        self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+
+    def test_mutated_or_deleted_native_prefix_rows_refuse_commit(self):
+        self.finish()
+        original = list(self.native_events)
+        for row in self.native_events:
+            if row.get('uuid') == 'review3-reply':
+                row['message']['model'] = 'a-different-model'
+        self.transcript.write_text(''.join(json.dumps(row) + chr(10) for row in self.native_events))
+        with self.assertRaisesRegex(ao.RoomError, 'Retained native transcript prefix'):
+            self.commit()
+        self.native_events = [row for row in original
+                              if row.get('uuid') not in ('review3-caller', 'review3-reply')]
+        self.transcript.write_text(''.join(json.dumps(row) + chr(10) for row in self.native_events))
+        with self.assertRaisesRegex(ao.RoomError, 'Retained native transcript prefix'):
+            self.commit()
+        self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+
+    def test_a_truncated_json_result_refuses_commit(self):
+        self.finish(text='{"decision": "accept"')
+        with self.assertRaises(ao.RoomError):
+            self.commit()
+        self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+
+    def test_a_non_object_json_result_refuses_commit(self):
+        self.finish(text='["accept"]')
+        with self.assertRaisesRegex(ao.RoomError, 'strict native JSON'):
+            self.commit()
+        self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+
+    def test_one_use_boundary_and_review_budgets_after_agreement(self):
+        self.finish()
+        self.commit()
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery_attempts'], 1)
+        self.assertEqual(status['spec_review_attempts'], 3)
+        self.assertEqual(status['acceptance_review_attempts'], 0)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'agreed')
+        self.assertEqual(status['spec_verdict_recovery']['recovery_request_id'], 'format1')
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+            self.audit(recovery_request_id='format2')
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format2', recovery.PURPOSE)
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_mcp_transport_exposes_and_calls_all_four_recovery_tools(self):
+        controller = project_room.Service(self.home)
+        listed = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, controller)
+        names = {tool['name'] for tool in listed['result']['tools']}
+        for name in ('audit', 'grant', 'commit', 'close'):
+            self.assertIn('ao_room_spec_verdict_recovery_' + name, names)
+        self.assertIn(recovery.PURPOSE,
+                      project_room.TOOL_SCHEMAS['ao_room_send'][1]['properties']['purpose']['enum'])
+        response = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+            'params': {'name': 'ao_room_spec_verdict_recovery_close', 'arguments': {'room_id': self.room}}},
+            controller)
+        self.assertTrue(response['result']['isError'])
+        self.assertIn('Invalid arguments', response['result']['content'][0]['text'])
+        with patch.object(ao, 'Service', return_value=self.service):
+            response = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+                'params': {'name': 'ao_room_spec_verdict_recovery_audit', 'arguments': self.audit_args()}},
+                controller)
+        self.assertFalse(response['result']['isError'])
+        self.assertTrue(response['result']['structuredContent']['eligible'])
+
+    def test_outcome_audit_of_a_completed_recovery_is_allowed_and_commit_still_agrees(self):
+        self.finish()
+        audit = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(audit['request_id'], 'format1')
+        self.assertTrue(self.commit()['agreed'])
+
     def test_real_entrypoint_preserves_three_reviews_and_source_receipt_then_handoff_and_implementation(self):
         original = copy.deepcopy(self.state()['requests'])
         receipts = {key: (self.directory() / row['receipt']).read_bytes() for key, row in original.items()}
@@ -344,6 +563,51 @@ class PriorHandoffRecoveryTests(RecoveryFixture):
         self.assertTrue(self.service.ao_room_verify(self.room, str(self.repo))['passed'])
         for key, row in old['requests'].items():
             self.assertEqual(self.state()['requests'][key], row)
+
+
+class HanShapedRecoveryTests(RecoveryFixture):
+    """A room that already lived a full R1: agreed charter, handoff, completed
+    implementation, passed gates, two rejected acceptance reviews, committed partial
+    work, then an R2 charter whose third review came back prose-only."""
+
+    def history_before_source(self):
+        self.agree(key='review1')
+        self.agree(key='review2')
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation', 'r1-implementation')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        self.fake.finish('engineer', json.dumps(self.report(outcome='completed')))
+        self.service.ao_room_sync(self.room)
+        self.assertTrue(self.service.ao_room_verify(self.room, str(self.repo))['passed'])
+        for key in ('ar1', 'ar2'):
+            self.send('acceptance_review', key)
+            request = self.state()['requests'][key]
+            self.fake.finish('reviewer', json.dumps({**request['review'], 'decision': 'rejected',
+                                                     'review': 'Rejected: the required behavior is not proven.'}))
+            self.service.ao_room_sync(self.room)
+        subprocess.run(['git', '-C', str(self.repo), 'add', 'feature.txt'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-m', 'Preserved partial R1 work'],
+                       check=True, capture_output=True)
+        self.service.ao_room_spec_put(self.room, 2, 'Preserve the implemented behavior and finish the exact R2 scope.',
+                                      self.gates, 'Astra approves R2 under the actual changed scope decision')
+
+    def test_rejected_acceptance_history_keeps_its_receipts_and_the_r2_agreement_recovers(self):
+        old = copy.deepcopy(self.state())
+        old_receipts = {key: (self.directory() / row['receipt']).read_bytes()
+                        for key, row in old['requests'].items()}
+        self.finish(); self.commit()
+        status = self.service.ao_room_status(self.room)
+        self.assertTrue(status['agreement']['agreed'])
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'agreed')
+        self.assertEqual(status['acceptance_review_attempts'], 2)
+        self.assertIsNone(self.state().get('acceptance_review_extension'))
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assertEqual(self.state()['handoff_sha256'],
+                         ao.digest(ao.read(self.directory() / self.state()['handoff'])))
+        after = self.state()
+        for key, row in old['requests'].items():
+            self.assertEqual(after['requests'][key], row)
+            self.assertEqual((self.directory() / row['receipt']).read_bytes(), old_receipts[key])
 
 
 class SettledQuotaRecoveryTests(RecoveryFixture):

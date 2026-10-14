@@ -411,7 +411,7 @@ class Service:
                 pending_acceptance_extension=False, pending_model_transition=False, pending_spec_verdict_recovery=False):
         import ao_spec_verdict_recovery
         ao_spec_verdict_recovery.journal(self.root / "rooms" / state["room_id"], state,
-                                         allow_pending=pending_spec_verdict_recovery)
+                                         allow_pending=pending_spec_verdict_recovery or outcome_request_id is not None)
         self._routing_refresh_gate(state)
         ao_engineering_model.journal(self.root / "rooms" / state["room_id"], state, allow_pending=pending_model_transition)
         from ao_reviewer_recovery import validate
@@ -1189,6 +1189,13 @@ class Service:
             return recovery.commit(self, directory, state, recovery_request_id, receipt_sha256, final_text_sha256,
                                    astra_review, confirm_same_verdict)
 
+    def ao_room_spec_verdict_recovery_close(self, room_id, recovery_request_id, receipt_sha256,
+                                            final_text_sha256, astra_review):
+        import ao_spec_verdict_recovery as recovery
+        with self.locked(room_id) as (directory, state):
+            return recovery.close(self, directory, state, recovery_request_id, receipt_sha256,
+                                  final_text_sha256, astra_review)
+
     def ao_room_response_normalize(self, room_id, request_id, receipt_sha256, final_text_sha256,
                                    json_start, json_end, astra_review, confirm_no_additional_verdict):
         from ao_response_normalization import normalize
@@ -1285,6 +1292,7 @@ class Service:
             import ao_review_extension
             import ao_review_followups
             import ao_acceptance_extension
+            import ao_spec_verdict_recovery
             try:
                 agreed = ao_workflow.agreement(self, directory, state)
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -1300,6 +1308,7 @@ class Service:
                          acceptance_review_attempts=sum(r.get("role") == "reviewer" for r in ordered),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
                          spec_verdict_recovery_attempts=sum(r.get("purpose") == "spec_verdict_repair" for r in ordered),
+                         spec_verdict_recovery=ao_spec_verdict_recovery.summary(directory, state),
                          engineer_context=ao_workflow.context_summary(state, directory),
                          review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
@@ -1450,6 +1459,7 @@ TOOL_SCHEMAS = {
     "ao_room_spec_verdict_recovery_audit": ("Audit the latest completed prose-only Fable specification verdict after exactly three ordinary reviews. Binds exact source receipt/text, current spec/candidate, native owner, complete settled histories and delegate ledger. Preserves earlier authenticated quota settlements, refuses held/uncertain work. No grant or model call.", schema({**R, "source_request_id": S, "recovery_request_id": S, "native_owner_database": S, "native_session_id": S})),
     "ao_room_spec_verdict_recovery_grant": ("Record actual human authorization and provenance for this room's sole format-recovery request against the fresh exact audit. No extra substantive review or acceptance allowance. Returns fixed ao_room_send inputs. An immutable intent consumes the grant before POST; unknown delivery is never replayed. Authorization text is an operator assertion, not authentication.", schema({**R, "audit_sha256": S, "authorization": S, "authorization_reference": S})),
     "ao_room_spec_verdict_recovery_commit": ("After reading both COMPLETE responses, explicitly attest that the new strict Fable JSON faithfully preserves the original verdict, interpretation and requirements. Refuses rejection, findings, changed meaning or identities, candidate drift and missing evidence. Creates derived agreement without changing either native receipt. Never infer agreement from prose or fabricate a verdict. No model call, acceptance or installation.", schema({**R, "recovery_request_id": S, "receipt_sha256": S, "final_text_sha256": S, "astra_review": S, "confirm_same_verdict": {"type": "boolean", "const": True}})),
+    "ao_room_spec_verdict_recovery_close": ("Record Astra's explicit negative comparison of the completed format-recovery result, closing this room's one-use lane without agreement. The completed result stays unusable as agreement, ordinary limits apply afterwards and no second recovery exists. Refuses a missing, unfinished, failed, already-agreed or identity-mismatched result; identical inputs read the saved closure. No model call and never edits either native receipt.", schema({**R, "recovery_request_id": S, "receipt_sha256": S, "final_text_sha256": S, "astra_review": S})),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
     "ao_room_accept": ("Validate an independent AO reviewer's completed JSON approval against the unchanged spec, candidate and gate evidence. Never merges or publishes.", schema({**R, "request_id": S})),
 }

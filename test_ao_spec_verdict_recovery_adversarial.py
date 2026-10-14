@@ -211,6 +211,50 @@ class VerdictRecoveryAdversarialTests(Fixture):
         self.assertEqual(result['state'], 'uncertain')
         self.assertEqual(len(self.fake.posts), posts)
 
+    def close(self, **changes):
+        request = self.state()['requests'][self.RECOVERY]
+        raw, identity = normalization.source(self.directory(), request)
+        args = {'room_id': self.room, 'recovery_request_id': self.RECOVERY,
+                'receipt_sha256': identity['receipt_sha256'], 'final_text_sha256': identity['final_text_sha256'],
+                'astra_review': 'I compared both complete native responses and cannot affirm the same verdict; the lane closes without agreement.',
+                **changes}
+        return self.service.ao_room_spec_verdict_recovery_close(**args)
+
+    def test_deleted_closure_is_damaged_and_never_pending(self):
+        self.dispatch(); self.finish(decision='changes_required', findings=['New requirement'], meaning_unchanged=False)
+        self.close()
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_verdict_recovery']['status'], 'closed')
+        (self.directory() / 'spec-verdict-recovery' / 'closure.json').unlink()
+        state = self.state()
+        with self.assertRaisesRegex(ao.RoomError, 'missing, changed or unclaimed'):
+            self.service.quiet(state)
+        with self.assertRaisesRegex(ao.RoomError, 'missing, changed or unclaimed'):
+            self.service.ao_room_handoff(self.room, str(self.repo))
+        status = self.service.ao_room_status(self.room)
+        self.assertFalse(status['agreement']['agreed'])
+        self.assertIn('missing, changed or unclaimed', status['agreement']['reason'])
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'damaged')
+        self.assertFalse(status['spec_verdict_recovery']['pending'])
+
+    def test_forged_agreement_over_a_rejected_result_cannot_validate(self):
+        self.dispatch(); self.finish(decision='changes_required', findings=['New requirement'], meaning_unchanged=False)
+        state = self.state(); request = state['requests'][self.RECOVERY]
+        forged = {'version': 1, 'room_id': self.room,
+                  'grant_sha256': state['spec_verdict_recovery']['grant_sha256'],
+                  'intent_sha256': state['spec_verdict_recovery']['intent_sha256'],
+                  'completion_sha256': request['spec_verdict_recovery_completion_sha256'],
+                  'inputs': {'recovery_request_id': self.RECOVERY, 'receipt_sha256': request['receipt_sha256'],
+                             'final_text_sha256': '0' * 64, 'astra_review': 'forged', 'confirm_same_verdict': True},
+                  'verdict_sha256': '0' * 64}
+        ao.atomic(self.directory() / 'spec-verdict-recovery' / 'agreement.json', forged)
+        state['spec_verdict_recovery']['agreement_sha256'] = ao.digest(forged)
+        ao.atomic(self.directory() / 'state.json', state)
+        status = self.service.ao_room_status(self.room)
+        self.assertFalse(status['agreement']['agreed'])
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'damaged')
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_handoff(self.room, str(self.repo))
+
     def test_lost_ack_reconciles_original_delivery_without_second_post(self):
         grant = self.grant(); request = self.fake.request
         def lose_ack(method, path, payload=None):
