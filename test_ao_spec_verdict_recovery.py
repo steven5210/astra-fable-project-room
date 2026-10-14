@@ -101,7 +101,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
     def close(self, **changes):
         return self.service.ao_room_spec_verdict_recovery_close(**self.close_args(**changes))
 
-    def test_quota_failed_recovery_turn_settles_and_the_room_continues(self):
+    def quota_failed_lane(self):
         grant = self.grant()
         self.service.ao_room_send(**grant['send_args'])
         request = self.state()['requests']['format1']
@@ -119,14 +119,20 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.native_requests.add('format1')
         self.fake.finish('engineer', state='failed')
         self.service.ao_room_sync(self.room)
-        self.assertEqual(self.state()['requests']['format1']['state'], 'uncertain')
+        return self.state()['requests']['format1']
+
+    def settle_quota_failure(self):
         audit = self.service.ao_room_outcome_audit(self.room)
         self.assertTrue(audit['resume_eligible'])
         # The released successor is named review4 so the semantic hold admits it and the
         # ordinary three-review cap, not the recovery lane, refuses it.
         self.service.ao_room_outcome_resume(self.room, 'format1', audit['outcome_sha256'], 'review4',
             'Actual standing human quota continuation authority; synthetic reset checked', 'Continue once')
-        self.assertEqual(self.state()['requests']['format1']['state'], 'settled_failure')
+        return self.state()['requests']['format1']
+
+    def test_quota_failed_recovery_turn_settles_and_the_room_continues(self):
+        self.assertEqual(self.quota_failed_lane()['state'], 'uncertain')
+        self.assertEqual(self.settle_quota_failure()['state'], 'settled_failure')
         status = self.service.ao_room_status(self.room)
         self.assertEqual(status['spec_verdict_recovery']['status'], 'settled_failure')
         self.assertFalse(status['spec_verdict_recovery']['pending'])
@@ -177,7 +183,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             self.service.quiet(self.state())
             self.spec(revision=2)
 
-    def test_a_held_completed_result_closes_without_lifting_the_hold(self):
+    def held_completed_lane(self):
         self.dispatch()
         real = ao_outcomes.observe
         def held(service, directory, state, request, snapshot, *args, **kwargs):
@@ -187,7 +193,10 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.fake.finish('engineer', json.dumps(self.verdict()))
         with patch.object(ao_outcomes, 'observe', side_effect=held):
             self.service.ao_room_sync(self.room)
-        request = self.state()['requests']['format1']
+        return self.state()['requests']['format1']
+
+    def test_a_held_completed_result_closes_without_lifting_the_hold(self):
+        request = self.held_completed_lane()
         self.assertEqual(request['state'], 'completed')
         self.assertIn('semantic_observation_error', request)
         self.assertIn('spec_verdict_recovery_error', request)
@@ -204,6 +213,111 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertIn('semantic_observation_error', self.state()['requests']['format1'])
         self.spec(revision=2)
         self.assertEqual(len(self.fake.posts), 4)
+
+    def test_a_late_hold_after_capture_still_diagnoses_and_closes(self):
+        self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
+        self.fake.snapshots['engineer']['turns'][-1]['error'] = {'type': 'rate_limit'}
+        self.service.ao_room_sync(self.room)
+        self.assertTrue(self.state()['requests']['format1']['semantic_status']['hold'])
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'completed')
+        self.assertEqual(self.service.ao_room_outcome_audit(self.room)['request_id'], 'format1')
+        self.assertTrue(self.close()['closed'])
+        self.assertTrue(self.state()['requests']['format1']['semantic_status']['hold'])
+        self.spec(revision=2)
+        with self.assertRaises(ao.RoomError):
+            self.commit()
+        self.assertEqual(len(self.fake.posts), 4)
+
+    def test_a_late_hold_after_closure_keeps_the_lane_closed(self):
+        self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
+        self.close()
+        self.fake.snapshots['engineer']['turns'][-1]['error'] = {'type': 'rate_limit'}
+        self.service.ao_room_sync(self.room)
+        self.assertTrue(self.state()['requests']['format1']['semantic_status']['hold'])
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+        self.service.ao_room_outcome_audit(self.room)
+        self.spec(revision=2)
+
+    def test_a_late_hold_after_agreement_blocks_reliance_without_damage(self):
+        self.finish()
+        self.commit()
+        self.fake.snapshots['engineer']['turns'][-1]['error'] = {'type': 'rate_limit'}
+        self.service.ao_room_sync(self.room)
+        self.assertTrue(self.state()['requests']['format1']['semantic_status']['hold'])
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'agreed')
+        self.assertFalse(status['agreement']['agreed'])
+        self.assertIn('semantic hold', status['agreement']['reason'])
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_handoff(self.room, str(self.repo))
+
+    def test_a_deleted_settled_receipt_damages_the_lane(self):
+        self.assertEqual(self.quota_failed_lane()['state'], 'uncertain')
+        self.assertEqual(self.settle_quota_failure()['state'], 'settled_failure')
+        request = self.state()['requests']['format1']
+        (self.directory() / request['receipt']).unlink()
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'damaged')
+        with self.assertRaises(ao.RoomError):
+            self.spec(revision=3)
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_handoff(self.room, str(self.repo))
+        with self.assertRaises(ao.RoomError):
+            self.audit(recovery_request_id='format2')
+
+    def test_a_symlinked_closed_receipt_damages_the_lane(self):
+        self.held_completed_lane()
+        self.close()
+        request = self.state()['requests']['format1']
+        receipt = self.directory() / request['receipt']
+        outside = self.root / 'unowned-receipt-copy.json'
+        outside.write_bytes(receipt.read_bytes())
+        receipt.unlink()
+        receipt.symlink_to(outside)
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'damaged')
+        with self.assertRaises(ao.RoomError):
+            self.spec(revision=3)
+
+    def flaky_observe(self):
+        real = ao_outcomes.observe
+        once = []
+        def flaky(service, directory, state, request, snapshot, *args, **kwargs):
+            if request['request_id'] == 'format1' and not once:
+                once.append(True)
+                raise ao.RoomError('synthetic transient native inspection error')
+            return real(service, directory, state, request, snapshot, *args, **kwargs)
+        return patch.object(ao_outcomes, 'observe', side_effect=flaky)
+
+    def test_a_transient_observation_error_recaptures_on_the_next_sync(self):
+        self.dispatch()
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        with self.flaky_observe():
+            self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['format1']
+        self.assertEqual(request['state'], 'completed')
+        self.assertIn('spec_verdict_recovery_error', request)
+        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['format1']
+        self.assertNotIn('spec_verdict_recovery_error', request)
+        self.assertTrue((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertTrue(self.commit()['agreed'])
+
+    def test_a_changed_candidate_between_syncs_still_refuses_commit(self):
+        self.dispatch()
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        with self.flaky_observe():
+            self.service.ao_room_sync(self.room)
+        (self.repo / 'late-drift.txt').write_text('changed after the failed capture\n')
+        self.service.ao_room_sync(self.room)
+        self.assertTrue((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        with self.assertRaisesRegex(ao.RoomError, 'candidate'):
+            self.commit()
+        completions = list((self.directory() / 'spec-verdict-recovery').glob('completion*.json'))
+        self.assertEqual(len(completions), 1)
 
     def test_close_refuses_every_unfinished_or_misidentified_lane(self):
         grant = self.grant()

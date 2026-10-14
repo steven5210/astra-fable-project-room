@@ -55,15 +55,30 @@ def _store(directory, name, value):
     return model.store_once(directory, _path(name), value)
 
 
-def _source(directory, request):
-    """Authenticate the confined receipt before any baseline final-text reader."""
+def _identity(directory, request):
+    """Authenticate the confined receipt and exact identities; no usability gate."""
     from ao_model_boundaries import _authenticated_request
     from ao_response_normalization import source
     _authenticated_request(directory, request)
-    if request.get("state") != "completed" or request.get("semantic_observation_error"):
+    if request.get("state") != "completed":
+        raise RoomError("Format recovery requires a completed, unheld native result")
+    return source(directory, request)
+
+
+def _closed_text(directory, request):
+    """Authenticate a consumed lane's confined receipt, then read its retained final text."""
+    from ao_model_boundaries import _authenticated_request
+    _authenticated_request(directory, request)
+    return ao_workflow.raw_final_text(directory, request, allow_missing=True)
+
+
+def _source(directory, request):
+    """Authenticate the confined receipt before any baseline final-text reader."""
+    raw, identity = _identity(directory, request)
+    if request.get("semantic_observation_error"):
         raise RoomError("Format recovery requires a completed, unheld native result")
     ao_outcomes.usable(directory, request)
-    return source(directory, request)
+    return raw, identity
 
 
 def _source_review(service, directory, state, request):
@@ -152,8 +167,10 @@ def journal(directory, state, allow_pending=False):
             # A consumed-and-unsuccessful lane closes through the supported outcome
             # settlement alone; no completion, agreement or closure may coexist.
             try:
+                from ao_model_boundaries import _authenticated_request
+                _authenticated_request(directory, recovery)
                 ao_outcomes.validate_settlement(directory, recovery)
-            except RoomError as exc:
+            except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
                 raise RoomError(DAMAGED) from exc
             if (pointer.get("agreement_sha256") is not None or pointer.get("closure_sha256") is not None
                     or recovery.get("spec_verdict_recovery_completion_sha256") is not None
@@ -164,7 +181,7 @@ def journal(directory, state, allow_pending=False):
         completion_sha = recovery.get("spec_verdict_recovery_completion_sha256")
         if completion_sha is not None:
             completion = _read(directory, "completion", completion_sha)
-            raw_new, identity = _source(directory, recovery)
+            raw_new, identity = _identity(directory, recovery)
             if (completion.get("intent_sha256") != pointer["intent_sha256"]
                     or completion.get("source") != identity):
                 raise RoomError(DAMAGED)
@@ -191,7 +208,10 @@ def journal(directory, state, allow_pending=False):
         raise RoomError(DAMAGED)
     if pointer.get("closure_sha256") is not None:
         record = _read(directory, "closure", pointer["closure_sha256"])
-        closed_raw = ao_workflow.raw_final_text(directory, recovery, allow_missing=True)
+        try:
+            closed_raw = _closed_text(directory, recovery)
+        except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
+            raise RoomError(DAMAGED) from exc
         try:
             _verdict(closed_raw, evidence)
             check_verdict_error = None
@@ -576,9 +596,7 @@ def close(service, directory, state, recovery_request_id, receipt_sha256, final_
         return {"closed": True, "closure_sha256": chain["pointer"]["closure_sha256"],
                 "agreed": False, "model_dispatch": False}
     service.quiet(state, pending_spec_verdict_recovery=True)
-    from ao_model_boundaries import _authenticated_request
-    _authenticated_request(directory, request)
-    raw = ao_workflow.raw_final_text(directory, request, allow_missing=True)
+    raw = _closed_text(directory, request)
     if request.get("receipt_sha256") != receipt_sha256 or ao.digest(raw.encode()) != final_text_sha256:
         raise RoomError("The closure does not name the complete exact native response")
     try:
@@ -604,6 +622,9 @@ def agreement(service, directory, state, request):
     if (chain is None or "agreement" not in chain
             or request["request_id"] != chain["evidence"]["target"]["source_request_id"]):
         return None
+    if chain["request"].get("semantic_observation_error"):
+        raise RoomError("Format recovery requires a completed, unheld native result")
+    ao_outcomes.usable(directory, chain["request"])
     if request["spec_record_sha256"] != state["spec_record_sha256"]:
         raise RoomError("Recovered agreement belongs to a different specification")
     model.check_request(directory, state, chain["request"])

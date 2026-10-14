@@ -974,6 +974,14 @@ class Service:
         summary["wait"] = wait
         return summary
 
+    def _capture_recovery(self, directory, state, request):
+        import ao_spec_verdict_recovery
+        try:
+            ao_spec_verdict_recovery.capture(directory, state, request)
+            request.pop("spec_verdict_recovery_error", None)
+        except RoomError as exc:
+            request["spec_verdict_recovery_error"] = str(exc)[:500]
+
     def _sync_once(self, room_id):
         with self.locked(room_id) as (directory, state):
             self._routing_refresh_gate(state)  # Sync also persists observations and changes the pending intent's state.
@@ -1004,6 +1012,11 @@ class Service:
                                 except RoomError as exc:
                                     request['semantic_observation_error'] = str(exc)[:500]
                                     # Sync remains usable; dispatch and acceptance still require a fresh exact audit.
+                            import ao_spec_verdict_recovery
+                            if (request["state"] == "completed"
+                                    and request.get("purpose") == ao_spec_verdict_recovery.PURPOSE
+                                    and "spec_verdict_recovery_completion_sha256" not in request):
+                                self._capture_recovery(directory, state, request)
                         continue
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
@@ -1074,11 +1087,7 @@ class Service:
                         except RoomError as exc:
                             request['semantic_observation_error'] = str(exc)[:500]
                     if request["state"] == "completed" and request.get("purpose") == "spec_verdict_repair":
-                        import ao_spec_verdict_recovery
-                        try:
-                            ao_spec_verdict_recovery.capture(directory, state, request)
-                        except RoomError as exc:
-                            request["spec_verdict_recovery_error"] = str(exc)[:500]
+                        self._capture_recovery(directory, state, request)
                     if request["state"] == "completed" and not request.get("semantic_observation_error") and request.get("purpose") in ("implementation", "correction"):
                         ao_workflow.capture_engineering(self.root.parent, directory, state, request)
             self.save(directory, state)

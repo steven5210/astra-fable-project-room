@@ -41,9 +41,11 @@ verdict from a fourth-charter extension review is out of scope; that review's
 result must be used or preserved as it stands.
 
 The recovery turn is read-only except for the native task-list tools. TaskList,
-TaskGet, TaskCreate and TaskUpdate are permitted because the room's own progress
-parts instruct them. Any other tool, a delegate call, a launch or a malformed
-native row refuses the recovery at commit.
+TaskGet, TaskCreate and TaskUpdate are permitted for compatibility with the
+room's progress bookkeeping, which instructs a turn-start TaskList on
+implementation and correction turns; a formatting turn does not require them.
+Any other tool, a delegate call, a launch or a malformed native row refuses
+the recovery at commit.
 
 ## Operator sequence
 
