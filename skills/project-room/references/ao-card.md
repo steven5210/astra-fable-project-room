@@ -103,6 +103,10 @@ extension needs [one-charter review extension](../../../docs/guides/one-charter-
 [pre-acceptance review extension](../../../docs/guides/pre-acceptance-review-extension.md);
 both share the room's one grant).
 Prose around the final JSON → [formatting recovery](ao.md#completed-response-formatting-recovery).
+Completed prose-only verdict with no usable JSON →
+[one-use spec-verdict format recovery](../../../docs/guides/spec-verdict-format-recovery.md).
+This requires specific human authorization, a native format-only response and
+Astra's comparison of both complete texts; it never renews ordinary review limits.
 
 ## 3. Handoff and implementation
 

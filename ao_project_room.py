@@ -408,7 +408,10 @@ class Service:
             _chain(directory, state, ao_delegates.preparation(directory, state))
 
     def settled(self, state, pending_transition=False, outcome_request_id=None, pending_review_extension=False,
-                pending_acceptance_extension=False, pending_model_transition=False):
+                pending_acceptance_extension=False, pending_model_transition=False, pending_spec_verdict_recovery=False):
+        import ao_spec_verdict_recovery
+        ao_spec_verdict_recovery.journal(self.root / "rooms" / state["room_id"], state,
+                                         allow_pending=pending_spec_verdict_recovery)
         self._routing_refresh_gate(state)
         ao_engineering_model.journal(self.root / "rooms" / state["room_id"], state, allow_pending=pending_model_transition)
         from ao_reviewer_recovery import validate
@@ -436,8 +439,9 @@ class Service:
         if any(v["state"] == "running" for v in state["verifications"]):
             raise RoomError("An unfinished verification is recorded; inspect its processes and evidence, never start a second verifier")
 
-    def quiet(self, state, outcome_request_id=None):
-        self.settled(state, outcome_request_id=outcome_request_id)
+    def quiet(self, state, outcome_request_id=None, pending_spec_verdict_recovery=False):
+        self.settled(state, outcome_request_id=outcome_request_id,
+                     pending_spec_verdict_recovery=pending_spec_verdict_recovery)
         client = self.client(state)
         for binding in state["bindings"].values():
             if busy(self.identity(client, state, binding)):
@@ -763,8 +767,11 @@ class Service:
     def ao_room_send(self, room_id, role, message, request_id, purpose=None):
         identifier(request_id)
         nonempty(message, "message", 6000)
+        import ao_spec_verdict_recovery
+        with self.locked(room_id) as (directory, state):
+            recovery_chain = ao_spec_verdict_recovery.before_send(directory, state, role, purpose, request_id, message)
         standing = None
-        if role == "engineer":
+        if role == "engineer" and purpose != ao_spec_verdict_recovery.PURPOSE:
             # The standing family-member policy runs its own short lock windows at this dispatch
             # boundary, never nested inside the send lock; a deferral never blocks this send.
             import ao_engineering_policy
@@ -774,13 +781,14 @@ class Service:
             if purpose is not None:
                 payload["purpose"] = purpose
             key = digest(payload)
+            ao_spec_verdict_recovery.before_send(directory, state, role, purpose, request_id, message)
             if request_id in state["requests"]:
                 previous = state["requests"][request_id]
                 if previous["key"] != key:
                     raise RoomError("request_id already belongs to another payload")
                 return self.request_summary(previous)
             ao_prompt_metrics.assert_dispatch_projections(state)  # Fail closed before any new dispatch.
-            self.quiet(state)
+            self.quiet(state, pending_spec_verdict_recovery=purpose == ao_spec_verdict_recovery.PURPOSE)
             if role not in state["bindings"]:
                 raise RoomError("Bind the requested role first")
             # W2 request boundary: new-dispatch readiness and the independently qualified workers are
@@ -895,6 +903,8 @@ class Service:
             if grant is not None:
                 # Durable consumption precedes state projection and dispatch.
                 ao_acceptance_extension.consume(self, directory, state, request, grant)
+            if purpose == ao_spec_verdict_recovery.PURPOSE:
+                ao_spec_verdict_recovery.consume(directory, state, request)
             state["requests"][request_id] = request
             self.save(directory, state)  # Persist intent BEFORE any request may reach AO.
             try:
@@ -1060,6 +1070,12 @@ class Service:
                             request.pop('semantic_observation_error', None)
                         except RoomError as exc:
                             request['semantic_observation_error'] = str(exc)[:500]
+                    if request["state"] == "completed" and request.get("purpose") == "spec_verdict_repair":
+                        import ao_spec_verdict_recovery
+                        try:
+                            ao_spec_verdict_recovery.capture(directory, state, request)
+                        except RoomError as exc:
+                            request["spec_verdict_recovery_error"] = str(exc)[:500]
                     if request["state"] == "completed" and not request.get("semantic_observation_error") and request.get("purpose") in ("implementation", "correction"):
                         ao_workflow.capture_engineering(self.root.parent, directory, state, request)
             self.save(directory, state)
@@ -1151,6 +1167,25 @@ class Service:
             self.save(directory, state)
             return {k: v for k, v in checkpoint.items() if k != "candidate"} | {"evidence_sha256": digest(checkpoint), "path": str(directory / relative)}
 
+    def ao_room_spec_verdict_recovery_audit(self, room_id, source_request_id, recovery_request_id,
+                                            native_owner_database, native_session_id):
+        import ao_spec_verdict_recovery as recovery
+        with self.locked(room_id) as (directory, state):
+            return recovery.audit(self, directory, state, source_request_id, recovery_request_id,
+                                  native_owner_database, native_session_id)
+
+    def ao_room_spec_verdict_recovery_grant(self, room_id, audit_sha256, authorization, authorization_reference):
+        import ao_spec_verdict_recovery as recovery
+        with self.locked(room_id) as (directory, state):
+            return recovery.grant(self, directory, state, audit_sha256, authorization, authorization_reference)
+
+    def ao_room_spec_verdict_recovery_commit(self, room_id, recovery_request_id, receipt_sha256, final_text_sha256,
+                                             astra_review, confirm_same_verdict):
+        import ao_spec_verdict_recovery as recovery
+        with self.locked(room_id) as (directory, state):
+            return recovery.commit(self, directory, state, recovery_request_id, receipt_sha256, final_text_sha256,
+                                   astra_review, confirm_same_verdict)
+
     def ao_room_response_normalize(self, room_id, request_id, receipt_sha256, final_text_sha256,
                                    json_start, json_end, astra_review, confirm_no_additional_verdict):
         from ao_response_normalization import normalize
@@ -1206,7 +1241,9 @@ class Service:
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
-                  "response_normalization", "response_normalization_sha256")
+                  "response_normalization", "response_normalization_sha256",
+                  "spec_verdict_recovery_intent_sha256", "spec_verdict_recovery_completion_sha256",
+                  "spec_verdict_recovery_error")
         fields += ('semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'outcome_resume', 'outcome_resume_sha256',
                    "standing_policy")
         result = {k: request[k] for k in fields if k in request}
@@ -1259,6 +1296,7 @@ class Service:
                          acceptance_review_extension=ao_acceptance_extension.summary(self, state),
                          acceptance_review_attempts=sum(r.get("role") == "reviewer" for r in ordered),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
+                         spec_verdict_recovery_attempts=sum(r.get("purpose") == "spec_verdict_repair" for r in ordered),
                          engineer_context=ao_workflow.context_summary(state, directory),
                          review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
@@ -1400,12 +1438,15 @@ TOOL_SCHEMAS = {
     "ao_room_routing_adoption_stage": ("Stage the exact audited routing adoption with the actual user operating authorization and diagnosis. Save immutable intent before changing managed local runtime files; emit the exact AO project-config PUT payload for the operator to apply while the engineer is stopped. Preserve original evidence, handoff and counters. Pending adoption blocks new work; never repeat an uncertain external operation.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
     "ao_room_routing_adoption_activate": ("Activate only the identical staged routing-adoption request after the exact new project configuration, managed files and unchanged stopped native identity/history are observed. Pin the new preparation without changing provider snapshots, handoff or review budgets. No AO POST or inference; native MCP startup remains a separate dispatch gate.", schema({**R, "request_id": S})),
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
-    "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
+    "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; spec_verdict_repair requires its separate one-use audited grant and fixed message; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "spec_verdict_repair", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_release_check": ("Compare the running AO daemon with the official latest stable release once per new or resumed AO session. One bounded GitHub GET plus loopback /healthz and local bundle metadata; never invokes a model, restarts or updates AO, or touches rooms and workers. Outcome up_to_date | update_available | mismatch | unknown; unknown is never up to date. Two report-only sections are included: claude_code compares the configured claude_bin with the bundled and qualified family floors, the newest installed Claude Code and the latest published release, and names the exact setup command when one applies; qualification_sources re-fetches each captured qualification source and reports whether its bytes still match and whether its claude-<family> identifiers still match the retained capture. Neither section switches executables or models. Saves private evidence in version-check.json.", schema({"ao_url": S}, [])),
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
     "ao_room_status": ("Read saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate. The optional view enum selects the full status (default) or a compact projection with the latest request per role, request counts and delegate job/routing summaries.", schema({**R, "view": {"type": "string", "enum": ["full", "compact"]}}, ["room_id"])),
     "ao_room_progress": ("Read one request's saved progress view (the latest by default): its engineer task list folded from native task-tool rows, Agent launches, served-model and stop-reason histograms, error and refusal counts, and the bounded last assistant text, plus the request's recorded state. Additive provenance says who authored the plan and last text and whether the selected request can refresh them; additive stages report the saved engineering, verification and acceptance records checked against their recorded digests, comparing saved identities only, never the live worktree. Bounded local reads only; no AO/network/model calls, no state change; an unavailable native source reports its reason instead of failing.", schema({**R, "request_id": S, "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 2000}}, ["room_id"])),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
+    "ao_room_spec_verdict_recovery_audit": ("Audit the latest completed prose-only Fable specification verdict after exactly three ordinary reviews. Binds exact source receipt/text, current spec/candidate, native owner, complete settled histories and delegate ledger. Preserves earlier authenticated quota settlements, refuses held/uncertain work. No grant or model call.", schema({**R, "source_request_id": S, "recovery_request_id": S, "native_owner_database": S, "native_session_id": S})),
+    "ao_room_spec_verdict_recovery_grant": ("Record actual human authorization and provenance for this room's sole format-recovery request against the fresh exact audit. No extra substantive review or acceptance allowance. Returns fixed ao_room_send inputs. An immutable intent consumes the grant before POST; unknown delivery is never replayed. Authorization text is an operator assertion, not authentication.", schema({**R, "audit_sha256": S, "authorization": S, "authorization_reference": S})),
+    "ao_room_spec_verdict_recovery_commit": ("After reading both COMPLETE responses, explicitly attest that the new strict Fable JSON faithfully preserves the original verdict, interpretation and requirements. Refuses rejection, findings, changed meaning or identities, candidate drift and missing evidence. Creates derived agreement without changing either native receipt. Never infer agreement from prose or fabricate a verdict. No model call, acceptance or installation.", schema({**R, "recovery_request_id": S, "receipt_sha256": S, "final_text_sha256": S, "astra_review": S, "confirm_same_verdict": {"type": "boolean", "const": True}})),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
     "ao_room_accept": ("Validate an independent AO reviewer's completed JSON approval against the unchanged spec, candidate and gate evidence. Never merges or publishes.", schema({**R, "request_id": S})),
 }
