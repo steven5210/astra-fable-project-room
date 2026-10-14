@@ -197,7 +197,7 @@ def journal(directory, state, allow_pending=False):
             check_verdict_error = None
         except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
             check_verdict_error = str(exc)
-        check = record.get("controller_check") or {}
+        check = record.get("controller_check")
         inputs = record.get("inputs") or {}
         if (record.get("version") != 1 or record.get("room_id") != state["room_id"]
                 or record.get("grant_sha256") != pointer["grant_sha256"]
@@ -208,8 +208,10 @@ def journal(directory, state, allow_pending=False):
                 or inputs.get("receipt_sha256") != recovery.get("receipt_sha256")
                 or inputs.get("final_text_sha256") != ao.digest(closed_raw.encode())
                 or not isinstance(inputs.get("astra_review"), str) or not inputs["astra_review"].strip()
-                or check.get("verdict_error") != check_verdict_error
-                or check.get("capture_error") != recovery.get("spec_verdict_recovery_error")):
+                or not isinstance(check, dict)
+                or "verdict_error" not in check or "capture_error" not in check
+                or (check["verdict_error"] is None) != (check_verdict_error is None)
+                or (check["capture_error"] is None) != (recovery.get("spec_verdict_recovery_error") is None)):
             raise RoomError(DAMAGED)
         result.update(closure=record)
     elif "closure" in present:
@@ -439,7 +441,10 @@ def _allowed_tool_uses(native_raw, prior):
     for line in native_raw[:prior["bytes"]].splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise RoomError(TOOL_REFUSAL) from exc
         if isinstance(row, dict) and isinstance(row.get("uuid"), str):
             prefix_rows.add(row["uuid"])
     allowed = set()
@@ -571,8 +576,10 @@ def close(service, directory, state, recovery_request_id, receipt_sha256, final_
         return {"closed": True, "closure_sha256": chain["pointer"]["closure_sha256"],
                 "agreed": False, "model_dispatch": False}
     service.quiet(state, pending_spec_verdict_recovery=True)
-    raw, identity = _source(directory, request)
-    if identity["receipt_sha256"] != receipt_sha256 or identity["final_text_sha256"] != final_text_sha256:
+    from ao_model_boundaries import _authenticated_request
+    _authenticated_request(directory, request)
+    raw = ao_workflow.raw_final_text(directory, request, allow_missing=True)
+    if request.get("receipt_sha256") != receipt_sha256 or ao.digest(raw.encode()) != final_text_sha256:
         raise RoomError("The closure does not name the complete exact native response")
     try:
         _verdict(raw, chain["evidence"])

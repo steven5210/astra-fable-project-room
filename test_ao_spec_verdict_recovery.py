@@ -5,6 +5,7 @@ import subprocess
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import ao_outcomes
 import ao_project_room as ao
 import ao_spec_verdict_recovery as recovery
 import ao_workflow
@@ -165,6 +166,43 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertEqual(self.close(), closed)
         with self.assertRaises(ao.RoomError):
             self.close(astra_review='A different judgment')
+        self.assertEqual(len(self.fake.posts), 4)
+
+    def test_a_reworded_verdict_refusal_does_not_damage_a_closed_lane(self):
+        self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
+        self.close()
+        with patch.object(recovery, '_verdict', side_effect=ao.RoomError('reworded refusal text')):
+            status = self.service.ao_room_status(self.room)
+            self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+            self.service.quiet(self.state())
+            self.spec(revision=2)
+
+    def test_a_held_completed_result_closes_without_lifting_the_hold(self):
+        self.dispatch()
+        real = ao_outcomes.observe
+        def held(service, directory, state, request, snapshot, *args, **kwargs):
+            if request['request_id'] == 'format1':
+                raise ao.RoomError('synthetic native inspection hold')
+            return real(service, directory, state, request, snapshot, *args, **kwargs)
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        with patch.object(ao_outcomes, 'observe', side_effect=held):
+            self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['format1']
+        self.assertEqual(request['state'], 'completed')
+        self.assertIn('semantic_observation_error', request)
+        self.assertIn('spec_verdict_recovery_error', request)
+        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        with self.assertRaises(ao.RoomError):
+            self.commit()
+        closed = self.close()
+        self.assertTrue(closed['closed'])
+        record = ao.read(self.directory() / 'spec-verdict-recovery' / 'closure.json')
+        self.assertIsNotNone(record['controller_check']['capture_error'])
+        self.assertIsNone(record['completion_sha256'])
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+        self.assertIn('semantic_observation_error', self.state()['requests']['format1'])
+        self.spec(revision=2)
         self.assertEqual(len(self.fake.posts), 4)
 
     def test_close_refuses_every_unfinished_or_misidentified_lane(self):
