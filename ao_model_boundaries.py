@@ -262,7 +262,7 @@ def readiness(directory, state, purpose):
     import ao_engineering_model
     import ao_executable_binding
     import ao_routing_refresh
-    if purpose not in NOTICE_PURPOSES:
+    if purpose not in NOTICE_PURPOSES + ("spec_verdict_repair",):
         return None
     if not (state.get("bindings") or {}).get("engineer"):
         return None  # the existing bind-first refusal still applies at this boundary

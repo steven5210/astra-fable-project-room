@@ -98,12 +98,16 @@ def spec_review_report(service, directory, state, request):
 
 def agreement(service, directory, state):
     request = latest(state, {"spec_review"})
-    verdict = spec_review_report(service, directory, state, request)
+    import ao_spec_verdict_recovery
+    recovered = ao_spec_verdict_recovery.agreement(service, directory, state, request)
+    verdict = recovered["verdict"] if recovered else spec_review_report(service, directory, state, request)
     if verdict['decision'] != 'accept' or any(f.startswith('BLOCKER:') for f in verdict['findings']):
         raise RoomError("Fable rejected, incompletely reviewed, or did not accept the exact current spec")
     spec = service.spec(directory, state)
     return {"agreed": True, "spec_revision": spec["revision"], "spec_sha256": spec["sha256"],
-            "request_id": request["request_id"], "receipt_sha256": request["receipt_sha256"], "astra_approval": spec["approval"]}
+            "request_id": request["request_id"], "receipt_sha256": request["receipt_sha256"], "astra_approval": spec["approval"],
+            **({"spec_verdict_recovery_sha256": recovered["pointer"]["agreement_sha256"],
+                "format_request_id": recovered["request"]["request_id"]} if recovered else {})}
 
 
 def workspace(service, directory, state, check_routing=True):
@@ -160,6 +164,8 @@ def handoff(service, directory, state, worktree_path):
     from ao_project_room import atomic, digest, git, project_path
     agreed = agreement(service, directory, state)
     actual = workspace(service, directory, state)
+    import ao_spec_verdict_recovery
+    ao_spec_verdict_recovery.check_handoff(service, directory, state, actual)
     if project_path(worktree_path) != actual:
         raise RoomError("Handoff must use the actual bound engineer workspace")
     ao_delegates.assert_settled(service.root.parent, state, directory)
@@ -745,6 +751,12 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
         assembly.add("workflow", "\nTask instruction:\n")
         assembly.add("caller", message)
         return assembly.text, None
+    if purpose == "spec_verdict_repair":
+        import ao_spec_verdict_recovery
+        if state.get("provider_transition"):
+            import ao_provider_transition
+            ao_provider_transition.dispatch_gate(service, directory, state, snapshot)
+        return ao_spec_verdict_recovery.packet(service, directory, state, message, assembly)
     if purpose == "spec_review":
         from ao_review_extension import admission
         review_extension = admission(service, directory, state)
