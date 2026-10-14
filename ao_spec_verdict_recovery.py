@@ -61,7 +61,7 @@ def _identity(directory, request):
     from ao_response_normalization import source
     _authenticated_request(directory, request)
     if request.get("state") != "completed":
-        raise RoomError("Format recovery requires a completed, unheld native result")
+        raise RoomError("Format recovery requires a completed native result")
     return source(directory, request)
 
 
