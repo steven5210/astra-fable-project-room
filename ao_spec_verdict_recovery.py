@@ -219,6 +219,11 @@ def journal(directory, state, allow_pending=False):
             check_verdict_error = str(exc)
         check = record.get("controller_check")
         inputs = record.get("inputs") or {}
+        # controller_check is diagnostic bookkeeping recorded at close time.
+        # verdict_error stays deterministic from the pinned receipt, so only its
+        # nullness is rechecked; capture_error describes a live request field
+        # that capture retries may legitimately leave untouched, so it is shape
+        # checked but never re-derived here.
         if (record.get("version") != 1 or record.get("room_id") != state["room_id"]
                 or record.get("grant_sha256") != pointer["grant_sha256"]
                 or record.get("intent_sha256") != pointer["intent_sha256"]
@@ -230,8 +235,7 @@ def journal(directory, state, allow_pending=False):
                 or not isinstance(inputs.get("astra_review"), str) or not inputs["astra_review"].strip()
                 or not isinstance(check, dict)
                 or "verdict_error" not in check or "capture_error" not in check
-                or (check["verdict_error"] is None) != (check_verdict_error is None)
-                or (check["capture_error"] is None) != (recovery.get("spec_verdict_recovery_error") is None)):
+                or (check["verdict_error"] is None) != (check_verdict_error is None)):
             raise RoomError(DAMAGED)
         result.update(closure=record)
     elif "closure" in present:
@@ -443,11 +447,12 @@ def capture(directory, state, request):
     if chain is None or chain.get("request") is not request:
         raise RoomError(DAMAGED)
     if "completion" in chain or "agreement" in chain or "closure" in chain:
-        return
+        return False
     _, identity = _source(directory, request)
     record = {"version": 1, "room_id": state["room_id"], "intent_sha256": chain["pointer"]["intent_sha256"],
               "source": identity, "candidate": candidate_snapshot(chain["evidence"]["worktree"])}
     request["spec_verdict_recovery_completion_sha256"] = _store(directory, "completion", record)
+    return True
 
 
 def _allowed_tool_uses(native_raw, prior):

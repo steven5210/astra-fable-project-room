@@ -319,6 +319,33 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         completions = list((self.directory() / 'spec-verdict-recovery').glob('completion*.json'))
         self.assertEqual(len(completions), 1)
 
+    def test_syncs_after_closing_a_held_result_keep_the_error_and_the_lane(self):
+        self.held_completed_lane()
+        self.close()
+        original_error = self.state()['requests']['format1']['spec_verdict_recovery_error']
+        for _ in range(2):
+            self.service.ao_room_sync(self.room)
+            status = self.service.ao_room_status(self.room)
+            self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+        request = self.state()['requests']['format1']
+        self.assertEqual(request['spec_verdict_recovery_error'], original_error)
+        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.service.quiet(self.state())
+        self.spec(revision=2)
+
+    def test_a_closed_uncaptured_lane_does_not_recapture_on_later_syncs(self):
+        self.dispatch()
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        with self.flaky_observe():
+            self.service.ao_room_sync(self.room)
+        self.assertIn('spec_verdict_recovery_error', self.state()['requests']['format1'])
+        self.close()
+        self.service.ao_room_sync(self.room)
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
+        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.spec(revision=2)
+
     def test_close_refuses_every_unfinished_or_misidentified_lane(self):
         grant = self.grant()
         with self.assertRaises(ao.RoomError):

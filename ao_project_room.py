@@ -977,8 +977,8 @@ class Service:
     def _capture_recovery(self, directory, state, request):
         import ao_spec_verdict_recovery
         try:
-            ao_spec_verdict_recovery.capture(directory, state, request)
-            request.pop("spec_verdict_recovery_error", None)
+            if ao_spec_verdict_recovery.capture(directory, state, request):
+                request.pop("spec_verdict_recovery_error", None)
         except RoomError as exc:
             request["spec_verdict_recovery_error"] = str(exc)[:500]
 
