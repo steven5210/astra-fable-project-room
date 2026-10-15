@@ -408,7 +408,8 @@ class Service:
             _chain(directory, state, ao_delegates.preparation(directory, state))
 
     def settled(self, state, pending_transition=False, outcome_request_id=None, pending_review_extension=False,
-                pending_acceptance_extension=False, pending_model_transition=False, pending_spec_verdict_recovery=False):
+                pending_acceptance_extension=False, pending_model_transition=False, pending_spec_verdict_recovery=False,
+                pending_spec_rereview=False):
         import ao_spec_verdict_recovery
         ao_spec_verdict_recovery.journal(self.root / "rooms" / state["room_id"], state,
                                          allow_pending=pending_spec_verdict_recovery or outcome_request_id is not None)
@@ -418,6 +419,8 @@ class Service:
         validate(self, state)
         from ao_review_extension import validate as review_extension_validate
         review_extension_validate(self, state, allow_pending=pending_review_extension)
+        import ao_spec_rereview
+        ao_spec_rereview.validate(self, state, allow_pending=pending_spec_rereview)
         import ao_acceptance_extension
         ao_acceptance_extension.validate(self, state, allow_pending=pending_acceptance_extension)
         from ao_provider_transition import validate as transition_validate
@@ -561,6 +564,11 @@ class Service:
             from ao_review_extension import LIMIT, _reviews
             if state.get("spec_review_extension") and len(_reviews(state)) == LIMIT:
                 raise RoomError("The unused fourth-review grant belongs to the current exact charter; a different spec was not saved")
+            if state.get("spec_rereview"):
+                import ao_spec_rereview
+                if ao_spec_rereview._consumption(directory, state, state["spec_rereview"]) is None:
+                    raise RoomError("The unused re-review grant belongs to the current exact corrected "
+                                    "charter; a different spec was not saved")
             atomic(target, spec)
             state.update(spec=relative, spec_record_sha256=digest(spec), checkpoint=None)
             self.save(directory, state)
@@ -635,6 +643,20 @@ class Service:
     def ao_room_preacceptance_review_extend(self, room_id, audit_sha256, authorization, diagnosis, request_id):
         from ao_review_extension import extend_preacceptance
         return extend_preacceptance(self, room_id, audit_sha256, authorization, diagnosis, request_id)
+
+    def ao_room_spec_rereview_audit(self, room_id, spec_revision, spec_sha256, source_request_id,
+                                  source_receipt_sha256, source_final_text_sha256, source_classification,
+                                  request_id, message_sha256, gate_artifacts, native_session_id,
+                                  native_owner_database):
+        from ao_spec_rereview import audit
+        return audit(self, room_id, spec_revision, spec_sha256, source_request_id, source_receipt_sha256,
+                     source_final_text_sha256, source_classification, request_id, message_sha256,
+                     gate_artifacts, native_session_id, native_owner_database)
+
+    def ao_room_spec_rereview_grant(self, room_id, audit_sha256, authorization, authorization_reference,
+                                    diagnosis):
+        from ao_spec_rereview import grant
+        return grant(self, room_id, audit_sha256, authorization, authorization_reference, diagnosis)
 
     def ao_room_acceptance_review_audit(self, room_id, review_request_id, message_sha256, native_owner_database,
                                         engineer_native_session_id, reviewer_native_session_id):
@@ -903,6 +925,10 @@ class Service:
             if (carried or {}).get('spec_review_extension_sha256'):
                 from ao_review_extension import consume
                 consume(self, directory, state, request)  # Durable consumption precedes state projection and dispatch.
+            if (carried or {}).get('spec_rereview_sha256'):
+                import ao_spec_rereview
+                # Durable consumption precedes state projection and dispatch.
+                ao_spec_rereview.consume(self, directory, state, request, message)
             if grant is not None:
                 # Durable consumption precedes state projection and dispatch.
                 ao_acceptance_extension.consume(self, directory, state, request, grant)
@@ -988,6 +1014,8 @@ class Service:
             ao_engineering_model.journal(directory, state)  # Ancestry must be intact before any reconciliation write.
             from ao_review_extension import validate as review_extension_validate
             review_extension_validate(self, state)  # Verify consumption before any reconciliation evidence is written.
+            import ao_spec_rereview
+            ao_spec_rereview.validate(self, state)  # Verify the re-review journal before reconciliation writes.
             import ao_acceptance_extension
             ao_acceptance_extension.validate(self, state)  # Verify the acceptance journal before reconciliation writes.
             from ao_provider_transition import validate as transition_validate
@@ -1302,6 +1330,7 @@ class Service:
             import ao_review_followups
             import ao_acceptance_extension
             import ao_spec_verdict_recovery
+            import ao_spec_rereview
             try:
                 agreed = ao_workflow.agreement(self, directory, state)
             except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -1313,6 +1342,7 @@ class Service:
                          engineering_model_policy=ao_engineering_policy.summary(state),
                          provider_transition=ao_provider_transition.summary(self, directory, state, delegate),
                          spec_review_extension=ao_review_extension.summary(self, state),
+                         spec_rereview=ao_spec_rereview.summary(self, state),
                          acceptance_review_extension=ao_acceptance_extension.summary(self, state),
                          acceptance_review_attempts=sum(r.get("role") == "reviewer" for r in ordered),
                          spec_review_attempts=sum(r.get("purpose") == "spec_review" for r in ordered),
@@ -1445,6 +1475,8 @@ TOOL_SCHEMAS = {
     "ao_room_spec_review_extend": ("Commit this room's one-ever additional Fable charter-review allowance using the exact audit, actual new user approval text with its context, diagnosis and durable request_id. Applies only to the audited next charter and retained native session/candidate. The fourth review intent exhausts it even if failed or uncertain. Identical calls read or reconcile the same receipt; no repeat grants, counter reset, source-review/acceptance allowance change, provider-hold release or model dispatch.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
     "ao_room_preacceptance_review_audit": ("Audit the one-time pre-acceptance exact-spec review extension for a room with zero acceptances whose latest completed engineering turn proposed a scope change, after exactly three retained spec-review intents. Register the exact next charter revision first. Binds the retained agreed handoff, the named scope-change request, its unaccepted candidate-at-completion, retained MAX bindings and the explicit read-only AO database's native session identity. Saves audit evidence only; no model, native lifecycle or room/session replacement.", schema({**R, "spec_revision": {"type": "integer", "minimum": 2}, "spec_sha256": S, "scope_request_id": S, "candidate_sha256": S, "native_session_id": S, "native_owner_database": S})),
     "ao_room_preacceptance_review_extend": ("Grant the one-time pre-acceptance exact-spec review extension for a room with zero acceptances whose latest completed engineering turn proposed a scope change, using the exact pre-acceptance audit, actual new user approval text with its context, diagnosis and durable request_id. It is the room's one-ever additional charter review, shared with ao_room_spec_review_extend; the fourth review intent exhausts it even if failed or uncertain. Identical calls read or reconcile the same receipt; no repeat grants, counter reset, allowance change, provider-hold release or model dispatch.", schema({**R, "audit_sha256": S, "authorization": S, "diagnosis": S, "request_id": S})),
+    "ao_room_spec_rereview_audit": ("Audit the one explicitly authorized exact-spec re-review for a room whose one charter-review extension was granted and consumed, whose consumed fourth review completed with a retained negative or noncanonical verdict, and whose operator registered the exact corrected next revision. Bind the corrected spec revision and SHA256, the source request, receipt and final-text digests, the declared source classification (changes_required, accept_with_blockers or noncanonical_negative), the one named request_id, the exact caller-message SHA256, declared gate artifacts and the explicit read-only AO database's native session identity. Saves audit evidence only; an audit alone is never an allowance; no model dispatch, native lifecycle or room/session replacement.", schema({**R, "spec_revision": {"type": "integer", "minimum": 2}, "spec_sha256": S, "source_request_id": S, "source_receipt_sha256": S, "source_final_text_sha256": S, "source_classification": {"type": "string", "enum": ["changes_required", "accept_with_blockers", "noncanonical_negative"]}, "request_id": S, "message_sha256": S, "gate_artifacts": {"type": "array", "items": S}, "native_session_id": S, "native_owner_database": S})),
+    "ao_room_spec_rereview_grant": ("Commit this room's one-ever exact-spec re-review grant using the exact re-review audit, the actual human authorization answer with its context, the provenance of that decision and the concrete bounded diagnosis. One named intent only; it is consumed durably before POST, and failed or uncertain delivery exhausts it with no refund and no second grant. Identical calls read or reconcile the same receipt; no review-limit change, provider-hold release or model dispatch.", schema({**R, "audit_sha256": S, "authorization": S, "authorization_reference": S, "diagnosis": S})),
     "ao_room_acceptance_review_audit": ("Audit eligibility for exactly one additional independent acceptance review after the room's retained reviewer attempts are exhausted (three, plus one per earlier consumed grant). Name the unused intended reviewer request_id and the SHA256 of the exact caller-message UTF-8 bytes; supply the explicit read-only AO database and both native provider session identities. Reuses every ordinary acceptance check and freezes the exact spec, candidate, checkpoint and gate logs, final engineering result, prior reviews, histories, earlier grants and both retained native owners. Refuses unsettled, busy, substituted, held or incomplete evidence. Saves private audit evidence and may persist ordinary outcome observations; no model dispatch, native lifecycle operation, candidate edit or grant. Every later grant must retain both native owners frozen by the earlier grants; only controller generation and liveness may differ.", schema({**R, "review_request_id": S, "message_sha256": S, "native_owner_database": S, "engineer_native_session_id": S, "reviewer_native_session_id": S})),
     "ao_room_acceptance_review_extend": ("With the fresh exact audit digest, a distinct durable request_id, the actual user authorization text, its source/provenance reference and an operator diagnosis, commit one single-use grant naming only the audited reviewer request_id, message digest and acceptance_review purpose. Text and provenance are recorded operator assertions, not authentication. Exactly one additional review, never a raised counter; at most one unconsumed grant; no expiry, revocation, replacement or retirement. While unused, new specifications, verification, engineering dispatch and other invalidating mutations are refused before any write. A broad real authorization may be recorded again for a separately audited later grant in the same scope; it never makes a multi-review allowance. Identical calls read or reconcile the same receipt; no model dispatch and no hold release.", schema({**R, "audit_sha256": S, "request_id": S, "authorization": S, "authorization_reference": S, "diagnosis": S})),
     "ao_room_reviewer_recover": ("With the exact audit and actual user authorization, recover one never-used reviewer into a separate ready native Codex reviewer at the same model/MAX. Preserves the original binding claim, all evidence and review limits. Refuses any prior reviewer request, missing history or uncertainty. One recovery per room; identical request reads the saved result. No model dispatch or AO POST.", schema({**R, "audit_sha256": S, "replacement_session_id": S, "diagnosis": S, "authorization": S, "request_id": S})),

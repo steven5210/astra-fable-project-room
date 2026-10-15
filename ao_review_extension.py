@@ -1102,7 +1102,9 @@ def validate(service, state, allow_pending=False):
             raise RoomError('Review-extension audit chain changed')
         _retained(service, directory, state, evidence, lane)
         consumed = _consumption(directory, state, reference)
-        reviews = _reviews(state)
+        # A separately authorized re-review intent carries its own claim and is accounted by
+        # ao_spec_rereview, never by this extension; it must not disturb this LIMIT..LIMIT+1 bound.
+        reviews = [r for r in _reviews(state) if not (r.get('carried') or {}).get('spec_rereview_sha256')]
         if not LIMIT <= len(reviews) <= LIMIT + 1:
             raise RoomError('Review-extension attempts were removed or exceeded the single fourth intent')
         claims = [r for r in state['requests'].values() if (r.get('carried') or {}).get('spec_review_extension_sha256')]
@@ -1124,7 +1126,7 @@ def validate(service, state, allow_pending=False):
 
 
 def _result(state, record):
-    reviews = _reviews(state)
+    reviews = [r for r in _reviews(state) if not (r.get('carried') or {}).get('spec_rereview_sha256')]
     lane = state['spec_review_extension'].get('lane', ACCEPTED)
     return {'extended': True, 'lane': lane, 'request_id': record['inputs']['request_id'], 'additional_spec_reviews': 1,
             'maximum_spec_review_attempts': LIMIT + 1, 'remaining_spec_reviews': int(len(reviews) == LIMIT),

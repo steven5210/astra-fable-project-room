@@ -193,6 +193,13 @@ about this lane shortens or bypasses that remaining lifecycle.
 
 ## What stays unchanged
 
+When this lane's fourth review completes with a retained negative or
+noncanonical-negative verdict and the operator registers the exact corrected
+next revision with human approval for one more exact-spec review, the room's
+separate one-ever re-review continuation applies; see
+[one authorized exact-spec re-review](spec-rereview.md). It never renews,
+refunds or renumbers this consumed extension.
+
 Source-review and independent-acceptance allowances, provider and semantic
 holds, the retained native owner check, and every maintenance operation
 available during an unused original-lane grant (instruction staging, outcome-

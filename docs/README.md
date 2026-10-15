@@ -10,6 +10,7 @@ Project Room's documents are grouped into guides, references and operations runb
 - [Audited acceptance-review continuation](guides/acceptance-review-continuation.md) — the single-use grant for one more acceptance review after the ordinary three attempts.
 - [One additional AO charter review](guides/one-charter-review-extension.md) — the audited, once-per-room extension after three charter reviews are consumed.
 - [Pre-acceptance exact-spec review extension](guides/pre-acceptance-review-extension.md) — the same once-per-room extension granted before any acceptance, for a scope-change proposal on an unaccepted candidate.
+- [One authorized exact-spec re-review](guides/spec-rereview.md) — the once-per-room named re-review of an operator-corrected charter after the consumed extension's fourth review completed with a retained negative or noncanonical-negative verdict.
 - [One-use specification verdict format recovery](guides/spec-verdict-format-recovery.md) — the once-per-room re-expression of a completed prose-only Fable verdict into its required strict JSON, gated by an explicit human comparison of both complete responses.
 - [Native context compaction for AO rooms](guides/context-compaction.md) — the configured automatic compaction window and its validation limits.
 - [Roles, agreement and delegation](guides/roles-and-delegation.md) — participant responsibilities, the exact-spec agreement flow and the bounded delegation ladder.
