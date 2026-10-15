@@ -213,11 +213,9 @@ class ReportCorrectionTests(DelegateFixture):
 
     # Compound report recovery: malformed native attribution together with malformed operator_requests.
     MALFORMED_REQUESTS = ['Run the agreed gates']
-    # The live report's shape: twelve routing entries whose delegate_job_ids name native worker ids
-    # (short hex strings), never the room's provider ledger ids.
-    NATIVE_IDS = ('a11c02469bd0d0c16', 'b22d13570ce1e1d27', 'c33e24681df2f2e38', 'd44f35792e0303d49',
-                  'e55046803f1414e5a', 'f6615791402525f6b', '0772681251363607c', '1883792362474718d',
-                  '2994803473585829e', '30a591458469693af', '41b60256957a7a4b0', '52c71367068b8b5c1')
+    # The malformed report's shape: twelve routing entries whose delegate_job_ids name synthetic native
+    # worker ids (short hex strings), never the room's provider ledger ids.
+    NATIVE_IDS = tuple('f%016x' % (index + 1) for index in range(12))
     PROOF_KEYS = {'kind', 'request_id', 'receipt_sha256', 'report_sha256', 'completion_candidate_sha256',
                   'candidate_sha256', 'handoff_sha256', 'spec_record_sha256', 'rejected_attribution_ids',
                   'verified_provider_jobs'}
@@ -489,6 +487,7 @@ class ReportCorrectionTests(DelegateFixture):
             self.assertNotIn('engineering_record', request)
             self.assertIn('candidate changed', request['engineering_error'])
             with self.assertRaises(ao.RoomError): self.service.ao_room_verify(self.room, str(self.repo))
+            self.refused_send('second', 'candidate changed')
 
     def test_compound_scope_change_incomplete_shape_and_other_spec_have_no_recovery(self):
         cases = (({'outcome': 'scope_change'}, 'scope change'), ({'implementation_complete': 'yes'}, 'incomplete'),
@@ -537,6 +536,61 @@ class ReportCorrectionTests(DelegateFixture):
                 with self.assertRaisesRegex(ao.RoomError, 'metadata differs'):
                     self.service.ao_room_accept(self.room, 'acceptance_review')
                 self.refused_send('second')  # The quality-evidence integrity guard may refuse before the walk.
+
+    # An unsuccessful first repair keeps the report-only boundary: the next correction re-anchors to
+    # the original evidence and candidate until a strict valid repair is captured.
+    def test_an_unsuccessful_first_repair_keeps_the_report_only_boundary(self):
+        repairs = (('omitted_disposition', lambda: self.finish_correction()),
+                   ('malformed_entries', lambda: self.finish_correction(operator_requests=self.MALFORMED_REQUESTS)),
+                   ('non_json', lambda: self.finish_turn('correction', 'Narrative without a report')))
+        for index, (name, first_repair) in enumerate(repairs):
+            with self.subTest(first_repair=name):
+                self.fresh(index); self.job(); self.capture_compound(); self.correction()
+                proof = self.admission('correction')
+                first = first_repair()
+                self.assertNotIn('engineering_record', first)
+                self.assertIn('engineering_error', first)
+                posts = len(self.fake.posts)
+                self.send_correction('report-fix-again', 'Correct the report formatting only.')
+                self.assertEqual(len(self.fake.posts), posts + 1)
+                anchored = self.state()['requests']['report-fix-again']['carried']['report_correction_admission']
+                self.assertEqual(anchored, proof)
+                self.assertIs(anchored['malformed_operator_requests'], True)
+                (self.repo / 'unexpected.txt').write_text('implementation change during report repair')
+                last = self.finish_report('report-fix-again', operator_requests=[])
+                self.assertNotIn('engineering_record', last)
+                self.assertIn('candidate changed', last['engineering_error'])
+                with self.assertRaises(ao.RoomError): self.service.ao_room_verify(self.room, str(self.repo))
+                with self.assertRaises(ao.RoomError): self.service.ao_room_accept(self.room, 'acceptance_review')
+        with self.subTest(first_repair='valid_repair_after_omission'):
+            self.setUp(); self.job(); self.capture_compound(); self.correction()
+            first = self.finish_correction()
+            self.assertNotIn('engineering_record', first)
+            self.send_correction('report-fix-again', 'Correct the report formatting only.')
+            anchored = self.state()['requests']['report-fix-again']['carried']['report_correction_admission']
+            self.assertEqual(anchored, self.admission('correction'))
+            last = self.finish_report('report-fix-again', operator_requests=[])
+            self.assertIn('engineering_record', last, last.get('engineering_error'))
+            self.assertEqual(last['result_candidate_sha256'], anchored['candidate_sha256'])
+            self.review(); self.assertTrue(self.service.ao_room_accept(self.room, 'acceptance_review')['accepted'])
+
+    def test_candidate_drift_before_the_reanchored_send_refuses_without_a_post(self):
+        self.job(); self.capture_compound(); self.correction()
+        self.assertNotIn('engineering_record', self.finish_correction())
+        (self.repo / 'feature.txt').write_text('drift before the re-anchored correction\n')
+        self.refused_send('report-fix-again', 'candidate changed')
+
+    def test_ordinary_correction_after_a_captured_repair_stays_ordinary(self):
+        self.job(); self.capture_compound(); self.correction()
+        corrected = self.finish_correction(operator_requests=[])
+        self.assertIn('engineering_record', corrected)
+        posts = len(self.fake.posts)
+        self.send_correction('next-work', 'Implement the reviewed follow-up.')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertNotIn('report_correction_admission', self.state()['requests']['next-work']['carried'])
+        (self.repo / 'followup.txt').write_text('authorized ordinary engineering after the repair\n')
+        later = self.finish_report('next-work', operator_requests=[])
+        self.assertIn('engineering_record', later, later.get('engineering_error'))
 
 
 if __name__ == '__main__':

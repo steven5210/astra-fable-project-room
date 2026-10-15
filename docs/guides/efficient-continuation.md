@@ -367,9 +367,16 @@ A rejected report whose `operator_requests` entries are also malformed is
 admitted the same way; its admission records `malformed_operator_requests:
 true`, and the corrected report must then state `operator_requests` explicitly
 (`[]` or valid entries) because omission cannot clear pending operator work.
-Malformed `operator_requests` alone keeps the ordinary correction. The
-correction instruction is Astra's and must name both defects: `operator_requests`
-as structured entries, and provider job IDs only in `delegate_job_ids`.
+Malformed `operator_requests` alone keeps the ordinary correction. Admission is
+decided on the authenticated evidence (the rejected report, candidate and
+receipt), never by parsing the instruction text, so a live repair instruction
+should name both defects — `operator_requests` as structured entries, and
+provider job IDs only in `delegate_job_ids` — for Fable to know what to fix.
+
+An unsuccessful repair never becomes ordinary engineering: while the latest
+report-only correction has no captured engineering record, the next correction
+is admitted only against the same original evidence until a strict valid repair
+is captured.
 
 When a document is requested, deliver complete bounded units, placing artifact
 content before optional reporting. Preserve all required substantive coverage.

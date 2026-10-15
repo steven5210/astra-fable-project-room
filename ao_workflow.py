@@ -844,6 +844,23 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
                             service.root.parent, directory, state, last, error)
                     else:
                         raise
+            if (attribution_admission is None and correction_admission is None and purpose == "correction"
+                    and isinstance(last.get("carried"), dict)
+                    and "report_correction_admission" in last["carried"]
+                    and "engineering_record" not in last and "engineering_record_sha256" not in last):
+                # An unsuccessful repair never becomes ordinary engineering; the restriction
+                # re-anchors to the original until a strict valid repair is captured.
+                root = state["requests"].get(last["carried"]["report_correction_admission"].get("request_id"))
+                if not isinstance(root, dict):
+                    raise RoomError("Invalid report-only correction predecessor")
+                report, _ = recovery_report(directory, state, root)
+                try:
+                    ao_delegates.verify_delegation(service.root.parent, directory, state, report)
+                except ao_delegates.MalformedDelegateAttributionError as error:
+                    attribution_admission = report_correction_admission(
+                        service.root.parent, directory, state, root, error)
+                else:
+                    raise RoomError("Report-only correction no longer matches its original attribution failure")
     else:
         raise RoomError("Normal engineer purpose must be spec_review, implementation or correction")
     # Every new engineer turn belongs to the active epoch, including read-only specification review.
