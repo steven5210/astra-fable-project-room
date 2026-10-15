@@ -14,6 +14,7 @@ Project Room's documents are grouped into guides, references and operations runb
 - [Native context compaction for AO rooms](guides/context-compaction.md) — the configured automatic compaction window and its validation limits.
 - [Roles, agreement and delegation](guides/roles-and-delegation.md) — participant responsibilities, the exact-spec agreement flow and the bounded delegation ladder.
 - [AO backend setup and normal workflow](guides/ao-setup.md) — configuring the private AO endpoint, delegate provider and preparation hook, then the normal room workflow.
+- [Controller maintenance lane](guides/controller-maintenance-lane.md) — the standing path for a controller defect that blocks a live room's supported path: synthetic reproduction, minimum fix, evidence bundle, draft PR and separate merge/install authorizations.
 
 ## Reference
 
