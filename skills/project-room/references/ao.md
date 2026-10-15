@@ -270,7 +270,12 @@ Codex task discovers updated MCP tools after plugin installation.
    for a room with a retained acceptance, or
    [pre-acceptance exact-spec review extension](../../../docs/guides/pre-acceptance-review-extension.md)
    for a room with zero acceptances whose latest completed engineering turn
-   proposed a scope change; the two lanes share the one grant.
+   proposed a scope change; the two lanes share the one grant. When that
+   granted fourth review completed with a retained negative or
+   noncanonical-negative verdict and the operator registered the corrected
+   next revision, the room's one-ever explicitly authorized exact-spec
+   re-review can admit one named intent — see
+   [one authorized exact-spec re-review](../../../docs/guides/spec-rereview.md).
 5. Call `ao_room_handoff` for the actual bound engineer worktree. It pins the exact
    agreement, baseline, candidate, authorization, delegate preparation and gates.
    Send engineer purpose `implementation` once for that handoff. Once the session

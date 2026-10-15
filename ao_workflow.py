@@ -779,6 +779,7 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     correction_admission = None
     attribution_admission = None
     review_extension = None
+    rereview = None
     binding = state.get("bindings", {}).get("engineer", {})
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
@@ -803,8 +804,12 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
             ao_provider_transition.dispatch_gate(service, directory, state, snapshot)
         return ao_spec_verdict_recovery.packet(service, directory, state, message, assembly)
     if purpose == "spec_review":
-        from ao_review_extension import admission
-        review_extension = admission(service, directory, state)
+        if state.get("spec_rereview") is not None:
+            import ao_spec_rereview
+            rereview = ao_spec_rereview.admission(service, directory, state, message)
+        else:
+            from ao_review_extension import admission
+            review_extension = admission(service, directory, state)
     elif purpose in ("implementation", "correction"):
         agreement(service, directory, state)
         handoff = handoff_record(directory, state)
@@ -895,6 +900,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     carried = {"spec_record_sha256": None, "spec_delivery": None, "parts": [], "part_sha256": {}}
     if review_extension is not None:
         carried['spec_review_extension_sha256'] = review_extension  # Audited allowance, never native prompt text.
+    if rereview is not None:
+        carried['spec_rereview_sha256'] = rereview  # Audited re-review allowance, never native prompt text.
     if correction_admission is not None:
         carried["correction_admission"] = correction_admission  # audit metadata only, never appended to the native prompt
     if attribution_admission is not None:
@@ -904,7 +911,10 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
             continue  # Verified immutable amendment roots also satisfy this new part.
         if name in ao_progress.SUPERSEDED_PARTS:
             continue  # progress_plan_v3 consolidates and supersedes v1/v2; never sent to a new session, never backfilled to a retained one.
-        if name not in held["parts"]:
+        # The authorized re-review re-delivers only its audit-bound review contract; it was already
+        # delivered with an earlier review, so the ordinary once-only rule would omit it here. Every
+        # other part keeps its once-only behaviour and no delivered flags are reset.
+        if name not in held["parts"] or (rereview is not None and name == "review_contract"):
             assembly.add("workflow", texts[name])
             carried["parts"].append(name)
             carried["part_sha256"][name] = digest(texts[name].encode())
