@@ -107,8 +107,9 @@ user; an extension needs [one-charter review extension](../../../docs/guides/one
 both share the room's one grant).
 Prose around the final JSON → [formatting recovery](ao.md#completed-response-formatting-recovery).
 Completed prose-only verdict with no usable JSON →
-[one-use spec-verdict format recovery](../../../docs/guides/spec-verdict-format-recovery.md).
-This requires specific human authorization, a native format-only response and
+[strict-format re-ask](../../../docs/guides/spec-verdict-format-recovery.md):
+audit → grant → send → compare → commit/close, once per source review.
+Budget-neutral with no human grant; a native format-only response and
 Astra's comparison of both complete texts; it never renews ordinary review limits.
 A completed result Astra cannot affirm closes through
 `ao_room_spec_verdict_recovery_close`; a failed turn settles through the ordinary
