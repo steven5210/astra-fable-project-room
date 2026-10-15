@@ -173,6 +173,15 @@ refuses ordinary validation, so room status, sync, handoff, send and the other
 room operations that run it refuse; because the extension is granted only once,
 it cannot be re-granted, and the room fails closed rather than dispatching.
 
+A settled request's retained proof lineage can also hold records minted
+before the saved-error anchor existed. Such a superseded proof validates
+under its own minted format: the exact earlier input-key set and the raw
+terminal digest of its referenced outcome row, error text included. The
+current proof must always have the later format, with the saved-error anchor
+and the normalized terminal digest. A later-format proof never validates
+under the earlier rule, an earlier-format proof refuses as the current head,
+and no retained record is ever rewritten to pass.
+
 ## After the fourth review
 
 Reaching agreement on the fourth review does not itself finish anything: the
