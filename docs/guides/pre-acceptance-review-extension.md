@@ -132,6 +132,47 @@ validation checks the repaired executable, and after a committed refresh it
 compares the files and guard with that refresh's committed target. The
 accepted-candidate lane is unchanged and keeps its read-only routing behavior.
 
+The engineer's own native history may also carry authenticated, historically
+settled native failures — a quota or compaction failure already resolved
+through the supported outcome-audit and outcome-resume operations. Only when
+the engineer's session owns at least one settled failure does this lane admit
+them into the audited native history; the audit evidence then records each one
+under `settled_failures` (its request id, turn and provider-turn ids,
+settlement kind, its outcome-resume path, and the exact receipt,
+outcome-resume and outcome digests that settled it), and send admission
+refuses the fourth review if any of that evidence is missing, modified or
+re-pointed. Each settled request must also carry the bound engineer identity
+in force when it was sent (the engineer role and every stored binding field,
+including harness, AO session, conversation and branch, with the model and
+reasoning effort of its engineering-model epoch), or the audit, grant and send
+refuse. After the grant, the granted settlements stay pinned: ordinary
+validation, an identical grant replay, a routing refresh and every later send
+refuse if a granted settlement is re-pointed or changed, while failures of
+later requests can still be settled through the same supported operations.
+The live row of a settled failed turn must still read failed, as its saved
+receipt does; any other live state contradicts the settled receipt and refuses
+the audit, the grant and the send before the grant is consumed, while a
+settled turn missing from the live history still refuses as any missing owned
+turn does. Its live `errorMessage` is excluded from the audited evidence only
+while it is the saved receipt's text or cleared (absent, null or empty) after
+a native controller restart, so such a restart between grant and send does not
+change the evidence. A different nonempty live error contradicts the settled
+receipt and refuses the audit, the grant and the send before the grant is
+consumed. In such a history a recovered turn is admitted only with
+its positive context proof (an audited compaction or task-notification
+import). A settled failure whose saved receipt was truncated must also carry
+its retained failed-turn reconciliation proof. The bound reviewer's own
+history, the accepted-candidate lane and the acceptance-review extension all
+remain strict and unaffected; active, interrupted, cancelled, unowned failed
+and unverified recovered native turns still refuse the audit or admission. An
+audit taken before this change on a room whose settled failures were already
+admitted through a provider transition must be repeated, because its evidence
+now lists them. For the same reason, a fourth-review grant committed before
+this change on such a room, used or not, records no granted settlements and now
+refuses ordinary validation, so room status, sync, handoff, send and the other
+room operations that run it refuse; because the extension is granted only once,
+it cannot be re-granted, and the room fails closed rather than dispatching.
+
 ## After the fourth review
 
 Reaching agreement on the fourth review does not itself finish anything: the

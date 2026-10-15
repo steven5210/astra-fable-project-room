@@ -51,10 +51,11 @@ def _history_require(condition):
 
 class _HistoryEvidence:
     """Bounded local retention only; stale proofs never grant delivery authority."""
-    def __init__(self, directory, native_session_id):
+    def __init__(self, directory, native_session_id, settled_history=False):
         import ao_evidence_audit_io as io
         self.io, self.directory, self.native_session_id = io, Path(directory), native_session_id
         self.root, self.total, self.cache, self.raw_hashes = None, 0, {}, {}
+        self.settled_history = settled_history
 
     def __enter__(self):
         return self
@@ -109,9 +110,12 @@ class _HistoryEvidence:
 
     def proof(self, request, receipt, sha):
         row = self.record('history-reconciliations', request, sha)
-        _history_require(request.get('state') == 'completed' and request.get('role') == 'engineer'
+        completed = request.get('state') == 'completed' and row.get('kind') == 'complete_history_native_quota'
+        settled = (self.settled_history and request.get('state') == 'settled_failure'
+                   and row.get('kind') == 'complete_history_native_quota_failed_turn')
+        _history_require((completed or settled) and request.get('role') == 'engineer'
             and request.get('harness') == 'claude-code' and receipt.get('history_truncated') is True
-            and row.get('kind') == 'complete_history_native_quota' and row.get('saved_history_truncated') is True
+            and row.get('saved_history_truncated') is True
             and all(row.get(k) == request.get(k) for k in ('receipt_sha256', 'text_sha256')))
         inputs = row.get('inputs')
         _history_require(isinstance(inputs, dict))
@@ -121,6 +125,15 @@ class _HistoryEvidence:
         _history_require(all(inputs.get(key) == value for key, value in anchors.items()))
         for key in ('turns_sha256', 'ao_terminal_sha256', 'provider_failures_sha256', 'session_failures_sha256'):
             _hash(inputs.get(key), 'retained proof input')
+        if settled:
+            # Exact anchors to the immutable saved receipt (ao_history_reconciliation.py:326-327);
+            # a controller restart clears only the live row's errorMessage, never the receipt's.
+            # Parity with completed proofs: ownership is the native-session source check below,
+            # not an anchor to the bound engineer binding's AO session.
+            turn = receipt.get('turn')
+            _history_require(isinstance(turn, dict) and turn.get('state') == 'failed'
+                and inputs.get('saved_turn_sha256') == ao.digest(turn)
+                and inputs.get('saved_error_message_sha256') == ao.digest(turn.get('errorMessage')))
         native = inputs.get('native')
         _history_require(isinstance(native, dict) and not native.get('unknown')
             and isinstance(native.get('anchor_uuid'), str) and bool(native['anchor_uuid'].strip())
@@ -183,9 +196,19 @@ class _HistoryEvidence:
             if claimed is not None:
                 _hash(claimed, 'retained outcome proof')
                 _history_require(claimed in proofs)
-                inputs = proofs[claimed]['inputs']
+                proof, terminal = proofs[claimed], row.get('ao_terminal')
+                inputs = proof['inputs']
+                if proof.get('kind') == 'complete_history_native_quota_failed_turn':
+                    # A failed-turn proof binds ao_terminal_sha256 to the row with its errorMessage
+                    # stripped (ao_history_reconciliation.py:325), since AO clears that field on a
+                    # native controller restart; mirror that normalization here too, exactly as
+                    # ao_outcomes.py:764-777 does for the live revalidation path.
+                    from ao_history_reconciliation import _terminal_identity
+                    _history_require(isinstance(terminal, dict)
+                        and inputs['ao_terminal_sha256'] == ao.digest(_terminal_identity(terminal)))
+                else:
+                    _history_require(inputs['ao_terminal_sha256'] == ao.digest(terminal))
                 _history_require(inputs['native'] == row.get('native')
-                    and inputs['ao_terminal_sha256'] == ao.digest(row.get('ao_terminal'))
                     and inputs['provider_failures_sha256'] == ao.digest(row.get('provider_failures'))
                     and inputs['session_failures_sha256'] == ao.digest(row.get('session_failures')))
         return proofs, invalidations
@@ -317,14 +340,16 @@ def _manifest(directory, state):
 
 
 
-def _grant_manifest(directory, state, native_session_id):
+def _grant_manifest(directory, state, native_session_id, settled_history=False):
     """Add authenticated history only to a grant's explicitly owned baseline.
 
     Routing-refresh intents retain the legacy two-argument manifest unchanged.
     Their existing grant guards separately validate retained history authority.
+    ``settled_history`` is true only for the pre-acceptance lane, and only when the bound
+    engineer session owns at least one settled failure.
     """
     result = _manifest(directory, state)
-    with _HistoryEvidence(directory, native_session_id) as history:
+    with _HistoryEvidence(directory, native_session_id, settled_history) as history:
         for request in state['requests'].values():
             if any(key in request for key in HISTORY_POINTERS):
                 receipt = ao_workflow.completed_receipt(directory, request)
@@ -522,10 +547,139 @@ def _owner(state, database, native_session_id, workspace):
     return {k: v for k, v in owner.items() if k not in ('activity_state', 'controller_generation')}
 
 
-def _native_evidence(directory, state, binding, snapshot):
+def _native_evidence(directory, state, binding, snapshot, *, settled_history=False):
+    """Native history evidence for one binding; ``settled_history`` is only ever true for the
+    pre-acceptance lane's bound engineer role.
+
+    The opt-in applies only when that engineer session owns at least one settled failure. Its
+    authenticated, historically settled native failures (quota or compaction, each re-verified
+    through ``ao_outcomes.validate_settlement``) are then admitted into native history and recorded
+    under ``settled_failures``: request, turn and provider-turn identity, settlement kind,
+    outcome-resume path, and the exact receipt, outcome-resume and outcome digests that settled
+    them. In such a settled history a recovered turn is admitted only with its positive context
+    proof (compaction or task-notification import), as routing refresh already requires. Rooms
+    whose engineer session owns no settled failure keep the strict evaluation and today's exact
+    evidence bytes. Rooms whose settled failures the provider-transition exception already
+    admitted now gain the ``settled_failures`` entries, so a pre-acceptance audit taken before this
+    change must be repeated. The live row of a settled failed turn must still read ``failed``, as
+    its receipt does; any other live state refuses the audit, the grant and the send before
+    ``consume()``, and a settled turn absent from the live snapshot keeps ``_native``'s refusal of a
+    missing owned turn. Its live ``errorMessage`` is excluded from the audited evidence only while
+    it is its authenticated receipt's text or cleared (absent, ``None`` or empty) after a native
+    controller restart, so such a restart between grant and send does not change it; a different
+    nonempty live error refuses the audit, the grant and the send before ``consume()``.
+
+    Missing, modified or re-pointed settlement, outcome or failure-receipt evidence, or any identity
+    drift, refuses at audit, at grant through ``_extend``'s exact evidence comparison, and at send
+    admission before ``consume()``. ``_grant_manifest``/``_retained`` authenticate the retained
+    failed-turn reconciliation proofs.
+    """
     from ao_provider_transition import _native
-    return {**_native(state, binding, snapshot, directory),
-            'activities_sha256': ao.digest(snapshot['activities'])}
+    if not (settled_history and _settled_requests(state, binding)):
+        return {**_native(state, binding, snapshot, directory),
+                'activities_sha256': ao.digest(snapshot['activities'])}
+    # Settlement evidence first, so its clean refusal precedes _native's own raw evidence reads.
+    rows = _settled_failures_with_receipts(directory, state, binding)
+    settled = [entry for entry, _ in rows]
+    # AO clears a failed turn's live errorMessage on a native controller restart; the saved receipt
+    # keeps it. Only settled turns whose live row still reads failed drop it, and only while it is
+    # the receipt's text or cleared (the restart rule of ao_history_reconciliation._failed_inputs);
+    # every other turn and snapshot key is unchanged.
+    from ao_history_reconciliation import _terminal_identity
+    saved_errors = {}
+    for entry, receipt in rows:
+        saved_turn = receipt.get('turn')
+        saved_errors[entry['turn_id']] = saved_turn.get('errorMessage') if isinstance(saved_turn, dict) else None
+    normalized = snapshot
+    if isinstance(snapshot.get('turns'), list):  # Otherwise _native refuses it itself.
+        turns = []
+        for turn in snapshot['turns']:
+            if isinstance(turn, dict) and isinstance(turn.get('id'), str) and turn['id'] in saved_errors:
+                # Its receipt reads failed (_native checks it). A live row reading completed would
+                # otherwise pass _native as a plain completed turn, so any live state other than
+                # failed refuses here, before the errorMessage rule.
+                if turn.get('state') != 'failed':
+                    raise RoomError('Settled native failure live state contradicts its settled receipt')
+                if (turn.get('errorMessage') not in (None, '')
+                        and turn['errorMessage'] != saved_errors[turn['id']]):
+                    raise RoomError('Settled native failure live error contradicts its settled receipt')
+                turn = _terminal_identity(turn)
+            turns.append(turn)
+        normalized = {**snapshot, 'turns': turns}
+    value = _native(state, binding, normalized, directory, allow_settled_failures=True)
+    value['settled_failures'] = settled  # Non-empty: the gate above found at least one settled row.
+    value['activities_sha256'] = ao.digest(snapshot['activities'])
+    return value
+
+
+def _settled_requests(state, binding):
+    """The settled native failures this binding's session owns, ordered by turn id."""
+    return sorted((request for request in state['requests'].values()
+                   if request.get('state') == 'settled_failure'
+                   and request.get('session_id') == binding['session_id']),
+                  key=lambda request: request['turn_id'])
+
+
+def _settled_failures(directory, state, binding, request_ids=None):
+    """Pre-acceptance, engineer-only: authenticate every settled native failure this binding owns.
+
+    Session ownership only selects a request. Each selected request must also carry the bound
+    engineer identity in force when it was sent: the engineer role and every stored binding field
+    (harness, AO session, conversation, branch, Fable reason and identity basis), with the model
+    and reasoning effort of the engineering-model epoch that owned its creation order. A
+    contradiction refuses; it never falls back to the strict evaluation. ``request_ids``, when
+    given, restricts the entries to those requests.
+
+    Each entry is JSON-serializable strings only. Missing or changed entry evidence refuses at
+    audit, at grant through ``_extend``'s exact evidence comparison, and at send admission before
+    ``consume()``; after the grant ``_retained`` keeps the granted entries pinned, and
+    ``_grant_manifest``/``_retained`` authenticate the retained failed-turn reconciliation proofs.
+    """
+    return [entry for entry, _ in _settled_failures_with_receipts(directory, state, binding, request_ids)]
+
+
+def _settled_failures_with_receipts(directory, state, binding, request_ids=None):
+    """The ``_settled_failures`` entries, in order, each paired with its authenticated receipt.
+
+    The same checks, refusals and exception wrapping. The receipt is never recorded in any entry or
+    evidence; ``_native_evidence`` reads only its saved ``turn.errorMessage``.
+    """
+    import ao_engineering_model
+    import ao_outcomes
+    rows = []
+    for request in _settled_requests(state, binding):
+        if request_ids is not None and request.get('request_id') not in request_ids:
+            continue
+        try:
+            frozen = ao_engineering_model.binding_for_request(directory, state, binding, request)
+            if request.get('role') != 'engineer' or any(request.get(k) != v for k, v in frozen.items()):
+                raise RoomError('Settled native failure request identity contradicts the bound engineer identity')
+            # For a settled request completed_receipt also runs ao_outcomes.validate_settlement.
+            receipt = ao_workflow.completed_receipt(directory, request)
+            release = ao_outcomes.release_record(directory, {'room_id': directory.name}, request)
+            if release is None:
+                raise RoomError('Settled native failure lacks its audited continuation')
+            truncated = receipt.get('history_truncated')
+            if truncated is True:
+                # Lineage authentication of the pointer itself happens in _HistoryEvidence.
+                pointer = request.get('history_reconciliation_sha256')
+                if not (isinstance(pointer, str) and re.fullmatch(r'[0-9a-f]{64}', pointer)):
+                    raise RoomError('Settled native failure with a truncated receipt requires its retained '
+                                    'failed-turn reconciliation proof')
+            elif truncated is not False:
+                raise RoomError('Settled native failure receipt lacks its complete-history flag')
+            proof = release.get('native_failure_settlement') or {}
+            rows.append(({'request_id': request['request_id'], 'turn_id': request['turn_id'],
+                          'provider_turn_id': ao.native_turn_identity(request),
+                          'settlement_kind': proof.get('kind', 'quota_limit'),
+                          'receipt_sha256': request['receipt_sha256'],
+                          'outcome_resume': request['outcome_resume'],
+                          'outcome_resume_sha256': request['outcome_resume_sha256'],
+                          'outcome_sha256': release['outcome_sha256']}, receipt))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            # RoomError subclasses none of these, so the specific refusals above propagate unchanged.
+            raise RoomError('Settled native failure evidence is missing or unreadable') from error
+    return rows
 
 
 def _live_routing(directory, state):
@@ -571,16 +725,22 @@ def _inspect(service, directory, state, target, reconcile=False):
     from ao_provider_transition import _CompleteClient, _ReadOnlyIdentity
     client, observer = _CompleteClient(service.client(state)), _ReadOnlyIdentity(service)
     snapshots = {role: observer.identity(client, state, binding) for role, binding in state['bindings'].items()}
-    native = {role: _native_evidence(directory, state, state['bindings'][role], snapshot)
+    native = {role: _native_evidence(directory, state, state['bindings'][role], snapshot,
+                                      settled_history=(pre_acceptance and role == 'engineer'))
               for role, snapshot in snapshots.items()}
     owner = _owner(state, target['native_owner_database'], target['native_session_id'], actual)
     if pre_acceptance:
         retained = _scope_proposal(directory, state, target, actual)
     else:
         retained = _acceptance(directory, state, target['retained_candidate_sha256'], actual)
+    # The same ownership gate as _native_evidence; otherwise, including the accepted-candidate
+    # lane, the exact legacy three-argument _grant_manifest call.
+    settled_history = pre_acceptance and bool(_settled_requests(state, state['bindings']['engineer']))
+    manifest = (_grant_manifest(directory, state, target['native_session_id'], settled_history=True)
+                if settled_history else _grant_manifest(directory, state, target['native_session_id']))
     evidence = {'state_sha256': ao.digest(state), 'state': copy.deepcopy(state), 'target': target,
                 'spec_record_sha256': state['spec_record_sha256'], 'retained': retained,
-                'native': native, 'native_owner': owner, 'manifest': _grant_manifest(directory, state, target['native_session_id'])}
+                'native': native, 'native_owner': owner, 'manifest': manifest}
     if pre_acceptance:
         evidence['lane'] = PRE  # The accepted-candidate lane keeps its original evidence bytes.
     return evidence, snapshots
@@ -753,7 +913,9 @@ def _retained(service, directory, state, evidence, lane):
     for key in ('acceptances', 'verifications'):
         if state[key][:len(baseline[key])] != baseline[key]:
             raise RoomError('Review-extension retained acceptance or verification history changed')
-    with _HistoryEvidence(directory, evidence['target']['native_session_id']) as history:
+    # From the stored audited baseline, so it is deterministic and equals the flag _inspect used.
+    settled_history = lane == PRE and bool(_settled_requests(baseline, baseline['bindings']['engineer']))
+    with _HistoryEvidence(directory, evidence['target']['native_session_id'], settled_history) as history:
         for request_id, original in baseline['requests'].items():
             current = state['requests'].get(request_id)
             if not current or any(current.get(k) != v for k, v in original.items()
@@ -771,6 +933,18 @@ def _retained(service, directory, state, evidence, lane):
                 actual = ao.digest(ao_delegates.owned_bytes(_relative(directory, path), 96_000_000))
             if actual != expected:
                 raise RoomError('Review-extension retained evidence is missing or modified')
+    if settled_history:
+        # The granted settlements stay pinned: the request comparison above exempts the
+        # outcome-resume pointer as an observation and the manifest admits new files, so every
+        # settled request of the audited baseline must be granted and must still produce exactly
+        # its granted entry. Requests settled after the grant are not pinned here. Evidence without
+        # settled_failures predates their recording and fails closed.
+        granted = evidence['native']['engineer'].get('settled_failures')
+        pinned = {request['request_id'] for request in _settled_requests(baseline, baseline['bindings']['engineer'])}
+        if (not isinstance(granted, list) or not granted or not all(isinstance(entry, dict) for entry in granted)
+                or {entry.get('request_id') for entry in granted} != pinned
+                or _settled_failures(directory, state, baseline['bindings']['engineer'], request_ids=pinned) != granted):
+            raise RoomError('Review-extension granted settlement evidence changed')
     ao_workflow.spec_record_file(directory, evidence['spec_record_sha256'])
 
 
@@ -1092,7 +1266,9 @@ def admission(service, directory, state):
     client, observer = _CompleteClient(service.client(state)), _ReadOnlyIdentity(service)
     for role, binding in state['bindings'].items():
         snapshot = observer.identity(client, state, binding)
-        if _native_evidence(directory, state, binding, snapshot) != evidence['native'][role]:
+        if (_native_evidence(directory, state, binding, snapshot,
+                              settled_history=(pre_acceptance and role == 'engineer'))
+                != evidence['native'][role]):
             raise RoomError('Native history or metadata changed after the review extension')
     return state['spec_review_extension']['receipt_sha256']
 
