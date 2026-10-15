@@ -561,8 +561,13 @@ def _native_evidence(directory, state, binding, snapshot, *, settled_history=Fal
     whose engineer session owns no settled failure keep the strict evaluation and today's exact
     evidence bytes. Rooms whose settled failures the provider-transition exception already
     admitted now gain the ``settled_failures`` entries, so a pre-acceptance audit taken before this
-    change must be repeated. The live ``errorMessage`` of a settled failed turn is excluded from the
-    audited evidence, so a native controller restart between grant and send does not change it.
+    change must be repeated. The live row of a settled failed turn must still read ``failed``, as
+    its receipt does; any other live state refuses the audit, the grant and the send before
+    ``consume()``, and a settled turn absent from the live snapshot keeps ``_native``'s refusal of a
+    missing owned turn. Its live ``errorMessage`` is excluded from the audited evidence only while
+    it is its authenticated receipt's text or cleared (absent, ``None`` or empty) after a native
+    controller restart, so such a restart between grant and send does not change it; a different
+    nonempty live error refuses the audit, the grant and the send before ``consume()``.
 
     Missing, modified or re-pointed settlement, outcome or failure-receipt evidence, or any identity
     drift, refuses at audit, at grant through ``_extend``'s exact evidence comparison, and at send
@@ -574,16 +579,33 @@ def _native_evidence(directory, state, binding, snapshot, *, settled_history=Fal
         return {**_native(state, binding, snapshot, directory),
                 'activities_sha256': ao.digest(snapshot['activities'])}
     # Settlement evidence first, so its clean refusal precedes _native's own raw evidence reads.
-    settled = _settled_failures(directory, state, binding)
+    rows = _settled_failures_with_receipts(directory, state, binding)
+    settled = [entry for entry, _ in rows]
     # AO clears a failed turn's live errorMessage on a native controller restart; the saved receipt
-    # keeps it. Only settled failed turns drop it; every other turn and snapshot key is unchanged.
+    # keeps it. Only settled turns whose live row still reads failed drop it, and only while it is
+    # the receipt's text or cleared (the restart rule of ao_history_reconciliation._failed_inputs);
+    # every other turn and snapshot key is unchanged.
     from ao_history_reconciliation import _terminal_identity
-    turn_ids, normalized = {entry['turn_id'] for entry in settled}, snapshot
+    saved_errors = {}
+    for entry, receipt in rows:
+        saved_turn = receipt.get('turn')
+        saved_errors[entry['turn_id']] = saved_turn.get('errorMessage') if isinstance(saved_turn, dict) else None
+    normalized = snapshot
     if isinstance(snapshot.get('turns'), list):  # Otherwise _native refuses it itself.
-        normalized = {**snapshot, 'turns': [
-            _terminal_identity(turn) if (isinstance(turn, dict) and isinstance(turn.get('id'), str)
-                                         and turn['id'] in turn_ids and turn.get('state') == 'failed')
-            else turn for turn in snapshot['turns']]}
+        turns = []
+        for turn in snapshot['turns']:
+            if isinstance(turn, dict) and isinstance(turn.get('id'), str) and turn['id'] in saved_errors:
+                # Its receipt reads failed (_native checks it). A live row reading completed would
+                # otherwise pass _native as a plain completed turn, so any live state other than
+                # failed refuses here, before the errorMessage rule.
+                if turn.get('state') != 'failed':
+                    raise RoomError('Settled native failure live state contradicts its settled receipt')
+                if (turn.get('errorMessage') not in (None, '')
+                        and turn['errorMessage'] != saved_errors[turn['id']]):
+                    raise RoomError('Settled native failure live error contradicts its settled receipt')
+                turn = _terminal_identity(turn)
+            turns.append(turn)
+        normalized = {**snapshot, 'turns': turns}
     value = _native(state, binding, normalized, directory, allow_settled_failures=True)
     value['settled_failures'] = settled  # Non-empty: the gate above found at least one settled row.
     value['activities_sha256'] = ao.digest(snapshot['activities'])
@@ -613,9 +635,18 @@ def _settled_failures(directory, state, binding, request_ids=None):
     ``consume()``; after the grant ``_retained`` keeps the granted entries pinned, and
     ``_grant_manifest``/``_retained`` authenticate the retained failed-turn reconciliation proofs.
     """
+    return [entry for entry, _ in _settled_failures_with_receipts(directory, state, binding, request_ids)]
+
+
+def _settled_failures_with_receipts(directory, state, binding, request_ids=None):
+    """The ``_settled_failures`` entries, in order, each paired with its authenticated receipt.
+
+    The same checks, refusals and exception wrapping. The receipt is never recorded in any entry or
+    evidence; ``_native_evidence`` reads only its saved ``turn.errorMessage``.
+    """
     import ao_engineering_model
     import ao_outcomes
-    entries = []
+    rows = []
     for request in _settled_requests(state, binding):
         if request_ids is not None and request.get('request_id') not in request_ids:
             continue
@@ -638,17 +669,17 @@ def _settled_failures(directory, state, binding, request_ids=None):
             elif truncated is not False:
                 raise RoomError('Settled native failure receipt lacks its complete-history flag')
             proof = release.get('native_failure_settlement') or {}
-            entries.append({'request_id': request['request_id'], 'turn_id': request['turn_id'],
-                             'provider_turn_id': ao.native_turn_identity(request),
-                             'settlement_kind': proof.get('kind', 'quota_limit'),
-                             'receipt_sha256': request['receipt_sha256'],
-                             'outcome_resume': request['outcome_resume'],
-                             'outcome_resume_sha256': request['outcome_resume_sha256'],
-                             'outcome_sha256': release['outcome_sha256']})
+            rows.append(({'request_id': request['request_id'], 'turn_id': request['turn_id'],
+                          'provider_turn_id': ao.native_turn_identity(request),
+                          'settlement_kind': proof.get('kind', 'quota_limit'),
+                          'receipt_sha256': request['receipt_sha256'],
+                          'outcome_resume': request['outcome_resume'],
+                          'outcome_resume_sha256': request['outcome_resume_sha256'],
+                          'outcome_sha256': release['outcome_sha256']}, receipt))
         except (OSError, ValueError, KeyError, TypeError) as error:
             # RoomError subclasses none of these, so the specific refusals above propagate unchanged.
             raise RoomError('Settled native failure evidence is missing or unreadable') from error
-    return entries
+    return rows
 
 
 def _live_routing(directory, state):

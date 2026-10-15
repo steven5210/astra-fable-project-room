@@ -149,9 +149,16 @@ refuse. After the grant, the granted settlements stay pinned: ordinary
 validation, an identical grant replay, a routing refresh and every later send
 refuse if a granted settlement is re-pointed or changed, while failures of
 later requests can still be settled through the same supported operations.
-The live `errorMessage` of a settled failed turn is excluded from
-the audited evidence, so a native controller restart between grant and send
-does not change it. In such a history a recovered turn is admitted only with
+The live row of a settled failed turn must still read failed, as its saved
+receipt does; any other live state contradicts the settled receipt and refuses
+the audit, the grant and the send before the grant is consumed, while a
+settled turn missing from the live history still refuses as any missing owned
+turn does. Its live `errorMessage` is excluded from the audited evidence only
+while it is the saved receipt's text or cleared (absent, null or empty) after
+a native controller restart, so such a restart between grant and send does not
+change the evidence. A different nonempty live error contradicts the settled
+receipt and refuses the audit, the grant and the send before the grant is
+consumed. In such a history a recovered turn is admitted only with
 its positive context proof (an audited compaction or task-notification
 import). A settled failure whose saved receipt was truncated must also carry
 its retained failed-turn reconciliation proof. The bound reviewer's own

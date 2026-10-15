@@ -1477,3 +1477,173 @@ class PostConsumptionSettlementRetentionTests(SettledHistoryFixture):
         self.assertEqual(self.state()['requests'][successor]['state'], 'submitted')
         record, evidence = extension.validate(self.service, self.state())
         self.assertEqual(record['lane'], extension.PRE)
+
+
+LIVE_ERROR_CONTRADICTION_MESSAGE = 'Settled native failure live error contradicts its settled receipt'
+LIVE_STATE_CONTRADICTION_MESSAGE = 'Settled native failure live state contradicts its settled receipt'
+
+
+class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
+    """Group 13: a settled failed turn's live row is checked against that same request's
+    authenticated, settled receipt before the pre-acceptance audit, the grant and the fourth-review
+    send admit it. The live row must still read 'failed', as its receipt does: a row flipped to
+    'completed' would otherwise pass ``_native`` as a plain completed turn, so any other live state
+    refuses first with ``LIVE_STATE_CONTRADICTION_MESSAGE``. Its live errorMessage is tolerated only
+    while it is absent, ``None`` or ``''`` (a native controller restart clears it, while the saved
+    receipt keeps the original provider text) or exactly the receipt's own saved text; any other
+    value contradicts what was actually settled and refuses with
+    ``LIVE_ERROR_CONTRADICTION_MESSAGE``. Each refusal happens at all three boundaries, before any
+    room mutation, POST or consumption. Only a live row that passes both checks is replaced by
+    ``_terminal_identity(turn)`` (the live turn minus errorMessage) before the native-history
+    comparison, so such a restart between grant and send leaves the audited evidence unchanged.
+
+    ``fake.finish``'s own default 'failed' turn carries no errorMessage at all, so this class's
+    ``_build_history`` override wraps ``fake.finish`` to stamp ``SAVED_ERROR_TEXT`` on the live
+    turn the instant it is marked failed, before ``ao_room_sync`` reads it into the receipt. The one
+    test named in ``STOCK_FIXTURE_TEST`` keeps the unmodified stock fixture (saved errorMessage
+    ``None``) instead; its own ``assertIsNone`` precondition fails if that name ever drifts.
+    """
+
+    SAVED_ERROR_TEXT = 'Rate limit'
+    STOCK_FIXTURE_TEST = 'test_nonempty_live_error_on_a_turn_settled_without_error_text_refuses_the_fourth_send'
+
+    def _build_history(self):
+        if self._testMethodName == self.STOCK_FIXTURE_TEST:
+            super()._build_history()
+            return
+        finish = self.fake.finish
+
+        def wrapped(session, *args, **kwargs):
+            value = finish(session, *args, **kwargs)
+            if kwargs.get('state') == 'failed':
+                self.fake.snapshots[session]['turns'][-1]['errorMessage'] = self.SAVED_ERROR_TEXT
+            return value
+
+        self.fake.finish = wrapped
+        super()._build_history()
+
+    def _settled_request(self, index=0):
+        request_id = self.settled[index]['request_id']
+        return request_id, self.state()['requests'][request_id]
+
+    def _settled_turn(self, index=0):
+        """The exact live turn row ``self.settled[index]`` names, found by turn id."""
+        turn_id = self.settled[index]['turn_id']
+        return next(t for t in self.fake.snapshots['engineer']['turns'] if t['id'] == turn_id)
+
+    def _saved_error_message(self, index=0):
+        _, request = self._settled_request(index)
+        receipt = ao.read(self.directory() / request['receipt'])
+        return receipt['turn'].get('errorMessage')
+
+    def _flip_settled_turn_to_completed(self, index=0):
+        """Rewrite that live row as a plain completed turn: state 'completed', no errorMessage key."""
+        turn = self._settled_turn(index)
+        self.assertEqual((turn['state'], turn['errorMessage']), ('failed', self.SAVED_ERROR_TEXT))
+        turn['state'] = 'completed'
+        del turn['errorMessage']
+
+    def test_different_live_error_before_audit_refuses_the_audit_without_mutation(self):
+        self.assertEqual(self._saved_error_message(), self.SAVED_ERROR_TEXT)
+        turn = self._settled_turn()
+        turn['errorMessage'] = 'Permission denied'
+        self.assert_refuses_without_mutation(LIVE_ERROR_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_different_live_error_after_a_clean_audit_refuses_the_grant_without_mutation(self):
+        audited = self.audit()
+        turn = self._settled_turn()
+        turn['errorMessage'] = 'Permission denied'
+        inputs = self.grant_inputs(audit=audited)
+        self.assert_refuses_without_mutation(
+            LIVE_ERROR_CONTRADICTION_MESSAGE,
+            lambda: self.service.ao_room_preacceptance_review_extend(**inputs))
+        self.assertIsNone(self.state().get('spec_review_extension'))
+        self.assertEqual(list((self.directory() / extension.BASE / 'requests').glob('*.json')), [])
+
+    def test_different_live_error_after_the_grant_refuses_the_fourth_send_before_consumption(self):
+        self.grant()
+        _, request = self._settled_request()
+        receipt_path = self.directory() / request['receipt']
+        original_receipt = receipt_path.read_bytes()
+        before_files = self.room_files()
+        turn = self._settled_turn()
+        turn['errorMessage'] = 'Permission denied'
+        self._assert_fourth_send_refuses(LIVE_ERROR_CONTRADICTION_MESSAGE)
+        self.assertEqual(self.room_files(), before_files)
+        self.assertEqual(receipt_path.read_bytes(), original_receipt)
+
+    def test_nonempty_live_error_on_a_turn_settled_without_error_text_refuses_the_fourth_send(self):
+        self.assertIsNone(self._saved_error_message())
+        self.grant()
+        before_files = self.room_files()
+        turn = self._settled_turn()
+        turn['errorMessage'] = 'Permission denied'
+        self._assert_fourth_send_refuses(LIVE_ERROR_CONTRADICTION_MESSAGE)
+        self.assertEqual(self.room_files(), before_files)
+
+    def test_original_live_error_text_still_audits_grants_and_sends_the_fourth_review_once(self):
+        self.assertEqual(self._settled_turn()['errorMessage'], self.SAVED_ERROR_TEXT)
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        self.grant()
+        posts = len(self.fake.posts)
+        self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+
+    def test_cleared_live_error_none_after_the_grant_still_sends_the_fourth_review_once(self):
+        self.grant()
+        turn = self._settled_turn()
+        turn['errorMessage'] = None
+        posts = len(self.fake.posts)
+        self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+
+    def test_cleared_live_error_empty_string_after_the_grant_still_sends_the_fourth_review_once(self):
+        self.grant()
+        turn = self._settled_turn()
+        turn['errorMessage'] = ''
+        posts = len(self.fake.posts)
+        self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+
+    def test_cleared_live_error_before_audit_still_audits_grants_and_sends_the_fourth_review_once(self):
+        turn = self._settled_turn()
+        turn['errorMessage'] = None
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        self.grant()
+        posts = len(self.fake.posts)
+        self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+
+    def test_live_state_flip_of_a_settled_turn_before_audit_refuses_the_audit_without_mutation(self):
+        self._flip_settled_turn_to_completed()
+        self.assert_refuses_without_mutation(LIVE_STATE_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_live_state_flip_of_a_settled_turn_after_a_clean_audit_refuses_the_grant_without_mutation(self):
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        self._flip_settled_turn_to_completed()
+        inputs = self.grant_inputs(audit=audited)
+        self.assert_refuses_without_mutation(
+            LIVE_STATE_CONTRADICTION_MESSAGE,
+            lambda: self.service.ao_room_preacceptance_review_extend(**inputs))
+        self.assertIsNone(self.state().get('spec_review_extension'))
+        self.assertEqual(list((self.directory() / extension.BASE / 'requests').glob('*.json')), [])
+
+    def test_live_state_flip_of_a_settled_turn_after_the_grant_refuses_the_fourth_send_before_consumption(self):
+        self.grant()
+        _, request = self._settled_request()
+        receipt_path = self.directory() / request['receipt']
+        original_receipt = receipt_path.read_bytes()
+        before_files = self.room_files()
+        self._flip_settled_turn_to_completed()
+        self._assert_fourth_send_refuses(LIVE_STATE_CONTRADICTION_MESSAGE)
+        self.assertEqual(self.room_files(), before_files)
+        self.assertEqual(receipt_path.read_bytes(), original_receipt)
