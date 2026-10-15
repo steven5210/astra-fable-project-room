@@ -225,7 +225,7 @@ class VerdictRecoveryAdversarialTests(Fixture):
         self.dispatch(); self.finish(decision='changes_required', findings=['New requirement'], meaning_unchanged=False)
         self.close()
         self.assertEqual(self.service.ao_room_status(self.room)['spec_verdict_recovery']['status'], 'closed')
-        (self.directory() / 'spec-verdict-recovery' / 'closure.json').unlink()
+        (self.directory() / 'spec-verdict-recovery' / 'chains' / self.SOURCE / 'closure.json').unlink()
         state = self.state()
         with self.assertRaisesRegex(ao.RoomError, 'missing, changed or unclaimed'):
             self.service.quiet(state)
@@ -247,7 +247,7 @@ class VerdictRecoveryAdversarialTests(Fixture):
                   'inputs': {'recovery_request_id': self.RECOVERY, 'receipt_sha256': request['receipt_sha256'],
                              'final_text_sha256': '0' * 64, 'astra_review': 'forged', 'confirm_same_verdict': True},
                   'verdict_sha256': '0' * 64}
-        ao.atomic(self.directory() / 'spec-verdict-recovery' / 'agreement.json', forged)
+        ao.atomic(self.directory() / 'spec-verdict-recovery' / 'chains' / self.SOURCE / 'agreement.json', forged)
         state['spec_verdict_recovery']['agreement_sha256'] = ao.digest(forged)
         ao.atomic(self.directory() / 'state.json', state)
         status = self.service.ao_room_status(self.room)
