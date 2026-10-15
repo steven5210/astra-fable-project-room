@@ -16,6 +16,8 @@ from room import RoomError
 FABLE_MODEL = "fable"
 ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_reported", "review_findings",
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
+DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
+                        "operator work with operator_requests ([] or valid entries); omission cannot clear it")
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
@@ -186,15 +188,19 @@ def handoff(service, directory, state, worktree_path):
     return value
 
 
-def engineering_report(directory, state, request, report=None):
-    """Pure shape validation of the saved final JSON; delegate evidence is verified at the lifecycle boundaries."""
+def engineering_report(directory, state, request, report=None, validate_operator_requests=True):
+    """Pure shape validation of the saved final JSON; delegate evidence is verified at the lifecycle boundaries.
+
+    Only report-only recovery evidence (recovery_report) passes validate_operator_requests=False;
+    every other caller keeps this exact order and these messages."""
     record = handoff_record(directory, state)
     if report is None:
         report = final_json(directory, request)
     from ao_report_contract import project
     report = project(directory, state, request, report)
-    from ao_review_followups import validate
-    validate(report, fields=('operator_requests',))
+    if validate_operator_requests:
+        from ao_review_followups import validate
+        validate(report, fields=('operator_requests',))
     if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
             or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
@@ -205,6 +211,26 @@ def engineering_report(directory, state, request, report=None):
                    or not all(isinstance(j, str) for j in r["delegate_job_ids"]) for r in report["routing_log"])):
         raise RoomError("Engineering report is incomplete or refers to another spec/handoff")
     return report
+
+
+def malformed_operator_requests(report):
+    """Whether a parsed report's operator_requests field fails its structured contract."""
+    from ao_review_followups import validate
+    try:
+        validate(report, fields=("operator_requests",))
+    except RoomError:
+        return True
+    return False
+
+
+def recovery_report(directory, state, request):
+    """The shape-only variant for a rejected result considered for report-only recovery.
+
+    The same projection and shape checks as engineering_report, except that a malformed
+    operator_requests field is classified instead of raising: (report, malformed_operator_requests).
+    Capture, readiness and acceptance keep the strict engineering_report."""
+    report = engineering_report(directory, state, request, validate_operator_requests=False)
+    return report, malformed_operator_requests(report)
 
 
 def completion_candidate(directory, state, request, capture=False):
@@ -235,7 +261,10 @@ def completion_candidate(directory, state, request, capture=False):
 
 
 def _report_correction_proof(home, directory, state, request, error):
-    """Evidence for correcting attribution only, never an accepted delegate claim."""
+    """Evidence for correcting attribution only, never an accepted delegate claim.
+
+    A malformed operator_requests field in the same rejected result only adds
+    malformed_operator_requests; an attribution-only proof keeps exactly its existing fields."""
     from ao_project_room import digest
     from ao_outcomes import usable
     import ao_engineering_model
@@ -251,18 +280,21 @@ def _report_correction_proof(home, directory, state, request, error):
             or any(request.get(k) != v for k, v in binding.items())):
         raise RoomError("Report-only correction requires the same completed engineer/spec binding")
     usable(directory, request)
-    report = engineering_report(directory, state, request)
+    report, malformed = recovery_report(directory, state, request)
     if report["outcome"] == "scope_change":
         raise RoomError("Engineering discovered a scope change; revise and agree the specification first")
     saved = completion_candidate(directory, state, request)
     if candidate_snapshot(handoff_record(directory, state)["worktree"]) != saved:
         raise RoomError("Report-only correction candidate changed since original completion")
-    return {"kind": "malformed_delegate_attribution", "request_id": request["request_id"],
-            "receipt_sha256": request["receipt_sha256"], "report_sha256": digest(report),
-            "completion_candidate_sha256": request["completion_candidate_sha256"],
-            "candidate_sha256": saved["sha256"], "handoff_sha256": request["handoff_sha256"],
-            "spec_record_sha256": request["spec_record_sha256"],
-            "rejected_attribution_ids": error.rejected_ids, "verified_provider_jobs": error.verified_jobs}
+    proof = {"kind": "malformed_delegate_attribution", "request_id": request["request_id"],
+             "receipt_sha256": request["receipt_sha256"], "report_sha256": digest(report),
+             "completion_candidate_sha256": request["completion_candidate_sha256"],
+             "candidate_sha256": saved["sha256"], "handoff_sha256": request["handoff_sha256"],
+             "spec_record_sha256": request["spec_record_sha256"],
+             "rejected_attribution_ids": error.rejected_ids, "verified_provider_jobs": error.verified_jobs}
+    if malformed:
+        proof["malformed_operator_requests"] = True
+    return proof
 
 
 def report_correction_admission(home, directory, state, request, error):
@@ -271,10 +303,20 @@ def report_correction_admission(home, directory, state, request, error):
     return _report_correction_proof(home, directory, state, request, error)
 
 
+def require_disposition(links, report):
+    """Malformed operator work in the walked chain is cleared only by an explicit structured operator_requests field."""
+    if "operator_requests" not in report and any(
+            link.get("malformed_operator_requests") is True for link in links):
+        raise RoomError(DISPOSITION_REQUIRED)
+
+
 def validate_report_correction(home, directory, state, request):
-    """Walk receipt-bound recovery links; deletion and a second correction cannot reset them."""
+    """Walk receipt-bound recovery links; deletion and a second correction cannot reset them.
+
+    Returns the walked proofs, newest first."""
     from ao_project_room import digest
     seen = set()
+    links = []
     while True:
         identity = request.get("request_id")
         if not isinstance(identity, str) or not identity.strip():
@@ -292,7 +334,7 @@ def validate_report_correction(home, directory, state, request):
             raise RoomError("Report-only correction delivery metadata differs from its immutable native receipt")
         carried = request.get("carried") or {}
         if "report_correction_admission" not in carried:
-            return
+            return links
         proof = carried["report_correction_admission"]
         if not isinstance(proof, dict) or not isinstance(proof.get("request_id"), str):
             raise RoomError("Invalid report-only correction evidence")
@@ -301,12 +343,13 @@ def validate_report_correction(home, directory, state, request):
                 or type(prior.get("created_order")) is not int
                 or type(request.get("created_order")) is not int):
             raise RoomError("Invalid report-only correction predecessor")
+        links.append(proof)
         if proof["request_id"] in seen:
             request = prior
             continue
         if prior["created_order"] >= request["created_order"]:
             raise RoomError("Invalid report-only correction predecessor")
-        report = engineering_report(directory, state, prior)
+        report, _ = recovery_report(directory, state, prior)
         ao_delegates.assert_settled(home, state, directory)
         try:
             ao_delegates.verify_delegation(home, directory, state, report)
@@ -324,8 +367,9 @@ def capture_engineering(home, directory, state, request, capture_completion=True
         completed_candidate = completion_candidate(directory, state, request, capture=capture_completion)
         from ao_outcomes import usable
         usable(directory, request)
-        validate_report_correction(home, directory, state, request)
+        links = validate_report_correction(home, directory, state, request)
         report = engineering_report(directory, state, request)
+        require_disposition(links, report)
         # The claim is recorded before verification so a ledger lost afterwards still counts as recorded delegation.
         request["reported_delegate_job_ids"] = ao_delegates.report_job_ids(report)
         evidence = ao_delegates.verify_delegation(home, directory, state, report)
@@ -361,8 +405,9 @@ def engineering_ready(service, directory, state):
     from ao_outcomes import usable, observe
     observe(service, directory, state, request, service.identity(service.client(state), state, request))
     usable(directory, request)
-    validate_report_correction(service.root.parent, directory, state, request)
+    links = validate_report_correction(service.root.parent, directory, state, request)
     report = engineering_report(directory, state, request)
+    require_disposition(links, report)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")
     from ao_review_followups import pending_operator_work
@@ -799,6 +844,23 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
                             service.root.parent, directory, state, last, error)
                     else:
                         raise
+            if (attribution_admission is None and correction_admission is None and purpose == "correction"
+                    and isinstance(last.get("carried"), dict)
+                    and "report_correction_admission" in last["carried"]
+                    and "engineering_record" not in last and "engineering_record_sha256" not in last):
+                # An unsuccessful repair never becomes ordinary engineering; the restriction
+                # re-anchors to the original until a strict valid repair is captured.
+                root = state["requests"].get(last["carried"]["report_correction_admission"].get("request_id"))
+                if not isinstance(root, dict):
+                    raise RoomError("Invalid report-only correction predecessor")
+                report, _ = recovery_report(directory, state, root)
+                try:
+                    ao_delegates.verify_delegation(service.root.parent, directory, state, report)
+                except ao_delegates.MalformedDelegateAttributionError as error:
+                    attribution_admission = report_correction_admission(
+                        service.root.parent, directory, state, root, error)
+                else:
+                    raise RoomError("Report-only correction no longer matches its original attribution failure")
     else:
         raise RoomError("Normal engineer purpose must be spec_review, implementation or correction")
     # Every new engineer turn belongs to the active epoch, including read-only specification review.
