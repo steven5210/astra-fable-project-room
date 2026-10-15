@@ -49,6 +49,20 @@ def _history_require(condition):
         raise RoomError('Review-extension retained history evidence is inconsistent')
 
 
+# The two exact failed-turn proof input shapes. Proofs minted before the saved-error anchor
+# existed carry the 14 legacy keys and bind ao_terminal_sha256 to the raw observed terminal
+# row, errorMessage included; later proofs add saved_error_message_sha256 and bind the
+# normalized terminal identity. Proof version and kind never changed, so only the exact key
+# set tells a retained record's minted format; a legacy shape is valid only as a superseded
+# ancestor reached through a validated invalidation edge, never as the current head.
+LEGACY_FAILED_INPUT_KEYS = frozenset({'session_id', 'role', 'turn_id', 'provider_turn_id',
+                                      'conversation_id', 'branch_id', 'baseline_sha256',
+                                      'messages_sha256', 'turns_sha256', 'ao_terminal_sha256',
+                                      'saved_turn_sha256', 'provider_failures_sha256',
+                                      'session_failures_sha256', 'native'})
+MODERN_FAILED_INPUT_KEYS = LEGACY_FAILED_INPUT_KEYS | {'saved_error_message_sha256'}
+
+
 class _HistoryEvidence:
     """Bounded local retention only; stale proofs never grant delivery authority."""
     def __init__(self, directory, native_session_id, settled_history=False):
@@ -108,7 +122,7 @@ class _HistoryEvidence:
                     opened.close()
         return self.cache[path]
 
-    def proof(self, request, receipt, sha):
+    def proof(self, request, receipt, sha, superseded=False):
         row = self.record('history-reconciliations', request, sha)
         completed = request.get('state') == 'completed' and row.get('kind') == 'complete_history_native_quota'
         settled = (self.settled_history and request.get('state') == 'settled_failure'
@@ -130,10 +144,17 @@ class _HistoryEvidence:
             # a controller restart clears only the live row's errorMessage, never the receipt's.
             # Parity with completed proofs: ownership is the native-session source check below,
             # not an anchor to the bound engineer binding's AO session.
+            # The saved-error anchor exists only in the modern shape; a proof minted before it
+            # keeps its 14-key shape and validates only as a superseded ancestor, never as the
+            # current head. Any missing or extra key refuses under either rule.
             turn = receipt.get('turn')
+            shape = set(inputs)
             _history_require(isinstance(turn, dict) and turn.get('state') == 'failed'
+                and (shape == MODERN_FAILED_INPUT_KEYS
+                     or (superseded and shape == LEGACY_FAILED_INPUT_KEYS))
                 and inputs.get('saved_turn_sha256') == ao.digest(turn)
-                and inputs.get('saved_error_message_sha256') == ao.digest(turn.get('errorMessage')))
+                and (shape != MODERN_FAILED_INPUT_KEYS
+                     or inputs.get('saved_error_message_sha256') == ao.digest(turn.get('errorMessage'))))
         native = inputs.get('native')
         _history_require(isinstance(native, dict) and not native.get('unknown')
             and isinstance(native.get('anchor_uuid'), str) and bool(native['anchor_uuid'].strip())
@@ -166,10 +187,10 @@ class _HistoryEvidence:
                 _hash(row['outcome_sha256'], 'invalidated outcome'); outcomes.add(row['outcome_sha256'])
             invalidations[cursor] = row
             cursor = row.get('previous_sha256')
-        proofs, cursor = {}, proof_sha
+        proofs, cursor, superseded = {}, proof_sha, False
         while cursor is not None:
             _history_require(cursor not in proofs and len(proofs) <= MAX_HISTORY_INVALIDATIONS)
-            proof = self.proof(request, receipt, cursor)
+            proof = self.proof(request, receipt, cursor, superseded)
             proofs[cursor] = proof
             if proof.get('supersedes_outcome_sha256') is not None:
                 outcomes.add(proof['supersedes_outcome_sha256'])
@@ -178,9 +199,10 @@ class _HistoryEvidence:
                 break
             _history_require(head in invalidations)
             edge = invalidations[head]
-            previous = self.proof(request, receipt, edge['proof_sha256'])
+            previous = self.proof(request, receipt, edge['proof_sha256'], True)
             _history_require(edge.get('previous_sha256') == previous.get('invalidation_sha256'))
             cursor = edge['proof_sha256']
+            superseded = True
         head = request.get(INVALIDATION)
         recorded = proofs[proof_sha].get('invalidation_sha256')
         if head != recorded:
@@ -199,13 +221,18 @@ class _HistoryEvidence:
                 proof, terminal = proofs[claimed], row.get('ao_terminal')
                 inputs = proof['inputs']
                 if proof.get('kind') == 'complete_history_native_quota_failed_turn':
-                    # A failed-turn proof binds ao_terminal_sha256 to the row with its errorMessage
-                    # stripped (ao_history_reconciliation.py:325), since AO clears that field on a
-                    # native controller restart; mirror that normalization here too, exactly as
-                    # ao_outcomes.py:764-777 does for the live revalidation path.
-                    from ao_history_reconciliation import _terminal_identity
-                    _history_require(isinstance(terminal, dict)
-                        and inputs['ao_terminal_sha256'] == ao.digest(_terminal_identity(terminal)))
+                    # A failed-turn proof binds ao_terminal_sha256 in its minted format: the
+                    # modern shape hashes the row with its errorMessage stripped
+                    # (ao_history_reconciliation.py:325), since AO clears that field on a native
+                    # controller restart, while a legacy proof bound the raw observed row. The
+                    # exact key set selects the one comparison; neither falls back to the other.
+                    if set(inputs) == LEGACY_FAILED_INPUT_KEYS:
+                        _history_require(isinstance(terminal, dict)
+                            and inputs['ao_terminal_sha256'] == ao.digest(terminal))
+                    else:
+                        from ao_history_reconciliation import _terminal_identity
+                        _history_require(isinstance(terminal, dict)
+                            and inputs['ao_terminal_sha256'] == ao.digest(_terminal_identity(terminal)))
                 else:
                     _history_require(inputs['ao_terminal_sha256'] == ao.digest(terminal))
                 _history_require(inputs['native'] == row.get('native')
