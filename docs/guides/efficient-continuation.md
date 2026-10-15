@@ -343,8 +343,9 @@ A completed report that puts malformed strings (for example native Agent IDs) in
 `routing_log[].delegate_job_ids` still fails engineering capture. That field is
 reserved for the room's provider ledger IDs; record native worker attribution
 separately. The existing engineer `purpose: correction` operation can admit a
-report-only repair when the full report is otherwise valid, the original
-completion receipt and candidate are intact, and the same engineer/spec/handoff
+report-only repair when the full report is otherwise valid or its only other
+defect is malformed `operator_requests` entries, the original completion
+receipt and candidate are intact, and the same engineer/spec/handoff
 still apply. It verifies every well-formed provider claim first, regardless of
 where malformed strings occur; unknown or foreign IDs, wrong provider identities,
 damaged results and unresolved jobs remain refusals. A rejected string is not
@@ -361,6 +362,14 @@ transition; the separate historical-provider correction retains its own rules.
 A corrected report still requires normal strict capture, formal verification and
 independent acceptance. Reissuing the identical request remains idempotent;
 unknown delivery is never retried under another request ID.
+
+A rejected report whose `operator_requests` entries are also malformed is
+admitted the same way; its admission records `malformed_operator_requests:
+true`, and the corrected report must then state `operator_requests` explicitly
+(`[]` or valid entries) because omission cannot clear pending operator work.
+Malformed `operator_requests` alone keeps the ordinary correction. The
+correction instruction is Astra's and must name both defects: `operator_requests`
+as structured entries, and provider job IDs only in `delegate_job_ids`.
 
 When a document is requested, deliver complete bounded units, placing artifact
 content before optional reporting. Preserve all required substantive coverage.
