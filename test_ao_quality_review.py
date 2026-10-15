@@ -880,6 +880,8 @@ class FreshLedgerFixture(fixtures.DelegateFixture):
     grant_inputs = extension_fixtures.ReviewExtensionFixture.grant_inputs
     grant = extension_fixtures.ReviewExtensionFixture.grant
     finish_fourth = extension_fixtures.ReviewExtensionFixture.finish_fourth
+    accept_charter = extension_fixtures.ReviewExtensionFixture.accept_charter
+    exhaust_debate = extension_fixtures.ReviewExtensionFixture.exhaust_debate
 
     def setUp(self):
         super().setUp()
@@ -894,10 +896,8 @@ class FreshLedgerFixture(fixtures.DelegateFixture):
         for snapshot in self.fake.snapshots.values():
             snapshot.update(controller='ready', branchMaterialization={'strategy': 'native', 'replayTruncated': False})
         self.bind()
-        for number in range(1, 4):
-            self.agree(key='charter-' + str(number))
-        self.implement(); self.review()
-        self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.accept_charter()
+        self.exhaust_debate()
         self.target_spec = None
 
 
@@ -931,7 +931,7 @@ class ExtensionQualityTests(unittest.TestCase):
         status = f.finish_fourth()
         self.assertEqual(status['spec_review_extension']['remaining_spec_reviews'], 0)
         self.assertEqual(status['engineer_context']['quality_first_review']['delivery'], 'verified_delivered')
-        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
             f.send('spec_review', 'fifth-charter')
         self.assertEqual(len(f.fake.posts), posts + 1)
 

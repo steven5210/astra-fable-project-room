@@ -403,14 +403,14 @@ class NormalWorkflowTests(Fixture):
         self.agree(decision='changes_required')
         with self.assertRaisesRegex(ao.RoomError, 'rejected'):
             self.service.ao_room_handoff(self.room, str(self.repo))
-        self.agree(key='review2')
+        self.agree(decision='changes_required', key='review2')
         self.spec(2)
         self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
         with self.assertRaisesRegex(ao.RoomError, 'current exact spec'):
             self.service.ao_room_handoff(self.room, str(self.repo))
         self.agree(revision=1, key='stale-review')
         with self.assertRaises(ao.RoomError): self.service.ao_room_handoff(self.room, str(self.repo))
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
+        with self.assertRaisesRegex(ao.RoomError, 'debate budget'):
             self.send('spec_review', 'fourth')
         self.assertEqual(len(self.fake.posts), 3)
 

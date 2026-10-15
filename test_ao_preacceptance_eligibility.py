@@ -56,6 +56,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
     def test_dirty_candidate_at_completion_stays_eligible_through_audit_grant_and_fourth_send(self):
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         expected = implementation.candidate_snapshot(self.repo)['sha256']
         # The captured candidate-at-completion is itself dirty, not a clean baseline snapshot.
         self.assertEqual(self.candidate_sha256(), expected)
@@ -73,6 +74,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
     def test_reverting_the_dirty_edits_after_capture_refuses_the_audit(self):
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Prime self.target_spec so the audit-without-mutation check below is not
                           # attributed to this unrelated, one-time-per-test next-charter registration.
         (self.repo / 'feature.txt').write_text('start\n')
@@ -82,6 +84,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
     def test_reverting_the_dirty_edits_after_a_grant_refuses_the_fourth_send(self):
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         (self.repo / 'feature.txt').write_text('start\n')
         (self.repo / 'untracked.txt').unlink()
@@ -91,6 +94,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
     def test_committing_the_dirty_edits_after_capture_refuses_the_audit(self):
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Prime self.target_spec; see the revert test above for why.
         self.commit_dirty()
         self.assert_refuses_without_mutation(DRIFT_MESSAGE, self.audit)
@@ -101,6 +105,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
         the uncommitted content itself differs from what completion captured."""
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Prime self.target_spec; see the revert test above for why.
         (self.repo / 'feature.txt').write_text('dirty-tracked-different\n')
         self.assert_refuses_without_mutation(DRIFT_MESSAGE, self.audit)
@@ -110,6 +115,7 @@ class PreAcceptanceDirtyCandidateEligibilityTests(PreAcceptanceFixture):
         head and the tracked index entries are unchanged; only the untracked set differs."""
         self.dirty()
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Prime self.target_spec; see the revert test above for why.
         (self.repo / 'another-untracked.txt').write_text('more-dirty\n')
         self.assert_refuses_without_mutation(DRIFT_MESSAGE, self.audit)
@@ -120,21 +126,23 @@ class PreAcceptanceSkippedRevisionTests(PreAcceptanceFixture):
 
     ``ao_room_spec_put`` only requires a strictly newer revision than the room's current one
     (ao_project_room.py:555-556); it does not require every intermediate revision to have been
-    reviewed first, so revision 3 can be registered directly on top of a real, saved, but never
-    reviewed revision 2. ``_inspect`` (ao_review_extension.py:548-552) then refuses the audit either
-    way: revision 3 exactly matches the room's current spec but is not the agreed revision (1) plus
-    one, and revision 2 -- though genuinely registered and cited with its own real digest -- no
-    longer identifies the room's current spec at all, since revision 3 superseded it.
+    reviewed first, so revision 4 can be registered directly on top of a real, saved, but never
+    reviewed revision 3. ``_inspect`` (ao_review_extension.py:548-552) then refuses the audit either
+    way: revision 4 exactly matches the room's current spec but is not the highest reviewed
+    revision (2) plus one, and revision 3 -- though genuinely registered and cited with its own
+    real digest -- no longer identifies the room's current spec at all, since revision 4
+    superseded it.
     """
 
     def test_skipped_revision_with_matching_identity_refuses_the_audit(self):
         self.propose_scope_change()
-        spec2 = self.register()
-        spec3 = self.service.ao_room_spec_put(
-            self.room, 3, 'A further charter registered directly, skipping any review at revision 2.',
+        self.exhaust_debate()
+        spec3 = self.register()
+        spec4 = self.service.ao_room_spec_put(
+            self.room, 4, 'A further charter registered directly, skipping any review at revision 3.',
             self.gates, 'Astra approves this further scope decision')
-        self.assertEqual(spec3['revision'], 3)
-        self.assertEqual(self.service.spec(self.directory(), self.state())['revision'], 3)
+        self.assertEqual(spec4['revision'], 4)
+        self.assertEqual(self.service.spec(self.directory(), self.state())['revision'], 4)
 
         def audit_at(revision, spec):
             return self.service.ao_room_preacceptance_review_audit(
@@ -142,14 +150,14 @@ class PreAcceptanceSkippedRevisionTests(PreAcceptanceFixture):
                 scope_request_id='implementation', candidate_sha256=self.candidate_sha256(),
                 native_session_id=self.NATIVE, native_owner_database=str(self.database))
 
-        # The skip itself: revision 3 is the room's genuine current spec, exactly matching the
-        # caller's supplied revision and digest, but it is not revision 1 (the agreed reviews) plus one.
-        self.assert_refuses_without_mutation(SKIPPED_REVISION_MESSAGE, lambda: audit_at(3, spec3))
-        # The superseded revision: revision 2 is also genuinely registered and cited with its own
-        # real digest, but revision 3 is now current, so this is an identity mismatch against the
+        # The skip itself: revision 4 is the room's genuine current spec, exactly matching the
+        # caller's supplied revision and digest, but it is not the highest reviewed revision (2) plus one.
+        self.assert_refuses_without_mutation(SKIPPED_REVISION_MESSAGE, lambda: audit_at(4, spec4))
+        # The superseded revision: revision 3 is also genuinely registered and cited with its own
+        # real digest, but revision 4 is now current, so this is an identity mismatch against the
         # room's actual current spec rather than a not-next-revision mismatch; _inspect's single
         # combined check still refuses with the exact same message either way.
-        self.assert_refuses_without_mutation(SKIPPED_REVISION_MESSAGE, lambda: audit_at(2, spec2))
+        self.assert_refuses_without_mutation(SKIPPED_REVISION_MESSAGE, lambda: audit_at(3, spec3))
 
 
 if __name__ == '__main__':

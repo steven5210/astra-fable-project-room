@@ -1185,7 +1185,10 @@ class P10CharterLaneTests(MatrixFixture):
         with self.assertRaisesRegex(ao.RoomError, 'unused acceptance-review grant freezes'):
             self.spec(2)
         self.assertEqual(self.state_bytes(), before)
-        with self.assertRaisesRegex(ao.RoomError, 'Register the exact next charter revision'):
+        # Debate counting made the charter lane stricter: an unused acceptance grant needs
+        # a standing agreement, which only accepting reviews can supply, so its room can
+        # never hold the three non-accepting reviews the charter audit now requires first.
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted debate budget'):
             self.service.ao_room_spec_review_extension_audit(
                 self.room, 2, 'a' * 64, accepted['candidate_sha256'],
                 'synthetic-native-engineer', str(self.database))

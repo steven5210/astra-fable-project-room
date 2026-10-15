@@ -1,4 +1,4 @@
-"""Offline fourth-charter allowance contracts; synthetic rooms, native storage and AO only."""
+"""Offline additional-charter allowance contracts; synthetic rooms, native storage and AO only."""
 
 import copy
 import json
@@ -18,6 +18,7 @@ import ao_native_outcome
 import ao_project_room as ao
 import ao_provider_transition
 import ao_review_extension as extension
+import ao_spec_review_budget
 import ao_workflow
 import project_room
 import project_room_mcp
@@ -26,7 +27,7 @@ from test_ao_adoption import AdoptionFixture
 
 
 class ReviewExtensionFixture(Fixture):
-    """Synthetic fourth-review room whose one native source is the synthetic AO database below."""
+    """Synthetic exhausted-debate room whose one native source is the synthetic AO database below."""
 
     NATIVE = 'synthetic-native-owner'
 
@@ -35,6 +36,13 @@ class ReviewExtensionFixture(Fixture):
         self.configure_runtime()
         self.room = self.open()
         self.spec()
+        self.observe_full_conversations()
+        self.bind()
+        self.accept_charter()
+        self.exhaust_debate()
+        self.target_spec = None
+
+    def observe_full_conversations(self):
         original_request = self.fake.request
 
         def raw_request(method, path, payload=None):
@@ -47,13 +55,19 @@ class ReviewExtensionFixture(Fixture):
             session['isTerminated'] = False
         for snapshot in self.fake.snapshots.values():
             snapshot.update(controller='ready', branchMaterialization={'strategy': 'native', 'replayTruncated': False})
-        self.bind()
-        for number in range(1, 4):
-            self.agree(key='charter-' + str(number))
+
+    def accept_charter(self):
+        """One accepting charter review of revision 1, then implementation and independent acceptance."""
+        self.agree(key='charter-1')
         self.implement()
         self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
-        self.target_spec = None
+
+    def exhaust_debate(self):
+        """Revision 2 with its three completed non-accepting reviews: the exhausted debate budget."""
+        self.spec(2)
+        for number in range(2, 5):
+            self.agree(decision='changes_required', revision=2, key='charter-' + str(number))
 
     def register_native_source(self):
         """One coherent synthetic owner, database and source, registered before any dispatch.
@@ -102,14 +116,14 @@ class ReviewExtensionFixture(Fixture):
 
     def register(self):
         if self.target_spec is None:
-            self.target_spec = self.service.ao_room_spec_put(self.room, 2,
+            self.target_spec = self.service.ao_room_spec_put(self.room, 3,
                 'Review the newly authorized validation charter. Preserve the accepted research candidate.',
                 self.gates, 'Astra approves this exact next charter under the actual scope decision')
         return self.target_spec
 
     def audit(self, **changes):
         spec = self.register()
-        inputs = {'room_id': self.room, 'spec_revision': 2, 'spec_sha256': spec['sha256'],
+        inputs = {'room_id': self.room, 'spec_revision': 3, 'spec_sha256': spec['sha256'],
                   'retained_candidate_sha256': self.accepted['candidate_sha256'],
                   'native_session_id': self.NATIVE, 'native_owner_database': str(self.database), **changes}
         return self.service.ao_room_spec_review_extension_audit(**inputs)
@@ -117,7 +131,7 @@ class ReviewExtensionFixture(Fixture):
     def grant_inputs(self, audit=None, **changes):
         return {'room_id': self.room, 'audit_sha256': (audit or self.audit())['audit_sha256'],
                 'authorization': 'User answered "I approve" to the explicit proposal for one additional charter review in this retained room and session.',
-                'diagnosis': 'Three prior source/spec review intents remain; the newly approved charter needs one exact review.',
+                'diagnosis': 'Four prior source/spec review intents remain; the newly approved charter needs one exact review.',
                 'request_id': 'one-charter-extension', **changes}
 
     def grant(self):
@@ -126,7 +140,7 @@ class ReviewExtensionFixture(Fixture):
 
     def finish_fourth(self):
         self.fake.finish('engineer', json.dumps({'interpretation': 'Exact next charter only.', 'findings': [],
-                         'decision': 'accept', 'spec_revision': 2, 'spec_sha256': self.target_spec['sha256']}))
+                         'decision': 'accept', 'spec_revision': 3, 'spec_sha256': self.target_spec['sha256']}))
         return self.service.ao_room_sync(self.room)
 
 
@@ -138,11 +152,11 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         audited = self.audit()
         self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
         self.assertEqual(len(self.fake.posts), posts)
-        self.assertEqual(audited['prior_spec_review_attempts'], 3)
+        self.assertEqual(audited['prior_spec_review_attempts'], 4)
         self.assertEqual(self.state()['acceptances'][-1]['candidate_sha256'], self.accepted['candidate_sha256'])
         self.assertIsNone(self.state()['checkpoint'])
         self.assertNotIn('spec_review_extension', self.state())
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
+        with self.assertRaisesRegex(ao.RoomError, 'debate budget'):
             self.send('spec_review', 'ungranted-fourth')
 
     def test_one_grant_preserves_state_and_one_completed_fourth_intent_exhausts_it(self):
@@ -171,7 +185,7 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         self.assertEqual(self.state()['acceptances'], before['acceptances'])
         for request_id, request in before['requests'].items():
             self.assertEqual(self.state()['requests'][request_id], request)
-        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
             self.send('spec_review', 'fifth-charter')
         posts = len(self.fake.posts)
         self.assertEqual(self.send('spec_review', 'fourth-charter')['state'], 'completed')
@@ -341,7 +355,7 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         self.grant()
         self.send('spec_review', 'sync-fourth')
         self.fake.finish('engineer', json.dumps({'interpretation': 'Exact next charter only.', 'findings': [],
-                         'decision': 'accept', 'spec_revision': 2, 'spec_sha256': self.target_spec['sha256']}))
+                         'decision': 'accept', 'spec_revision': 3, 'spec_sha256': self.target_spec['sha256']}))
         posts = len(self.fake.posts)
         original_state = self.state()
         consumption_path = extension._consumptions(self.directory())[0]
@@ -390,24 +404,35 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         self.assertEqual(len(self.fake.posts), posts)
 
     def test_existing_three_acceptance_attempts_get_no_extra_allowance(self):
+        self.grant()
+        self.send('spec_review', 'extension-review')
+        self.finish_fourth()
+        # The extension's accepted charter supports one fresh engineering round on revision 3;
+        # acceptance keeps its own three-attempt allowance, which the grant never extends.
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation', 'implementation-rev3')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
         for request_id in ('acceptance-two', 'acceptance-three'):
+            self.service.ao_room_verify(self.room, str(self.repo))
             self.send('acceptance_review', request_id)
             request = self.state()['requests'][request_id]
             self.fake.finish('reviewer', json.dumps({**request['review'], 'decision': 'approved', 'review': 'Exact candidate independently checked.'}))
             self.service.ao_room_sync(self.room)
-        self.grant()
         self.assertEqual(sum(r['role'] == 'reviewer' for r in self.state()['requests'].values()), 3)
+        self.service.ao_room_verify(self.room, str(self.repo))
         with self.assertRaisesRegex(ao.RoomError, 'Three review attempts'):
             self.send('acceptance_review', 'acceptance-four')
         self.assertEqual(ao.MAX_REVIEW_ATTEMPTS, 3)
 
     def test_requires_registered_exact_next_charter_and_retained_accepted_candidate(self):
         self.register()
-        for changed in ({'spec_revision': 1}, {'spec_revision': 3}, {'spec_sha256': '0' * 64},
+        for changed in ({'spec_revision': 1}, {'spec_revision': 4}, {'spec_sha256': '0' * 64},
                         {'retained_candidate_sha256': '0' * 64}, {'native_session_id': 'another-native-owner'}):
             with self.subTest(changed=changed), self.assertRaises(ao.RoomError):
                 self.audit(**changed)
-        self.service.ao_room_spec_put(self.room, 3, 'Another charter.', self.gates, 'Another exact approval')
+        self.service.ao_room_spec_put(self.room, 4, 'Another charter.', self.gates, 'Another exact approval')
         with self.assertRaisesRegex(ao.RoomError, 'exact next charter'):
             self.audit()
 
@@ -417,7 +442,7 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         with self.assertRaisesRegex(ao.RoomError, 'accepted candidate'):
             self.audit()
         (self.repo / 'feature.txt').write_bytes(original)
-        request = self.state()['requests']['charter-1']
+        request = self.state()['requests']['charter-2']
         path = self.directory() / request['receipt']
         path.write_text('{}')
         with self.assertRaisesRegex(ao.RoomError, 'receipt was modified'):
@@ -579,7 +604,7 @@ class ReviewExtensionTests(ReviewExtensionFixture):
             with self.assertRaises(OSError):
                 self.service.ao_room_spec_review_extend(**inputs)
         path = extension._pending(self.directory())[0]
-        record = ao.read(path); record['maximum_spec_review_attempts'] = 5
+        record = ao.read(path); record['maximum_spec_review_attempts'] = 6
         ao.atomic(path, record)
         with self.assertRaisesRegex(ao.RoomError, 'recomputed grant'):
             self.service.ao_room_spec_review_extend(**inputs)
@@ -631,8 +656,8 @@ class ReviewExtensionTests(ReviewExtensionFixture):
     def test_changed_charter_native_owner_cannot_use_committed_grant(self):
         self.grant()
         before = (self.directory() / 'state.json').read_bytes()
-        with self.assertRaisesRegex(ao.RoomError, 'unused fourth-review grant'):
-            self.service.ao_room_spec_put(self.room, 3, 'Another authorized scope.', self.gates, 'Another exact approval')
+        with self.assertRaisesRegex(ao.RoomError, 'unused review-extension grant'):
+            self.service.ao_room_spec_put(self.room, 4, 'Another authorized scope.', self.gates, 'Another exact approval')
         self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
         with sqlite3.connect(self.database) as db:
             db.execute("UPDATE sessions SET provider_conversation_id='replacement'")
@@ -640,7 +665,7 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold'):
             self.send('spec_review', 'wrong-native')
         self.assertNotIn('wrong-native', self.state()['requests'])
-        self.assertTrue(self.state()['requests']['implementation']['semantic_status']['hold'])
+        self.assertTrue(self.state()['requests']['charter-4']['semantic_status']['hold'])
         with self.assertRaisesRegex(ao.RoomError, 'Native owner differs'):
             extension._owner(self.state(), str(self.database), self.NATIVE, str(self.repo))
         with sqlite3.connect(self.database) as db:
@@ -663,12 +688,12 @@ class ReviewExtensionTests(ReviewExtensionFixture):
         self.register()
         self.fake.snapshots['engineer']['turns'][-1]['error'] = {'type': 'quota_limit'}
         self.service.ao_room_sync(self.room)
-        original = self.state()['requests']['implementation']
+        original = self.state()['requests']['charter-4']
         self.assertTrue(original['semantic_status']['hold'])
         self.grant()
         with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
             self.send('spec_review', 'fourth-on-hold')
-        self.assertEqual(self.state()['requests']['implementation'], original)
+        self.assertEqual(self.state()['requests']['charter-4'], original)
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
 
     def test_existing_provider_gate_still_runs_after_extension_admission(self):
@@ -742,7 +767,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         self.assertEqual((self.directory() / first['path']).read_bytes(), original)
         self.assertEqual(self.state()['instruction_amendments'][:2],
                          [{'path': first['path'], 'sha256': first['sha256']}, {'path': second['path'], 'sha256': second['sha256']}])
-        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
             self.send('spec_review', 'fifth')
         state = self.state(); state['instruction_amendments'].pop(0)
         ao.atomic(self.directory() / 'state.json', state)
@@ -853,22 +878,22 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         else:
             snapshot['sessionFailures'] = [{'type': 'unclassified'}]
         self.service.ao_room_sync(self.room)
-        original_request = self.state()['requests']['implementation']
+        original_request = self.state()['requests']['charter-4']
         original_outcome = (self.directory() / original_request['semantic_outcome']).read_bytes()
         path = self.write_native(self.root / 'native-first')
         first = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(path))
         self.assertEqual(first['outcome']['kind'], kind)
         if kind == 'quota_limit':
-            self.service.ao_room_outcome_resume(self.room, 'implementation', first['outcome_sha256'], 'fourth-after-source',
+            self.service.ao_room_outcome_resume(self.room, 'charter-4', first['outcome_sha256'], 'fourth-after-source',
                 'The original correlated quota stop was diagnosed.', 'Actual approval for only the named continuation.')
-        previous = self.state()['requests']['implementation']
+        previous = self.state()['requests']['charter-4']
         release_bytes = ((self.directory() / previous['outcome_resume']).read_bytes() if previous.get('outcome_resume') else None)
         snapshot['turns'][-1].pop('error', None)
         snapshot['sessionFailures'] = []
         moved_folder = self.root / 'native-moved'; moved_folder.mkdir()
         moved_path = moved_folder / path.name; path.rename(moved_path)
         moved = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(moved_path))
-        current = self.state()['requests']['implementation']
+        current = self.state()['requests']['charter-4']
         self.assertEqual(moved['outcome'], first['outcome'])
         self.assertTrue(moved['outcome']['hold'])
         self.assertNotEqual(moved['outcome_sha256'], first['outcome_sha256'])
@@ -902,7 +927,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         source = self.state()['native_outcome_source']
         snapshot = self.fake.snapshots['engineer']
         path = Path(source['transcript']); raw = path.read_bytes()
-        before = self.state()['requests']['implementation']
+        before = self.state()['requests']['charter-4']
         old_release = (self.directory() / before['outcome_resume']).read_bytes()
         if ambiguity == 'ao':
             snapshot['sessionFailures'] = [{'type': 'unclassified'}]
@@ -915,29 +940,29 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         self.assertEqual(uncertain['observation_outcome']['kind'], 'unknown')
         self.assertFalse(uncertain['resume_eligible'])
         self.assertNotEqual(uncertain['outcome_sha256'], before['semantic_outcome_sha256'])
-        unknown_request = self.state()['requests']['implementation']
+        unknown_request = self.state()['requests']['charter-4']
         unknown_bytes = (self.directory() / unknown_request['semantic_outcome']).read_bytes()
         with self.assertRaisesRegex(ao.RoomError, 'eligible diagnosed failure'):
-            self.service.ao_room_outcome_resume(self.room, 'implementation', uncertain['outcome_sha256'], 'fourth-after-source',
+            self.service.ao_room_outcome_resume(self.room, 'charter-4', uncertain['outcome_sha256'], 'fourth-after-source',
                 'Unknown evidence is not a diagnosis.', 'Synthetic approval cannot bypass ambiguous evidence.')
         snapshot['sessionFailures'] = []
         if not path.exists(): path.write_bytes(raw)
         # A quiet automatic observation retains the unresolved diagnosis; only
         # an explicit healthy audit can update it, while preserving known quota.
         self.service.ao_room_sync(self.room)
-        automatic = self.state()['requests']['implementation']
+        automatic = self.state()['requests']['charter-4']
         self.assertEqual(ao.read(self.directory() / automatic['semantic_outcome'])['observation_outcome']['kind'], 'unknown')
         healthy = self.service.ao_room_outcome_audit(self.room)
         self.assertEqual(healthy['outcome']['kind'], 'quota_limit')
         self.assertTrue(healthy['outcome']['hold'])
         self.assertIsNone(healthy['observation_outcome'])
         self.assertTrue(healthy['resume_eligible'])
-        self.assertIn('resolved_observation_sha256', ao.read(self.directory() / self.state()['requests']['implementation']['semantic_outcome']))
+        self.assertIn('resolved_observation_sha256', ao.read(self.directory() / self.state()['requests']['charter-4']['semantic_outcome']))
         self.assertEqual((self.directory() / before['outcome_resume']).read_bytes(), old_release)
         self.assertEqual((self.directory() / unknown_request['semantic_outcome']).read_bytes(), unknown_bytes)
         with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
             self.send('spec_review', 'unnamed-after-unknown')
-        self.service.ao_room_outcome_resume(self.room, 'implementation', healthy['outcome_sha256'], 'fourth-after-source',
+        self.service.ao_room_outcome_resume(self.room, 'charter-4', healthy['outcome_sha256'], 'fourth-after-source',
             'Complete evidence now resolves the ambiguity; original quota stop remains.',
             'Actual fresh approval for the same named continuation and this exact outcome.')
         self.assertEqual(self.send('spec_review', 'fourth-after-source')['state'], 'submitted')
@@ -955,9 +980,9 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
         snapshot = self.fake.snapshots['engineer']
         snapshot['turns'][-1]['error'] = {'type': 'rate_limit'}
         first = self.service.ao_room_outcome_audit(self.room)
-        self.service.ao_room_outcome_resume(self.room, 'implementation', first['outcome_sha256'], 'named-successor',
+        self.service.ao_room_outcome_resume(self.room, 'charter-4', first['outcome_sha256'], 'named-successor',
             'Original quota failure diagnosis.', 'Actual approval for this single named successor.')
-        previous = self.state()['requests']['implementation']
+        previous = self.state()['requests']['charter-4']
         original_release_path = previous['outcome_resume']
         release_bytes = (self.directory() / previous['outcome_resume']).read_bytes()
         for cycle in (1, 2):
@@ -969,7 +994,7 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             state = self.state()
             with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
                 gate(self.service, self.directory(), state, 'engineer', 'named-successor', snapshot)
-            ambiguous = self.state()['requests']['implementation']
+            ambiguous = self.state()['requests']['charter-4']
             self.assertNotEqual(ambiguous['semantic_outcome_sha256'], previous['semantic_outcome_sha256'])
             audit = self.service.ao_room_outcome_audit(self.room)
             self.assertEqual(audit['outcome']['kind'], 'quota_limit')
@@ -977,15 +1002,15 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
             self.assertNotEqual(audit['outcome_sha256'], previous['semantic_outcome_sha256'])
             with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
                 gate(self.service, self.directory(), self.state(), 'engineer', 'named-successor', snapshot)
-            self.service.ao_room_outcome_resume(self.room, 'implementation', audit['outcome_sha256'], 'named-successor',
+            self.service.ao_room_outcome_resume(self.room, 'charter-4', audit['outcome_sha256'], 'named-successor',
                 'Explicit resolution of uncertainty cycle ' + str(cycle), 'Actual fresh approval for the exact current outcome.')
-            current = self.state()['requests']['implementation']
+            current = self.state()['requests']['charter-4']
             current_hash = current['semantic_outcome_sha256']
             gate(self.service, self.directory(), self.state(), 'engineer', 'named-successor', snapshot)
-            self.assertEqual(self.state()['requests']['implementation']['semantic_outcome_sha256'], current_hash)
+            self.assertEqual(self.state()['requests']['charter-4']['semantic_outcome_sha256'], current_hash)
             previous = current
         self.assertEqual((self.directory() / original_release_path).read_bytes(), release_bytes)
-        self.assertNotEqual(self.state()['requests']['implementation']['outcome_resume'], original_release_path)
+        self.assertNotEqual(self.state()['requests']['charter-4']['outcome_resume'], original_release_path)
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 1)
 
     def test_provider_and_routing_replacement_refuse_before_intents_and_used_reviewer_stays_used(self):
@@ -1295,6 +1320,11 @@ class ExtensionConfiguredIdempotenceTests(AdoptionFixture):
         self.fake.snapshots['engineer']['controller'] = 'ready'
         self.implement(); self.review()
         self.accepted = self.service.ao_room_accept(self.room, 'acceptance_review')
+        # The adopted room held two non-accepting reviews and one acceptance; one more
+        # non-accepting review of the next revision exhausts the debate budget. It dispatches
+        # while the native attachment lease is still held.
+        self.spec(2)
+        self.agree(decision='changes_required', revision=2, key='charter-4')
         attachment.stdin.close(); attachment.wait(timeout=10)
         self.fake.snapshots['engineer']['controller'] = 'stopped'
         # The grant reuses the synthetic native source registered at bind time; the owner database
@@ -1327,7 +1357,7 @@ from ao_reviewer_recovery import _saved_audit, _store_once
 class SyntheticService:
     @contextlib.contextmanager
     def locked(self, room_id):
-        yield directory, {'spec_record_sha256': 'a' * 64}
+        yield directory, {'spec_record_sha256': 'a' * 64, 'requests': {}}
 
 with tempfile.TemporaryDirectory() as temp:
     directory = Path(temp).resolve()
@@ -1390,6 +1420,67 @@ class CompactionOwnerScopeTests(unittest.TestCase):
             record = {'native': {'source': source, 'compaction_imports': [proof]}}
             with self.subTest(source=source), patch.object(ao_outcomes, 'load', return_value=record):
                 self.assertEqual(ao_outcomes.known_compaction_turns(None, state, snapshot), set())
+
+
+
+
+class DebateEligibilityTests(ReviewExtensionFixture):
+    """The audit needs the debate budget exhausted; elapsed dispatches alone are not enough."""
+
+    def exhaust_debate(self):
+        # Two non-accepting reviews of revision 2 leave one debate attempt unspent.
+        self.spec(2)
+        for number in range(2, 4):
+            self.agree(decision='changes_required', revision=2, key='charter-' + str(number))
+
+    def test_audit_refuses_while_a_debate_attempt_remains(self):
+        self.register()
+        self.assertEqual(ao_spec_review_budget.debate_attempts(self.directory(), self.state()), 2)
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted debate budget'):
+            self.audit()
+        # A third ordinary review of the same charter stays admitted and exhausts the budget.
+        self.agree(decision='changes_required', revision=2, key='charter-4')
+        self.assertEqual(ao_spec_review_budget.dispatches(self.state()), 4)
+        self.assertEqual(ao_spec_review_budget.debate_attempts(self.directory(), self.state()), 3)
+
+
+class AdditionalIntentCeilingTests(ReviewExtensionFixture):
+    def test_consumed_additional_intent_leaves_only_the_hard_ceiling(self):
+        self.grant()
+        self.send('spec_review', 'fifth-charter')
+        self.finish_fourth()
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'Five Fable spec-review dispatches reached the room ceiling'):
+            self.send('spec_review', 'sixth-charter')
+        self.assertNotIn('sixth-charter', self.state()['requests'])
+        self.assertEqual(len(self.fake.posts), posts)
+
+
+class DispatchCeilingFixture(ReviewExtensionFixture):
+    """All five spec-review dispatches spent while only two completed reviews count as debate."""
+
+    def accept_charter(self):
+        self.agree(key='charter-1')
+
+    def exhaust_debate(self):
+        for number in (2, 3):
+            self.agree(decision='changes_required', key='charter-' + str(number))
+        for number in (4, 5):
+            self.agree(key='charter-' + str(number))
+
+
+class DispatchCeilingTests(DispatchCeilingFixture):
+    def test_five_dispatches_refuse_audit_and_any_further_review(self):
+        self.assertEqual(ao_spec_review_budget.dispatches(self.state()), 5)
+        self.assertEqual(ao_spec_review_budget.debate_attempts(self.directory(), self.state()), 2)
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'Five Fable spec-review dispatches reached the room ceiling'):
+            self.send('spec_review', 'sixth-charter')
+        self.assertNotIn('sixth-charter', self.state()['requests'])
+        self.assertEqual(len(self.fake.posts), posts)
+        with self.assertRaisesRegex(ao.RoomError, 'below the dispatch ceiling'):
+            self.service.ao_room_spec_review_extension_audit(
+                self.room, 2, '0' * 64, '0' * 64, self.NATIVE, str(self.database))
 
 
 if __name__ == '__main__':
