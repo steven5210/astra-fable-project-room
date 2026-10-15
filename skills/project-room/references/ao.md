@@ -297,8 +297,11 @@ Codex task discovers updated MCP tools after plugin installation.
    `findings`, `decision` (`accept` or `changes_required`), `spec_revision` and
    `spec_sha256`. Findings prefixed `BLOCKER:` prevent agreement. Sync the completed
    turn before another send. Agreement binds that actual receipt to Astra's exact
-   approved spec. Three spec-review attempts are available across revisions; no
-   automatic renewal. An actual new user approval can grant one further review
+   approved spec. Only completed reviews that did not accept consume the
+   debate budget: three non-accepting completed reviews exhaust it across
+   revisions, with no automatic renewal, while every dispatched intent counts
+   toward the hard ceiling of five spec-review dispatches regardless of
+   outcome. An actual new user approval can grant one further review
    as the room's one-ever extension: see
    [one additional AO charter review](../../../docs/guides/one-charter-review-extension.md)
    for a room with a retained acceptance, or
@@ -357,7 +360,7 @@ Codex task discovers updated MCP tools after plugin installation.
    correction turns until a revised charter is registered as the exact next
    revision and Fable reaches a renewed exact-spec agreement on it. The room's
    one-ever extension (above) can instead grant one additional exact-spec review
-   of that registered revision for that exact proposal; that fourth review's own
+   of that registered revision for that exact proposal; that additional review's own
    agreement is the renewed agreement itself, never a substitute for it or for
    implementation authority. Unknown delivery stays blocked. Commit, if needed, before the final
    engineering response is captured: later changes to HEAD/index/files invalidate

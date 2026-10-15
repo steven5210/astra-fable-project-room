@@ -16,7 +16,7 @@ class RoutingRefreshGrantTests(ReviewExtensionFixture):
 
     def test_unused_and_inflight_fourth_review_stay_blocked(self):
         self.grant()
-        with self.assertRaisesRegex(ao.RoomError, 'unused fourth-review'):
+        with self.assertRaisesRegex(ao.RoomError, 'unused review-extension'):
             self.guard()
         self.send('spec_review', 'fourth')
         with self.assertRaisesRegex(ao.RoomError, 'completed accepted'):
@@ -38,7 +38,7 @@ class RoutingRefreshGrantTests(ReviewExtensionFixture):
         self.grant(); self.send('spec_review', 'fourth')
         self.fake.finish('engineer', json.dumps({'interpretation': 'A conflict remains.',
             'findings': ['BLOCKER: Need a product decision'], 'decision': 'changes_required',
-            'spec_revision': 2, 'spec_sha256': self.target_spec['sha256']}))
+            'spec_revision': 3, 'spec_sha256': self.target_spec['sha256']}))
         self.service.ao_room_sync(self.room)
         with self.assertRaisesRegex(ao.RoomError, 'rejected'):
             self.guard()
@@ -62,7 +62,7 @@ class RoutingRefreshGrantTests(ReviewExtensionFixture):
 
     def test_changed_exact_spec_cannot_reuse_prior_fourth_agreement(self):
         self.grant(); self.send('spec_review', 'fourth'); self.finish_fourth()
-        self.service.ao_room_spec_put(self.room, 3, 'A different authorized charter.',
+        self.service.ao_room_spec_put(self.room, 4, 'A different authorized charter.',
                                      self.gates, 'Actual approval of this different charter')
         before = copy.deepcopy(self.state()); posts = len(self.fake.posts)
         with self.assertRaisesRegex(ao.RoomError, 'current exact spec'):

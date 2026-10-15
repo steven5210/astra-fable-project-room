@@ -30,11 +30,13 @@ from test_ao_review_extension import ReviewExtensionFixture
 
 
 class PreAcceptanceFixture(ReviewExtensionFixture):
-    """A normal room through its three agreed charter reviews; no acceptance, no implementation yet.
+    """A normal room through one agreed charter review; no acceptance, no implementation yet.
 
     The pre-acceptance lane applies only before any independent acceptance, so this fixture stops
     short of ``ReviewExtensionFixture.setUp``'s own implement/review/accept and instead lets each
     test propose its own scope-change completion (or a normal one, for the negative-path tests).
+    ``CHARTER_REVIEWS`` is the number of non-accepting reviews ``exhaust_debate`` completes on
+    revision 2 after that proposal; the default 3 exhausts the debate budget at 4 dispatches.
     """
 
     CHARTER_REVIEWS = 3
@@ -57,8 +59,7 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         for snapshot in self.fake.snapshots.values():
             snapshot.update(controller='ready', branchMaterialization={'strategy': 'native', 'replayTruncated': False})
         self.bind()
-        for number in range(1, self.CHARTER_REVIEWS + 1):
-            self.agree(key='charter-' + str(number))
+        self.agree(key='charter-1')
         self.target_spec = None
 
     def after_restore(self):
@@ -67,6 +68,12 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         # synthetic AO database must keep the genuine reader so owner/branch/workspace negatives
         # observe real bytes. Only the fake's request closure needs re-binding after a restore.
         self._install_raw_request()
+
+    def exhaust_debate(self):
+        """Revision 2 and its non-accepting reviews: the exhausted debate budget for this room."""
+        self.spec(2)
+        for number in range(2, self.CHARTER_REVIEWS + 2):
+            self.agree(decision='changes_required', revision=2, key='charter-' + str(number))
 
     def room_files(self):
         """Every file under this room's own directory, keyed by its relative path.
@@ -88,7 +95,7 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
 
     def register(self):
         if self.target_spec is None:
-            self.target_spec = self.service.ao_room_spec_put(self.room, 2,
+            self.target_spec = self.service.ao_room_spec_put(self.room, 3,
                 'Review the newly authorized validation charter after the proposed scope change.',
                 self.gates, 'Astra approves this exact next charter under the actual scope decision')
         return self.target_spec
@@ -128,7 +135,7 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
 
     def audit(self, **changes):
         spec = self.register()
-        inputs = {'room_id': self.room, 'spec_revision': 2, 'spec_sha256': spec['sha256'],
+        inputs = {'room_id': self.room, 'spec_revision': 3, 'spec_sha256': spec['sha256'],
                   'scope_request_id': 'implementation', 'native_session_id': self.NATIVE,
                   'native_owner_database': str(self.database)}
         if 'candidate_sha256' not in changes:
@@ -142,7 +149,7 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         return {'room_id': self.room, 'audit_sha256': (audit or self.audit())['audit_sha256'],
                 'authorization': ('User answered "I approve" to the explicit proposal for one additional charter '
                                   'review before any acceptance, in this retained room and session.'),
-                'diagnosis': 'Three prior source/spec review intents remain; the scope-change charter needs one exact review.',
+                'diagnosis': 'Three non-accepting reviews exhausted the debate budget; the scope-change charter needs one exact review.',
                 'request_id': 'pre-acceptance-extension', **changes}
 
     def grant(self):
@@ -190,8 +197,14 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         return path
 
     def moved_source_hold(self, kind):
-        """Copied from ``ExtensionEvolutionTests.moved_source_hold``, with its own scope-change grant."""
+        """Copied from ``ExtensionEvolutionTests.moved_source_hold``, with its own scope-change grant.
+
+        The held request is the latest completed spec review (``charter-4``): under debate counting
+        the scope-change implementation precedes the three non-accepting reviews, so only the last
+        review stays the latest engineer request the outcome audits target.
+        """
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         snapshot = self.fake.snapshots['engineer']
         if kind == 'quota_limit':
@@ -199,22 +212,22 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         else:
             snapshot['sessionFailures'] = [{'type': 'unclassified'}]
         self.service.ao_room_sync(self.room)
-        original_request = self.state()['requests']['implementation']
+        original_request = self.state()['requests']['charter-4']
         original_outcome = (self.directory() / original_request['semantic_outcome']).read_bytes()
         path = self.write_native(self.root / 'native-first')
         first = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(path))
         self.assertEqual(first['outcome']['kind'], kind)
         if kind == 'quota_limit':
-            self.service.ao_room_outcome_resume(self.room, 'implementation', first['outcome_sha256'], 'fourth-after-source',
+            self.service.ao_room_outcome_resume(self.room, 'charter-4', first['outcome_sha256'], 'fourth-after-source',
                 'The original correlated quota stop was diagnosed.', 'Actual approval for only the named continuation.')
-        previous = self.state()['requests']['implementation']
+        previous = self.state()['requests']['charter-4']
         release_bytes = ((self.directory() / previous['outcome_resume']).read_bytes() if previous.get('outcome_resume') else None)
         snapshot['turns'][-1].pop('error', None)
         snapshot['sessionFailures'] = []
         moved_folder = self.root / 'native-moved'; moved_folder.mkdir()
         moved_path = moved_folder / path.name; path.rename(moved_path)
         moved = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(moved_path))
-        current = self.state()['requests']['implementation']
+        current = self.state()['requests']['charter-4']
         self.assertEqual(moved['outcome'], first['outcome'])
         self.assertTrue(moved['outcome']['hold'])
         self.assertNotEqual(moved['outcome_sha256'], first['outcome_sha256'])
@@ -239,7 +252,7 @@ class AcceptedLaneUnchangedTests(ReviewExtensionFixture):
         spec = self.register()
         with self.assertRaisesRegex(ao.RoomError, 'zero retained independent acceptances'):
             self.service.ao_room_preacceptance_review_audit(
-                room_id=self.room, spec_revision=2, spec_sha256=spec['sha256'], scope_request_id='implementation',
+                room_id=self.room, spec_revision=3, spec_sha256=spec['sha256'], scope_request_id='implementation',
                 candidate_sha256='0' * 64, native_session_id=self.NATIVE, native_owner_database=str(self.database))
 
     def test_accepted_lane_audit_grant_and_meaning_carry_no_lane_field(self):
@@ -253,7 +266,7 @@ class AcceptedLaneUnchangedTests(ReviewExtensionFixture):
         self.assertNotIn('lane', self.state()['spec_review_extension'])
         self.assertEqual(granted['lane'], extension.ACCEPTED)
         self.assertEqual(extension.MEANINGS[extension.ACCEPTED],
-                         'One fourth charter-review intent only; source-review and acceptance allowances and all holds stay unchanged')
+                         'One additional charter-review intent only; source-review and acceptance allowances and all holds stay unchanged')
 
 
 class PreAcceptanceEligibilityTests(PreAcceptanceFixture):
@@ -261,6 +274,7 @@ class PreAcceptanceEligibilityTests(PreAcceptanceFixture):
 
     def test_eligible_room_audits_then_grants_once_and_the_fourth_send_consumes_it(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Registering the exact next charter is itself a precondition, not the audit's own effect.
         before = (self.directory() / 'state.json').read_bytes()
         posts = len(self.fake.posts)
@@ -271,7 +285,7 @@ class PreAcceptanceEligibilityTests(PreAcceptanceFixture):
         self.assertEqual(audited['lane'], extension.PRE)
         self.assertEqual(audited['acceptances'], 0)
         self.assertEqual(audited['candidate_status'], 'unaccepted_unverified')
-        self.assertEqual(audited['prior_spec_review_attempts'], 3)
+        self.assertEqual(audited['prior_spec_review_attempts'], 4)
         self.assertEqual(audited['scope_proposal']['request_id'], 'implementation')
         self.assertEqual(audited['scope_proposal']['outcome'], 'scope_change')
         self.assertEqual(audited['scope_proposal']['evidence'], 'engineering_record')
@@ -279,7 +293,7 @@ class PreAcceptanceEligibilityTests(PreAcceptanceFixture):
         self.assertEqual(self.state()['acceptances'], [])
         self.assertIsNone(self.state().get('checkpoint'))
         self.assertNotIn('spec_review_extension', self.state())
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
+        with self.assertRaisesRegex(ao.RoomError, 'Three non-accepting Fable spec reviews exhausted the debate budget'):
             self.send('spec_review', 'ungranted-fourth')
         granted = self.grant()
         self.assertEqual(granted['lane'], extension.PRE)
@@ -296,7 +310,7 @@ class PreAcceptanceEligibilityTests(PreAcceptanceFixture):
         self.assertTrue(status['agreement']['agreed'])
         self.assertEqual(status['spec_review_extension']['remaining_spec_reviews'], 0)
         self.assertEqual(status['spec_review_extension']['consumed_by'], 'fourth')
-        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'Five Fable spec-review dispatches reached the room ceiling'):
             self.send('spec_review', 'fifth')
         posts = len(self.fake.posts)
         self.assertEqual(self.send('spec_review', 'fourth')['state'], 'completed')
@@ -317,6 +331,7 @@ class PreAcceptanceReportFormTests(PreAcceptanceFixture):
 
     def test_full_report_form_is_accepted(self):
         self.propose_scope_change()  # the default full form: no report_format key.
+        self.exhaust_debate()
         audited = self.audit()
         self.assertTrue(audited['eligible'])
         self.assertEqual(audited['scope_proposal']['evidence'], 'engineering_record')
@@ -330,6 +345,7 @@ class PreAcceptanceReportFormTests(PreAcceptanceFixture):
                    'backlog': [], 'routing_log': []}
         self.fake.finish('engineer', json.dumps(compact))
         self.service.ao_room_sync(self.room)
+        self.exhaust_debate()
         request = self.state()['requests']['implementation']
         self.assertIsNotNone(request.get('engineering_record'))
         audited = self.audit()
@@ -342,10 +358,11 @@ class PreAcceptanceRevisionTests(PreAcceptanceFixture):
 
     def test_wrong_spec_revision_or_sha256_refuses_the_audit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         spec = self.register()
         with self.assertRaisesRegex(ao.RoomError, 'Register the exact next charter revision'):
             self.service.ao_room_preacceptance_review_audit(
-                room_id=self.room, spec_revision=3, spec_sha256=spec['sha256'], scope_request_id='implementation',
+                room_id=self.room, spec_revision=4, spec_sha256=spec['sha256'], scope_request_id='implementation',
                 candidate_sha256=self.candidate_sha256(), native_session_id=self.NATIVE,
                 native_owner_database=str(self.database))
         with self.assertRaisesRegex(ao.RoomError, 'Register the exact next charter revision'):
@@ -356,8 +373,9 @@ class PreAcceptanceRevisionTests(PreAcceptanceFixture):
 
     def test_registering_a_further_charter_between_audit_and_grant_makes_the_audit_stale(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         audited = self.audit()
-        self.service.ao_room_spec_put(self.room, 3, 'A further charter registered before granting.',
+        self.service.ao_room_spec_put(self.room, 4, 'A further charter registered before granting.',
             self.gates, 'Astra approves this further scope decision')
         with self.assertRaisesRegex(ao.RoomError, 'Register the exact next charter revision'):
             self.service.ao_room_preacceptance_review_extend(
@@ -365,11 +383,31 @@ class PreAcceptanceRevisionTests(PreAcceptanceFixture):
                 diagnosis='Diagnosis for the stale-audit scenario.', request_id='stale-after-further-charter')
 
 
+    def test_debate_reviews_of_later_charters_still_audit_against_their_handoff_agreement(self):
+        """The debate that exhausted the budget may review later registered charters, not only the
+        handoff's own revision: the agreed review stays anchored by the handoff's saved agreement,
+        and the extension still targets ``prior_revision + 1``."""
+        self.propose_scope_change()
+        for revision in (2, 3, 4):
+            self.spec(revision)
+            self.agree(decision='changes_required', revision=revision, key='charter-' + str(revision))
+        spec = self.service.ao_room_spec_put(self.room, 5,
+            'Review the newly authorized validation charter after the proposed scope change.',
+            self.gates, 'Astra approves this exact next charter under the actual scope decision')
+        audited = self.service.ao_room_preacceptance_review_audit(
+            room_id=self.room, spec_revision=5, spec_sha256=spec['sha256'], scope_request_id='implementation',
+            candidate_sha256=self.candidate_sha256(), native_session_id=self.NATIVE,
+            native_owner_database=str(self.database))
+        self.assertTrue(audited['eligible'])
+        self.assertEqual(audited['prior_spec_review_attempts'], 4)
+
+
 class PreAcceptanceAttributionTests(PreAcceptanceFixture):
     """Coverage item 2: malformed delegate attribution is preserved verbatim and still supports the proposal."""
 
     def test_malformed_delegate_attribution_is_preserved_verbatim_and_still_supports_the_proposal(self):
         self.propose_scope_change(routing_log=[{'delegate_job_ids': ['not-a-provider-job']}])
+        self.exhaust_debate()
         request = self.state()['requests']['implementation']
         self.assertIn('malformed delegate job identifier', request['engineering_error'])
         self.assertEqual(request['reported_delegate_job_ids'], ['not-a-provider-job'])
@@ -392,6 +430,7 @@ class PreAcceptanceZeroAcceptanceTests(PreAcceptanceFixture):
     def test_pre_acceptance_audit_succeeds_with_zero_retained_acceptances(self):
         self.assertEqual(self.state()['acceptances'], [])
         self.propose_scope_change()
+        self.exhaust_debate()
         audited = self.audit()
         self.assertTrue(audited['eligible'])
         self.assertEqual(audited['acceptances'], 0)
@@ -402,11 +441,13 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
 
     def test_unknown_scope_request_id_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
             self.audit(scope_request_id='no-such-request')
 
     def test_scope_request_naming_a_non_implementation_purpose_request_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
             self.audit(scope_request_id='charter-3')
 
@@ -423,6 +464,7 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
         self.send('correction', 'scope-change-correction')
         self.fake.finish('engineer', json.dumps(self.scope_change_report()))
         self.service.ao_room_sync(self.room)
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
             self.audit(scope_request_id='first-implementation', candidate_sha256=self.candidate_sha256('first-implementation'))
 
@@ -454,18 +496,32 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
         self.send('implementation')
         self.fake.finish('engineer', json.dumps(self.report()))  # outcome == 'completed', not scope_change.
         self.service.ao_room_sync(self.room)
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
             self.audit(candidate_sha256=self.candidate_sha256())
 
     def test_quota_held_outcome_refuses_the_audit_until_independently_resolved(self):
+        # A retained outcome flips to a quota hold only while its request is still the latest
+        # engineer request -- sync observes the latest request per role. Under debate counting the
+        # same hold then blocks the debate reviews themselves, so the audit refuses on its
+        # unexhausted-budget eligibility instead of reaching the proposal's own usable() check;
+        # a separate exact outcome audit plus the named resume resolves it.
         self.propose_scope_change()
         self.fake.snapshots['engineer']['turns'][-1]['error'] = {'type': 'rate_limit'}
         self.service.ao_room_sync(self.room)
+        posts = len(self.fake.posts)
         with self.assertRaisesRegex(ao.RoomError, 'Native semantic hold: quota_limit'):
+            self.send('spec_review', 'charter-2')
+        self.assertEqual(len(self.fake.posts), posts)
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted debate budget'):
             self.audit(candidate_sha256=self.candidate_sha256())
+        audited = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(audited['outcome']['kind'], 'quota_limit')
+        self.assertTrue(audited['resume_eligible'])
 
     def test_missing_or_modified_candidate_evidence_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         candidate_sha256 = self.candidate_sha256()
         request = self.state()['requests']['implementation']
         path = self.directory() / request['completion_candidate']
@@ -479,6 +535,7 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
 
     def test_missing_or_modified_engineering_record_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         request = self.state()['requests']['implementation']
         path = self.directory() / request['engineering_record']
         original = path.read_bytes()
@@ -492,11 +549,13 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
 
     def test_wrong_candidate_sha256_refuses_with_the_exact_identity_message(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, 'Use the exact immutable candidate-at-completion identity'):
             self.audit(candidate_sha256='0' * 64)
 
     def test_modified_scope_request_receipt_refuses_the_audit_without_mutation(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()  # Prime self.target_spec so the audit-without-mutation check below is not
                           # attributed to this unrelated, one-time-per-test next-charter registration.
         candidate_sha256 = self.candidate_sha256()
@@ -510,11 +569,28 @@ class PreAcceptanceScopeRequestTests(PreAcceptanceFixture):
         finally:
             path.write_bytes(original)
 
+    def test_tampered_handoff_agreement_anchor_refuses_scope_handoff(self):
+        """The agreed review is the one the handoff's saved agreement names; repointing it at a
+        later non-accepting debate review keeps the bytes and digest consistent but is not the
+        handoff's own agreed review."""
+        self.propose_scope_change()
+        self.exhaust_debate()
+        self.register()
+        state = self.state()
+        handoff = ao.read(self.directory() / state['handoff'])
+        handoff['agreement']['request_id'] = 'charter-2'
+        ao.atomic(self.directory() / state['handoff'], handoff)
+        state['handoff_sha256'] = ao.digest(handoff)
+        ao.atomic(self.directory() / 'state.json', state)
+        self.assert_refuses_without_mutation(extension.SCOPE_HANDOFF,
+            lambda: self.audit(candidate_sha256=self.candidate_sha256()))
+
     def test_changes_required_outcome_report_refuses_with_the_request_message(self):
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation')
         self.fake.finish('engineer', json.dumps(self.report(outcome='changes_required', implementation_complete=False)))
         self.service.ao_room_sync(self.room)
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, extension.SCOPE_REQUEST):
             self.audit(candidate_sha256=self.candidate_sha256())
 
@@ -524,6 +600,7 @@ class PreAcceptanceCandidateDriftTests(PreAcceptanceFixture):
 
     def test_worktree_drift_between_audit_and_grant_refuses_and_restoring_allows_a_fresh_audit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         audited = self.audit()
         (self.repo / 'feature.txt').write_text('drifted\n')
         try:
@@ -541,6 +618,7 @@ class PreAcceptanceCandidateDriftTests(PreAcceptanceFixture):
 
     def test_worktree_drift_between_commit_and_send_refuses_the_fourth_send(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         (self.repo / 'feature.txt').write_text('drifted-after-commit\n')
         try:
@@ -560,13 +638,14 @@ class PreAcceptanceAfterGrantDriftTests(PreAcceptanceFixture):
 
     def test_reregistering_an_unused_charter_refuses_but_an_identical_put_is_idempotent(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         spec = self.register()
         self.audit()
         self.grant()
         with self.assertRaisesRegex(ao.RoomError, 'a different spec was not saved'):
-            self.service.ao_room_spec_put(self.room, 3, 'A further charter after granting.', self.gates,
+            self.service.ao_room_spec_put(self.room, 4, 'A further charter after granting.', self.gates,
                                           'Astra approves a further scope decision')
-        same = self.service.ao_room_spec_put(self.room, 2,
+        same = self.service.ao_room_spec_put(self.room, 3,
             'Review the newly authorized validation charter after the proposed scope change.',
             self.gates, 'Astra approves this exact next charter under the actual scope decision')
         self.assertEqual(same['sha256'], spec['sha256'])
@@ -574,6 +653,7 @@ class PreAcceptanceAfterGrantDriftTests(PreAcceptanceFixture):
 
     def test_native_owner_drift_after_a_committed_grant_blocks_without_mutation(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         with sqlite3.connect(self.database) as db:
             db.execute("UPDATE sessions SET provider_conversation_id='replacement-native'")
@@ -592,6 +672,7 @@ class PreAcceptanceAuthorityTests(PreAcceptanceFixture):
 
     def test_empty_authorization_or_diagnosis_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         audited = self.audit()
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_preacceptance_review_extend(
@@ -604,6 +685,7 @@ class PreAcceptanceAuthorityTests(PreAcceptanceFixture):
 
     def test_wrong_audit_sha256_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.audit()
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_preacceptance_review_extend(
@@ -612,6 +694,7 @@ class PreAcceptanceAuthorityTests(PreAcceptanceFixture):
 
     def test_identical_grant_replay_reconciles_without_a_second_receipt(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         granted = self.grant()
         pending_before = extension._pending(self.directory())
         self.assertEqual(self.service.ao_room_preacceptance_review_extend(**self.inputs), granted)
@@ -619,6 +702,7 @@ class PreAcceptanceAuthorityTests(PreAcceptanceFixture):
 
     def test_changed_payload_replay_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         with self.assertRaisesRegex(ao.RoomError, 'cannot renew or renumber'):
             self.service.ao_room_preacceptance_review_extend(
@@ -634,6 +718,7 @@ class PreAcceptanceAuthorityTests(PreAcceptanceFixture):
 
     def test_cross_lane_grant_refuses_after_a_commit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         with self.assertRaisesRegex(ao.RoomError, 'already belongs to the other lane'):
             self.service.ao_room_spec_review_extend(
@@ -646,6 +731,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
 
     def test_grant_commit_interruption_before_state_write_reconciles_without_a_model_call(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         inputs = self.grant_inputs()
         before = (self.directory() / 'state.json').read_bytes()
         posts = len(self.fake.posts)
@@ -669,13 +755,14 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
 
     def test_pending_receipt_tampering_refuses_reconciliation(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         inputs = self.grant_inputs()
         with patch.object(self.service, 'save', side_effect=OSError('synthetic crash')):
             with self.assertRaisesRegex(OSError, 'synthetic crash'):
                 self.service.ao_room_preacceptance_review_extend(**inputs)
         path = extension._pending(self.directory())[0]
         record = ao.read(path)
-        record['maximum_spec_review_attempts'] = 5
+        record['maximum_spec_review_attempts'] = 6
         ao.atomic(path, record)
         with self.assertRaisesRegex(ao.RoomError, 'recomputed grant'):
             self.service.ao_room_preacceptance_review_extend(**inputs)
@@ -683,6 +770,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
 
     def test_consumption_receipt_without_state_projection_requires_diagnosis_not_resend(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         save = self.service.save
         posts = len(self.fake.posts)
@@ -706,6 +794,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
 
     def test_committed_receipt_and_retained_file_tampering_block_without_mutation(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         pointer = self.state()['spec_review_extension']
         paths = [self.directory() / pointer['receipt'],
@@ -727,6 +816,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
 
     def test_tampered_state_reference_cannot_be_rewritten(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         original = self.state()
         changes = {
@@ -759,6 +849,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
         self.send('correction')
         self.fake.finish('engineer', json.dumps(self.scope_change_report()))
         self.service.ao_room_sync(self.room)
+        self.exhaust_debate()
         self.register()
         audited = self.audit(scope_request_id='correction', candidate_sha256=self.candidate_sha256('correction'))
         self.inputs = self.grant_inputs(audit=audited)
@@ -780,6 +871,7 @@ class PreAcceptanceDurabilityTests(PreAcceptanceFixture):
         ``_retained``'s own manifest-digest loop runs first, on raw bytes, and refuses with its own
         message before the lane-specific scope-proposal re-check is ever reached."""
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         request = self.state()['requests']['implementation']
         paths = [self.directory() / request['completion_candidate'], self.directory() / request['engineering_record']]
@@ -806,6 +898,7 @@ class PreAcceptanceOutcomeSourceTests(PreAcceptanceFixture):
 
     def test_outcome_pointer_move_without_a_hold_does_not_block_admission(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         path = self.write_native(self.root / 'native-first')
         self.service.ao_room_outcome_audit(self.room, ao_database_path=str(self.database), native_transcript_path=str(path))
@@ -830,6 +923,7 @@ class PreAcceptanceLifecycleTests(PreAcceptanceFixture):
 
     def test_full_lifecycle_after_fourth_review_reaches_independent_acceptance(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         self.send('spec_review', 'fourth')
         self.finish_fourth()
@@ -846,6 +940,7 @@ class PreAcceptanceCliMcpTests(PreAcceptanceFixture):
 
     def test_cli_and_mcp_expose_both_new_tools_and_require_explicit_complete_inputs(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         controller = project_room.Service(self.home)
         listed = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, controller)
         names = {item['name'] for item in listed['result']['tools']}
@@ -855,7 +950,7 @@ class PreAcceptanceCliMcpTests(PreAcceptanceFixture):
             with self.assertRaisesRegex(ao.RoomError, 'Invalid arguments'):
                 controller.call('ao_room_preacceptance_review_extend', {'room_id': self.room})
             spec = self.register()
-            audit_inputs = {'room_id': self.room, 'spec_revision': 2, 'spec_sha256': spec['sha256'],
+            audit_inputs = {'room_id': self.room, 'spec_revision': 3, 'spec_sha256': spec['sha256'],
                             'scope_request_id': 'implementation', 'candidate_sha256': self.candidate_sha256(),
                             'native_session_id': self.NATIVE, 'native_owner_database': str(self.database)}
             response = project_room_mcp.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
@@ -903,6 +998,7 @@ class PreAcceptanceBaselineDriftTests(PreAcceptanceFixture):
 
     def test_new_commit_with_identical_working_files_still_refuses_the_fourth_send(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         ao.git(self.repo, 'commit', '--allow-empty', '-m', 'No-op: HEAD moves, working files unchanged')
         self.assert_refuses_without_mutation(
@@ -918,6 +1014,7 @@ class PreAcceptanceSourceDriftTests(PreAcceptanceFixture):
 
     def test_changed_engineer_source_after_grant_refuses(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         original_native = self.write_native(self.root / 'source-register-native')
         with sqlite3.connect(self.database) as db:
@@ -949,6 +1046,7 @@ class PreAcceptanceRoutingDriftTests(PreAcceptanceFixture):
 
     def test_routing_adoption_stage_and_a_fresh_audit_both_refuse_after_the_grant(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         self.assert_refuses_without_mutation('unsupported after that grant',
             lambda: self.service.ao_room_routing_adoption_stage(
@@ -963,6 +1061,7 @@ class PreAcceptanceProviderTransitionDriftTests(PreAcceptanceFixture):
 
     def test_provider_transition_after_grant_refuses_before_any_transition_receipt(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         self.assert_refuses_without_mutation('unsupported after that grant',
             lambda: self.service.ao_room_provider_transition(
@@ -978,6 +1077,7 @@ class PreAcceptanceNativeSettingsDriftTests(PreAcceptanceFixture):
 
     def test_tampered_pinned_reasoning_effort_refuses_the_fourth_send(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         original = self.state()
         tampered = copy.deepcopy(original)
@@ -1016,6 +1116,7 @@ class PreAcceptancePinnedModelDriftTests(PreAcceptanceFixture):
 
     def test_tampered_pinned_engineer_model_refuses_status_and_the_fourth_send_until_restored(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         original = self.state()
         tampered = copy.deepcopy(original)
@@ -1031,12 +1132,13 @@ class PreAcceptancePinnedModelDriftTests(PreAcceptanceFixture):
 
     def test_engineer_model_transition_and_audit_refuse_after_the_grant_with_no_wedge(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         before_files = self.room_files()
         posts = len(self.fake.posts)
         audited = self.service.ao_room_engineer_model_audit(
             self.room, 'claude-some-other-model', str(self.database), str(self.root / 'nonexistent-transition.jsonl'))
-        guard = ('The committed fourth-review grant pins provider and routing identity; engineering model '
+        guard = ('The committed review-extension grant pins provider and routing identity; engineering model '
                  'transition is unsupported after that grant. No transition intent was written')
         self.assertFalse(audited['eligible'])
         self.assertEqual(audited['reason'], guard)
@@ -1056,6 +1158,7 @@ class PreAcceptancePinnedModelDriftTests(PreAcceptanceFixture):
 
     def test_pinned_model_drift_between_audit_and_grant_refuses_the_grant(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         audited = self.audit()
         original = self.state()
         tampered = copy.deepcopy(original)
@@ -1079,6 +1182,7 @@ class PreAcceptanceHistoryBoundsTests(PreAcceptanceFixture):
 
     def test_truncated_native_history_refuses_the_audit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()
         self.fake.snapshots['engineer']['history_truncated'] = True
         try:
@@ -1093,6 +1197,7 @@ class PreAcceptanceHistoryBoundsTests(PreAcceptanceFixture):
 
     def test_oversized_audit_record_refuses_before_publication(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()
         for role in ('engineer', 'reviewer'):
             self.fake.snapshots[role]['activities'].append({
@@ -1122,8 +1227,9 @@ class PreAcceptanceReviewCountBoundaryTests(PreAcceptanceTwoReviewsFixture):
 
     def test_two_consumed_reviews_refuses_the_audit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()
-        self.assert_refuses_without_mutation('exactly three retained review intents',
+        self.assert_refuses_without_mutation('exhausted debate budget',
             lambda: self.audit(candidate_sha256=self.candidate_sha256()))
 
 
@@ -1143,9 +1249,10 @@ class PreAcceptanceCliDispatchTests(PreAcceptanceFixture):
 
     def test_cli_dispatch_prints_the_same_json_as_the_service_for_both_new_tools(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         controller = project_room.Service(self.home)
         spec = self.register()
-        audit_inputs = {'room_id': self.room, 'spec_revision': 2, 'spec_sha256': spec['sha256'],
+        audit_inputs = {'room_id': self.room, 'spec_revision': 3, 'spec_sha256': spec['sha256'],
                         'scope_request_id': 'implementation', 'candidate_sha256': self.candidate_sha256(),
                         'native_session_id': self.NATIVE, 'native_owner_database': str(self.database)}
         with patch.object(ao, 'Service', return_value=self.service):
@@ -1205,6 +1312,7 @@ class PreAcceptanceReviewerRecoveryFixture(PreAcceptanceFixture):
     def verified_after_fourth(self):
         """Grant and consume the fourth review, then implement and verify the newly agreed charter."""
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         self.send('spec_review', 'fourth')
         self.assertTrue(self.finish_fourth()['agreement']['agreed'])
@@ -1471,6 +1579,7 @@ class PreAcceptanceNormalizedProposalTests(PreAcceptanceFixture):
         self.assertEqual(request['engineering_error'], diagnostic)
         self.assertTrue(request.get('engineering_record'))
         self.assertNotIn('normalization_capture_error', request)
+        self.exhaust_debate()
         audited = self.audit()
         self.assertEqual(audited['scope_proposal']['evidence'], 'engineering_record')
         self.assertEqual(audited['scope_proposal']['engineering_error'], diagnostic)
@@ -1531,6 +1640,7 @@ class PreAcceptanceNormalizedProposalTests(PreAcceptanceFixture):
         self.assertNotIn('response_normalization_sha256', request)
         self.assertIsNone(request.get('reported_delegate_job_ids'))
         self.assertIsNone(request.get('delegate_job_ids'))
+        self.exhaust_debate()
         with self.assertRaisesRegex(ao.RoomError, NOT_STRICT_JSON):
             self.audit()
 
@@ -1552,6 +1662,7 @@ class PreAcceptanceReportGapTests(PreAcceptanceFixture):
         self.assertEqual(request['engineering_error'], self.INCOMPLETE)
         self.assertNotIn('engineering_record', request)
         self.assertIsNone(request.get('engineering_record_sha256'))
+        self.exhaust_debate()
         audited = self.audit()
         self.assertEqual(audited['scope_proposal']['evidence'], 'rejected_report_diagnostic')
         self.assertEqual(audited['scope_proposal']['engineering_error'], self.INCOMPLETE)
@@ -1563,6 +1674,7 @@ class PreAcceptanceReportGapTests(PreAcceptanceFixture):
 
     def test_stale_handoff_digest_refuses_the_audit_without_mutation(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()
         original = self.state()
         candidate_sha256 = self.candidate_sha256()
@@ -1624,6 +1736,7 @@ class PreAcceptanceLiveRoutingAuditGrantTests(PreAcceptanceLiveRoutingFixture):
 
     def test_guard_drift_before_the_audit_refuses_with_the_ordinary_message_and_writes_no_audit(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.register()
         audits = self.directory() / extension.BASE / 'audits'
         restore = self.drift(self.guard_path())
@@ -1636,6 +1749,7 @@ class PreAcceptanceLiveRoutingAuditGrantTests(PreAcceptanceLiveRoutingFixture):
 
     def test_agent_file_drift_between_audit_and_grant_refuses_without_a_receipt_until_restored(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         inputs = self.grant_inputs(self.audit())
         restore = self.drift(self.agent_path())
         self.assert_refuses_without_mutation(
@@ -1653,6 +1767,7 @@ class PreAcceptanceLiveRoutingAfterGrantTests(PreAcceptanceLiveRoutingFixture):
 
     def assert_replay_blocks_until_restored(self, path, pattern):
         self.propose_scope_change()
+        self.exhaust_debate()
         granted = self.grant()
         restore = self.drift(path)
         self.assert_refuses_without_mutation(
@@ -1664,6 +1779,7 @@ class PreAcceptanceLiveRoutingAfterGrantTests(PreAcceptanceLiveRoutingFixture):
 
     def assert_fourth_send_blocks_before_consumption_until_restored(self, path, pattern):
         self.propose_scope_change()
+        self.exhaust_debate()
         granted = self.grant()
         restore = self.drift(path)
         self.assert_refuses_without_mutation(pattern, lambda: self.send('spec_review', 'fourth'))
@@ -1699,6 +1815,7 @@ class PreAcceptanceLiveRoutingPendingTests(PreAcceptanceLiveRoutingFixture):
 
     def assert_pending_reconciliation_blocks_until_restored(self, path, pattern):
         self.propose_scope_change()
+        self.exhaust_debate()
         inputs = self.grant_inputs()
         with patch.object(self.service, 'save', side_effect=OSError('synthetic state write interruption')):
             with self.assertRaises(OSError):
@@ -1740,6 +1857,7 @@ class PreAcceptanceLiveRoutingRepairTests(PreAcceptanceLiveRoutingFixture):
         import ao_delegates
         import ao_executable_binding as executable
         self.propose_scope_change()
+        self.exhaust_debate()
         granted = self.grant()
         self.fake.snapshots['engineer']['controller'] = 'stopped'
         target = self.root / 'repair-target'
@@ -1788,6 +1906,7 @@ class PreAcceptanceLiveRoutingRefreshTests(PreAcceptanceLiveRoutingFixture):
     def refresh_after_fourth(self):
         import ao_routing_refresh as refresh
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         self.send('spec_review', 'fourth')
         self.finish_fourth()
@@ -1839,6 +1958,7 @@ class PreAcceptanceOrdinaryRoutingValidationTests(PreAcceptanceLiveRoutingFixtur
         import ao_delegates
         import ao_routing
         self.propose_scope_change()
+        self.exhaust_debate()
         self.grant()
         directory, state = self.directory(), self.state()
         prepared = ao_delegates.preparation(directory, state)

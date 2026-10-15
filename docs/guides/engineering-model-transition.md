@@ -221,7 +221,7 @@ All of the following are required before a transition can be applied:
 - A normal `fable_engineering` room with a bound engineer.
 - A settled room: no active or uncertain request, and no pending journal of
   any kind.
-- No committed fourth charter/specification-review extension grant, used or
+- No committed charter/specification-review extension grant, used or
   unused: it pins provider and routing identity and blocks this
   engineering-model transition. The separate acceptance-review grant blocks
   only while unused. This review-extension restriction is specific to the

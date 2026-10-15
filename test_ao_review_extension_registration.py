@@ -16,8 +16,8 @@ class ReviewExtensionRegistrationTests(ReviewExtensionFixture):
     def test_new_revision_refuses_before_write_and_original_fourth_review_still_completes(self):
         grant = self.grant()
         before, posts = self.files(), copy.deepcopy(self.fake.posts)
-        with self.assertRaisesRegex(ao.RoomError, 'unused fourth-review grant.*different spec was not saved'):
-            self.service.ao_room_spec_put(self.room, 3, 'A different charter needs a separate scope decision.',
+        with self.assertRaisesRegex(ao.RoomError, 'unused review-extension grant.*different spec was not saved'):
+            self.service.ao_room_spec_put(self.room, 4, 'A different charter needs a separate scope decision.',
                                           self.gates, 'Actual approval to propose this new revision')
         self.assertEqual(self.files(), before)
         self.assertEqual(self.fake.posts, posts)
@@ -46,7 +46,7 @@ class ReviewExtensionRegistrationTests(ReviewExtensionFixture):
         self.assertEqual(len(extension._pending(self.directory())), 1)
         before = self.files()
         with self.assertRaisesRegex(ao.RoomError, 'uncommitted review-extension receipt'):
-            self.service.ao_room_spec_put(self.room, 3, 'A different charter.', self.gates, 'Actual new approval')
+            self.service.ao_room_spec_put(self.room, 4, 'A different charter.', self.gates, 'Actual new approval')
         self.assertEqual(self.files(), before)
         reconciled = self.service.ao_room_spec_review_extend(**inputs)
         self.assertEqual(reconciled['remaining_spec_reviews'], 1)
@@ -57,10 +57,10 @@ class ReviewExtensionRegistrationTests(ReviewExtensionFixture):
         self.send('spec_review', 'fourth')
         self.finish_fourth()
         grant = copy.deepcopy(self.state()['spec_review_extension'])
-        self.service.ao_room_spec_put(self.room, 3, 'Explicit later proposed revision.', self.gates, 'Actual later approval')
+        self.service.ao_room_spec_put(self.room, 4, 'Explicit later proposed revision.', self.gates, 'Actual later approval')
         self.assertEqual(self.state()['spec_review_extension'], grant)
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_extension']['remaining_spec_reviews'], 0)
-        with self.assertRaisesRegex(ao.RoomError, 'fourth.*exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
             self.send('spec_review', 'fifth')
         self.assertNotIn('fifth', self.state()['requests'])
 

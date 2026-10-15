@@ -1,4 +1,4 @@
-"""One explicitly authorized fourth Fable charter review, with no dispatch or renewal."""
+"""One explicitly authorized additional Fable charter review, with no dispatch or renewal."""
 
 import copy
 import json
@@ -10,20 +10,23 @@ import time
 import ao_delegates
 import ao_native_identity
 import ao_project_room as ao
+import ao_spec_review_budget
 import ao_workflow
 from ao_reviewer_recovery import _store_once
 from implementation import candidate_snapshot
 from room import RoomError
 
 BASE = 'spec-review-extension'
-LIMIT = 3
+# The debate budget counts only completed reviews that did not accept; the separate dispatch
+# ceiling bounds every spec-review intent. LIMIT stays the exported name for the debate limit.
+LIMIT = ao_spec_review_budget.DEBATE_LIMIT
 # Two lanes share the one extension. The original lane is implicit: its existing audits,
 # receipts and state references never carry a lane field and stay byte-identical.
 ACCEPTED = 'accepted_candidate'
 PRE = 'pre_acceptance'
 MEANINGS = {
-    ACCEPTED: 'One fourth charter-review intent only; source-review and acceptance allowances and all holds stay unchanged',
-    PRE: ('One fourth charter-review intent only, granted before any independent acceptance on an unaccepted, '
+    ACCEPTED: 'One additional charter-review intent only; source-review and acceptance allowances and all holds stay unchanged',
+    PRE: ('One additional charter-review intent only, granted before any independent acceptance on an unaccepted, '
           'unverified candidate; source-review, acceptance and implementation allowances and all holds stay unchanged'),
 }
 SCOPE_HANDOFF = 'Pre-acceptance review extension requires the retained agreed handoff of the latest accepted review'
@@ -292,13 +295,13 @@ def _consumption(directory, state, reference):
     if not paths:
         return None
     if len(paths) != 1:
-        raise RoomError('Multiple fourth-review consumption records exist; preserve them and diagnose without resending')
+        raise RoomError('Multiple review-extension consumption records exist; preserve them and diagnose without resending')
     path = paths[0]
     record = _read(path)
     sha256 = ao.digest(record)
     if (path.name != sha256 + '.json' or record.get('version') != 1 or record.get('room_id') != state['room_id']
             or record.get('grant_receipt_sha256') != reference['receipt_sha256']):
-        raise RoomError('The immutable fourth-review consumption evidence was modified')
+        raise RoomError('The immutable review-extension consumption evidence was modified')
     original = record['request']
     request_id = ao.identifier(original['request_id'])
     current = state['requests'].get(request_id)
@@ -309,7 +312,7 @@ def _consumption(directory, state, reference):
             or current.get('review_extension_consumption') != relative
             or current.get('review_extension_consumption_sha256') != sha256
             or any(current.get(k) != v for k, v in original.items() if k != 'state')):
-        raise RoomError('The fourth-review request identity differs from its immutable consumption evidence')
+        raise RoomError('The review-extension request identity differs from its immutable consumption evidence')
     return original
 
 
@@ -333,8 +336,7 @@ def _audit(directory, sha256):
 
 
 def _reviews(state):
-    return sorted((r for r in state['requests'].values() if r.get('purpose') == 'spec_review'),
-                  key=lambda r: r['created_order'])
+    return ao_spec_review_budget.reviews(state)
 
 
 def _manifest(directory, state):
@@ -420,6 +422,8 @@ def _acceptance(directory, state, candidate_sha256, actual):
 def _scope_proposal(directory, state, target, actual):
     """The retained agreed handoff, its latest scope-change proposal and the unaccepted candidate.
 
+    The agreed review is the one named by the handoff's saved agreement, never the chronologically
+    latest request: debate reviews of this or later charters may be dispatched after the handoff.
     Registering the next charter moves spec_record_sha256 while the room still names the original
     agreed handoff, so that handoff is authenticated by its saved pointer and digest only. A rejected
     report's delegate claim stays recorded evidence: it is never verified, normalized or accepted here.
@@ -439,17 +443,22 @@ def _scope_proposal(directory, state, target, actual):
     agreed_spec = ao_workflow.spec_record_file(directory, handoff['spec_record_sha256'])
     engineer = state['bindings']['engineer']
     reviews = _reviews(state)
-    if not reviews or reviews[-1].get('spec_record_sha256') != handoff['spec_record_sha256']:
+    if not reviews:
         raise RoomError(SCOPE_HANDOFF)
-    last = reviews[-1]
+    agreement = handoff.get('agreement')
+    last = (state['requests'].get(agreement['request_id']) if isinstance(agreement, dict)
+            and isinstance(agreement.get('request_id'), str) else None)
+    if not isinstance(last, dict):
+        raise RoomError(SCOPE_HANDOFF)
     ao_outcomes.usable(directory, last)
     ao_engineering_model.check_request(directory, state, last)
     verdict = ao_workflow.final_json(directory, last)
     findings = verdict.get('findings')
-    agreement = handoff.get('agreement')
     prior_revision = max(ao_workflow.spec_record_file(directory, r['spec_record_sha256'])['revision'] for r in reviews)
     if (last.get('role') != 'engineer' or last.get('harness') != 'claude-code'
             or last.get('reasoning_effort') != 'max' or last.get('session_id') != engineer['session_id']
+            or last.get('purpose') != 'spec_review'
+            or last.get('spec_record_sha256') != handoff['spec_record_sha256']
             or verdict.get('decision') != 'accept'
             or not isinstance(verdict.get('interpretation'), str) or not verdict['interpretation'].strip()
             or not isinstance(findings, list) or not all(isinstance(f, str) for f in findings)
@@ -457,9 +466,9 @@ def _scope_proposal(directory, state, target, actual):
             or type(verdict.get('spec_revision')) is not int or verdict['spec_revision'] != agreed_spec['revision']
             or verdict.get('spec_sha256') != agreed_spec['sha256']
             or handoff['spec_revision'] != agreed_spec['revision'] or handoff['spec_sha256'] != agreed_spec['sha256']
-            or not isinstance(agreement, dict) or agreement.get('request_id') != last['request_id']
+            or agreement.get('request_id') != last['request_id']
             or agreement.get('receipt_sha256') != last['receipt_sha256']
-            or prior_revision != agreed_spec['revision']):
+            or prior_revision < agreed_spec['revision']):
         raise RoomError(SCOPE_HANDOFF)
     request = state['requests'].get(target['scope_request_id'])
     if (request is None or ao_workflow.latest(state, {'implementation', 'correction'}) is not request
@@ -729,12 +738,15 @@ def _inspect(service, directory, state, target, reconcile=False):
     engineer = state['bindings'].get('engineer')
     # Pinned evidence keeps the immutable stored binding; eligibility reads the epoch in force.
     effective = ao_engineering_model.effective_binding(directory, state) if engineer else None
-    if (len(reviews) != LIMIT or not effective or effective.get('harness') != 'claude-code'
+    if (ao_spec_review_budget.debate_attempts(directory, state) != ao_spec_review_budget.DEBATE_LIMIT
+            or len(reviews) >= ao_spec_review_budget.DISPATCH_CEILING
+            or not effective or effective.get('harness') != 'claude-code'
             or effective.get('model') != ao_engineering_model.current(directory, state)['model']
             or effective.get('reasoning_effort') != 'max'
             or any(r.get('role') != 'engineer' or r['session_id'] != engineer['session_id'] for r in reviews)):
-        raise RoomError('The one extension requires exactly three retained review intents from the existing normal '
-                        'engineering orchestrator at its configured model and MAX')
+        raise RoomError('The one extension requires an exhausted debate budget (three non-accepting retained reviews) '
+                        'below the dispatch ceiling, from the existing normal engineering orchestrator at its '
+                        'configured model and MAX')
     spec = service.spec(directory, state)
     prior_revision = max(ao_workflow.spec_record_file(directory, r['spec_record_sha256'])['revision'] for r in reviews)
     if (spec['revision'] != target['spec_revision'] or spec['sha256'] != target['spec_sha256']
@@ -790,7 +802,7 @@ def audit(service, room_id, spec_revision, spec_sha256, retained_candidate_sha25
                  'observed_snapshots': {role: projected_snapshot(snapshot) for role, snapshot in snapshots.items()}}
         sha256 = _store_audit(directory, value)
         return {'eligible': True, 'audit_sha256': sha256, 'room_id': room_id, **target,
-                'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': LIMIT,
+                'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': len(_reviews(state)),
                 'additional_spec_reviews': 1, 'model_dispatch': False}
 
 
@@ -830,7 +842,7 @@ def audit_preacceptance(service, room_id, spec_revision, spec_sha256, scope_requ
         sha256 = _store_audit(directory, value)
         proposal = evidence['retained']['scope_proposal']
         return {'eligible': True, 'lane': PRE, 'audit_sha256': sha256, 'room_id': room_id, **target,
-                'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': LIMIT,
+                'spec_record_sha256': state['spec_record_sha256'], 'prior_spec_review_attempts': len(_reviews(state)),
                 'additional_spec_reviews': 1, 'acceptances': 0, 'candidate_status': 'unaccepted_unverified',
                 'scope_proposal': {'request_id': proposal['request_id'], 'outcome': 'scope_change',
                                    'evidence': proposal['evidence'], 'engineering_error': proposal['engineering_error']},
@@ -926,7 +938,7 @@ def _retained(service, directory, state, evidence, lane):
             _same_owner(record['evidence']['native_owner'], evidence)
             proof = record['evidence'].get('review_extension')
             if consumed is None or not isinstance(proof, dict):
-                raise RoomError('Routing refresh lacks its consumed fourth-review compatibility evidence')
+                raise RoomError('Routing refresh lacks its consumed review-extension compatibility evidence')
             request = state['requests'][consumed['request_id']]
             agreement = proof.get('agreement') or {}
             if (proof.get('grant_receipt_sha256') != state['spec_review_extension']['receipt_sha256']
@@ -935,7 +947,7 @@ def _retained(service, directory, state, evidence, lane):
                     or agreement.get('agreed') is not True
                     or agreement.get('request_id') != consumed['request_id']
                     or agreement.get('receipt_sha256') != request['receipt_sha256']):
-                raise RoomError('Routing refresh changed the retained fourth-review agreement')
+                raise RoomError('Routing refresh changed the retained review-extension agreement')
             pointer = record['previous']
     for key in ('acceptances', 'verifications'):
         if state[key][:len(baseline[key])] != baseline[key]:
@@ -979,7 +991,7 @@ def _same_owner(owner, evidence):
     if (not isinstance(owner, dict)
             or {k: v for k, v in owner.items() if k not in ('activity_state', 'controller_generation')}
             != evidence['native_owner']):
-        raise RoomError('The committed fourth-review grant requires the same native owner; replacement was not recorded')
+        raise RoomError('The committed review-extension grant requires the same native owner; replacement was not recorded')
 
 
 def _source_record(directory, state, evidence):
@@ -1038,12 +1050,12 @@ def guard_native_owner(service, state, owner, role='engineer'):
 
 def guard_replacement(state, operation):
     if state.get('spec_review_extension'):
-        raise RoomError('The committed fourth-review grant pins provider and routing identity; ' + operation
+        raise RoomError('The committed review-extension grant pins provider and routing identity; ' + operation
                         + ' is unsupported after that grant. No transition intent was written')
 
 
 def guard_routing_refresh(service, state, owner):
-    """A consumed, accepted fourth review may retain its owner through a routing refresh.
+    """A consumed, accepted extension review may retain its owner through a routing refresh.
 
     This is not a provider/preparation replacement or a new review allowance.
     The refresh journal separately proves which ignored configuration bytes changed.
@@ -1057,13 +1069,13 @@ def guard_routing_refresh(service, state, owner):
     _same_owner(owner, evidence)
     consumed = _consumption(directory, state, state['spec_review_extension'])
     if consumed is None:
-        raise RoomError('Routing refresh cannot change an unused fourth-review grant')
+        raise RoomError('Routing refresh cannot change an unused review-extension grant')
     request = state['requests'][consumed['request_id']]
     if request['state'] != 'completed':
-        raise RoomError('Routing refresh requires a completed accepted fourth review')
+        raise RoomError('Routing refresh requires a completed accepted extension review')
     agreement = ao_workflow.agreement(service, directory, state)
     if agreement['request_id'] != consumed['request_id']:
-        raise RoomError('Routing refresh must retain the exact accepted fourth-review agreement')
+        raise RoomError('Routing refresh must retain the exact accepted review-extension agreement')
     return {'grant_receipt_sha256': state['spec_review_extension']['receipt_sha256'],
             'consumed_by': consumed['request_id'],
             'consumption_sha256': request['review_extension_consumption_sha256'],
@@ -1088,7 +1100,7 @@ def validate(service, state, allow_pending=False):
         record = _read(directory / relative)
         if (ao.digest(record) != reference['receipt_sha256'] or record['room_id'] != state['room_id']
                 or record['inputs']['request_id'] != request_id or ao.digest(record['inputs']) != reference['key']
-                or record.get('additional_spec_reviews') != 1 or record.get('maximum_spec_review_attempts') != LIMIT + 1):
+                or record.get('additional_spec_reviews') != 1):
             raise RoomError('Committed review-extension grant was modified')
         # Only the pre-acceptance lane writes a lane field; the receipt and its state reference agree.
         lane = record.get('lane', ACCEPTED)
@@ -1097,18 +1109,22 @@ def validate(service, state, allow_pending=False):
             raise RoomError('Committed review-extension grant was modified')
         saved = _audit(directory, record['inputs']['audit_sha256'])
         evidence = saved['evidence']
+        granted_at = len(_reviews(evidence['state']))
+        if record.get('maximum_spec_review_attempts') != granted_at + 1:
+            raise RoomError('Committed review-extension grant was modified')
         if (record['evidence_sha256'] != ao.digest(evidence) or record['before_state_sha256'] != evidence['state_sha256']
-                or len(_reviews(evidence['state'])) != LIMIT or saved.get('lane', ACCEPTED) != lane):
+                or not LIMIT <= granted_at < ao_spec_review_budget.DISPATCH_CEILING
+                or saved.get('lane', ACCEPTED) != lane):
             raise RoomError('Review-extension audit chain changed')
         _retained(service, directory, state, evidence, lane)
         consumed = _consumption(directory, state, reference)
         # A separately authorized re-review intent carries its own claim and is accounted by
-        # ao_spec_rereview, never by this extension; it must not disturb this LIMIT..LIMIT+1 bound.
+        # ao_spec_rereview, never by this extension; it must not disturb the granted_at window.
         reviews = [r for r in _reviews(state) if not (r.get('carried') or {}).get('spec_rereview_sha256')]
-        if not LIMIT <= len(reviews) <= LIMIT + 1:
-            raise RoomError('Review-extension attempts were removed or exceeded the single fourth intent')
+        if not granted_at <= len(reviews) <= granted_at + 1:
+            raise RoomError('Review-extension attempts were removed or exceeded the single additional intent')
         claims = [r for r in state['requests'].values() if (r.get('carried') or {}).get('spec_review_extension_sha256')]
-        if len(reviews) == LIMIT + 1:
+        if len(reviews) == granted_at + 1:
             last = reviews[-1]
             import ao_engineering_model
             frozen = ao_engineering_model.binding_for_request(directory, state, evidence['state']['bindings']['engineer'], last)
@@ -1117,7 +1133,7 @@ def validate(service, state, allow_pending=False):
                     or last['role'] != 'engineer' or last['session_id'] != evidence['state']['bindings']['engineer']['session_id']
                     or last['carried']['spec_review_extension_sha256'] != reference['receipt_sha256']
                     or any(last.get(k) != v for k, v in frozen.items())):
-                raise RoomError('The fourth review intent has no exact matching one-time grant')
+                raise RoomError('The additional review intent has no exact matching one-time grant')
         elif claims or consumed:
             raise RoomError('A review-extension claim was relabeled or removed from review accounting')
         return record, evidence
@@ -1128,9 +1144,11 @@ def validate(service, state, allow_pending=False):
 def _result(state, record):
     reviews = [r for r in _reviews(state) if not (r.get('carried') or {}).get('spec_rereview_sha256')]
     lane = state['spec_review_extension'].get('lane', ACCEPTED)
+    granted_at = record['maximum_spec_review_attempts'] - 1
     return {'extended': True, 'lane': lane, 'request_id': record['inputs']['request_id'], 'additional_spec_reviews': 1,
-            'maximum_spec_review_attempts': LIMIT + 1, 'remaining_spec_reviews': int(len(reviews) == LIMIT),
-            'consumed_by': reviews[-1]['request_id'] if len(reviews) > LIMIT else None,
+            'maximum_spec_review_attempts': record['maximum_spec_review_attempts'],
+            'remaining_spec_reviews': int(len(reviews) == granted_at),
+            'consumed_by': reviews[-1]['request_id'] if len(reviews) > granted_at else None,
             'audit_sha256': record['inputs']['audit_sha256'],
             'receipt': state['spec_review_extension']['receipt'],
             'receipt_sha256': state['spec_review_extension']['receipt_sha256'], 'model_dispatch': False,
@@ -1144,9 +1162,11 @@ def consume(service, directory, state, request):
     The orphaned record remains a diagnosed hold even if native history is empty.
     """
     committed = validate(service, state)
-    if not committed or len(_reviews(state)) != LIMIT:
-        raise RoomError('An unused exact one-time review grant is required before consuming its fourth intent')
+    if not committed:
+        raise RoomError('An unused exact one-time review grant is required before consuming its additional intent')
     _, evidence = committed
+    if len(_reviews(state)) != len(_reviews(evidence['state'])):
+        raise RoomError('An unused exact one-time review grant is required before consuming its additional intent')
     reference = state['spec_review_extension']
     import ao_engineering_model
     if (request['request_id'] in state['requests'] or request.get('purpose') != 'spec_review'
@@ -1154,7 +1174,7 @@ def consume(service, directory, state, request):
             or request.get('spec_record_sha256') != evidence['spec_record_sha256']
             or (request.get('carried') or {}).get('spec_review_extension_sha256') != reference['receipt_sha256']
             or any(request.get(k) != v for k, v in ao_engineering_model.effective_binding(directory, state).items())):
-        raise RoomError('Only the exact new fourth charter-review intent may consume this grant')
+        raise RoomError('Only the exact new additional charter-review intent may consume this grant')
     record = {'version': 1, 'room_id': state['room_id'], 'grant_receipt_sha256': reference['receipt_sha256'],
               'request': copy.deepcopy(request)}
     sha256 = ao.digest(record)
@@ -1242,7 +1262,8 @@ def _extend(service, room_id, inputs, lane):
                 raise RoomError('Review-extension audit is stale; charter, retained evidence or native metadata changed')
             evidence = saved['evidence']
         record = {'version': 1, 'room_id': room_id, 'inputs': inputs, 'additional_spec_reviews': 1,
-                  'maximum_spec_review_attempts': LIMIT + 1, 'before_state_sha256': evidence['state_sha256'],
+                  'maximum_spec_review_attempts': len(_reviews(evidence['state'])) + 1,
+                  'before_state_sha256': evidence['state_sha256'],
                   'evidence_sha256': ao.digest(evidence), 'recorded_at': prior['recorded_at'] if prior else time.time()}
         if lane == PRE:
             record['lane'] = PRE
@@ -1266,14 +1287,18 @@ def _extend(service, room_id, inputs, lane):
 
 def admission(service, directory, state):
     committed = validate(service, state)
-    count = len(_reviews(state))
-    if count < LIMIT and not committed:
-        return None
+    dispatches = len(_reviews(state))
+    if dispatches >= ao_spec_review_budget.DISPATCH_CEILING:
+        raise RoomError('Five Fable spec-review dispatches reached the room ceiling; preserve evidence and return the '
+                        'product decision to the user')
     if not committed:
-        raise RoomError('Three Fable spec-review attempts exhausted; preserve evidence and surface the user decision')
-    if count >= LIMIT + 1:
-        raise RoomError('The one fourth Fable review intent is exhausted, including failed or uncertain delivery')
+        if ao_spec_review_budget.debate_attempts(directory, state) < ao_spec_review_budget.DEBATE_LIMIT:
+            return None
+        raise RoomError('Three non-accepting Fable spec reviews exhausted the debate budget; preserve evidence and '
+                        'surface the user decision')
     _, evidence = committed
+    if dispatches >= len(_reviews(evidence['state'])) + 1:
+        raise RoomError('The one additional Fable review intent is exhausted, including failed or uncertain delivery')
     spec = service.spec(directory, state)
     target = evidence['target']
     if (state['spec_record_sha256'] != evidence['spec_record_sha256']
@@ -1300,6 +1325,18 @@ def admission(service, directory, state):
                 != evidence['native'][role]):
             raise RoomError('Native history or metadata changed after the review extension')
     return state['spec_review_extension']['receipt_sha256']
+
+
+def unused_grant(service, state):
+    """True only while a committed, valid grant still holds its one additional intent undispatched.
+
+    Consumed, absent or pending grants are all False; a damaged grant refuses through validate.
+    """
+    committed = validate(service, state)
+    if not committed:
+        return False
+    _, evidence = committed
+    return len(_reviews(state)) == len(_reviews(evidence['state']))
 
 
 def summary(service, state):
