@@ -381,7 +381,9 @@ class SettledHistorySettlementEvidenceNegativeTests(SettledHistoryFixture):
     ``OBSERVATIONS``/``HISTORY_POINTERS`` (``'Review-extension prior requests, receipts or counters
     changed'``). ``outcome_resume`` and ``outcome_resume_sha256`` are themselves listed in
     ``OBSERVATIONS`` (ao_review_extension.py:40), so re-pointing them escapes that earlier diff and
-    reaches the deeper, settlement-specific checks this module adds.
+    reaches the deeper, settlement-specific checks: ``_retained``'s granted-settlement pin, which
+    re-runs ``_settled_failures`` for every granted request after the manifest loop, and then
+    admission's own comparison.
     """
 
     def _settled_request(self, index=0):
@@ -527,8 +529,8 @@ class SettledHistorySettlementEvidenceNegativeTests(SettledHistoryFixture):
     def test_outcome_resume_repointed_to_a_rewritten_valid_release_refuses_the_fourth_send(self):
         """A self-consistent, content-addressed release written after the grant passes
         validate_settlement, the baseline diff (outcome_resume fields are OBSERVATIONS) and the
-        manifest loop (the granted file is untouched); only admission's settled_failures
-        comparison refuses it."""
+        manifest loop (the granted file is untouched); _retained's granted-settlement pin now
+        refuses it before the send reaches admission's settled_failures comparison."""
         self.grant()
         request_id, request = self._settled_request()
         record = ao.read(self.directory() / request['outcome_resume'])
@@ -539,7 +541,7 @@ class SettledHistorySettlementEvidenceNegativeTests(SettledHistoryFixture):
         tampered = copy.deepcopy(self.state())
         tampered['requests'][request_id].update(outcome_resume=relative, outcome_resume_sha256=sha256)
         ao.atomic(self.directory() / 'state.json', tampered)
-        self._assert_fourth_send_refuses('Native history or metadata changed after the review extension')
+        self._assert_fourth_send_refuses(SETTLEMENT_EVIDENCE_CHANGED_MESSAGE)
 
     def test_settled_turn_provider_identity_drift_after_grant_refuses_the_fourth_send(self):
         self.grant()
@@ -1269,3 +1271,209 @@ class SettledHistoryReviewerRecoveryTests(SettledHistoryReviewerRecoveryFixture)
         record, evidence = extension.validate(self.service, after)
         self.assertEqual(record['lane'], extension.PRE)
         self.assertEqual(evidence['state']['bindings']['reviewer'], before['bindings']['reviewer'])
+
+
+IDENTITY_CONTRADICTION_MESSAGE = 'Settled native failure request identity contradicts the bound engineer identity'
+SETTLEMENT_EVIDENCE_CHANGED_MESSAGE = 'Review-extension granted settlement evidence changed'
+
+
+class SettledRequestIdentityContradictionTests(SettledHistoryFixture):
+    """Group 11: a settled native failure's own bound identity fields -- not only its state and
+    session_id -- are authenticated against the bound engineer before the pre-acceptance audit,
+    the grant and the fourth-review send admit it. A settled request whose role, harness, native
+    conversation id, native branch id, reasoning effort or model no longer matches the bound
+    engineer contradicts the one identity this opt-in is scoped to and refuses with the exact same
+    message at audit and at grant; the identical single-field drift reaching the fourth send
+    instead hits the existing, unrelated baseline comparison that already refuses any change to an
+    ordinary tracked request field.
+    """
+
+    def _contradict(self, field, value, index=0):
+        """Mutate one settled request's own ``field`` directly in state.json, exactly as a historical
+        record would read if its bound identity had actually drifted; returns its request_id."""
+        request_id = self.settled[index]['request_id']
+        tampered = copy.deepcopy(self.state())
+        tampered['requests'][request_id][field] = value
+        ao.atomic(self.directory() / 'state.json', tampered)
+        return request_id
+
+    def test_role_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('role', 'reviewer')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_harness_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('harness', 'codex')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_conversation_id_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('conversation_id', 'foreign-conversation')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_branch_id_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('branch_id', 'foreign-branch')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_reasoning_effort_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('reasoning_effort', 'low')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_model_contradiction_refuses_the_audit_without_mutation(self):
+        self._contradict('model', 'foreign-model')
+        self.assert_refuses_without_mutation(IDENTITY_CONTRADICTION_MESSAGE, self.audit)
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
+    def test_role_contradiction_after_a_clean_audit_refuses_the_grant_without_mutation(self):
+        audited = self.audit()
+        self._contradict('role', 'reviewer')
+        inputs = self.grant_inputs(audit=audited)
+        self.assert_refuses_without_mutation(
+            IDENTITY_CONTRADICTION_MESSAGE,
+            lambda: self.service.ao_room_preacceptance_review_extend(**inputs))
+        self.assertIsNone(self.state().get('spec_review_extension'))
+        self.assertEqual(list((self.directory() / extension.BASE / 'requests').glob('*.json')), [])
+
+    def test_role_contradiction_after_a_clean_grant_refuses_the_fourth_send_with_the_retained_baseline_control(self):
+        """Not a new behaviour: role is a plain tracked request field (outside OBSERVATIONS and
+        HISTORY_POINTERS), so the existing _retained baseline-diff loop already refuses any change
+        to it before admission's own fresh native-evidence recheck -- and before the settled-request
+        identity comparison -- ever runs."""
+        self.grant()
+        self._contradict('role', 'reviewer')
+        self._assert_fourth_send_refuses('Review-extension prior requests, receipts or counters changed')
+
+    def test_unmutated_settled_history_still_audits_grants_and_sends_the_fourth_review_once(self):
+        """Positive control: SettledHistoryPositiveTests.test_audit_admits_settled_failures_and_full_cycle_consumes_the_grant
+        already proves the full audit/grant/send/consume cycle in detail; this only confirms these
+        identity checks do not disturb an unmutated settled history."""
+        audited = self.audit()
+        self.assertTrue(audited['eligible'])
+        self.grant()
+        posts = len(self.fake.posts)
+        self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+
+
+class PostConsumptionSettlementRetentionTests(SettledHistoryFixture):
+    """Group 12: once the fourth review is consumed and completed, the settlement evidence the
+    grant was authenticated against stays pinned, not only the ordinary tracked fields _retained's
+    own baseline-diff loop already covers. A content-addressed copy of one settled request's own
+    outcome-resume release, re-pointed from state.json with the original release retained
+    untouched, refuses every later evidence check -- ordinary validation, an identical grant
+    replay, the routing-refresh guard and the handoff before any further send -- with the
+    pinned-entry message. A re-point that also breaks the release's own authentication -- only
+    the state-recorded pointer digest drifting, or an outcome_sha256 naming no record of this
+    request -- is refused by that same pin with the settlement validator's own message.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.grant()
+        self.send('spec_review', 'fourth')
+        self.finish_fourth()
+
+    def _settled_request(self, index=0):
+        request_id = self.settled[index]['request_id']
+        return request_id, self.state()['requests'][request_id]
+
+    def _repoint(self, request_id, **record_changes):
+        """Write a content-addressed copy of ``request_id``'s own outcome-resume release with
+        ``record_changes`` applied -- the original release file stays retained, untouched -- then
+        re-point that request's outcome_resume/outcome_resume_sha256 to the copy. Returns the new
+        record's own room-relative path."""
+        state = self.state()
+        request = state['requests'][request_id]
+        record = ao.read(self.directory() / request['outcome_resume'])
+        record.update(record_changes)
+        sha256 = ao.digest(record)
+        new_path = 'outcome-resumes/' + request_id + '/' + sha256 + '.json'
+        ao.atomic(self.directory() / new_path, record)
+        tampered = copy.deepcopy(state)
+        tampered['requests'][request_id].update(outcome_resume=new_path, outcome_resume_sha256=sha256)
+        ao.atomic(self.directory() / 'state.json', tampered)
+        return new_path
+
+    def test_post_consumption_release_diagnosis_repoint_refuses_every_later_entry_point(self):
+        first_id, first = self._settled_request(0)
+        original_path = first['outcome_resume']
+        original_bytes = (self.directory() / original_path).read_bytes()
+        before_files = self.room_files()
+
+        new_path = self._repoint(
+            first_id, diagnosis='Hostile replacement of the previously granted settlement diagnosis.')
+
+        # The original release stays retained, byte-for-byte, beside the new content-addressed copy.
+        self.assertEqual((self.directory() / original_path).read_bytes(), original_bytes)
+        posts = len(self.fake.posts)
+
+        with self.assertRaisesRegex(ao.RoomError, SETTLEMENT_EVIDENCE_CHANGED_MESSAGE):
+            extension.validate(self.service, self.state())
+        with self.assertRaisesRegex(ao.RoomError, SETTLEMENT_EVIDENCE_CHANGED_MESSAGE):
+            self.service.ao_room_preacceptance_review_extend(**self.inputs)
+        with self.assertRaisesRegex(ao.RoomError, SETTLEMENT_EVIDENCE_CHANGED_MESSAGE):
+            extension.guard_routing_refresh(
+                self.service, self.state(),
+                extension.ao_native_identity.read_owner(str(self.database), 'engineer'))
+        with self.assertRaisesRegex(ao.RoomError, SETTLEMENT_EVIDENCE_CHANGED_MESSAGE):
+            self.implement_after_fourth()
+
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+        after_files = self.room_files()
+        changed = {path for path in set(before_files) | set(after_files)
+                   if before_files.get(path) != after_files.get(path)}
+        self.assertEqual(changed, {new_path, 'state.json'})
+
+    def test_outcome_resume_sha256_pointer_drift_refuses_ordinary_validate(self):
+        """Pointer digest drift only: the release file at outcome_resume is untouched, but the
+        state-recorded outcome_resume_sha256 no longer matches its real bytes, so the pinned
+        entry's own release authentication refuses before any entry comparison."""
+        first_id, first = self._settled_request(0)
+        digit = '1' if first['outcome_resume_sha256'][0] == '0' else '0'
+        bogus = digit + first['outcome_resume_sha256'][1:]
+        tampered = copy.deepcopy(self.state())
+        tampered['requests'][first_id]['outcome_resume_sha256'] = bogus
+        ao.atomic(self.directory() / 'state.json', tampered)
+        with self.assertRaisesRegex(ao.RoomError, 'Outcome continuation has no exact owned path'):
+            extension.validate(self.service, self.state())
+
+    def test_release_outcome_sha256_source_repoint_refuses_ordinary_validate(self):
+        """A distinct mutation from the diagnosis-repoint test above, sharing only its copy-and-
+        repoint mechanism: the release copy's own outcome_sha256 pointer -- the one release field
+        _settled_failures itself surfaces into the pinned settled_failures entry -- now carries
+        another settled request's outcome digest, which names no record under this request's own
+        outcomes directory, so the pinned entry's settlement validation refuses it as missing
+        before any entry comparison."""
+        first_id, first = self._settled_request(0)
+        second_id, second = self._settled_request(1)
+        foreign_release = ao_outcomes.release_record(self.directory(), {'room_id': self.directory().name}, second)
+        original = ao.read(self.directory() / first['outcome_resume'])
+        self.assertNotEqual(original['outcome_sha256'], foreign_release['outcome_sha256'])
+        self._repoint(first_id, outcome_sha256=foreign_release['outcome_sha256'])
+        with self.assertRaisesRegex(ao.RoomError, 'Settled native failure evidence is missing or unreadable'):
+            extension.validate(self.service, self.state())
+
+    def test_without_mutation_ordinary_validate_passes_and_implement_after_fourth_dispatches_once(self):
+        record, evidence = extension.validate(self.service, self.state())
+        self.assertEqual(record['lane'], extension.PRE)
+        posts = len(self.fake.posts)
+        self.implement_after_fourth()
+        self.assertEqual(len(self.fake.posts), posts + 1)
+
+    def test_a_later_post_consumption_settlement_keeps_ordinary_validate_passing(self):
+        """Maintenance preservation: a fresh engineer request settled through the fixture's own
+        supported settlement recipe, after the fourth review is already consumed and completed,
+        neither disturbs ordinary validate nor blocks the correction send that recipe itself sends
+        for its successor."""
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        new_request_id = self._fresh_id()
+        successor = self._settle(new_request_id, 'implementation', presend=True)
+        self.assertEqual(self.state()['requests'][new_request_id]['state'], 'settled_failure')
+        self.assertEqual(self.state()['requests'][successor]['state'], 'submitted')
+        record, evidence = extension.validate(self.service, self.state())
+        self.assertEqual(record['lane'], extension.PRE)

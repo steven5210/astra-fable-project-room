@@ -141,7 +141,15 @@ under `settled_failures` (its request id, turn and provider-turn ids,
 settlement kind, its outcome-resume path, and the exact receipt,
 outcome-resume and outcome digests that settled it), and send admission
 refuses the fourth review if any of that evidence is missing, modified or
-re-pointed. The live `errorMessage` of a settled failed turn is excluded from
+re-pointed. Each settled request must also carry the bound engineer identity
+in force when it was sent (the engineer role and every stored binding field,
+including harness, AO session, conversation and branch, with the model and
+reasoning effort of its engineering-model epoch), or the audit, grant and send
+refuse. After the grant, the granted settlements stay pinned: ordinary
+validation, an identical grant replay, a routing refresh and every later send
+refuse if a granted settlement is re-pointed or changed, while failures of
+later requests can still be settled through the same supported operations.
+The live `errorMessage` of a settled failed turn is excluded from
 the audited evidence, so a native controller restart between grant and send
 does not change it. In such a history a recovered turn is admitted only with
 its positive context proof (an audited compaction or task-notification
@@ -152,10 +160,11 @@ remain strict and unaffected; active, interrupted, cancelled, unowned failed
 and unverified recovered native turns still refuse the audit or admission. An
 audit taken before this change on a room whose settled failures were already
 admitted through a provider transition must be repeated, because its evidence
-now lists them. For the same reason, an unused fourth-review grant committed
-before this change on such a room now refuses at send admission and, because
-the extension is granted only once, cannot be re-granted; the lane fails
-closed rather than dispatching.
+now lists them. For the same reason, a fourth-review grant committed before
+this change on such a room, used or not, records no granted settlements and now
+refuses ordinary validation, so room status, sync, handoff, send and the other
+room operations that run it refuse; because the extension is granted only once,
+it cannot be re-granted, and the room fails closed rather than dispatching.
 
 ## After the fourth review
 

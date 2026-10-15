@@ -598,18 +598,31 @@ def _settled_requests(state, binding):
                   key=lambda request: request['turn_id'])
 
 
-def _settled_failures(directory, state, binding):
+def _settled_failures(directory, state, binding, request_ids=None):
     """Pre-acceptance, engineer-only: authenticate every settled native failure this binding owns.
+
+    Session ownership only selects a request. Each selected request must also carry the bound
+    engineer identity in force when it was sent: the engineer role and every stored binding field
+    (harness, AO session, conversation, branch, Fable reason and identity basis), with the model
+    and reasoning effort of the engineering-model epoch that owned its creation order. A
+    contradiction refuses; it never falls back to the strict evaluation. ``request_ids``, when
+    given, restricts the entries to those requests.
 
     Each entry is JSON-serializable strings only. Missing or changed entry evidence refuses at
     audit, at grant through ``_extend``'s exact evidence comparison, and at send admission before
-    ``consume()``; ``_grant_manifest``/``_retained`` authenticate the retained failed-turn
-    reconciliation proofs.
+    ``consume()``; after the grant ``_retained`` keeps the granted entries pinned, and
+    ``_grant_manifest``/``_retained`` authenticate the retained failed-turn reconciliation proofs.
     """
+    import ao_engineering_model
     import ao_outcomes
     entries = []
     for request in _settled_requests(state, binding):
+        if request_ids is not None and request.get('request_id') not in request_ids:
+            continue
         try:
+            frozen = ao_engineering_model.binding_for_request(directory, state, binding, request)
+            if request.get('role') != 'engineer' or any(request.get(k) != v for k, v in frozen.items()):
+                raise RoomError('Settled native failure request identity contradicts the bound engineer identity')
             # For a settled request completed_receipt also runs ao_outcomes.validate_settlement.
             receipt = ao_workflow.completed_receipt(directory, request)
             release = ao_outcomes.release_record(directory, {'room_id': directory.name}, request)
@@ -889,6 +902,18 @@ def _retained(service, directory, state, evidence, lane):
                 actual = ao.digest(ao_delegates.owned_bytes(_relative(directory, path), 96_000_000))
             if actual != expected:
                 raise RoomError('Review-extension retained evidence is missing or modified')
+    if settled_history:
+        # The granted settlements stay pinned: the request comparison above exempts the
+        # outcome-resume pointer as an observation and the manifest admits new files, so every
+        # settled request of the audited baseline must be granted and must still produce exactly
+        # its granted entry. Requests settled after the grant are not pinned here. Evidence without
+        # settled_failures predates their recording and fails closed.
+        granted = evidence['native']['engineer'].get('settled_failures')
+        pinned = {request['request_id'] for request in _settled_requests(baseline, baseline['bindings']['engineer'])}
+        if (not isinstance(granted, list) or not granted or not all(isinstance(entry, dict) for entry in granted)
+                or {entry.get('request_id') for entry in granted} != pinned
+                or _settled_failures(directory, state, baseline['bindings']['engineer'], request_ids=pinned) != granted):
+            raise RoomError('Review-extension granted settlement evidence changed')
     ao_workflow.spec_record_file(directory, evidence['spec_record_sha256'])
 
 
