@@ -36,9 +36,9 @@ malformed recovery consumes that intent. There is no automatic second attempt.
 Keep the original final response, rejected format diagnostic and every original
 review request unchanged.
 
-The lane applies only to the room's ordinary three-review budget. A prose-only
-verdict from a fourth-charter extension review is out of scope; that review's
-result must be used or preserved as it stands.
+The lane applies only to the room's ordinary three-review debate budget. A
+prose-only verdict from an extension-granted review is out of scope; that
+review's result must be used or preserved as it stands.
 
 The recovery turn is read-only except for the native task-list tools. TaskList,
 TaskGet, TaskCreate and TaskUpdate are permitted for compatibility with the

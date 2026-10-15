@@ -13,15 +13,32 @@ from unittest.mock import patch
 import ao_project_room as ao
 import ao_history_reconciliation as history
 import ao_review_extension as extension
+from test_ao_normal import Fixture
 from test_ao_review_extension import ReviewExtensionFixture
 
 
 class RetainedHistoryTests(unittest.TestCase):
     def setUp(self):
         f = self.f = ReviewExtensionFixture('runTest')
-        self.addCleanup(f.doCleanups); f.setUp()
+        self.addCleanup(f.doCleanups)
+        # The fixture's phases run in order, but the synthetic failed spec review must complete
+        # while it is still the latest engineer request: the outcome audits in this file target the
+        # latest engineer request only. The held request is the third non-accepting spec review
+        # itself: its empty verdict counts as debate, so the room is at debate 3 and 4 dispatches
+        # with the held request retained before any grant.
+        Fixture.setUp(f)
+        f.configure_runtime()
+        f.room = f.open()
+        f.spec()
+        f.observe_full_conversations()
+        f.bind()
+        f.accept_charter()
+        f.target_spec = None
+        f.spec(2)
+        f.agree(decision='changes_required', revision=2, key='charter-2')
+        f.agree(decision='changes_required', revision=2, key='charter-3')
         self.request_id = 'pregrant-quota'
-        f.send('correction', self.request_id)
+        f.send('spec_review', self.request_id)
         f.fake.finish('engineer', '')
         snapshot = f.fake.snapshots['engineer']; snapshot['history_truncated'] = True
         with patch.object(history, 'requires_strict_history', return_value=False):
@@ -632,6 +649,10 @@ class PendingCanonicalEvidenceTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(_PRE_CANONICAL_EXTEND_SOURCE.encode()).hexdigest(),
                              '4b2c38cd2eae58a7aaef5dee74a0026479e9597c2dc9567d1d2a246dd461d722')
             namespace = dict(vars(extension))
+            # The pinned oracle writes maximum_spec_review_attempts as LIMIT + 1, where its era's
+            # LIMIT equalled the exhausted intent count; inject this fixture's audited dispatch
+            # count so the crashed writer's receipt stays byte-identical to the recomputed grant.
+            namespace['LIMIT'] = len(extension._reviews(saved['evidence']['state']))
             exec(compile(_PRE_CANONICAL_EXTEND_SOURCE, '<frozen-pre-repair-extend>', 'exec'), namespace)
             with (patch.object(extension, 'extend', namespace['extend']),
                   patch.object(f.service, 'save', side_effect=SystemExit('Synthetic old-writer process loss'))):

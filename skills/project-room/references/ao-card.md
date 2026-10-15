@@ -96,9 +96,12 @@ For a source-qualified family, run `ao_room_engineer_source_register` before
 the first engineer response. Then `ao_room_send` role `engineer`, purpose
 `spec_review`, and sync to terminal. `BLOCKER:` findings prevent agreement.
 Dispose of each finding with evidence; a behavior change needs a newer revision.
-There are 3 spec-review attempts across revisions, with no automatic renewal.
-**Stop:** attempts exhausted → bring the product tradeoff to the user; an
-extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md)
+Only completed reviews that did not accept consume the 3-review debate budget;
+accepted reviews do not, and failed or uncertain dispatches count only toward
+the hard ceiling of 5 spec-review dispatches, with no automatic renewal. Room
+status reports both counters under `spec_review_budget`.
+**Stop:** debate budget or ceiling exhausted → bring the product tradeoff to the
+user; an extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md)
 (a room with zero acceptances and a completed `scope_change` report instead uses
 [pre-acceptance review extension](../../../docs/guides/pre-acceptance-review-extension.md);
 both share the room's one grant).
@@ -124,11 +127,11 @@ Pending operator requests block acceptance: do only the authorized execution,
 return the evidence, then get Fable's next judgment.
 **Stop:** `scope_change` → a revised, agreed spec first: register the exact next
 charter revision and reach Fable's renewed exact-spec agreement on it before any
-new handoff or implementation. With the room's three charter reviews already
-consumed and zero independent acceptances, the user may instead authorize the
+new handoff or implementation. With the room's debate budget already exhausted
+and zero independent acceptances, the user may instead authorize the
 [pre-acceptance review extension](../../../docs/guides/pre-acceptance-review-extension.md)
 for that exact proposal, which grants exactly one additional exact-spec review
-of the registered revision; that fourth review's own agreement **is** the
+of the registered revision; that additional review's own agreement **is** the
 renewed agreement, never a substitute for it or for implementation authority.
 Enhancement proposals →
 [enhancement issue handoff](../../../docs/guides/workflow.md#enhancement-issue-handoff).

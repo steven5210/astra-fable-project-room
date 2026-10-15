@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import ao_outcomes
 import ao_project_room as ao
+import ao_spec_review_budget as budget
 import ao_spec_verdict_recovery as recovery
 import ao_workflow
 import project_room
@@ -143,9 +144,9 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             self.audit(recovery_request_id='format2')
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format-resume', recovery.PURPOSE)
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
-            self.send('spec_review', 'review4')
-        self.assertEqual(len(self.fake.posts), 4)
+        # One prose-only completed review is one debate attempt; the settled failure consumes only dispatch capacity.
+        self.assertEqual(self.send('spec_review', 'review4')['state'], 'submitted')
+        self.assertEqual(len(self.fake.posts), 5)
 
     def test_rejected_recovery_result_closes_explicitly_and_the_room_continues(self):
         self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
@@ -165,14 +166,13 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertIsNotNone(record['controller_check']['verdict_error'])
         self.assertEqual(record['request_state'], 'completed')
         self.spec(revision=2)
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
-            self.send('spec_review', 'review4')
+        self.assertEqual(self.send('spec_review', 'review4')['state'], 'submitted')
         with self.assertRaisesRegex(ao.RoomError, 'already used'):
             self.audit(recovery_request_id='format2')
         self.assertEqual(self.close(), closed)
         with self.assertRaises(ao.RoomError):
             self.close(astra_review='A different judgment')
-        self.assertEqual(len(self.fake.posts), 4)
+        self.assertEqual(len(self.fake.posts), 5)
 
     def test_a_reworded_verdict_refusal_does_not_damage_a_closed_lane(self):
         self.finish(decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)
@@ -493,8 +493,13 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
         self.finish()
         self.assertFalse(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        # A prose-only completed source review is a debate attempt until the authenticated
+        # format recovery's agreement binds it; afterwards it counts as accepting.
+        source = self.state()['requests']['review3']
+        self.assertEqual(budget.counted_as(self.directory(), self.state(), source), 'debate')
         result = self.commit()
         self.assertTrue(result['agreed'])
+        self.assertEqual(budget.counted_as(self.directory(), self.state(), source), 'accepting')
         status = self.service.ao_room_status(self.room)
         self.assertTrue(status['agreement']['agreed'])
         self.assertEqual(status['spec_review_attempts'], 3)
@@ -506,8 +511,11 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             self.assertEqual(after['requests'][key], row)
             self.assertEqual((self.directory() / row['receipt']).read_bytes(), receipts[key])
         self.service.ao_room_handoff(self.room, str(self.repo))
-        with self.assertRaisesRegex(ao.RoomError, 'Three Fable'):
-            self.send('spec_review', 'review4')
+        # The recovered agreement counts review3 as accepting, so the debate budget is at zero;
+        # only the five-dispatch ceiling still bounds further spec reviews.
+        self.agree(key='review4'); self.agree(key='review5')
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
+            self.send('spec_review', 'review6')
         self.send('implementation')
         (self.repo / 'feature.txt').write_text('implemented\n')
         self.fake.finish('engineer', json.dumps(self.report()))
