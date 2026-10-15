@@ -175,6 +175,14 @@ class SettledHistoryFixture(PreAcceptanceFixture):
         entries.sort(key=lambda entry: entry['turn_id'])
         return entries
 
+    def _assert_fourth_send_refuses(self, pattern):
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, pattern):
+            self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertNotIn('fourth', self.state()['requests'])
+        self.assertEqual(extension._consumptions(self.directory()), [])
+
 
 class SettledHistoryPositiveTests(SettledHistoryFixture):
     """Group 2: positive production-entry proof that settled history is admitted and granted."""
@@ -379,14 +387,6 @@ class SettledHistorySettlementEvidenceNegativeTests(SettledHistoryFixture):
     def _settled_request(self, index=0):
         request_id = self.settled[index]['request_id']
         return request_id, self.state()['requests'][request_id]
-
-    def _assert_fourth_send_refuses(self, pattern):
-        posts = len(self.fake.posts)
-        with self.assertRaisesRegex(ao.RoomError, pattern):
-            self.send('spec_review', 'fourth')
-        self.assertEqual(len(self.fake.posts), posts)
-        self.assertNotIn('fourth', self.state()['requests'])
-        self.assertEqual(extension._consumptions(self.directory()), [])
 
     def test_tampered_receipt_bytes_refuse_the_fourth_send(self):
         self.grant()
@@ -888,6 +888,41 @@ class RecoveredContextWithProofWithoutSettledFailureTests(PreAcceptanceFixture):
             self.audit()
 
 
+def _splice_compaction_import_proof(fixture):
+    """Append a 'recovered' engineer turn and splice a verified compaction-import proof for it onto
+    the latest engineer request's own semantic-outcome record, content-addressed under its own new
+    digest, re-pointing ``semantic_outcome``/``semantic_outcome_sha256`` to it. Shared by
+    ``RecoveredContextWithProofTests`` and ``RecoveredContextLifecycleTests`` below.
+
+    Returns a dict with ``recovered_turn`` (the exact object living in
+    ``fixture.fake.snapshots['engineer']['turns']``, so mutating it in place drifts the live
+    history), ``original``/``original_path``/``original_sha256`` (the pre-splice record and its own
+    still-valid content-addressed pointer) and ``modified``/``new_path``/``new_sha256`` (the spliced
+    record this function wrote and pointed the request to).
+    """
+    request = fixture.state()['requests'][fixture.final_request_id]
+    original_path, original_sha256 = request['semantic_outcome'], request['semantic_outcome_sha256']
+    original = ao.read(fixture.directory() / original_path)
+    recovered_turn = {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1',
+                      'state': 'recovered'}
+    fixture.fake.snapshots['engineer']['turns'].append(recovered_turn)
+    modified = copy.deepcopy(original)
+    modified['native'] = {**modified['native'], 'compaction_imports': [
+        {'turn_id': 'recovered-turn-1', 'turn_sha256': ao.digest(recovered_turn),
+         'messages_sha256': ao.digest([])}]}
+    new_sha256 = ao.digest(modified)
+    fixture.assertNotEqual(new_sha256, original_sha256)
+    new_path = 'outcomes/' + fixture.final_request_id + '/' + new_sha256 + '.json'
+    ao.atomic(fixture.directory() / new_path, modified)
+    tampered = copy.deepcopy(fixture.state())
+    tampered['requests'][fixture.final_request_id]['semantic_outcome'] = new_path
+    tampered['requests'][fixture.final_request_id]['semantic_outcome_sha256'] = new_sha256
+    ao.atomic(fixture.directory() / 'state.json', tampered)
+    return {'recovered_turn': recovered_turn, 'original': original, 'original_path': original_path,
+            'original_sha256': original_sha256, 'modified': modified, 'new_path': new_path,
+            'new_sha256': new_sha256}
+
+
 class RecoveredContextWithProofTests(SettledHistoryFixture):
     """Group 7 positive: a settled history (SettledHistoryFixture, so the settled-history opt-in
     is active -- C2) plus a 'recovered' native turn backed by a verified compaction-import proof
@@ -911,23 +946,7 @@ class RecoveredContextWithProofTests(SettledHistoryFixture):
 
     def setUp(self):
         super().setUp()
-        request = self.state()['requests'][self.final_request_id]
-        original = ao.read(self.directory() / request['semantic_outcome'])
-        self.recovered_turn = {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1',
-                               'state': 'recovered'}
-        self.fake.snapshots['engineer']['turns'].append(self.recovered_turn)
-        modified = copy.deepcopy(original)
-        modified['native'] = {**modified['native'], 'compaction_imports': [
-            {'turn_id': 'recovered-turn-1', 'turn_sha256': ao.digest(self.recovered_turn),
-             'messages_sha256': ao.digest([])}]}
-        new_sha256 = ao.digest(modified)
-        self.assertNotEqual(new_sha256, request['semantic_outcome_sha256'])
-        new_path = 'outcomes/' + self.final_request_id + '/' + new_sha256 + '.json'
-        ao.atomic(self.directory() / new_path, modified)
-        tampered = copy.deepcopy(self.state())
-        tampered['requests'][self.final_request_id]['semantic_outcome'] = new_path
-        tampered['requests'][self.final_request_id]['semantic_outcome_sha256'] = new_sha256
-        ao.atomic(self.directory() / 'state.json', tampered)
+        self.recovered_turn = _splice_compaction_import_proof(self)['recovered_turn']
 
     def test_recovered_turn_with_compaction_import_proof_is_admitted_and_excluded_from_unowned(self):
         audit = self.audit()
@@ -937,6 +956,126 @@ class RecoveredContextWithProofTests(SettledHistoryFixture):
         self.assertNotIn('recovered-turn-1', unowned_ids)
         owned_ids = {row['turn_id'] for row in native['owned_turns']}
         self.assertNotIn('recovered-turn-1', owned_ids)
+
+
+class RecoveredContextLifecycleTests(SettledHistoryFixture):
+    """Group 7 lifecycle: the proven recovered-context turn ``RecoveredContextWithProofTests`` admits
+    at audit is carried through the production grant and send entry points, plus post-grant changes
+    to its compaction-import evidence. ``ao_project_room.ao_room_send`` first validates the grant
+    (``Service.quiet`` -> ``ao_review_extension.validate``/``_retained``), then runs
+    ``ao_outcomes.gate``, which re-observes ``latest_for_role(state, 'engineer')`` through a fresh
+    ``ao_native_outcome.inspect`` call, refuses any extra native turn that observation does not name
+    as an import, and re-persists that request's semantic-outcome record from it. Only then does
+    ``ao_workflow.packet`` call ``ao_review_extension.admission``, which re-runs ``validate()`` and
+    recomputes native evidence (``_native_evidence`` -> ``ao_provider_transition._native`` ->
+    ``ao_outcomes.known_context_turns`` -> ``known_compaction_turns``), and only after admission
+    succeeds does ``ao_room_send`` call ``ao_review_extension.consume``. Every refusal below is
+    therefore pre-consumption and pre-POST, at whichever of the two checks it names.
+
+    Because the gate re-persists its fresh observation, that observation, not the stored record,
+    decides what admission later reads: a record that is only re-pointed or rewritten is replaced
+    by the gate. Tests that must pass the gate unchanged patch ``ao_native_outcome.inspect`` to
+    return the exact ``native`` dict of the record they leave in place, so the gate's re-persist is
+    a content-identical no-op and admission reads that record; the state-only re-point test instead
+    lets the observation differ from the re-pointed record to show the gate replacing it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.splice = _splice_compaction_import_proof(self)
+        self.recovered_turn = self.splice['recovered_turn']
+
+    def test_grant_admits_the_proven_context_turn_and_the_fourth_send_consumes_it_once(self):
+        """The recovered turn is counted in turn_count yet excluded from both owned_turns and
+        unowned_completed_turns -- a proven context import, not an inferred absence -- and the
+        grant's one-time fourth-review slot is consumed exactly once; a fifth stays exhausted."""
+        audited = self.audit()
+        native = self.saved_audit(audited['audit_sha256'])['evidence']['native']['engineer']
+        turns = self.fake.snapshots['engineer']['turns']
+        owned_ids = {row['turn_id'] for row in native['owned_turns']}
+        unowned_ids = {row['turn_id'] for row in native['unowned_completed_turns']}
+        self.assertIn(self.recovered_turn, turns)
+        self.assertNotIn('recovered-turn-1', owned_ids)
+        self.assertNotIn('recovered-turn-1', unowned_ids)
+        self.assertEqual(native['turn_count'], len(turns))
+        self.assertEqual(len(owned_ids) + len(unowned_ids), native['turn_count'] - 1)
+        inputs = self.grant_inputs(audit=audited)
+        self.service.ao_room_preacceptance_review_extend(**inputs)
+        posts_before_send = len(self.fake.posts)
+        with patch.object(native_outcome, 'inspect', return_value=self.splice['modified']['native']):
+            self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts_before_send + 1)
+        self.assertEqual([ao.read(path)['request']['request_id'] for path in extension._consumptions(self.directory())],
+                         ['fourth'])
+        self.assertIn('fourth', self.state()['requests'])
+        self.finish_fourth()
+        self.assertEqual(self.state()['requests']['fourth']['state'], 'completed')
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted'):
+            self.send('spec_review', 'fifth')
+        self.assertEqual(len(self.fake.posts), posts_before_send + 1)
+
+    def test_post_grant_import_proof_drift_refuses_the_fourth_send_at_admission(self):
+        """A new content-addressed semantic-outcome record whose compaction-import messages digest
+        no longer matches the live recovered turn refuses the fourth send at admission, even when
+        ``ao_outcomes.gate``'s own fresh re-observation reasserts that exact same drifted proof."""
+        self.grant()
+        drifted = copy.deepcopy(self.splice['modified'])
+        drifted['native']['compaction_imports'][0]['messages_sha256'] = ao.digest(['a-drifted-message'])
+        new_sha256 = ao.digest(drifted)
+        self.assertNotEqual(new_sha256, self.splice['new_sha256'])
+        new_path = 'outcomes/' + self.final_request_id + '/' + new_sha256 + '.json'
+        ao.atomic(self.directory() / new_path, drifted)
+        tampered = copy.deepcopy(self.state())
+        tampered['requests'][self.final_request_id]['semantic_outcome'] = new_path
+        tampered['requests'][self.final_request_id]['semantic_outcome_sha256'] = new_sha256
+        ao.atomic(self.directory() / 'state.json', tampered)
+        before_files = self.room_files()
+        with patch.object(native_outcome, 'inspect', return_value=drifted['native']):
+            self._assert_fourth_send_refuses('Verified native compaction import changed')
+        self.assertEqual(self.room_files(), before_files)
+
+    def test_post_grant_live_import_loss_refuses_the_fourth_send_at_the_outcome_gate(self):
+        """A fresh native re-observation that no longer carries the recovered turn's compaction import
+        (the un-spliced observation) refuses the fourth send at ``ao_outcomes.gate``'s own
+        unexplained-turn check, before admission is reached, with the granted spliced record still in
+        place. Re-pointing only ``state.json`` to the un-spliced record is not a removal: the gate
+        re-persists whatever the fresh observation carries (see the state-only re-point test below)."""
+        self.grant()
+        before_files = self.room_files()
+        with patch.object(native_outcome, 'inspect', return_value=self.splice['original']['native']):
+            self._assert_fourth_send_refuses('Native history contains unverified recovered context')
+        self.assertEqual(self.room_files(), before_files)
+
+    def test_post_grant_state_only_repoint_is_superseded_by_the_gates_fresh_observation(self):
+        """Re-pointing only ``state.json`` to the un-spliced record does not remove the import proof:
+        while the fresh native re-observation still names the recovered turn, ``ao_outcomes.gate``
+        re-persists the spliced record and re-points the request back to it, and the fourth send
+        dispatches exactly once."""
+        self.grant()
+        tampered = copy.deepcopy(self.state())
+        tampered['requests'][self.final_request_id]['semantic_outcome'] = self.splice['original_path']
+        tampered['requests'][self.final_request_id]['semantic_outcome_sha256'] = self.splice['original_sha256']
+        ao.atomic(self.directory() / 'state.json', tampered)
+        posts = len(self.fake.posts)
+        with patch.object(native_outcome, 'inspect', return_value=self.splice['modified']['native']):
+            self.send('spec_review', 'fourth')
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        self.assertEqual(len(extension._consumptions(self.directory())), 1)
+        request = self.state()['requests'][self.final_request_id]
+        self.assertEqual(request['semantic_outcome'], self.splice['new_path'])
+        self.assertEqual(request['semantic_outcome_sha256'], self.splice['new_sha256'])
+
+    def test_post_grant_live_recovered_turn_drift_refuses_the_fourth_send_at_admission(self):
+        """A live recovered-turn row that no longer digests to its granted proof's turn_sha256 refuses
+        the fourth send at admission's own ``known_compaction_turns`` re-verification, with the granted
+        proof record untouched. The patched re-observation deliberately reasserts the granted, now-stale
+        proof so the gate passes; unpatched, the gate refuses first (see the live-import-loss test)."""
+        self.grant()
+        self.splice['recovered_turn']['providerTurnId'] = 'native-drifted-recovered-turn-1'
+        before_files = self.room_files()
+        with patch.object(native_outcome, 'inspect', return_value=self.splice['modified']['native']):
+            self._assert_fourth_send_refuses('Verified native compaction import changed')
+        self.assertEqual(self.room_files(), before_files)
 
 
 class SettledHistoryDurabilityAndConcurrencyTests(SettledHistoryFixture):
