@@ -117,3 +117,19 @@ project-room call ao_room_send --args '{
   identical registration stays idempotent. `ao_room_status.spec_rereview`
   reports `none` (no field), `pending_uncommitted`, `granted`, `consumed` or
   `damaged`, with the named request id, remaining count and receipt fields.
+- Supported room operations stay valid through the grant. An explicit
+  `ao_room_outcome_audit` with native source paths may replace
+  `native_outcome_source` and `native_outcome_source_evidence`; the saved
+  verified source audit must prove the same retained native owner. A
+  stopped-controller executable repair may append a verified descendant to
+  `executable_binding`; every journal entry must prove the same retained
+  owner and the chain must reach the audited pointer. Neither change makes
+  the audited evidence stale, before the intent is consumed or after it is
+  agreed.
+- A routing refresh is not supported in this lane. The existing
+  fourth-review refresh guard requires the room agreement to be the consumed
+  fourth review's own; after a re-review grant there is no agreement, and
+  after an accepted re-review the agreement belongs to that fifth review, so
+  the guard refuses the refresh before any `routing-refresh/` journal write
+  and the room is never stranded. Validation also pins the audited
+  `routing_refresh` pointer itself, so a tampered pointer refuses.

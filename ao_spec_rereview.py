@@ -314,15 +314,18 @@ def _audit_history_unchanged(saved, snapshots):
 
 def _retained(service, directory, state, evidence):
     baseline = evidence['state']
+    lane = evidence['extension']['lane']
     if ao.digest(baseline) != evidence['state_sha256']:
         raise RoomError('Re-review original state evidence was modified')
     # 'spec' is deliberately not pinned: after the grant is consumed, a later charter registration
     # stays legal exactly as it does for the consumed extension, and validation must keep passing.
-    if (any(state.get(k) != baseline.get(k) for k in extension.PIN_FIELDS)
-            or state.get('spec_review_extension') != baseline.get('spec_review_extension')
-            or any(state.get(k) != baseline.get(k)
-                   for k in ('executable_binding', 'routing_refresh', 'native_outcome_source',
-                             'native_outcome_source_evidence'))):
+    # The pointer fields executable_binding, native_outcome_source and native_outcome_source_evidence
+    # are also not pinned by equality: a same-owner executable repair and a verified native-source
+    # audit are supported operations, authenticated below exactly as the extension authenticates them.
+    if ((any(state.get(k) != baseline.get(k) for k in extension.PIN_FIELDS)
+            and not (lane == extension.PRE
+                     and extension._recovered_reviewer(service, state, baseline)))
+            or state.get('spec_review_extension') != baseline.get('spec_review_extension')):
         raise RoomError('Re-review room, charter grant, native binding, authorization or pinned metadata changed')
     original_amendments = baseline.get('instruction_amendments', [])
     current_amendments = state.get('instruction_amendments', [])
@@ -331,7 +334,29 @@ def _retained(service, directory, state, evidence):
         raise RoomError('Re-review original instruction amendments were removed, reordered or changed')
     from ao_instruction_amendments import pending
     pending(directory, state, baseline['bindings']['engineer']['session_id'])
-    lane = evidence['extension']['lane']
+    extension._source_record(directory, state, evidence)
+    if (state.get('executable_binding') or baseline.get('executable_binding')
+            or list((directory / 'executable-bindings').glob('*.json'))):
+        import ao_executable_binding
+        prepared = _read(directory / state['preparation'])
+        ao_executable_binding._chain(directory, state, prepared)
+        pointer = state.get('executable_binding')
+        while pointer != baseline.get('executable_binding'):
+            if pointer is None:
+                raise RoomError('Re-review original executable binding is missing from its journal')
+            record = ao_executable_binding._read(directory, pointer)
+            extension._same_owner(record['evidence']['native_owner'], evidence)
+            pointer = record['previous']
+    if state.get('routing_refresh') != baseline.get('routing_refresh'):
+        raise RoomError('A routing refresh after the re-review grant is unsupported; '
+                        'the audited routing pointer must remain')
+    if baseline.get('routing_refresh') or list((directory / 'routing-refresh').glob('*.json')):
+        import ao_routing_refresh
+        prepared = _read(directory / state['preparation'])
+        # Routing validation separately blocks every unclaimed intent and mixed
+        # runtime file. Here only committed ancestry is inspected, allowing the
+        # exact interrupted refresh to validate its unchanged re-review evidence.
+        ao_routing_refresh._chain(directory, state, prepared, check_unclaimed=False)
     settled_history = (lane == extension.PRE
                        and bool(extension._settled_requests(baseline, baseline['bindings']['engineer'])))
     with extension._HistoryEvidence(directory, evidence['target']['native_session_id'], settled_history) as history:
@@ -461,9 +486,21 @@ def grant(service, room_id, audit_sha256, authorization, authorization_reference
         full_evidence, snapshots = _inspect(service, directory, state, saved['evidence']['target'],
                                             reconcile=bool(prior))
         _audit_history_unchanged(saved, snapshots)
-        if ao.digest(full_evidence) != ao.digest(saved['evidence']):
-            raise RoomError('Re-review audit is stale; charter, retained evidence or native metadata changed')
         evidence = full_evidence
+        if ao.digest(full_evidence) != ao.digest(saved['evidence']):
+            # Only an already durable receipt may reconcile across the pointer moves _retained
+            # tolerates: a same-owner executable repair or a verified native-source audit after the
+            # audit. The committed extension's own retained check authenticated every such move
+            # inside _inspect; every other evidence byte must still be identical.
+            moved = ('executable_binding', 'native_outcome_source', 'native_outcome_source_evidence')
+            fresh, original = full_evidence.get('state'), saved['evidence'].get('state')
+            rest = lambda value: {k: v for k, v in value.items() if k not in moved}
+            if (not prior or not isinstance(fresh, dict) or not isinstance(original, dict)
+                    or rest(fresh) != rest(original)
+                    or {k: v for k, v in full_evidence.items() if k not in ('state', 'state_sha256')}
+                    != {k: v for k, v in saved['evidence'].items() if k not in ('state', 'state_sha256')}):
+                raise RoomError('Re-review audit is stale; charter, retained evidence or native metadata changed')
+            evidence = saved['evidence']
         record = {'version': 1, 'room_id': room_id, 'inputs': inputs, 'additional_spec_reviews': 1,
                   'before_state_sha256': evidence['state_sha256'], 'evidence_sha256': ao.digest(evidence),
                   'recorded_at': prior['recorded_at'] if prior else time.time()}

@@ -10,8 +10,11 @@ import copy
 import io
 import json
 import os
+from pathlib import Path
+import shutil
 import sqlite3
 import sys
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -23,6 +26,7 @@ import project_room
 import project_room_mcp
 import project_room_runtime as runtime
 from test_ao_preacceptance_review_extension import PreAcceptanceFixture
+from test_ao_review_extension import ExtensionExecutableEvolutionTests
 
 EXHAUSTED = 'fourth Fable review intent is exhausted'
 REREVIEW_EXHAUSTED = 'one re-review intent is exhausted'
@@ -706,7 +710,8 @@ class ReReviewCrashBoundaryTests(ReReviewFixture):
         self.assertEqual(pending[0].read_bytes(), receipt_bytes)
         self.assertEqual(self.state()['spec_rereview']['request_id'], self.REREVIEW_ID)
 
-    def test_post_failure_after_consumption_stays_durable_and_never_replays(self):
+    def test_post_failure_after_projection_stays_durable_and_never_replays(self):
+        """The POST itself fails after the durable consumption and the projected state."""
         self.granted()
         original_request = self.fake.request
         def failing(method, path, payload=None):
@@ -763,7 +768,57 @@ class ReReviewCrashBoundaryTests(ReReviewFixture):
         record, evidence = rereview.validate(restarted, self.state())
         self.assertEqual(record['inputs']['request_id'], self.REREVIEW_ID)
 
-    def test_concurrent_or_repeated_sends_post_once_and_consume_once(self):
+    def test_concurrent_identical_sends_post_once_and_consume_once(self):
+        """Two sends of the same intent released on one barrier: exactly one POST, one consumption."""
+        self.granted()
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def attempt():
+            barrier.wait()
+            try:
+                results.append(self.service.ao_room_send(self.room, 'engineer', self.MESSAGE,
+                                                         self.REREVIEW_ID, purpose='spec_review'))
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse(errors)
+        self.assertEqual([result['state'] for result in results], ['submitted', 'submitted'])
+        self.assertEqual(len(self.fake.posts), 6)
+        self.assertEqual(len(rereview._consumptions(self.directory())), 1)
+        self.note_native_turn(self.REREVIEW_ID)
+
+    def test_concurrent_different_id_send_never_posts_a_second_turn(self):
+        """One authorized intent raced with a different request id: the wrong one refuses, one POST."""
+        self.granted()
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def attempt(request_id):
+            barrier.wait()
+            try:
+                results.append(self.service.ao_room_send(self.room, 'engineer', self.MESSAGE,
+                                                         request_id, purpose='spec_review'))
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=attempt, args=(self.REREVIEW_ID,)),
+                   threading.Thread(target=attempt, args=('concurrent-other',))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), 'active or uncertain|exact named re-review intent')
+        self.assertEqual(len(self.fake.posts), 6)
+        self.assertEqual(len(rereview._consumptions(self.directory())), 1)
+        self.assertNotIn('concurrent-other', self.state()['requests'])
+        self.assertIn(self.REREVIEW_ID, self.state()['requests'])
+        self.note_native_turn(self.REREVIEW_ID)
+
+    def test_repeated_same_id_send_never_posts_again(self):
         self.granted()
         self.send_rereview()
         posts = len(self.fake.posts)
@@ -773,6 +828,34 @@ class ReReviewCrashBoundaryTests(ReReviewFixture):
         self.assert_refuses_without_mutation('active or uncertain',
             lambda: self.send_rereview(request_id='concurrent-other'))
         self.assertEqual(len(rereview._consumptions(self.directory())), 1)
+
+    def test_consumption_survives_a_projection_crash_without_replay(self):
+        """A crash after the durable consumption but before the state projection: the record
+        stays, nothing POSTs, and every later operation reports the diagnosed hold."""
+        self.granted()
+        original_save = self.service.save
+        def crashing(directory, state):
+            if self.REREVIEW_ID in state['requests']:
+                raise OSError('synthetic projection interruption after durable consumption')
+            return original_save(directory, state)
+        with patch.object(self.service, 'save', side_effect=crashing):
+            with self.assertRaises(OSError):
+                self.service.ao_room_send(self.room, 'engineer', self.MESSAGE, self.REREVIEW_ID,
+                                          purpose='spec_review')
+        self.assertNotIn(self.REREVIEW_ID, self.state()['requests'])
+        self.assertEqual(len(rereview._consumptions(self.directory())), 1)
+        self.assertEqual(len(self.fake.posts), 5)
+        restarted = ao.Service(self.home, lambda url: self.fake)
+        with self.assertRaisesRegex(ao.RoomError, 'request projection is missing'):
+            rereview.validate(restarted, self.state())
+        status = restarted.ao_room_status(self.room)
+        self.assertEqual(status['spec_rereview']['status'], 'damaged')
+        self.assertIn('projection is missing', status['spec_rereview']['error'])
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'projection is missing'):
+            self.service.ao_room_send(self.room, 'engineer', self.MESSAGE, self.REREVIEW_ID,
+                                      purpose='spec_review')
+        self.assertEqual(len(self.fake.posts), posts)
 
 
 class ReReviewQuotaHoldTests(ReReviewFixture):
@@ -887,6 +970,347 @@ class ReReviewDelegateTests(ReReviewFixture):
         with patch.object(ao_delegates, 'assert_settled', side_effect=unfinished):
             self.assert_refuses_without_mutation('Active or unresolved delegate jobs',
                                                  lambda: self.send_rereview())
+
+
+class ReReviewSamePathAuditTests(ReReviewFixture):
+    """A supported same-path explicit outcome audit moves only the source-evidence pointer.
+
+    ``native_outcome_source`` stays byte-identical, so ``_source_record`` early-returns and the
+    re-review grant is untouched; only ``native_outcome_source_evidence`` moves to the new record.
+    """
+
+    def audit_same_paths(self):
+        before = copy.deepcopy(self.state().get('native_outcome_source_evidence'))
+        result = self.service.ao_room_outcome_audit(
+            self.room, ao_database_path=str(self.database), native_transcript_path=str(self.transcript))
+        after = self.state().get('native_outcome_source_evidence')
+        self.assertNotEqual(after, before)  # The supported audit really moved the pointer.
+        self.assertFalse(result['outcome']['hold'])
+        self.assertFalse(result['model_dispatch'])
+
+    def test_same_path_source_audit_before_consumption_keeps_the_send_admitted(self):
+        self.granted()
+        self.audit_same_paths()
+        posts = len(self.fake.posts)
+        self.send_rereview()
+        self.assertEqual(len(self.fake.posts), posts + 1)
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_rereview']['status'], 'consumed')
+
+    def test_same_path_source_audit_after_the_fifth_agreement_keeps_handoff(self):
+        self.granted()
+        self.send_rereview()
+        self.finish_rereview()
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        self.audit_same_paths()
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        handoff = self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assertEqual(handoff['spec_revision'], 3)
+
+
+class ReReviewSettledFailureTests(ReReviewFixture):
+    """A real native quota failure of the re-review turn settles without renewing the grant."""
+
+    def test_quota_failure_of_the_fifth_turn_settles_and_stays_exhausted(self):
+        import ao_native_outcome as native_outcome
+        from test_ao_preacceptance_settled_history import _quota_native
+        self.granted()
+        self.send_rereview()
+        self.fake.finish('engineer', state='failed')
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests'][self.REREVIEW_ID]['state'], 'uncertain')
+        receipts = {key: (self.directory() / self.state()['requests'][key]['receipt']).read_bytes()
+                    for key in ('charter-1', 'charter-2', 'charter-3', 'implementation', 'fourth')}
+        posts = len(self.fake.posts)
+        with patch.object(native_outcome, 'inspect', return_value=_quota_native(self.REREVIEW_ID)):
+            audited = self.service.ao_room_outcome_audit(self.room)
+            self.assertEqual(audited['outcome']['kind'], 'quota_limit')
+            self.assertTrue(audited['resume_eligible'])
+            self.service.ao_room_outcome_resume(self.room, self.REREVIEW_ID, audited['outcome_sha256'],
+                'post-quota-successor', 'The correlated native quota stop was diagnosed.',
+                'Actual approval for only the named continuation.')
+        self.assertEqual(self.state()['requests'][self.REREVIEW_ID]['state'], 'settled_failure')
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_rereview']['status'], 'consumed')
+        self.assertEqual(status['spec_rereview']['remaining_spec_reviews'], 0)
+        with self.assertRaisesRegex(ao.RoomError, REREVIEW_EXHAUSTED):
+            self.send_rereview(request_id='post-quota-successor')
+        with self.assertRaisesRegex(ao.RoomError, 'hold|exhausted'):
+            self.send_rereview(request_id='another-review')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(len(rereview._consumptions(self.directory())), 1)
+        for key, content in receipts.items():
+            self.assertEqual((self.directory() / self.state()['requests'][key]['receipt']).read_bytes(),
+                             content)
+
+
+class ReReviewSourceRecordTests(ReReviewFixture):
+    """A moved native source validates only through its saved verified source audit."""
+
+    def moved_audit(self):
+        """A real moved-path outcome audit after the grant: source and evidence pointer move
+        legitimately to the verified record for the moved bytes."""
+        moved_db = self.root / 'moved-ao.db'
+        shutil.copyfile(self.database, moved_db)
+        self.database.unlink()
+        moved_folder = self.root / 'native-moved'
+        moved_folder.mkdir()
+        moved_path = moved_folder / self.transcript.name
+        self.transcript.rename(moved_path)
+        result = self.service.ao_room_outcome_audit(self.room, ao_database_path=str(moved_db),
+                                                    native_transcript_path=str(moved_path))
+        return self.state()['native_outcome_source_evidence'], result
+
+    def repoint_pointer_record(self, pointer, mutate):
+        """Rewrite the pointed-at verified audit under its new content digest and repoint state."""
+        record = rereview._read(self.directory() / pointer['path'])
+        mutate(record)
+        sha256 = ao.digest(record)
+        path = 'outcomes/' + pointer['request_id'] + '/' + sha256 + '.json'
+        rereview._store_once(self.directory() / path, record)
+        state = self.state()
+        state['native_outcome_source_evidence'] = {'path': path, 'sha256': sha256,
+                                                   'request_id': pointer['request_id']}
+        ao.atomic(self.directory() / 'state.json', state)
+
+    def test_moved_source_with_a_verified_audit_still_validates_and_sends(self):
+        self.granted()
+        _, result = self.moved_audit()
+        self.assertFalse(result['outcome']['hold'])
+        record, _ = rereview.validate(self.service, self.state())
+        self.assertEqual(record['inputs']['request_id'], self.REREVIEW_ID)
+        posts = len(self.fake.posts)
+        self.send_rereview()
+        self.assertEqual(len(self.fake.posts), posts + 1)
+
+    def test_changed_source_without_a_verified_audit_refuses(self):
+        self.granted()
+        state = self.state()
+        state['native_outcome_source'] = {**state['native_outcome_source'],
+                                          'transcript': str(self.root / 'unverified.jsonl')}
+        state['native_outcome_source_evidence'] = 'not-a-pointer'
+        ao.atomic(self.directory() / 'state.json', state)
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'requires its saved verified source audit'):
+            rereview.validate(self.service, self.state())
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_status(self.room)
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_verified_audit_with_a_changed_owner_proof_refuses(self):
+        self.granted()
+        pointer, _ = self.moved_audit()
+        def tamper(record):
+            record['native_source_verification']['native_owner'] = {
+                **record['native_source_verification']['native_owner'],
+                'provider_conversation_id': 'other-native-owner'}
+        self.repoint_pointer_record(pointer, tamper)
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'same native owner'):
+            rereview.validate(self.service, self.state())
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_status(self.room)
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_verified_audit_with_malformed_verification_evidence_refuses(self):
+        self.granted()
+        pointer, _ = self.moved_audit()
+        self.repoint_pointer_record(pointer, lambda record: record.update(
+            native_source_verification='tampered'))
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'malformed verification evidence'):
+            rereview.validate(self.service, self.state())
+        self.assertEqual(len(self.fake.posts), posts)
+
+
+class ReReviewExecutableFixture(ReReviewFixture):
+    """The same room, but the AO engineer executable can break and be repaired through its journal."""
+
+    configure_runtime = ExtensionExecutableEvolutionTests.configure_runtime
+
+
+class ReReviewExecutableTests(ReReviewExecutableFixture):
+    """A same-owner executable repair is supported before consumption and after the fifth agreement."""
+
+    def repair(self, tag):
+        import ao_executable_binding as executable
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        target = self.root / ('rereview-' + tag)
+        target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n')
+        target.chmod(0o700)
+        launch = self.root / ('rereview-' + tag + '-launch')
+        if launch.exists() or launch.is_symlink():
+            launch.unlink()
+        launch.symlink_to(target)
+        previous = getattr(self, '_last_executable', self.original_executable)
+        previous.unlink()
+        self._last_executable = target
+        return executable.bind(self.service, self.room, tag, str(target), str(launch),
+                               str(self.database), 'Actual authorization for retained executable repair',
+                               'Original executable was removed')
+
+    def test_repairs_before_consumption_and_after_agreement_keep_every_check_valid(self):
+        self.granted()
+        self.repair('repair-one')
+        pointer_one = copy.deepcopy(self.state()['executable_binding'])
+        self.service.quiet(self.state())
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_rereview']['status'], 'granted')
+        rereview.validate(self.service, self.state())
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        self.send_rereview()
+        self.finish_rereview()
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        self.repair('repair-two')
+        self.service.quiet(self.state())
+        rereview.validate(self.service, self.state())
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        handoff = self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assertEqual(handoff['spec_revision'], 3)
+        # A pointer rolled back behind the newest committed repair refuses through the chain.
+        state = self.state()
+        state['executable_binding'] = pointer_one
+        ao.atomic(self.directory() / 'state.json', state)
+        with self.assertRaisesRegex(ao.RoomError, 'Unclaimed or missing executable binding intent'):
+            rereview.validate(self.service, self.state())
+
+    def test_orphan_repair_intent_and_altered_journal_record_refuse(self):
+        import ao_executable_binding as executable
+        self.granted()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        target = self.root / 'rereview-orphan-target'
+        target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n')
+        target.chmod(0o700)
+        launch = self.root / 'rereview-orphan-launch'
+        launch.symlink_to(target)
+        self.original_executable.unlink()
+        with patch.object(self.service, 'save',
+                          side_effect=OSError('synthetic repair projection interruption')):
+            with self.assertRaises(OSError):
+                executable.bind(self.service, self.room, 'rereview-orphan', str(target), str(launch),
+                                str(self.database), 'Actual repair approval preserves the retained owner.',
+                                'Original executable is missing')
+        # The durable unclaimed intent refuses validation until its exact call reconciles.
+        with self.assertRaisesRegex(ao.RoomError, 'Unclaimed or missing executable binding intent'):
+            rereview.validate(self.service, self.state())
+        with self.assertRaises(ao.RoomError):
+            self.service.ao_room_status(self.room)
+        executable.bind(self.service, self.room, 'rereview-orphan', str(target), str(launch),
+                        str(self.database), 'Actual repair approval preserves the retained owner.',
+                        'Original executable is missing')
+        rereview.validate(self.service, self.state())
+        path = self.directory() / self.state()['executable_binding']['path']
+        record = rereview._read(path)
+        record['recorded_at'] = record.get('recorded_at', 0) + 1
+        ao.atomic(path, record)
+        with self.assertRaisesRegex(ao.RoomError, 'Immutable executable binding evidence changed'):
+            rereview.validate(self.service, self.state())
+
+    def test_changed_owner_repair_refuses_before_any_intent(self):
+        import ao_executable_binding as executable
+        self.granted()
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        target = self.root / 'rereview-owner-target'
+        target.write_text('#!/bin/sh\nprintf "2.1.283 (Claude Code)\\n"\n')
+        target.chmod(0o700)
+        launch = self.root / 'rereview-owner-launch'
+        launch.symlink_to(target)
+        self.original_executable.unlink()
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE sessions SET provider_conversation_id='changed-native-owner'")
+            db.execute("UPDATE conversation_branches SET provider_conversation_id='changed-native-owner'")
+        before = {str(p.relative_to(self.home)): p.read_bytes()
+                  for p in self.home.rglob('*') if p.is_file()}
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'same native owner'):
+            executable.bind(self.service, self.room, 'rereview-owner', str(target), str(launch),
+                            str(self.database), 'Actual repair approval preserves the original owner.',
+                            'Original executable is missing')
+        self.assertEqual({str(p.relative_to(self.home)): p.read_bytes()
+                          for p in self.home.rglob('*') if p.is_file()}, before)
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_pending_receipt_reconciles_across_a_committed_repair(self):
+        """An uncommitted re-review receipt plus a committed same-owner repair still reconciles
+        only the identical grant call."""
+        audited = self.rereview_audit()
+        inputs = {'room_id': self.room, 'audit_sha256': audited['audit_sha256'],
+                  'authorization': 'Actual authorization answer text.',
+                  'authorization_reference': 'Recorded provenance.', 'diagnosis': 'Diagnosed correction.'}
+        before = (self.directory() / 'state.json').read_bytes()
+        with patch.object(self.service, 'save',
+                          side_effect=OSError('synthetic grant projection interruption')):
+            with self.assertRaises(OSError):
+                self.service.ao_room_spec_rereview_grant(**inputs)
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), before)
+        self.assertEqual(len(rereview._pending(self.directory())), 1)
+        self.repair('pending-repair')
+        reconciled = self.service.ao_room_spec_rereview_grant(**inputs)
+        self.assertEqual(reconciled['remaining_spec_reviews'], 1)
+        self.assertEqual(self.state()['spec_rereview']['request_id'], self.REREVIEW_ID)
+        self.fake.snapshots['engineer']['controller'] = 'ready'
+        posts = len(self.fake.posts)
+        self.send_rereview()
+        self.assertEqual(len(self.fake.posts), posts + 1)
+
+
+class ReReviewRoutingFixture(ReReviewFixture):
+    """The same room with a pinned historical guard, so a refresh has real guard bytes to change.
+
+    Mirrors ``PreAcceptanceLiveRoutingRefreshTests`` in
+    ``test_ao_preacceptance_review_extension``: the preparation pins a synthetic historical guard,
+    so the refresh passes the 'already matches' early check and reaches the extension guard itself.
+    """
+
+    def configure_runtime(self):
+        cli = self.root / 'fake-refresh-claude'
+        cli.write_text('#!' + sys.executable + '\nprint("2.1.282 (Claude Code)")\n')
+        cli.chmod(0o700)
+        ao.atomic(self.home / 'config.json', {'claude_bin': str(cli),
+                                              'claude_config_dir': str(self.claude_env)})
+
+    def bind(self):
+        import ao_routing_guard
+        from test_ao_routing_refresh import OLD_GUARD
+        original = Path.read_bytes
+        source = Path(ao_routing_guard.__file__)
+        with patch.object(Path, 'read_bytes',
+                          lambda path: OLD_GUARD if path == source else original(path)):
+            return super().bind()
+
+
+class ReReviewRoutingRefreshTests(ReReviewRoutingFixture):
+    """A routing refresh after the re-review grant is refused by the existing extension guard
+    before any routing-refresh journal write; the room is never stranded."""
+
+    def attempt_refresh(self):
+        import ao_routing_refresh as refresh
+        self.fake.snapshots['engineer']['controller'] = 'stopped'
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'agreement'):
+            refresh.refresh(self.service, self.room, 'post-grant-refresh', str(self.database),
+                            self.NATIVE, 'User authorizes the retained routing correction.',
+                            'Retained routing predates the re-review.')
+        self.assertFalse((self.directory() / refresh.BASE).exists())
+        self.assertIsNone(self.state().get('routing_refresh'))
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_refresh_refuses_while_the_grant_is_unconsumed(self):
+        self.granted()
+        self.attempt_refresh()
+        # The lane is unharmed: the named intent still sends exactly once.
+        posts = len(self.fake.posts)
+        self.send_rereview()
+        self.assertEqual(len(self.fake.posts), posts + 1)
+
+    def test_refresh_refuses_after_the_fifth_agreement(self):
+        self.granted()
+        self.send_rereview()
+        self.finish_rereview()
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        self.attempt_refresh()
+        self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
+        self.service.ao_room_handoff(self.room, str(self.repo))
 
 
 if __name__ == '__main__':
