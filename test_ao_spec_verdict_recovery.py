@@ -86,6 +86,9 @@ class RecoveryFixture(Fixture):
     def commit(self, **changes):
         return self.service.ao_room_spec_verdict_recovery_commit(**self.commit_args(**changes))
 
+    def chain_file(self, name):
+        return self.directory() / 'spec-verdict-recovery' / 'chains' / 'review3' / (name + '.json')
+
     def files(self):
         return {str(p.relative_to(self.directory())): p.read_bytes() for p in self.directory().rglob('*') if p.is_file()}
 
@@ -140,7 +143,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertFalse(status['agreement']['agreed'])
         self.assertIn('one unambiguous JSON object', status['agreement']['reason'])
         self.spec(revision=2)
-        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+        with self.assertRaisesRegex(ao.RoomError, 'already had its one format re-ask'):
             self.audit(recovery_request_id='format2')
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format-resume', recovery.PURPOSE)
@@ -162,12 +165,12 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
         self.assertFalse(status['spec_verdict_recovery']['pending'])
         self.assertEqual(status['spec_verdict_recovery']['closure_sha256'], closed['closure_sha256'])
-        record = ao.read(self.directory() / 'spec-verdict-recovery' / 'closure.json')
+        record = ao.read(self.chain_file('closure'))
         self.assertIsNotNone(record['controller_check']['verdict_error'])
         self.assertEqual(record['request_state'], 'completed')
         self.spec(revision=2)
         self.assertEqual(self.send('spec_review', 'review4')['state'], 'submitted')
-        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+        with self.assertRaisesRegex(ao.RoomError, 'already had its one format re-ask'):
             self.audit(recovery_request_id='format2')
         self.assertEqual(self.close(), closed)
         with self.assertRaises(ao.RoomError):
@@ -200,12 +203,12 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertEqual(request['state'], 'completed')
         self.assertIn('semantic_observation_error', request)
         self.assertIn('spec_verdict_recovery_error', request)
-        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertFalse((self.chain_file('completion')).exists())
         with self.assertRaises(ao.RoomError):
             self.commit()
         closed = self.close()
         self.assertTrue(closed['closed'])
-        record = ao.read(self.directory() / 'spec-verdict-recovery' / 'closure.json')
+        record = ao.read(self.chain_file('closure'))
         self.assertIsNotNone(record['controller_check']['capture_error'])
         self.assertIsNone(record['completion_sha256'])
         status = self.service.ao_room_status(self.room)
@@ -299,11 +302,11 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         request = self.state()['requests']['format1']
         self.assertEqual(request['state'], 'completed')
         self.assertIn('spec_verdict_recovery_error', request)
-        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertFalse((self.chain_file('completion')).exists())
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['format1']
         self.assertNotIn('spec_verdict_recovery_error', request)
-        self.assertTrue((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertTrue((self.chain_file('completion')).exists())
         self.assertTrue(self.commit()['agreed'])
 
     def test_a_changed_candidate_between_syncs_still_refuses_commit(self):
@@ -313,10 +316,10 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             self.service.ao_room_sync(self.room)
         (self.repo / 'late-drift.txt').write_text('changed after the failed capture\n')
         self.service.ao_room_sync(self.room)
-        self.assertTrue((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertTrue((self.chain_file('completion')).exists())
         with self.assertRaisesRegex(ao.RoomError, 'candidate'):
             self.commit()
-        completions = list((self.directory() / 'spec-verdict-recovery').glob('completion*.json'))
+        completions = list(self.chain_file('completion').parent.glob('completion*.json'))
         self.assertEqual(len(completions), 1)
 
     def test_syncs_after_closing_a_held_result_keep_the_error_and_the_lane(self):
@@ -329,7 +332,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
         request = self.state()['requests']['format1']
         self.assertEqual(request['spec_verdict_recovery_error'], original_error)
-        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertFalse((self.chain_file('completion')).exists())
         self.service.quiet(self.state())
         self.spec(revision=2)
 
@@ -343,7 +346,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.service.ao_room_sync(self.room)
         status = self.service.ao_room_status(self.room)
         self.assertEqual(status['spec_verdict_recovery']['status'], 'closed')
-        self.assertFalse((self.directory() / 'spec-verdict-recovery' / 'completion.json').exists())
+        self.assertFalse((self.chain_file('completion')).exists())
         self.spec(revision=2)
 
     def test_close_refuses_every_unfinished_or_misidentified_lane(self):
@@ -455,7 +458,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertEqual(status['spec_verdict_recovery']['status'], 'agreed')
         self.assertEqual(status['spec_verdict_recovery']['recovery_request_id'], 'format1')
         posts = len(self.fake.posts)
-        with self.assertRaisesRegex(ao.RoomError, 'already used'):
+        with self.assertRaisesRegex(ao.RoomError, 'already had its one format re-ask'):
             self.audit(recovery_request_id='format2')
         with self.assertRaises(ao.RoomError):
             self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format2', recovery.PURPOSE)
@@ -530,13 +533,13 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         self.assertFalse(grant['consumed'])
         self.assertEqual(source, self.state()['requests'])
         self.assertEqual(len(self.fake.posts), 3)
-        record = ao.read(self.directory() / recovery._path('grant'))
+        record = ao.read(self.chain_file('grant'))
         self.assertIn('Actual user', record['authorization'])
         self.assertIn('Synthetic human', record['authorization_reference'])
 
     def test_exact_same_grant_and_commit_are_idempotent_but_changed_authority_refuses(self):
         grant = self.grant()
-        record = ao.read(self.directory() / recovery._path('grant'))
+        record = ao.read(self.chain_file('grant'))
         again = self.service.ao_room_spec_verdict_recovery_grant(self.room, record['audit_sha256'],
                          record['authorization'], record['authorization_reference'])
         self.assertEqual(grant, again)
@@ -586,7 +589,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
         with self.assertRaisesRegex(ao.RoomError, 'candidate changed'):
             self.service.ao_room_send(**grant['send_args'])
         self.assertNotIn('format1', self.state()['requests'])
-        self.assertFalse((self.directory() / recovery._path('intent')).exists())
+        self.assertFalse((self.chain_file('intent')).exists())
 
     def test_candidate_drift_observed_at_completion_cannot_be_restored_for_commit(self):
         self.dispatch(); (self.repo / 'feature.txt').write_text('changed\n')
@@ -642,7 +645,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             path.unlink(); path.write_bytes(raw)
 
     def test_deleted_consumption_cannot_be_reauthorized_or_replayed(self):
-        self.dispatch(); path = self.directory() / recovery._path('intent'); path.unlink()
+        self.dispatch(); path = self.chain_file('intent'); path.unlink()
         with self.assertRaisesRegex(ao.RoomError, 'missing, changed or unclaimed'):
             self.service.ao_room_send(self.room, 'engineer', recovery.MESSAGE, 'format1', recovery.PURPOSE)
         with self.assertRaises(ao.RoomError):
@@ -679,7 +682,7 @@ class SpecVerdictRecoveryTests(RecoveryFixture):
             with self.assertRaises(ao.RoomError):
                 self.service.ao_room_send(**grant['send_args'])
         self.assertNotIn('format1', self.state()['requests'])
-        self.assertFalse((self.directory() / recovery._path('intent')).exists())
+        self.assertFalse((self.chain_file('intent')).exists())
         self.assertEqual(len(self.fake.posts), 3)
 
     def test_changed_frozen_source_model_cannot_receive_format_request(self):

@@ -1,7 +1,7 @@
 {
  "_meta": {
   "regenerate": "python3 tests/run_test_shards.py --list shows the estimated minutes per shard; refresh this file from a recent macOS job log when shards drift apart",
-  "source": "GitHub Actions run 36647433937 (main 8af4e80, 2026-09-29): per-module seconds averaged over the macos-latest 3.11 and 3.12 jobs, measured from the timestamps of consecutive test lines in the job logs; test_text_delegate (43.1 s) and test_run_test_shards (0.0 s) were added from the macos-latest 3.11 jobs of run 36658856547 (PR #147), the first run that contained them; test_lifecycle_closure (11.45 s) was added from a single local `/usr/bin/time -p python3 -B -m unittest <module> -v` run on 2026-10-08 (not CI-averaged); test_ao_deliverables (106.90 s) is the `Ran 86 tests in 106.898s` total of a single local `python3 -m unittest test_ao_deliverables -v` run on 2026-10-08 after the character-clip accounting tests were added (not CI-averaged; previously 84.14 s); test_progress_provenance (27.06 s) was remeasured from a single local `/usr/bin/time -p python3 -B -m unittest <module> -v` run on 2026-10-09 (`real 27.06`, `Ran 14 tests in 26.862s`; not CI-averaged); test_ao_spec_review_budget (12.40 s) is the `Ran 8 tests in 12.330s` total of a single local `python3 -m unittest test_ao_spec_review_budget -v` run on 2026-10-14 (not CI-averaged)",
+  "source": "GitHub Actions run 36647433937 (main 8af4e80, 2026-09-29): per-module seconds averaged over the macos-latest 3.11 and 3.12 jobs, measured from the timestamps of consecutive test lines in the job logs; test_text_delegate (43.1 s) and test_run_test_shards (0.0 s) were added from the macos-latest 3.11 jobs of run 36658856547 (PR #147), the first run that contained them; test_lifecycle_closure (11.45 s) was added from a single local `/usr/bin/time -p python3 -B -m unittest <module> -v` run on 2026-10-08 (not CI-averaged); test_ao_deliverables (106.90 s) is the `Ran 86 tests in 106.898s` total of a single local `python3 -m unittest test_ao_deliverables -v` run on 2026-10-08 after the character-clip accounting tests were added (not CI-averaged; previously 84.14 s); test_progress_provenance (27.06 s) was remeasured from a single local `/usr/bin/time -p python3 -B -m unittest <module> -v` run on 2026-10-09 (`real 27.06`, `Ran 14 tests in 26.862s`; not CI-averaged); test_ao_spec_review_budget (12.40 s) is the `Ran 8 tests in 12.330s` total of a single local `python3 -m unittest test_ao_spec_review_budget -v` run on 2026-10-14 (not CI-averaged); test_ao_format_reask (33.30 s) is the `Ran 9 tests in 33.267s` total of a single local `python3 -m unittest test_ao_format_reask -v` run on 2026-10-14 (not CI-averaged)",
   "unit": "seconds",
   "unknown_module_weight": "median of the listed weights"
  },
@@ -41,6 +41,7 @@
   "test_ao_evidence_audit_review": 0.0,
   "test_ao_executable_binding": 9.3,
   "test_ao_executable_upgrade": 7.2,
+  "test_ao_format_reask": 33.3,
   "test_ao_historical_correction": 198.4,
   "test_ao_history": 5.6,
   "test_ao_history_budget": 2.2,
