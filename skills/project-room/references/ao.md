@@ -322,7 +322,11 @@ Codex task discovers updated MCP tools after plugin installation.
    "none" from missing legacy fields. Read full receipts before acting on bounded
    previews. Pending `operator_requests` block acceptance even with completed/true:
    perform only authorized execution, return new evidence, and obtain the subsequent
-   Fable judgment. A request or optional proposal adds no scope authority. See the
+   Fable judgment. Saved `findings` projects the engineer's provenance tokens
+   read-only: read `findings.required_open` and `findings.preexisting_required_open`
+   as required work — a preexisting defect that blocks the approved behavior is
+   required, not cleanup — and the projection grants nothing. A request or optional
+   proposal adds no scope authority. See the
    [report contract](../../../docs/guides/efficient-continuation.md#personal-review-operator-handoffs-and-enhancements).
 7. For a confirmed completed turn, a new `correction` request may repair the
    implementation or missing/malformed report in the same session. The correction

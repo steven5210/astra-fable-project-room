@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import ao_execution_evidence
+import ao_finding_provenance
 import ao_progress
 import ao_project_room as ao
 import ao_read_admission
@@ -70,20 +71,25 @@ class SessionWindowTests(Fixture):
     def test_new_parts_arrive_last_in_a_new_session_with_pinned_digests(self):
         carried = self.state()['requests']['spec_review']['carried']
         # progress_plan_v2 is now superseded by progress_plan_v3 and is never carried to any session;
-        # the last three delivered parts are lifecycle_closure_v1, then the successor (which
-        # consolidates v1/v2), then execution_evidence_v1, appended last in ao_workflow.PARTS.
-        self.assertEqual(carried['parts'][-3:],
-                         [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART])
+        # the last four delivered parts are lifecycle_closure_v1, then the successor (which
+        # consolidates v1/v2), then execution_evidence_v1 and finding_provenance_v1, in
+        # ao_workflow.PARTS order.
+        self.assertEqual(carried['parts'][-4:],
+                         [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART,
+                          ao_finding_provenance.PART])
         self.assertNotIn(ao_progress.PART_V2, carried['parts'])
         self.assertEqual(carried['part_sha256'][ao_progress.PART_V3], ao_progress.INSTRUCTION_V3_SHA256)
         self.assertEqual(carried['part_sha256'][ao_execution_evidence.PART],
                          ao_execution_evidence.INSTRUCTION_SHA256)
         self.assertEqual(carried['part_sha256'][lifecycle_closure.PART], lifecycle_closure.INSTRUCTION_SHA256)
+        self.assertEqual(carried['part_sha256'][ao_finding_provenance.PART],
+                         ao_finding_provenance.INSTRUCTION_SHA256)
         impl = self.state()['requests']['impl-1']['carried']
         self.assertNotIn(ao_progress.PART_V3, impl['parts'])
         self.assertNotIn(ao_residual_escalation.PART, impl['parts'])
         self.assertNotIn(lifecycle_closure.PART, impl['parts'])
         self.assertNotIn(ao_execution_evidence.PART, impl['parts'])
+        self.assertNotIn(ao_finding_provenance.PART, impl['parts'])
 
     def test_a_completed_previous_request_carries_no_notice(self):
         text, carried = self.packet()
@@ -180,9 +186,10 @@ class RetainedSessionPartTests(Fixture):
 
     def test_residual_escalation_v1_delivers_once_to_a_retained_session_that_predates_it(self):
         # progress_plan_v2 is unconditionally superseded by progress_plan_v3 (ao_progress.SUPERSEDED_PARTS
-        # is not patched above), and progress_plan_v3/lifecycle_closure_v1 were already delivered in
-        # setUp's first packet since `newest` above only excludes progress_plan_v2 and residual_escalation_v1;
-        # so residual_escalation_v1 is the only part genuinely new for this retained session.
+        # is not patched above), and progress_plan_v3/lifecycle_closure_v1/finding_provenance_v1 were
+        # already delivered in setUp's first packet since `newest` above only excludes progress_plan_v2
+        # and residual_escalation_v1; so residual_escalation_v1 is the only part genuinely new for this
+        # retained session.
         self.assertIn(ao_progress.PART_V3, self.state()['requests']['spec_review']['carried']['parts'])
         self.send('correction', 'corr-1')
         self.fake.finish('engineer', json.dumps(self.report()))
