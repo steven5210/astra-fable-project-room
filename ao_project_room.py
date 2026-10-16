@@ -279,6 +279,40 @@ def _latest_bound_requests(state):
             for role in ("engineer", "reviewer") if role in (state.get("bindings") or {})}
 
 
+def reader_policy(client):
+    """The wrapper class names around the transport, outermost first."""
+    policy = []
+    while hasattr(client, "client"):
+        policy.append(type(client).__name__)
+        client = client.client
+    return tuple(policy)
+
+
+class IterationObservations:
+    """Native observations reused within ONE locked sync iteration.
+
+    Keyed by (reader policy, session_id). Never shared across iterations. Every request still
+    runs its own identity, model, branch and reroute checks on the shared snapshot; consumers
+    must not mutate it.
+    """
+
+    def __init__(self):
+        self.sessions = {}   # key -> raw GET /sessions/<id> response, as returned by the (wrapped) client
+        self.histories = {}  # key -> snapshot returned by the (wrapped) client's conversation()
+
+    def session(self, client, session_id):
+        key = (reader_policy(client), session_id)
+        if key not in self.sessions:
+            self.sessions[key] = client.request("GET", "/sessions/" + session_id)
+        return self.sessions[key]
+
+    def history(self, client, session_id):
+        key = (reader_policy(client), session_id)
+        if key not in self.histories:
+            self.histories[key] = client.conversation(session_id)
+        return self.histories[key]
+
+
 class Service:
     def __init__(self, home, client_factory=Client):
         self.root = Path(home).resolve() / "ao"
@@ -286,10 +320,13 @@ class Service:
         self.client_factory = client_factory
 
     @contextlib.contextmanager
-    def locked(self, room_id=None):
+    def locked(self, room_id=None, timing=None):
         # One adapter-wide lock also prevents binding the same AO session to two rooms.
         with (self.root / ".lock").open("a+") as stream:
+            lock_started = time.monotonic() if timing is not None else None
             fcntl.flock(stream, fcntl.LOCK_EX)
+            if timing is not None:
+                timing["lock_wait_seconds"] = time.monotonic() - lock_started
             if room_id is None:
                 yield None, None
             else:
@@ -360,7 +397,7 @@ class Service:
             raise RoomError("Immutable specification was modified")
         return spec
 
-    def identity(self, client, state, binding, expected=None):
+    def identity(self, client, state, binding, expected=None, observations=None):
         if (state.get("provider_transition")
                 and binding.get("session_id") == state.get("bindings", {}).get("engineer", {}).get("session_id")):
             # Keep raw completeness/lifecycle evidence for the retained engineer.
@@ -372,12 +409,18 @@ class Service:
         if (requires_strict_history(self.root / 'rooms' / state['room_id'], state, binding)
                 and not isinstance(client, StrictHistoryClient)):
             client = StrictHistoryClient(client)
-        raw = client.request("GET", "/sessions/" + binding["session_id"])
+        if observations is None:
+            raw = client.request("GET", "/sessions/" + binding["session_id"])
+        else:
+            raw = observations.session(client, binding["session_id"])
         session = raw.get("session", raw)
         if (session.get("id") != binding["session_id"] or session.get("projectId") != state["ao_project_id"]
                 or session.get("harness") != binding["harness"] or session.get("mode") != "chat" or session.get("kind") != "worker"):
             raise RoomError("AO session/project/harness identity mismatch")
-        snapshot = client.conversation(binding["session_id"])
+        if observations is None:
+            snapshot = client.conversation(binding["session_id"])
+        else:
+            snapshot = observations.history(client, binding["session_id"])
         if ao_workflow.normal(state):
             for request in state["requests"].values():
                 if request["session_id"] == binding["session_id"]:
@@ -965,8 +1008,27 @@ class Service:
             config_warning = str(exc)
         if not 0 <= wait_seconds <= maximum:
             raise RoomError(f"wait_seconds must be finite and between 0 and {maximum}")
-        deadline = time.monotonic() + wait_seconds
-        summary, initial = self._sync_once(room_id)
+        wait_started = time.monotonic()
+        deadline = wait_started + wait_seconds
+        iterations = 0
+        iteration_seconds = {"last": 0.0, "max": 0.0}
+        lock_wait_seconds = {"last": 0.0, "max": 0.0}
+
+        def iteration():
+            nonlocal iterations
+            timing = {}
+            started = time.monotonic()
+            result = self._sync_once(room_id, timing=timing)
+            elapsed = time.monotonic() - started
+            iteration_seconds["last"] = elapsed
+            iteration_seconds["max"] = max(iteration_seconds["max"], elapsed)
+            lock = timing.get("lock_wait_seconds", 0.0)
+            lock_wait_seconds["last"] = lock
+            lock_wait_seconds["max"] = max(lock_wait_seconds["max"], lock)
+            iterations += 1
+            return result
+
+        summary, initial = iteration()
         states = initial
         while True:
             active = [request_id for request_id, state in states.items() if state in ("submitted", "running")]
@@ -989,11 +1051,18 @@ class Service:
             elif interrupt.wait(min(AO_SYNC_WAIT_POLL_SECONDS, remaining)):
                 reason = "interrupted"
                 break
-            summary, states = self._sync_once(room_id)
+            if deadline - time.monotonic() < iteration_seconds["last"]:
+                reason = "budget"
+                break
+            summary, states = iteration()
         wait = {
             "requested_seconds": wait_seconds,
             "reason": reason,
             "settled": all(state in NATIVE_TERMINAL for state in states.values()),
+            "iterations": iterations,
+            "elapsed_seconds": round(time.monotonic() - wait_started, 3),
+            "iteration_seconds": {"last": round(iteration_seconds["last"], 3), "max": round(iteration_seconds["max"], 3)},
+            "lock_wait_seconds": {"last": round(lock_wait_seconds["last"], 3), "max": round(lock_wait_seconds["max"], 3)},
         }
         if config_warning is not None:
             wait["config_warning"] = config_warning
@@ -1008,8 +1077,8 @@ class Service:
         except RoomError as exc:
             request["spec_verdict_recovery_error"] = str(exc)[:500]
 
-    def _sync_once(self, room_id):
-        with self.locked(room_id) as (directory, state):
+    def _sync_once(self, room_id, timing=None):
+        with self.locked(room_id, timing=timing) as (directory, state):
             self._routing_refresh_gate(state)  # Sync also persists observations and changes the pending intent's state.
             ao_engineering_model.journal(directory, state)  # Ancestry must be intact before any reconciliation write.
             from ao_review_extension import validate as review_extension_validate
@@ -1023,6 +1092,7 @@ class Service:
             transition_validate(self, state)
             pending_gate(self, state)
             client = self.client(state)
+            observations = IterationObservations()
             for request in state["requests"].values():
                 if request["state"] in ('completed', 'settled_failure'):
                     # Preserve older known receipts rather than recomputing their
@@ -1031,7 +1101,7 @@ class Service:
                     if native_id:
                         request["provider_turn_id"] = native_id
                         if ao_workflow.normal(state):
-                            snapshot = self.identity(client, state, request)  # also audits late native reroutes
+                            snapshot = self.identity(client, state, request, observations=observations)  # also audits late native reroutes
                             import ao_outcomes
                             if ao_outcomes.latest_for_role(state, request['role']) == request and not request.get('model_reroute'):
                                 try:
@@ -1052,12 +1122,12 @@ class Service:
                     request["prior_terminal_state"] = request["state"]
                     request["state"] = "uncertain"
                 try:
-                    snapshot = self.identity(client, state, request)
+                    snapshot = self.identity(client, state, request, observations=observations)
                 except RoomError:
                     # AO may change configured model alongside a native reroute.
                     # Preserve that contradiction even when identity() refuses it.
                     if ao_workflow.normal(state):
-                        conflict = conflicting_reroute(request, client.conversation(request["session_id"]))
+                        conflict = conflicting_reroute(request, observations.history(client, request["session_id"]))
                         if conflict:
                             self.record_reroute(directory, state, request, conflict)
                     raise
@@ -1493,7 +1563,7 @@ TOOL_SCHEMAS = {
     "ao_room_handoff": ("After actual exact-spec Fable/Astra agreement, pin the prepared engineer workspace, baseline, provider policy and gates. No model dispatch.", schema({**R, "worktree_path": S})),
     "ao_room_send": ("Send once with a durable clientMessageId. Normal engineers require explicit purpose spec_review, implementation or correction; spec_verdict_repair requires its separate one-use audited grant and fixed message; reviewers use acceptance_review. Unknown delivery is never replayed. Three spec reviews, with only the separately audited one-ever fourth-charter extension. Three acceptance reviews per room; afterwards only the single named request of an unconsumed audited acceptance-review grant is admitted, consuming it irreversibly before any POST.", schema({**R, "role": ROLE, "message": S, "request_id": S, "purpose": {"type": "string", "enum": ["spec_review", "spec_verdict_repair", "implementation", "correction", "acceptance_review"]}}, ["room_id", "role", "message", "request_id"])),
     "ao_release_check": ("Compare the running AO daemon with the official latest stable release once per new or resumed AO session. One bounded GitHub GET plus loopback /healthz and local bundle metadata; never invokes a model, restarts or updates AO, or touches rooms and workers. Outcome up_to_date | update_available | mismatch | unknown; unknown is never up to date. Two report-only sections are included: claude_code compares the configured claude_bin with the bundled and qualified family floors, the newest installed Claude Code and the latest published release, and names the exact setup command when one applies; qualification_sources re-fetches each captured qualification source and reports whether its bytes still match and whether its claude-<family> identifiers still match the retained capture. Neither section switches executables or models. Saves private evidence in version-check.json.", schema({"ao_url": S}, [])),
-    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
+    "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Within one reconciliation each bound session's identity and history are observed once per reader policy and reused for every request's checks. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. The wait is best-effort: it stops with reason budget instead of starting a reconciliation the last iteration's duration shows would overrun the requested wait, while the first iteration, lock acquisition or a slower later iteration can still exceed it; wait reports iterations, elapsed_seconds, iteration_seconds and lock_wait_seconds. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
     "ao_room_status": ("Read saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate. The optional view enum selects the full status (default) or a compact projection with the latest request per role, request counts and delegate job/routing summaries.", schema({**R, "view": {"type": "string", "enum": ["full", "compact"]}}, ["room_id"])),
     "ao_room_progress": ("Read one request's saved progress view (the latest by default): its engineer task list folded from native task-tool rows, Agent launches, served-model and stop-reason histograms, error and refusal counts, and the bounded last assistant text, plus the request's recorded state. Additive provenance says who authored the plan and last text and whether the selected request can refresh them; additive stages report the saved engineering, verification and acceptance records checked against their recorded digests, comparing saved identities only, never the live worktree. Bounded local reads only; no AO/network/model calls, no state change; an unavailable native source reports its reason instead of failing.", schema({**R, "request_id": S, "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 2000}}, ["room_id"])),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),

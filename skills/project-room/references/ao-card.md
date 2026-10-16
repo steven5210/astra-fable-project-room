@@ -22,9 +22,13 @@ Rules for every phase:
   it with the same long yield, never short ones. Never poll room files, receipts,
   transcripts or the CLI with shell or Python watchers, `sleep` loops or short
   repeated calls: every check is a full Astra model turn. Between waits, give
-  at most a one-line update, and only when something changed. A `timeout` or
-  `interrupted` wait reason is not a stall. `settled` is true only when every
-  owned request is terminal. Sync each turn to terminal before another send.
+  at most a one-line update, and only when something changed. A `timeout`, `budget` or
+  `interrupted` wait reason is not a stall. The wait is best-effort: it stops
+  with `budget` instead of starting a reconciliation whose last measured
+  iteration would overrun the requested wait, while the first iteration, lock
+  acquisition or a slower later iteration can still exceed it. `settled` is
+  true only when every owned request is terminal. Sync each turn to terminal
+  before another send.
 - For a progress update at a breakpoint or when the user asks, call
   `ao_room_progress` (read-only: the engineer's task list, Agent launches,
   served models, errors, last message) and format the checklist from it plus

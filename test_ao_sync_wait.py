@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -32,6 +33,13 @@ class FakeClock:
         self.now += seconds
         if self.on_sleep:
             self.on_sleep(seconds)
+
+
+def wait_fields(iterations, elapsed):
+    """The wait report's measured fields under FakeClock: iterations never advance it."""
+    return {"iterations": iterations, "elapsed_seconds": elapsed,
+            "iteration_seconds": {"last": 0.0, "max": 0.0},
+            "lock_wait_seconds": {"last": 0.0, "max": 0.0}}
 
 
 class SyncWaitTests(unittest.TestCase):
@@ -91,7 +99,8 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(sync_once.call_count, 2)
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": True})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": True,
+                                          **wait_fields(2, 5.0)})
         self.assertEqual(result["requests"][0]["state"], "completed")
         request = ao.read(self.state_path())["requests"]["first"]
         receipt_path = self.service.root / "rooms" / self.room / request["receipt"]
@@ -111,7 +120,8 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(sync_once.call_count, 2)
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "state_changed", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "state_changed", "settled": False,
+                                          **wait_fields(2, 5.0)})
         self.assertEqual([request["state"] for request in result["requests"]], ["completed", "running"])
 
     def test_uncertain_request_is_not_settled_when_no_request_remains_active(self):
@@ -126,7 +136,8 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(sync_once.call_count, 2)
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": False,
+                                          **wait_fields(2, 5.0)})
         self.assertEqual(result["requests"][0]["state"], "uncertain")
 
     def test_running_turn_times_out_within_the_poll_bound(self):
@@ -136,7 +147,8 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "timeout", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "timeout", "settled": False,
+                                          **wait_fields(10, 45.0)})
         self.assertLessEqual(sync_once.call_count, math.ceil(45 / ao.AO_SYNC_WAIT_POLL_SECONDS) + 1)
         self.assertEqual(sync_once.call_count, 10)
         self.assertTrue(all(seconds == ao.AO_SYNC_WAIT_POLL_SECONDS for seconds in clock.sleeps))
@@ -151,7 +163,8 @@ class SyncWaitTests(unittest.TestCase):
                 patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
                 patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=600)
-        self.assertEqual(result["wait"], {"requested_seconds": 600, "reason": "timeout", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 600, "reason": "timeout", "settled": False,
+                                          **wait_fields(121, 600.0)})
         self.assertNotIn("config_warning", result["wait"])
         self.assertLessEqual(sync_once.call_count, math.ceil(600 / ao.AO_SYNC_WAIT_POLL_SECONDS) + 1)
         self.assertLessEqual(clock.now, 600 + ao.AO_SYNC_WAIT_POLL_SECONDS)
@@ -192,11 +205,14 @@ class SyncWaitTests(unittest.TestCase):
         self.prepare_running()
         interrupt = threading.Event()
         interrupt.set()
+        clock = FakeClock()
         with patch.object(ao, "SYNC_WAIT_INTERRUPT", interrupt), \
-                patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once:
+                patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once, \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(sync_once.call_count, 1)
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False,
+                                          **wait_fields(1, 0.0)})
 
     def test_wait_interrupt_event_can_interrupt_after_two_polls(self):
         self.prepare_running()
@@ -213,14 +229,17 @@ class SyncWaitTests(unittest.TestCase):
                 return self.wait_calls == 3
 
         interrupt = Interrupt()
+        clock = FakeClock()
         with patch.object(ao, "SYNC_WAIT_INTERRUPT", interrupt), \
                 patch.object(self.service, "_sync_once", wraps=self.service._sync_once) as sync_once, \
-                patch("ao_project_room.time.sleep") as sleep:
+                patch("ao_project_room.time.sleep") as sleep, \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(interrupt.wait_calls, 3)
         self.assertEqual(sync_once.call_count, 3)
         sleep.assert_not_called()
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "interrupted", "settled": False,
+                                          **wait_fields(3, 0.0)})
 
     def test_no_active_request_syncs_once_without_sleep(self):
         clock = FakeClock()
@@ -231,7 +250,8 @@ class SyncWaitTests(unittest.TestCase):
         self.assertEqual(sync_once.call_count, 1)
         self.assertEqual(clock.sleeps, [])
         sleep.assert_not_called()
-        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": True})
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "no_active_request", "settled": True,
+                                          **wait_fields(1, 0.0)})
 
     def test_invalid_wait_values_refuse_before_ao_get_or_state_write(self):
         self.prepare_running()
@@ -283,6 +303,51 @@ class SyncWaitTests(unittest.TestCase):
                 self.service.ao_room_sync(self.room, wait_seconds=45)
         self.assertEqual(sync_once.call_count, 2)
         self.assertEqual(session_gets, 2)
+
+    def test_wait_stops_with_budget_when_another_iteration_would_overrun(self):
+        self.prepare_running()
+        clock = FakeClock()
+        summary = {"requests": [{"request_id": "first", "state": "running"}]}
+        states = {"first": "running"}
+
+        def slow_sync(room_id, timing=None):
+            clock.now += 30
+            return summary, states
+
+        with patch.object(self.service, "_sync_once", side_effect=slow_sync) as sync_once, \
+                patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.time.monotonic", side_effect=clock.monotonic):
+            result = self.service.ao_room_sync(self.room, wait_seconds=45)
+        # Iteration 1 ends at t=30; after one 5-second poll the remaining 10
+        # seconds cannot fit another 30-second reconciliation.
+        self.assertEqual(sync_once.call_count, 1)
+        self.assertEqual(clock.sleeps, [5])
+        self.assertEqual(result["wait"], {"requested_seconds": 45, "reason": "budget", "settled": False,
+                                          "iterations": 1, "elapsed_seconds": 35.0,
+                                          "iteration_seconds": {"last": 30.0, "max": 30.0},
+                                          "lock_wait_seconds": {"last": 0.0, "max": 0.0}})
+
+    def test_lock_wait_seconds_measures_room_lock_acquisition(self):
+        held = threading.Event()
+
+        def hold():
+            with (self.service.root / ".lock").open("a+") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                held.set()
+                time.sleep(0.3)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            self.assertTrue(held.wait(10))
+            timing = {}
+            self.service._sync_once(self.room, timing=timing)
+        finally:
+            thread.join()
+        self.assertGreaterEqual(timing["lock_wait_seconds"], 0.25)
+        timing = {}
+        self.service._sync_once(self.room, timing=timing)
+        self.assertLess(timing["lock_wait_seconds"], 0.25)
 
     def test_tools_list_and_cli_and_mcp_forward_wait_seconds(self):
         arguments = {"room_id": "synthetic-room", "wait_seconds": 5}
