@@ -38,7 +38,9 @@ Rules for every phase:
   false is a handback awaiting Fable's judgment, not a completed unit;
   `unreturned` means the turn ended without a handback; the warnings are
   hygiene signals, never a verdict, and a launch links to a unit only through
-  its explicit `task=` reference. Report the
+  its explicit `task=` reference. For where elapsed time
+  went, call the read-only `ao_room_timing`; its gap kinds name saved evidence,
+  never causes. Report the
   rate-limit window label, its used percent or `not reported`, and its reset
   time; treat the reading as advisory, never as headroom.
 - `ao_room_progress.deliverables` (additive, read-only) folds the same task list

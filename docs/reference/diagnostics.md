@@ -178,6 +178,77 @@ Binding refusals have unavailable native-total coverage, no parent attribution a
 `api_delegates.reason: not_evaluated`; only the refusal reason is reported. Delegate
 ledger absence, unreadability and unsafe file types remain distinct outcomes.
 
+## Delivery timing view
+
+`ao_room_timing(room_id)` folds one AO room's saved records — request rows, verification
+entries, acceptances and saved terminal receipts — into labelled wall-clock intervals and
+the gaps between them, so an operator can see where elapsed delivery time went without
+reading a transcript. It is read-only like `ao_room_progress`: bounded local reads, no
+AO/network/model call, no room lock, no state write, and it reads no transcript and no
+rate-limit database. Malformed saved data degrades to `limitations` codes rather than
+raising. Seconds are floats rounded to three decimals; emitted timestamps are UTC ISO
+8601; saved ids, purposes and states are redacted and bounded to 64 characters.
+
+Each saved request becomes one interval with its role, purpose, recorded state, category,
+start and end evidence, duration, saved `semantic_status` kind and hold flag. The category
+is `acceptance_review` for a reviewer-role request, `engineering` for an engineer-role
+`implementation` or `correction`, `spec_review` for an engineer-role `spec_review` or
+`spec_verdict_repair`, and `other` for anything else. The start is the provider's
+`startedAt` from the observed turn when present (`start_basis: provider_started_at`),
+else the controller's `created_at`, else unknown: a request with no known start keeps its
+interval row (`start_basis: unknown`, null duration, `coverage.start_unknown` counted,
+limitation `start_time_unavailable`) but never enters the timeline, a gap or the merged
+union. The end is `open` while the request's saved state is live (`submitted`,
+`running`); otherwise the provider's `completedAt` (`provider_completed_at`), else the
+saved terminal receipt's numeric `observed_at` (`receipt_observed_at`, an upper bound;
+only a relative receipt path without `..` is read, bounded to 64 MiB), else `unknown`
+with limitation `end_time_unavailable`. `seconds` is end minus start when both are known
+and the end is not earlier; an end before the start reports null `seconds` and limitation
+`clock_anomaly`.
+
+Every saved verification entry appears in `verification.attempts` (`timing: recorded`
+when it carries a recorded `started_at`, else `not_recorded` with limitation
+`verification_timing_not_recorded`), and an entry with a recorded start also joins the
+timeline as a `verification` interval with `recorded` bases: its end is `recorded` when
+`finished_at` is present, `open` for a `running` entry, else `unknown`.
+
+`intervals` is sorted newest-last and keeps the 200 latest by start (`intervals_total`,
+`intervals_truncated`, limitation `intervals_truncated`); intervals with no known start
+follow it. `gaps` is the chronological list of the spaces between intervals
+(`gaps_total`, `gaps_truncated`, limitation `gaps_truncated`, 200 kept). A gap opens when
+the next interval starts after the furthest known end so far: `quota_wait` when the gap
+follows a terminal engineer turn whose saved semantic status kind is `quota_limit` and
+whose hold flag is true, `hold_wait` for the same shape with any other semantic kind,
+`unattributed` when the preceding interval carries no hold, and `unknown_bounds` — null
+`started_at` and `seconds`, counted not summed — when the preceding interval's end is
+unknown. An open interval emits no end, moves no frontier and sets no unknown bound; the
+next interval still measures its gap from the last known end. `totals.gaps` sums the
+seconds per gap kind.
+
+`totals.by_category` sums interval seconds per category, `totals.by_purpose` sums them
+per purpose (a `verification` key for verification intervals, `unknown` when the purpose
+is absent, at most 31 named keys before the rest fold into `other`), `sum_seconds` adds
+every interval with a known start and end, `union_seconds` merges the same intervals into
+one coverage measure, and `overlap_seconds` is their non-negative difference. Parallel
+intervals are never added to wall time: the overlap is reported, not accumulated.
+`coverage` reports the earliest known start, the latest known bound, the span between
+them, counts of open and start/end-unknown intervals, and the two basis histograms.
+Limitation `clock_sources_mixed` marks a view that mixes a provider basis
+(`provider_started_at`, `provider_completed_at`) with a controller basis (`created_at`,
+`receipt_observed_at`, `recorded`) — the two clocks are close but not identical, so a
+mixed view is labelled rather than silently precise.
+
+`closure.verifications` counts saved attempts by state (`passed`, `failed`, `running`,
+`other`), `acceptances_recorded` counts saved acceptances, and
+`latest_acceptance_request_id` names the latest one's request. `basis` restates every
+classification rule, `meaning` fixes the reading, and `native_worker_usage` stays
+explicitly unattributed (`coverage: unavailable`, reason
+`native_worker_usage_not_attributed`, per issue #121). A quiet parent turn is never
+idle — parallel worker activity inside a turn is not read and not added — and token or
+duration counters are never quota headroom. Gap kinds name the saved evidence behind
+them, never a cause; the view makes no stall verdict and no causal speed-up claim, and
+task counts are not closure.
+
 ## Resource and stability limits
 
 | Limit | Version 1 ceiling |
