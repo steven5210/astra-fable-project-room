@@ -49,7 +49,7 @@ BASIS = {
     "quota_wait": "the gap after a terminal engineer turn whose saved semantic status kind is quota_limit, until the next recorded activity starts",
     "hold_wait": "the gap after a terminal engineer turn whose saved semantic status holds for any other kind; the saved records do not separate diagnosis, controller repair and operator latency inside it",
     "unattributed": "a gap that follows no held turn: operator or reviewer latency, decisions, integration and anything else the room does not record",
-    "unknown_bounds": "a gap whose start cannot be placed because the preceding interval's end is unknown",
+    "unknown_bounds": "a gap whose length cannot be measured because the preceding interval's end is unknown, inverted or still open; after an open interval every later gap stays unmeasured",
     "start": "the provider's startedAt from the observed turn when present, else the controller's created_at",
     "end": "the provider's completedAt from the observed turn when present, else the observed_at of the saved terminal receipt (an upper bound), else unknown; a live request is open",
     "overlap": "sum_seconds adds every interval, union_seconds merges them; overlap_seconds is the difference and is never added to wall time"}
@@ -66,8 +66,13 @@ def _seconds(value):
 
 
 def _finite(value):
-    """A finite, non-bool number."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    """A finite, non-bool number; a huge saved int that overflows float conversion is not finite."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _epoch(value):
@@ -76,7 +81,7 @@ def _epoch(value):
         return None
     try:
         datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc)
-    except (OverflowError, OSError):
+    except (OverflowError, OSError, ValueError):
         return None
     return float(value)
 
@@ -91,11 +96,11 @@ def _parse(value):
     """One saved ISO timestamp as an epoch second; a missing or unparseable value is None."""
     try:
         return ao_native_outcome.timestamp(value)
-    except (RoomError, OverflowError, OSError):
+    except (RoomError, ValueError, OverflowError, OSError):
         return None
 
 
-def _receipt_observed_at(directory, request):
+def _receipt_observed_at(directory, request, limitations=None):
     """The saved receipt's finite numeric observed_at — an upper bound on the turn's end — else None.
 
     Only a relative receipt path without '..' is read, through the bounded owned-bytes guard;
@@ -112,6 +117,8 @@ def _receipt_observed_at(directory, request):
     except (OSError, ValueError):
         return None
     observed = data.get("observed_at") if isinstance(data, dict) else None
+    if observed is not None and _epoch(observed) is None and limitations is not None:
+        limitations.add("timestamp_unusable")
     return _epoch(observed)
 
 
@@ -142,6 +149,8 @@ def _request_interval(directory, request_id, request, limitations):
         start_basis = "provider_started_at"
     else:
         created = _epoch(request.get("created_at"))
+        if request.get("created_at") is not None and created is None:
+            limitations.add("timestamp_unusable")
         start, start_basis = (created, "created_at") if created is not None else (None, "unknown")
         if start is None:
             limitations.add("start_time_unavailable")
@@ -153,7 +162,7 @@ def _request_interval(directory, request_id, request, limitations):
         if end is not None:
             end_basis = "provider_completed_at"
         else:
-            end = _receipt_observed_at(directory, request)
+            end = _receipt_observed_at(directory, request, limitations)
             end_basis = "receipt_observed_at" if end is not None else "unknown"
             if end is None:
                 limitations.add("end_time_unavailable")
@@ -163,6 +172,12 @@ def _request_interval(directory, request_id, request, limitations):
     else:
         seconds = end - start if start is not None and end is not None else None
     order = request.get("created_order")
+    try:
+        order_seconds = float(order) if _finite(order) else 0.0
+    except OverflowError:
+        order_seconds = 0.0
+    if order is not None and not _finite(order):
+        limitations.add("timestamp_unusable")
     interval = {"kind": "request", "request_id": _bounded(request_id), "role": _bounded(request.get("role")),
                 "purpose": _bounded(request.get("purpose")), "state": _bounded(state),
                 "category": _category(request.get("role"), request.get("purpose")),
@@ -172,7 +187,7 @@ def _request_interval(directory, request_id, request, limitations):
                 "semantic_kind": _bounded(kind), "hold": hold,
                 # Timeline bookkeeping; stripped before the interval is emitted.
                 "_id": _bounded(request_id), "_start": start, "_end": end,
-                "_order": float(order) if _finite(order) else 0.0,
+                "_order": order_seconds,
                 "_raw_role": request.get("role"), "_raw_state": state,
                 "_semantic_kind": kind, "_hold": hold}
     return interval
@@ -185,6 +200,10 @@ def _verification_entry(entry, limitations):
     not_recorded; they cannot enter the timeline without a start.
     """
     started, finished = _epoch(entry.get("started_at")), _epoch(entry.get("finished_at"))
+    if entry.get("started_at") is not None and started is None:
+        limitations.add("timestamp_unusable")
+    if entry.get("finished_at") is not None and finished is None:
+        limitations.add("timestamp_unusable")
     timing = "recorded" if started is not None else "not_recorded"
     if timing == "not_recorded":
         limitations.add("verification_timing_not_recorded")
@@ -221,34 +240,45 @@ def _verification_entry(entry, limitations):
 def _gaps(timeline):
     """Chronological gaps between the sorted intervals, classified only from saved evidence.
 
-    The frontier is the furthest known end seen so far; an interval whose own end is unknown
-    makes the next gap's bounds unplaceable, and an open interval moves nothing.
+    The frontier is the furthest known valid end (end >= start) and its interval; an interval
+    whose end is open, unknown or inverted is a pending unresolved predecessor, never a
+    frontier. A terminal predecessor's unknown or inverted end is bounded by the next later
+    activity (a new send requires a settled room), so only that one gap is unmeasurable; an
+    open predecessor stays unresolved and every later gap stays unmeasured.
     """
-    gaps, frontier, frontier_source, frontier_unknown = [], None, None, False
+    gaps = []
+    frontier, frontier_source = None, None
+    pending = None
     for interval in timeline:
         start, end = interval["_start"], interval["_end"]
-        if frontier is not None and start > frontier:
-            gap = {"after": frontier_source["_id"], "before": interval["_id"],
-                   "ended_at": _iso(start), "semantic_kind": frontier_source.get("semantic_kind")}
-            if frontier_unknown:
-                gap.update(started_at=None, seconds=None, kind="unknown_bounds")
-            else:
-                kind = "unattributed"
-                if (frontier_source["kind"] == "request" and frontier_source["_raw_role"] == "engineer"
-                        and isinstance(frontier_source["_raw_state"], str)
-                        and frontier_source["_raw_state"] in _TERMINAL_REQUEST_STATES
-                        and frontier_source["_hold"] is True):
-                    kind = "quota_wait" if frontier_source["_semantic_kind"] == "quota_limit" else "hold_wait"
-                gap.update(started_at=_iso(frontier), seconds=_seconds(start - frontier), kind=kind)
-            gaps.append(gap)
+        if pending is not None:
+            gaps.append({"kind": "unknown_bounds", "after": pending["source"]["_id"],
+                         "before": interval["_id"], "started_at": None,
+                         "ended_at": _iso(start), "seconds": None,
+                         "semantic_kind": pending["source"].get("semantic_kind"),
+                         "after_end_basis": pending["basis"]})
+            if pending["basis"] != "open":
+                pending = None
+        elif frontier is not None and start > frontier:
+            kind = "unattributed"
+            if (frontier_source["kind"] == "request" and frontier_source["_raw_role"] == "engineer"
+                    and isinstance(frontier_source["_raw_state"], str)
+                    and frontier_source["_raw_state"] in _TERMINAL_REQUEST_STATES
+                    and frontier_source["_hold"] is True):
+                kind = "quota_wait" if frontier_source["_semantic_kind"] == "quota_limit" else "hold_wait"
+            gaps.append({"kind": kind, "after": frontier_source["_id"], "before": interval["_id"],
+                         "started_at": _iso(frontier), "ended_at": _iso(start),
+                         "seconds": _seconds(start - frontier),
+                         "semantic_kind": frontier_source.get("semantic_kind"),
+                         "after_end_basis": None})
         if interval["end_basis"] == "open":
-            continue
-        if end is not None:
-            if frontier is None or end > frontier:
-                frontier, frontier_source, frontier_unknown = end, interval, False
-        else:
-            # This interval's end is unknown: the next gap cannot place its start.
-            frontier_unknown, frontier_source = True, interval
+            pending = {"source": interval, "basis": "open"}
+        elif end is None:
+            pending = {"source": interval, "basis": "unknown"}
+        elif end < start:
+            pending = {"source": interval, "basis": "anomaly"}
+        elif frontier is None or end > frontier:
+            frontier, frontier_source = end, interval
     return gaps
 
 

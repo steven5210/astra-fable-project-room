@@ -69,16 +69,113 @@ class TimingViewTests(Fixture):
         self.add_request('a', created=t, completed=t + 10, order=1)
         self.add_request('live', req_state='submitted', created=t + 20, order=2)
         self.add_request('b', created=t + 30, completed=t + 40, order=3)
+        self.add_request('c', created=t + 50, completed=t + 60, order=4)
         view = self.view()
         live = self.interval(view, 'live')
         self.assertEqual(live['end_basis'], 'open')
         self.assertIsNone(live['ended_at'])
         self.assertIsNone(live['seconds'])
         self.assertEqual(view['coverage']['open_intervals'], 1)
-        # An open interval emits no end: no gap is named after it and the next interval still
-        # measures its gap from the last known end.
-        self.assertEqual([(g['after'], g['before'], g['seconds']) for g in view['gaps']],
-                         [('a', 'live', 10.0), ('a', 'b', 20.0)])
+        # An open interval is an unresolved predecessor, never a frontier: the gap before it
+        # still measures from the last known end, but every gap after it stays unmeasured,
+        # named after the still-open interval.
+        self.assertEqual([(g['after'], g['before'], g['kind'], g['seconds'], g['after_end_basis'])
+                          for g in view['gaps']],
+                         [('a', 'live', 'unattributed', 10.0, None),
+                          ('live', 'b', 'unknown_bounds', None, 'open'),
+                          ('live', 'c', 'unknown_bounds', None, 'open')])
+        self.assertEqual(view['totals']['gaps']['unknown_bounds'], 2)
+
+    def test_an_open_predecessor_leaves_every_later_gap_unmeasured(self):
+        t = self.base
+        self.add_request('quota', req_state='settled_failure', created=t, completed=t + 10,
+                         semantic={'kind': 'quota_limit', 'hold': True, 'reason': 'limit'},
+                         order=1)
+        self.add_request('live', req_state='running', created=t + 20, order=2)
+        self.add_request('c', created=t + 30, completed=t + 40, order=3)
+        self.add_request('d', created=t + 50, completed=t + 60, order=4)
+        view = self.view()
+        gaps = view['gaps']
+        # The measured quota wait before the open interval is exact.
+        self.assertEqual((gaps[0]['after'], gaps[0]['before'], gaps[0]['kind'],
+                          gaps[0]['seconds'], gaps[0]['after_end_basis']),
+                         ('quota', 'live', 'quota_wait', 10.0, None))
+        # The open interval stays pending: both later gaps are unmeasured, after it.
+        self.assertEqual([(g['after'], g['before'], g['kind'], g['after_end_basis'])
+                          for g in gaps[1:]],
+                         [('live', 'c', 'unknown_bounds', 'open'),
+                          ('live', 'd', 'unknown_bounds', 'open')])
+        self.assertEqual(view['totals']['gaps']['quota_wait'], 10.0)
+        self.assertEqual(view['totals']['gaps']['unknown_bounds'], 2)
+
+    def test_a_terminal_unknown_end_bounds_only_the_next_gap(self):
+        t = self.base
+        # Completed with neither a provider completedAt nor a readable receipt.
+        self.add_request('mid', created=t + 10, receipt='missing/never.json', order=1)
+        self.add_request('next', created=t + 40, completed=t + 50, order=2)
+        view = self.view()
+        self.assertEqual(len(view['gaps']), 1)
+        gap = view['gaps'][0]
+        self.assertEqual((gap['after'], gap['before'], gap['kind'], gap['after_end_basis']),
+                         ('mid', 'next', 'unknown_bounds', 'unknown'))
+        self.assertIsNone(gap['started_at'])
+        self.assertIsNone(gap['seconds'])
+        self.assertEqual(view['totals']['gaps']['unknown_bounds'], 1)
+        self.assertEqual(view['totals']['gaps']['unattributed'], 0.0)
+
+    def test_an_inverted_end_bounds_the_next_gap_as_anomaly(self):
+        t = self.base
+        # A held turn whose saved completedAt precedes its startedAt: the inverted end is an
+        # anomaly, never a frontier, so the gap after it is unmeasured and nothing is quota wait.
+        self.add_request('held', req_state='failed', created=t + 50, started=t + 50,
+                         completed=t + 10,
+                         semantic={'kind': 'quota_limit', 'hold': True, 'reason': 'x'}, order=1)
+        self.add_request('next', created=t + 100, completed=t + 110, order=2)
+        view = self.view()
+        self.assertIn('clock_anomaly', view['limitations'])
+        held = self.interval(view, 'held')
+        self.assertIsNone(held['seconds'])
+        self.assertEqual(len(view['gaps']), 1)
+        gap = view['gaps'][0]
+        self.assertEqual((gap['after'], gap['before'], gap['kind'], gap['after_end_basis']),
+                         ('held', 'next', 'unknown_bounds', 'anomaly'))
+        self.assertIsNone(gap['seconds'])
+        self.assertEqual(view['totals']['gaps']['quota_wait'], 0.0)
+
+    def test_unusable_saved_timestamps_degrade_to_limitations(self):
+        t = self.base
+        receipt = 'receipts/badend/result.json'
+        ao.atomic(self.directory() / receipt, {'observed_at': 10 ** 400})
+        self.add_request('ok', created=t, completed=t + 10, order=1)
+        # 10**400 overflows float conversion; 10**12 is finite but out of datetime range.
+        self.add_request('big-created', created=10 ** 400, completed=t + 20, order=2)
+        self.add_request('huge-created', created=10 ** 12, completed=t + 30, order=3)
+        self.add_request('big-order', created=t + 40, completed=t + 50, order=10 ** 400)
+        self.add_request('bad-end', created=t + 60, receipt=receipt, order=4)
+        self.edit(lambda state: state['verifications'].append(
+            {'id': 'verify-big', 'state': 'passed', 'started_at': 10 ** 12,
+             'finished_at': t + 70, 'candidate_sha256': '0' * 64, 'path': 'x'}))
+        view = self.view()
+        # The view returns; every unusable saved timestamp is an unknown bound, labelled.
+        self.assertIn('timestamp_unusable', view['limitations'])
+        self.assertIn('start_time_unavailable', view['limitations'])
+        self.assertIn('end_time_unavailable', view['limitations'])
+        self.assertIn('verification_timing_not_recorded', view['limitations'])
+        intervals = {i.get('request_id'): i for i in view['intervals']}
+        self.assertEqual(intervals['big-created']['start_basis'], 'unknown')
+        self.assertIsNone(intervals['big-created']['started_at'])
+        self.assertEqual(intervals['huge-created']['start_basis'], 'unknown')
+        self.assertIsNone(intervals['huge-created']['started_at'])
+        self.assertEqual(intervals['bad-end']['end_basis'], 'unknown')
+        self.assertIsNone(intervals['bad-end']['ended_at'])
+        # An unusable created_order falls back for sorting; the interval itself is intact, as
+        # is every other request's interval.
+        self.assertAlmostEqual(intervals['big-order']['seconds'], 10.0, places=6)
+        self.assertAlmostEqual(intervals['ok']['seconds'], 10.0, places=6)
+        attempt = next(a for a in view['verification']['attempts'] if a['id'] == 'verify-big')
+        self.assertEqual(attempt['timing'], 'not_recorded')
+        self.assertIsNone(attempt['started_at'])
+        self.assertIsNotNone(attempt['finished_at'])
 
     def test_completed_request_uses_provider_times(self):
         t = self.base
@@ -108,17 +205,24 @@ class TimingViewTests(Fixture):
         # Completed with neither a provider completedAt nor a readable receipt.
         self.add_request('mid', created=t + 20, receipt='missing/never.json', order=2)
         self.add_request('next', created=t + 40, completed=t + 50, order=3)
+        # A known end after the unknown one resumes normal measurement.
+        self.add_request('last', created=t + 70, completed=t + 80, order=4)
         view = self.view()
         mid = self.interval(view, 'mid')
         self.assertEqual(mid['end_basis'], 'unknown')
         self.assertIsNone(mid['ended_at'])
         self.assertIn('end_time_unavailable', view['limitations'])
         self.assertEqual(view['gaps'][0]['kind'], 'unattributed')
-        gap = view['gaps'][-1]
+        gap = view['gaps'][1]
         self.assertEqual((gap['after'], gap['before']), ('mid', 'next'))
         self.assertEqual(gap['kind'], 'unknown_bounds')
+        self.assertEqual(gap['after_end_basis'], 'unknown')
         self.assertIsNone(gap['started_at'])
         self.assertIsNone(gap['seconds'])
+        resumed = view['gaps'][2]
+        self.assertEqual((resumed['after'], resumed['before'], resumed['kind'],
+                          resumed['seconds']), ('next', 'last', 'unattributed', 20.0))
+        self.assertIsNone(resumed['after_end_basis'])
         self.assertEqual(view['totals']['gaps']['unknown_bounds'], 1)
         self.assertEqual(view['coverage']['end_unknown'], 1)
 

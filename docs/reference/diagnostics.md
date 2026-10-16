@@ -186,7 +186,10 @@ the gaps between them, so an operator can see where elapsed delivery time went w
 reading a transcript. It is read-only like `ao_room_progress`: bounded local reads, no
 AO/network/model call, no room lock, no state write, and it reads no transcript and no
 rate-limit database. Malformed saved data degrades to `limitations` codes rather than
-raising. Seconds are floats rounded to three decimals; emitted timestamps are UTC ISO
+raising; a saved numeric timestamp that is present but unusable — out of float or
+datetime range — adds `timestamp_unusable` in addition to the affected bound's
+start/end unavailability code, and an unusable saved `created_order` falls back to 0
+for timeline sorting. Seconds are floats rounded to three decimals; emitted timestamps are UTC ISO
 8601; saved ids, purposes and states are redacted and bounded to 64 characters.
 
 Each saved request becomes one interval with its role, purpose, recorded state, category,
@@ -220,10 +223,14 @@ the next interval starts after the furthest known end so far: `quota_wait` when 
 follows a terminal engineer turn whose saved semantic status kind is `quota_limit` and
 whose hold flag is true, `hold_wait` for the same shape with any other semantic kind,
 `unattributed` when the preceding interval carries no hold, and `unknown_bounds` — null
-`started_at` and `seconds`, counted not summed — when the preceding interval's end is
-unknown. An open interval emits no end, moves no frontier and sets no unknown bound; the
-next interval still measures its gap from the last known end. `totals.gaps` sums the
-seconds per gap kind.
+`started_at` and `seconds`, counted not summed, with `after_end_basis` naming the
+predecessor's unresolved basis `unknown`, `anomaly` or `open` — when the preceding
+interval's end is unknown, inverted or still open. A terminal predecessor's unknown or
+inverted end is bounded by the next later activity (a new send requires a settled
+room), so only that one gap is unmeasured and measurement resumes from the next known
+end; an open predecessor stays unresolved and every later gap stays unmeasured. An open
+interval never becomes a frontier. Measured gaps carry `after_end_basis: null` so every
+gap row has the same shape. `totals.gaps` sums the seconds per gap kind.
 
 `totals.by_category` sums interval seconds per category, `totals.by_purpose` sums them
 per purpose (a `verification` key for verification intervals, `unknown` when the purpose
