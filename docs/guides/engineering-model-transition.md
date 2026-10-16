@@ -473,7 +473,7 @@ manual transition. A pending transition epoch also refuses. A second record
 with `action` `revoke` ends the policy.
 
 While a policy is active, every engineer `ao_room_send` applies it first,
-before the send takes the room lock (the room lock is never nested). At that
+before the send takes the room's locks (one room's locks are never re-entered). At that
 boundary the controller compares the configured family qualification's
 `expected_model` for the recorded family with the room's pinned exact model and
 follows the newest qualified member only when the engineer is stopped with no

@@ -261,7 +261,7 @@ def recover(service, room_id, audit_sha256, replacement_session_id, diagnosis, a
     ao.nonempty(authorization, "authorization: actual user decision")
     inputs = {"request_id": request_id, "audit_sha256": audit_sha256, "replacement_session_id": replacement_session_id,
               "diagnosis": diagnosis, "authorization": authorization}
-    with service.locked(room_id) as (directory, state):
+    with service.locked(room_id, exclusive=True) as (directory, state):
         record = validate(service, state)
         if record is not None:
             if record["inputs"] != inputs:

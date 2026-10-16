@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -288,6 +289,111 @@ def reader_policy(client):
     return tuple(policy)
 
 
+LOCK_RETRY_SECONDS = 0.1
+
+
+class _LockTimeout(Exception):
+    """Internal: a bounded adapter-lock acquisition step hit the shared deadline."""
+
+
+def _flock_acquire(stream, flags, deadline):
+    """Acquire flags on stream; a plain blocking flock when deadline is None."""
+    if deadline is None:
+        fcntl.flock(stream, flags)
+        return
+    while True:
+        try:
+            fcntl.flock(stream, flags | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise _LockTimeout()
+            time.sleep(LOCK_RETRY_SECONDS)
+
+
+def lock_holders(root):
+    """Read-only holder records under <root>/locks/holders.
+
+    A record file still flock-held by its writer is a verified current holder;
+    a record whose lock can be claimed is stale — it is unlocked and removed
+    best-effort, and never reported as current.
+    """
+    records = []
+    for path in sorted((Path(root) / "locks" / "holders").glob("*.json")):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        verified = True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        except OSError:
+            os.close(fd)
+            continue
+        else:
+            verified = False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        try:
+            record = json.loads(os.read(fd, 65536))
+        except (OSError, ValueError):
+            record = {}
+        os.close(fd)
+        if isinstance(record, dict):
+            record["verified"] = verified
+            records.append(record)
+        if not verified:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return records
+
+
+def _holder_argv():
+    """Sanitized argv for holder records: basename plus safe bare tokens only.
+
+    The diagnosis is printed to the hook's stderr, which AO surfaces in the
+    spawn error, so flags, paths and inline JSON never enter the record.
+    """
+    argv = [os.path.basename(sys.argv[0])] if sys.argv else []
+    for arg in sys.argv[1:]:
+        if len(argv) >= 6:
+            break
+        if not arg.startswith("-") and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", arg):
+            argv.append(arg)
+    return argv
+
+
+def _holder_record_write(fd, record):
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+    os.fsync(fd)
+
+
+def _lock_diagnosis(root):
+    verified = [record for record in lock_holders(root) if record.get("verified")]
+    if not verified:
+        return "no verified holder record; an older controller process may hold the adapter lock"
+    named = []
+    for record in verified:
+        started = record.get("started_at")
+        since = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))
+                 if isinstance(started, (int, float)) else "unknown")
+        argv = " ".join(str(arg) for arg in record.get("argv") or [])
+        if record.get("mode") == "exclusive":
+            detail = "exclusive adapter lock"
+        elif "room" in (record.get("holds") or []):
+            detail = "shared adapter lock, holds room {}".format(record.get("room_id"))
+        else:
+            detail = "shared adapter lock, waiting for room {}".format(record.get("room_id"))
+        named.append("pid {} ({}, since {}{})".format(
+            record.get("pid"), detail, since, ", " + argv if argv else ""))
+    return "held by " + "; ".join(named)
+
+
 class IterationObservations:
     """Native observations reused within ONE locked sync iteration.
 
@@ -320,19 +426,72 @@ class Service:
         self.client_factory = client_factory
 
     @contextlib.contextmanager
-    def locked(self, room_id=None, timing=None):
-        # One adapter-wide lock also prevents binding the same AO session to two rooms.
-        with (self.root / ".lock").open("a+") as stream:
-            lock_started = time.monotonic() if timing is not None else None
-            fcntl.flock(stream, fcntl.LOCK_EX)
-            if timing is not None:
-                timing["lock_wait_seconds"] = time.monotonic() - lock_started
+    def locked(self, room_id=None, exclusive=False, timing=None, timeout_seconds=None):
+        """Shared adapter lock plus an optional per-room lock; never nested or upgraded.
+
+        ``<root>/.lock`` keeps its meaning for older controller processes: an old
+        process holds it exclusively, and flock still excludes shared holders, so
+        old-vs-new stays serialized while two new processes on different rooms
+        run concurrently. New room-scoped operations take the adapter lock
+        shared; ``exclusive=True`` or ``room_id=None`` takes it exclusively for
+        adapter-wide claims (cross-room session binds, preparation's shared
+        launchers/registry). The ``.lock.turnstile`` is held only while claiming
+        the adapter lock, so a waiting exclusive acquirer is not starved by new
+        shared entrants. Each room's own ``locks/<room_id>.lock`` then serializes
+        that room. The holder records itself under ``locks/holders/`` (kept
+        flock-held) so a bounded timeout can name the verified holder.
+
+        ``timeout_seconds=None`` blocks as before; a number retries every step
+        with LOCK_NB against one shared deadline and raises RoomError with the
+        holder diagnosis on expiry. ``timing["lock_wait_seconds"]`` covers the
+        turnstile, adapter and room-lock acquisition.
+        """
+        mode = fcntl.LOCK_EX if room_id is None or exclusive else fcntl.LOCK_SH
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        lock_started = time.monotonic() if timing is not None else None
+        opened = []
+        holder_fd = holder_path = holder_tmp = None
+        try:
+            # One adapter-wide lock also prevents binding the same AO session to two rooms.
+            with (self.root / ".lock.turnstile").open("a+") as turnstile:
+                _flock_acquire(turnstile, fcntl.LOCK_EX, deadline)
+                adapter = (self.root / ".lock").open("a+")
+                opened.append(adapter)
+                _flock_acquire(adapter, mode, deadline)
+            adapter_wait = time.monotonic() - lock_started if timing is not None else None
+            locks = self.root / "locks"
+            locks.mkdir(exist_ok=True, mode=0o700)
+            holders = locks / "holders"
+            holders.mkdir(exist_ok=True, mode=0o700)
+            holder_path = holders / (str(os.getpid()) + "-" + uuid.uuid4().hex[:8] + ".json")
+            # The record is locked and written under a name lock_holders() never
+            # globs, then renamed into place: a live holder is never judged stale.
+            holder_tmp = holders / (".tmp-" + holder_path.name[:-len(".json")])
+            holder_fd = os.open(holder_tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(holder_fd, fcntl.LOCK_EX)
+            record = {"pid": os.getpid(), "mode": "exclusive" if mode == fcntl.LOCK_EX else "shared",
+                      "room_id": room_id, "holds": ["adapter"], "started_at": time.time(),
+                      "argv": _holder_argv()}
+            _holder_record_write(holder_fd, record)
+            os.rename(holder_tmp, holder_path)
+            holder_tmp = None
             if room_id is None:
+                if timing is not None:
+                    timing["lock_wait_seconds"] = adapter_wait
                 yield None, None
             else:
-                directory = self.root / "rooms" / identifier(room_id)
+                room = identifier(room_id)
+                directory = self.root / "rooms" / room
                 if not (directory / "state.json").is_file():
                     raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
+                room_lock = (locks / (room + ".lock")).open("a+")
+                opened.append(room_lock)
+                room_started = time.monotonic() if timing is not None else None
+                _flock_acquire(room_lock, fcntl.LOCK_EX, deadline)
+                if timing is not None:
+                    timing["lock_wait_seconds"] = adapter_wait + (time.monotonic() - room_started)
+                record["holds"] = ["adapter", "room"]
+                _holder_record_write(holder_fd, record)
                 state = read(directory / "state.json")
                 try:
                     yield directory, state
@@ -340,6 +499,30 @@ class Service:
                     from ao_history_reconciliation import invalidate_latest
                     invalidate_latest(self, directory, state, exc)
                     raise
+        except _LockTimeout:
+            if holder_fd is not None:
+                os.close(holder_fd)
+                holder_fd = None
+            for path in (holder_path, holder_tmp):
+                if path is not None:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            holder_path = holder_tmp = None
+            raise RoomError("Project Room adapter lock not acquired within {} seconds; {}".format(
+                timeout_seconds, _lock_diagnosis(self.root))) from None
+        finally:
+            if holder_fd is not None:
+                os.close(holder_fd)
+            for path in (holder_path, holder_tmp):
+                if path is not None:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            for stream in reversed(opened):
+                stream.close()
 
     def save(self, directory, state):
         atomic(directory / "state.json", state)
@@ -623,7 +806,7 @@ class Service:
         identifier(session_id)
         nonempty(model, "model", 160)
         nonempty(reasoning_effort, "reasoning_effort", 32)
-        with self.locked(room_id) as (directory, state):
+        with self.locked(room_id, exclusive=True) as (directory, state):
             self.settled(state)
             session = self.client(state).request("GET", "/sessions/" + session_id)
             session = session.get("session", session)
@@ -799,8 +982,8 @@ class Service:
         from ao_routing_adoption import activate
         return activate(self, room_id, request_id)
 
-    def ao_room_prepare(self, room_id, worktree_path):
-        with self.locked(room_id) as (directory, state):
+    def ao_room_prepare(self, room_id, worktree_path, lock_timeout_seconds=None):
+        with self.locked(room_id, exclusive=True, timeout_seconds=lock_timeout_seconds) as (directory, state):
             self.quiet(state)
             if not ao_workflow.normal(state):
                 raise RoomError("Delegate preparation is for normal Fable rooms")
@@ -1538,7 +1721,7 @@ TOOL_SCHEMAS = {
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Optional engineering_model pins this room's engineering orchestrator selector: an engineer-role family alias (default fable; also opus), meaning the latest available member of that family at MAX, whose exact model is recorded only from verified native evidence, or a qualified exact identifier. A private operator-selected family qualification, when configured, pins each qualified family's exact expected model before inference from retained source evidence. Qualification is not provider availability. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}, "engineering_model": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
-    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper. Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
+    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper (which bounds its adapter-lock wait at 20 seconds and reports the verified holder when it expires; the tool itself blocks). Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and its exact configured model value/effort. Normal roles require the room's configured engineering orchestrator value (its family alias or exact identifier) and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
     "ao_room_reviewer_recovery_audit": ("Inspect one stopped, never-used native Codex reviewer against complete empty history and current passed spec/candidate/gate evidence. Saves a private audit digest, not a binding change. Bounded AO GETs only; no model, lifecycle or worker creation.", schema(R)),
     "ao_room_spec_review_extension_audit": ("Audit eligibility for this room's sole additional Fable charter review after exactly three retained spec-review intents. Register the exact next charter revision first. Bind its bytes, gates and approval, original accepted candidate/receipts/counters, retained MAX bindings and the explicit read-only AO database's native session identity. Complete settled native history is required. Saves audit evidence only; no model, native lifecycle or room/session replacement.", schema({**R, "spec_revision": {"type": "integer", "minimum": 2}, "spec_sha256": S, "retained_candidate_sha256": S, "native_session_id": S, "native_owner_database": S})),

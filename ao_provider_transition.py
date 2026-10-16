@@ -632,7 +632,7 @@ def transition(service, room_id, audit_sha256, diagnosis, authorization, request
     ao.nonempty(native_stop_record, "native_stop_record: the operator's record of the performed AO exit-agent")
     inputs = {"request_id": request_id, "audit_sha256": audit_sha256, "diagnosis": diagnosis,
               "authorization": authorization, "native_stop_record": native_stop_record}
-    with service.locked(room_id) as (directory, state):
+    with service.locked(room_id, exclusive=True) as (directory, state):
         committed = validate(service, state, allow_pending=True)
         if committed is not None:
             record, epoch = committed

@@ -452,7 +452,7 @@ Codex reviewer in the same repository with the same model/MAX and no native work
 Call `ao_room_reviewer_recover` with the audit's exact `audit_sha256`, the
 `replacement_session_id`, a concrete `diagnosis`, the actual `authorization` and a
 stable `request_id`. It rechecks the room and both native identities under the
-global lock, then atomically commits the new binding with its audit reference.
+exclusive adapter lock, then atomically commits the new binding with its audit reference.
 The original binding and observations stay in an immutable receipt, and the old
 reviewer remains reserved. No specification, handoff, provider pin, request,
 verification or review counter is reset. At most one recovery is allowed per room.
@@ -642,8 +642,18 @@ contract. Omitted send purpose preserves the historical pilot packet. A Claude
 binding requires `fable_reason`. This mode does not establish Fable agreement or
 delegate use, and never changes the default roles for future rooms.
 
-One adapter-wide filesystem lock serializes local changes and cross-room session
-claims. A durable intent with a native `clientMessageId` is written before POST.
+Filesystem locks serialize local changes and cross-room session claims: a
+shared adapter lock (`ao/.lock`) admits concurrent room-scoped operations, each
+room's own `ao/locks/<room>.lock` serializes that room, and adapter-wide claims
+(cross-room session binds, preparation, recovery and provider-transition
+commits, room creation) take the adapter lock exclusively. A turnstile held only
+during adapter acquisition keeps a waiting exclusive claim ahead of new shared
+entrants, and each holder keeps a flock-held record under `ao/locks/holders/` so
+a bounded wait names the verified holder. An older controller process that only
+takes `ao/.lock` exclusively still excludes every new holder. The AO postCreate
+preparation hook bounds its lock wait at 20 seconds and exits with that
+diagnosis instead of blocking until AO kills it. A durable intent with a native
+`clientMessageId` is written before POST.
 Identical repeated calls read the saved record; they do not POST again. After a lost
 acknowledgement, sync requires the exact sent message on a turn that did not exist
 before the send and, when acknowledged, on that acknowledged turn and matching conversation branch before
