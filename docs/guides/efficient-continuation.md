@@ -234,6 +234,12 @@ no model, guard, budget or authority. See the [Fable policy reference's matching
 section](../../skills/project-room/references/fable-policy.md#finding-provenance-one-time-part-finding_provenance_v1)
 for the exact delivered text, and [finding provenance
 tokens](#finding-provenance-tokens) for the read-only projection it feeds.
+Rollback window: before the first engineer send after install, resyncing the
+previous plugin is safe; after a completed or settled engineer turn has carried
+this part, the previous controller's delivered-context check refuses that
+session's history because its `ao_workflow.PARTS` vocabulary does not contain
+the name — recovery is a forward fix on a controller that keeps the name, never
+a rewrite or removal of the delivered record.
 
 ## Progress-plan successor delivery (AO rooms)
 

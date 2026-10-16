@@ -14,6 +14,7 @@ import ao_read_admission
 import ao_residual_escalation
 import ao_workflow
 import lifecycle_closure
+from room import RoomError
 import test_ao_continuation
 import test_ao_normal as fixtures
 
@@ -21,6 +22,8 @@ import test_ao_normal as fixtures
 # finding_provenance_v1, taken from the live tuple so a change to the historical ordering or the
 # new element is caught, not just inferred from today's value.
 OLDER_PARTS = tuple(p for p in ao_workflow.PARTS if p != ao_finding_provenance.PART)
+# The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
+PRE_EXECUTION_PARTS = ao_workflow.PARTS[:16]
 # The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
 
 # Independently copied pinned digests for the other existing frozen one-time workflow parts. Comparing
@@ -181,6 +184,27 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertEqual(carried['parts'], [])
         self.assertNotIn(ao_finding_provenance.INSTRUCTION, text)
 
+    def test_a_downgraded_controller_refuses_the_carried_record_without_repair(self):
+        # Rollback boundary: once a completed engineer turn has carried the new part, the
+        # previous PARTS vocabulary cannot read that session's delivered-context record, and
+        # the refusal repairs nothing — the saved receipt bytes are untouched throughout.
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['state'], 'completed')
+        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART])
+        receipt_bytes = (self.directory() / request['receipt']).read_bytes()
+        # The current vocabulary reads the same record fine.
+        record, names = ao_workflow.carried_by(request)
+        self.assertEqual(names, (ao_finding_provenance.PART,))
+        with patch.object(ao_workflow, 'PARTS', OLDER_PARTS):
+            with self.assertRaisesRegex(
+                    RoomError, 'Delivered-context record is inconsistent; preserve the '
+                               'evidence, do not resend automatically'):
+                ao_workflow.carried_by(request)
+        self.assertEqual((self.directory() / request['receipt']).read_bytes(), receipt_bytes)
+
     def test_packet_is_idempotent_for_the_same_undelivered_state(self):
         state = self.state()
         text1, carried1 = ao_workflow.packet(self.service, self.directory(), state, 'engineer',
@@ -210,6 +234,84 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         state2 = self.state()
         summary2 = ao_workflow.context_summary(state2, self.directory())
         self.assertNotIn(ao_finding_provenance.PART, summary2['undelivered_parts'])
+
+
+class CombinedPartsDeliveryTests(fixtures.Fixture):
+    """A session retained from before either of the last two parts existed receives
+    execution_evidence_v1 and finding_provenance_v1 once, together, in PARTS order."""
+
+    def setUp(self):
+        super().setUp()
+        with patch.object(ao_workflow, 'PARTS', PRE_EXECUTION_PARTS):
+            self.room = self.open()
+            self.spec()
+            self.bind()
+            self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', json.dumps(self.report()))
+            self.service.ao_room_sync(self.room)
+
+    def receipt_digests(self):
+        digests = {}
+        for key, request in self.state()['requests'].items():
+            receipt = request.get('receipt')
+            if receipt is not None:
+                digests[key] = (self.directory() / receipt).read_bytes()
+        return digests
+
+    def test_a_pre_execution_session_receives_both_new_parts_once_in_parts_order(self):
+        before = self.receipt_digests()
+        session_id = self.state()['bindings']['engineer']['session_id']
+        held = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertNotIn(ao_execution_evidence.PART, held['parts'])
+        self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['carried']['parts'],
+                         [ao_execution_evidence.PART, ao_finding_provenance.PART])
+        self.assertEqual(request['carried']['part_sha256'],
+                         {ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256,
+                          ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+        self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        # Every pre-existing receipt's bytes are unchanged by the new send.
+        for key, saved in before.items():
+            self.assertEqual((self.directory() / self.state()['requests'][key]['receipt']).read_bytes(),
+                             saved)
+
+        # The next send after that verified completion carries neither.
+        self.send('correction', 'corr-2')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        carried2 = self.state()['requests']['corr-2']['carried']
+        self.assertEqual(carried2['parts'], [])
+        self.assertNotIn(ao_execution_evidence.INSTRUCTION,
+                         self.state()['requests']['corr-2']['text'])
+        self.assertNotIn(ao_finding_provenance.INSTRUCTION,
+                         self.state()['requests']['corr-2']['text'])
+
+    def test_an_uncertain_turn_leaves_both_new_parts_undelivered(self):
+        before = self.receipt_digests()
+        session_id = self.state()['bindings']['engineer']['session_id']
+        self.fake.lose_ack = True
+        result = self.send('correction', 'corr-uncertain')
+        self.assertEqual(result['state'], 'uncertain')
+        request = self.state()['requests']['corr-uncertain']
+        self.assertEqual(request['carried']['parts'],
+                         [ao_execution_evidence.PART, ao_finding_provenance.PART])
+        held = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertNotIn(ao_execution_evidence.PART, held['parts'])
+        self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        summary = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertIn(ao_execution_evidence.PART, summary['undelivered_parts'])
+        self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
+        for key, saved in before.items():
+            self.assertEqual((self.directory() / self.state()['requests'][key]['receipt']).read_bytes(),
+                             saved)
 
 
 class HistoricalSessionDeliveryTests(fixtures.Fixture):
