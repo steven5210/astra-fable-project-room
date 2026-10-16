@@ -196,3 +196,4 @@ acceptance, and remaining blockers.
   `ao_room_engineer_model_policy` (the user's recorded decision, same family only);
   each later `ao_room_send` reports `standing_policy` (`transitioned`, `deferred`
   with a reason, or `no_change`) — a deferral never blocks the send.
+- Controller defect blocks a room's supported path → [controller-maintenance lane](../../../docs/guides/controller-maintenance-lane.md)
