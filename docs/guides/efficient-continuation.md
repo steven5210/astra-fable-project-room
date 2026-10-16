@@ -185,7 +185,13 @@ explicit `task=<id>` token in each Agent launch description so the read-only
 progress view can pair a launch with its unit by that reference alone; it is
 delivered text only and grants nothing. See the
 [Fable policy reference's matching section](../../skills/project-room/references/fable-policy.md#execution-evidence-one-time-part-execution_evidence_v1)
-for the exact delivered text.
+for the exact delivered text. Rollback window: before the first engineer
+send after install, resyncing the previous plugin is safe; after a
+completed or settled engineer turn has carried this part, the previous
+controller's delivered-context check refuses that session's history
+because its `ao_workflow.PARTS` vocabulary does not contain the name —
+recovery is a forward fix on a controller that keeps the name, never a
+rewrite or removal of the delivered record.
 
 ## Progress-plan successor delivery (AO rooms)
 

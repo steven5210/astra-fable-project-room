@@ -9,6 +9,7 @@ import ao_execution_evidence
 import ao_progress
 import ao_workflow
 import lifecycle_closure
+from room import RoomError
 import test_ao_continuation
 import test_ao_normal as fixtures
 
@@ -185,6 +186,27 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         text, carried = self.packet()
         self.assertEqual(carried['parts'], [])
         self.assertNotIn(ao_execution_evidence.INSTRUCTION, text)
+
+    def test_a_downgraded_controller_refuses_the_carried_record_without_repair(self):
+        # Rollback boundary: once a completed engineer turn has carried the new part, the
+        # previous PARTS vocabulary cannot read that session's delivered-context record, and
+        # the refusal repairs nothing — the saved receipt bytes are untouched throughout.
+        self.send('correction', 'corr-1')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['corr-1']
+        self.assertEqual(request['state'], 'completed')
+        self.assertEqual(request['carried']['parts'], [ao_execution_evidence.PART])
+        receipt_bytes = (self.directory() / request['receipt']).read_bytes()
+        # The current vocabulary reads the same record fine.
+        record, names = ao_workflow.carried_by(request)
+        self.assertEqual(names, (ao_execution_evidence.PART,))
+        with patch.object(ao_workflow, 'PARTS', EARLIER_PARTS):
+            with self.assertRaisesRegex(
+                    RoomError, 'Delivered-context record is inconsistent; preserve the '
+                               'evidence, do not resend automatically'):
+                ao_workflow.carried_by(request)
+        self.assertEqual((self.directory() / request['receipt']).read_bytes(), receipt_bytes)
 
     def test_packet_is_idempotent_for_the_same_undelivered_state(self):
         state = self.state()

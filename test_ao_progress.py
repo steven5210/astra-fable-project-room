@@ -1781,6 +1781,99 @@ class ExecutionEvidenceTests(ExecutionFixture):
         self.assertEqual(second_counts['linked'], 0)
         self.assertEqual(second_counts['unlinked'], 1)
 
+    def _second_turn(self, offset=10.0):
+        """Add a same-session impl-2 request and anchor it, returning its turn's base time."""
+        state = self.state()
+        first = state['requests']['impl-1']
+        state['requests']['impl-2'] = dict(first, request_id='impl-2',
+                                         created_order=first['created_order'] + 1,
+                                         created_at=first['created_at'] + offset)
+        ao.atomic(self.directory() / 'state.json', state)
+        base = first['created_at'] + offset
+        self.native_events.append(
+            {'type': 'user', 'uuid': 'impl-2-caller', 'sessionId': self.NATIVE,
+             'timestamp': _iso(base + 0.5), 'cwd': self.workspace,
+             'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': first['text']}})
+        return base
+
+    def test_a_later_turns_update_never_rewrites_the_selected_turns_evidence(self):
+        # Turn A returns a linked handback with no task update; a later turn's subject-only
+        # update of the same task is that turn's own evidence and changes nothing in turn A.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        first = self.view(request_id='impl-1')
+        self.assertEqual(first['handoff_checks']['returned_without_task_update'], 1)
+        self.assertIs(self.step(first, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      False)
+        self.assertEqual(first['handoff_checks']['next_launch_before_task_update'], 0)
+
+        base = self._second_turn()
+        self.update('1', _iso(base + 0.6), subject='EXIT-1: unit renamed')
+        again = self.view(request_id='impl-1')
+        self.assertEqual(again['handoff_checks']['returned_without_task_update'], 1)
+        self.assertEqual(again['handoff_checks']['next_launch_before_task_update'], 0)
+        self.assertIs(self.step(again, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      False)
+        self.assertIn('returned_units_not_updated', again['handoff_checks']['warnings'])
+        # Turn B reads only its own turn: the update is in the plan, but it holds no launches.
+        second = self.view(request_id='impl-2')
+        self.assertTrue(second['turn']['anchor_found'])
+        self.assertEqual(second['handoff_checks']['launches']['total'], 0)
+        self.assertEqual(second['handoff_checks']['returned_without_task_update'], 0)
+        self.assertEqual(self.step(second, 'EXIT-1')['execution']['linkage'], 'none')
+
+    def test_an_update_in_the_same_turn_after_the_handback_clears_the_signal(self):
+        # The in-turn update counts only against the handback that precedes it.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        self.update('1', self.at(0.4), subject='EXIT-1: unit done')
+        view = self.view()
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 0)
+        self.assertIs(self.step(view, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      True)
+
+    def test_a_completion_before_the_failure_never_counts_despite_a_later_edit(self):
+        # The completion transition is compared, not the last edit: the unit completed before
+        # the linked launch failed, and a subject-only edit afterwards changes nothing.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'review task=1'},
+                    result='review exploded', result_stamp=self.at(0.4), is_error=True)
+        self.update('1', self.at(0.5), subject='EXIT-1: unit renamed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_tasklist_observed_completion_after_the_failure_counts(self):
+        # A TaskList status change is an observed transition too: a unit the list first shows
+        # moved to completed after the linked launch's error counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.15), status='in_progress')
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.3), is_error=True)
+        self.task_list(['#1 [completed] EXIT-1: unit'], self.at(0.4))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_an_earlier_turns_completion_never_counts_in_this_turn(self):
+        # The linked launch's turn observed no completion transition: the unit completed in the
+        # previous turn, so the count stays zero even though a same-turn edit follows the error.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        base = self._second_turn()
+        self.launch('w2', _iso(base + 0.6), {'subagent_type': 'Explore',
+                                             'description': 'retry task=1'},
+                    result='worker exploded', result_stamp=_iso(base + 0.7), is_error=True)
+        self.update('1', _iso(base + 0.8), subject='EXIT-1: unit renamed')
+        second = self.view(request_id='impl-2')
+        self.assertTrue(second['turn']['anchor_found'])
+        self.assertEqual(second['handoff_checks']['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', second['handoff_checks']['warnings'])
+
     def test_a_superseded_unit_keeps_its_execution_evidence(self):
         # (j) Execution evidence describes the launch, not the unit's disposition: a superseded
         # task still shows its linked launch while the deliverables identities are unchanged.

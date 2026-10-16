@@ -124,7 +124,7 @@ Each shown `plan.steps[]` row adds an `execution` object, computed for every tra
 | `linkage` | `explicit`, `none` | Whether any launch of the turn is explicitly linked to this step's id. |
 | `launches` | integer | The count of those explicitly linked launches, in transcript order. |
 | `latest` | `running`, `launched`, `returned`, `error`, `unreturned`, `unknown`, null | The last linked launch's status with `completed` reported as `returned` — a handback is evidence received, not a completed unit; null when no launch is linked. |
-| `task_updated_after_latest_result` | true, false, null | Whether the task's last update stamp is at or after the latest linked launch's result time; null when that launch has no result (`running`, `launched`, `unreturned`, `unknown`) or the task's update time is unknown. |
+| `task_updated_after_latest_result` | true, false, null | Whether the task has an update event in the selected turn at or after the latest linked launch's result time; null when that launch has no result (`running`, `launched`, `unreturned`, `unknown`) or its result time is unparseable. |
 
 The engineer's own task status is never changed by any of this. AO's native plan panel shows only the engineer's status; displaying execution evidence there would be an AO UI change, identified separately, and is not patched through private state.
 
@@ -135,10 +135,10 @@ The additive, read-only `handoff_checks` object is present on every view and rep
 | `version`, `basis`, `meaning` | `version` 1; `basis` and `meaning` are fixed sentences stating that only explicit `task=` references and the saved state are used, that missing references and unknown times are reported as unknown rather than as verdicts, and that nothing here completes a unit, releases a hold or replaces review. |
 | `available` | True only when the native source was read and the request's turn anchor was found; otherwise every counter is zero, every list empty, `routing_log` unavailable and `warnings` empty. |
 | `launches` | `total` (every launch of the turn), `shown` (after the 64 cap), `linked`, `unlinked` (`none` + `ambiguous` + `unobserved`), `ambiguous`, `unobserved`. |
-| `returned_without_task_update` | Linked launches whose result arrived with no task update at or after it. |
-| `update_time_unknown` | Linked returned launches whose task's last update time is unknown. |
-| `next_launch_before_task_update` | Linked returned launches followed by another launch that started before the unit's first update at or after that handback (or with no such update at all); parallel launches started at or before the handback never count. |
-| `completed_after_failed_launch` | Tracked units completed at or after their latest linked launch's error time (or unreturned start); an unknown update time never counts. |
+| `returned_without_task_update` | Linked launches whose result arrived with no task update in the selected turn at or after it; the anchored turn's window is complete, so an update in a later turn never clears an earlier turn's count. |
+| `update_time_unknown` | Linked returned launches whose own result time is unparseable, so the update comparison cannot be made. |
+| `next_launch_before_task_update` | Linked returned launches followed by another launch that started before the unit's first in-turn update at or after that handback (or with no such update at all); parallel launches started at or before the handback never count. |
+| `completed_after_failed_launch` | Tracked units whose completion transition was observed in the selected turn at or after their latest linked launch's error time (or unreturned start); a completion only revealed by a TaskList read or recorded in another turn never counts. |
 | `unreturned_at_turn_end` | All launches with status `unreturned`, linked or not. |
 | `areas_with_repeated_defects`, `areas_truncated` | Up to eight area keys (the leading subject code minus its round suffix) each holding two or more tracked defect units, sorted by unit count then key, with `launch_tiers` counting each unit's explicitly linked launches by `subagent_type` (`unknown` when absent); `areas_truncated` is true when more areas qualified. |
 | `routing_log` | Only for a `completed` request: `status` is `reported` when the captured report's `routing_log` holds entries, `empty` when it holds none, `unavailable` for any other request state or an unreadable report; `entries` counts them (null when unavailable); `launches_in_turn` restates `launches.total`. |
@@ -193,6 +193,8 @@ Saved status reports this delivery's progress through `successor_delivery`, one 
 ## The one-time execution-evidence instruction
 
 The one-time `execution_evidence_v1` workflow part, delivered once to each retained engineer session like the other one-time parts and appended last in `ao_workflow.PARTS`, asks the engineer to put the explicit `task=<id>` token — that unit's native task id, one task per launch — in each Agent launch description, so the read-only view can pair a launch with its unit by that reference alone. It also states the evidence rule the checks above restate: a returned handback is evidence received, not a completed unit; the engineer inspects it and updates that unit's task before launching further work or writing the final handback, and a failed, cut-off or unreturned worker's unit stays unfinished with its reason. The controller only reads these references; it never edits the task list, completes a unit, interrupts a worker or infers a link. It is delivered text only: it grants no scope, execution permission, recovery or review allowance, changes no model, guard, budget or authority, and supersedes no earlier part.
+
+Rollback window: before the first engineer send after install, resyncing the previous plugin is safe. After a completed or settled engineer turn has carried this part, the previous controller's delivered-context check refuses that session's history because its `ao_workflow.PARTS` vocabulary does not contain the name — recovery is a forward fix on a controller that keeps the name, never a rewrite or removal of the delivered record.
 
 ## Rate limits
 
