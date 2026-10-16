@@ -16,6 +16,14 @@ from room import RoomError
 import ao_routing
 
 
+# postCreate hook budget: AO runs the hook under the spawn request's client
+# timeout, so the adapter-lock wait is a best-effort 20-second budget that
+# fails loudly with a holder diagnosis under continued contention instead of
+# blocking silently until kill. This is a calibration constant, not a
+# configuration knob.
+PREPARE_LOCK_WAIT_SECONDS = 20.0
+
+
 class MalformedDelegateAttributionError(RoomError):
     """Invalid attribution strings; all well-formed provider claims were verified."""
 
@@ -445,7 +453,8 @@ def main():
     parser.add_argument("--room", required=True)
     args = parser.parse_args()
     from ao_project_room import Service
-    result = Service(Path(args.home)).ao_room_prepare(args.room, str(Path.cwd()))
+    result = Service(Path(args.home)).ao_room_prepare(args.room, str(Path.cwd()),
+                                                    lock_timeout_seconds=PREPARE_LOCK_WAIT_SECONDS)
     print(json.dumps({"room_id": result["room_id"], "worktree": result["worktree"], "prepared": True}))
 
 
