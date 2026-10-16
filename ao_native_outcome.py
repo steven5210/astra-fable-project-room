@@ -96,9 +96,22 @@ def _non_substantive_continuation(message):
     return False
 
 
+def _api_error_nested(row):
+    '''The dict form of apiError, or {} when the field is absent or a string code.
+
+    Claude Code >=2.1.29x writes apiError as a string such as "usage_limit_reached" and
+    moves the structured detail to apiErrorParams and quotaLimits; those fields are never
+    read for classification — apiErrorStatus and error still carry the typed failure.
+    Older versions used a nested dict or omitted the field entirely.'''
+    nested = row.get('apiError') or {}
+    if isinstance(nested, str):
+        return {}
+    return nested
+
+
 def _same_error_envelope(row):
     """Later same-id synthetic records must not contradict the exact typed error."""
-    nested = row.get('apiError') or {}
+    nested = _api_error_nested(row)
     if not isinstance(nested, dict):
         return False
     if row.get('apiErrorStatus', nested.get('status')) is not None:
@@ -169,7 +182,7 @@ def compaction_failure(events, request, session_id, workspace, outcome):
         return None
     if _message_text(message) != COMPACTION_THRASHING_TEXT:
         return None
-    nested = error_row.get('apiError') or {}
+    nested = _api_error_nested(error_row)
     if not isinstance(nested, dict):
         return None
     if error_row.get('apiErrorStatus', nested.get('status')) is not None:
@@ -299,7 +312,7 @@ def events_outcome(events, request, session_id, workspace=None):
                     and message.get('model') != request['model']):
                 raise RoomError('Native response model contradicts the owned request')
         if row.get('isApiErrorMessage') is True:
-            nested = row.get('apiError') or {}
+            nested = _api_error_nested(row)
             if not isinstance(nested, dict):
                 raise RoomError('Malformed native API error')
             status = row.get('apiErrorStatus', nested.get('status'))

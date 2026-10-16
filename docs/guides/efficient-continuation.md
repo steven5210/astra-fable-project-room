@@ -430,6 +430,14 @@ digest, native session and bounded human-message interval; compaction summaries,
 tool results, queue metadata and child sessions are not caller messages.
 Malformed, changed or ambiguous evidence holds rather than authorizing work.
 
+An `isApiErrorMessage` row's `apiError` field may be absent, a nested object
+(older Claude Code), or a string code such as `"usage_limit_reached"`
+(Claude Code 2.1.29x and later, which moves the structured detail to
+`apiErrorParams` and `quotaLimits`). Only the nested-object form can supply a
+status; the string form is classified by the row's `apiErrorStatus` and typed
+`error` exactly like a legacy row, and the supplementary detail fields are
+never read. Any other `apiError` shape still refuses as malformed.
+
 The explicit operator-supplied read-only owner storage and matching transcript are
 the first reviewer workspace trust anchor. This is not an independent preexisting
 room proof or a candidate-directory inference, and the workspace need not still
