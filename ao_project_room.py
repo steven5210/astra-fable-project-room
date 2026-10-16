@@ -297,7 +297,12 @@ class _LockTimeout(Exception):
 
 
 def _flock_acquire(stream, flags, deadline):
-    """Acquire flags on stream; a plain blocking flock when deadline is None."""
+    """Acquire flags on stream; a plain blocking flock when deadline is None.
+
+    With a deadline this is a best-effort budget: a successful poll is accepted
+    even when it wakes after the deadline; a failed poll at or after the
+    deadline raises _LockTimeout.
+    """
     if deadline is None:
         fcntl.flock(stream, flags)
         return
@@ -441,9 +446,12 @@ class Service:
         that room. The holder records itself under ``locks/holders/`` (kept
         flock-held) so a bounded timeout can name the verified holder.
 
-        ``timeout_seconds=None`` blocks as before; a number retries every step
-        with LOCK_NB against one shared deadline and raises RoomError with the
-        holder diagnosis on expiry. ``timing["lock_wait_seconds"]`` covers the
+        ``timeout_seconds=None`` blocks as before; a number is a best-effort
+        budget: every step retries with LOCK_NB against one shared deadline, a
+        poll that wakes after the deadline still accepts a successful
+        acquisition, and continued contention raises RoomError with the holder
+        diagnosis. Scheduler delays can extend the wake-up, so the budget is
+        not a guaranteed maximum. ``timing["lock_wait_seconds"]`` covers the
         turnstile, adapter and room-lock acquisition.
         """
         mode = fcntl.LOCK_EX if room_id is None or exclusive else fcntl.LOCK_SH
@@ -1721,7 +1729,7 @@ TOOL_SCHEMAS = {
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
     "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Optional engineering_model pins this room's engineering orchestrator selector: an engineer-role family alias (default fable; also opus), meaning the latest available member of that family at MAX, whose exact model is recorded only from verified native evidence, or a qualified exact identifier. A private operator-selected family qualification, when configured, pins each qualified family's exact expected model before inference from retained source evidence. Qualification is not provider availability. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}, "engineering_model": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
-    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper (which bounds its adapter-lock wait at 20 seconds and reports the verified holder when it expires; the tool itself blocks). Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
+    "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper (which waits for the adapter lock on a best-effort 20-second budget and reports the verified holder under continued contention; the tool itself blocks). Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and its exact configured model value/effort. Normal roles require the room's configured engineering orchestrator value (its family alias or exact identifier) and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
     "ao_room_reviewer_recovery_audit": ("Inspect one stopped, never-used native Codex reviewer against complete empty history and current passed spec/candidate/gate evidence. Saves a private audit digest, not a binding change. Bounded AO GETs only; no model, lifecycle or worker creation.", schema(R)),
     "ao_room_spec_review_extension_audit": ("Audit eligibility for this room's sole additional Fable charter review after exactly three retained spec-review intents. Register the exact next charter revision first. Bind its bytes, gates and approval, original accepted candidate/receipts/counters, retained MAX bindings and the explicit read-only AO database's native session identity. Complete settled native history is required. Saves audit evidence only; no model, native lifecycle or room/session replacement.", schema({**R, "spec_revision": {"type": "integer", "minimum": 2}, "spec_sha256": S, "retained_candidate_sha256": S, "native_session_id": S, "native_owner_database": S})),

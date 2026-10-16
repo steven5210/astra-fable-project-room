@@ -275,5 +275,68 @@ class RoomLockTests(Fixture):
         self.assertFalse(errors)
 
 
+class _DelayedWakeClock:
+    """sleep() lands 30 seconds later — a scheduler delay far past any deadline."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += 30.0
+
+
+class FlockAcquireBudgetTests(unittest.TestCase):
+    """_flock_acquire's deadline is a best-effort budget, not a guaranteed maximum."""
+
+    def _run_acquire(self, outcomes, timeout):
+        """Drive _flock_acquire with a fake clock, fake sleep and canned flock outcomes."""
+        clock = _DelayedWakeClock()
+        deadline = None if timeout is None else clock.now + timeout
+        calls = []
+
+        def flock(stream, flags):
+            calls.append(flags)
+            outcome = outcomes[len(calls) - 1]
+            if outcome is not None:
+                raise outcome
+
+        error = None
+        with patch("ao_project_room.time.monotonic", side_effect=clock.monotonic), \
+                patch("ao_project_room.time.sleep", side_effect=clock.sleep), \
+                patch("ao_project_room.fcntl.flock", side_effect=flock):
+            try:
+                ao._flock_acquire(object(), fcntl.LOCK_EX, deadline)
+            except Exception as exc:  # noqa: BLE001 - asserted by the test body
+                error = exc
+        return clock, calls, error
+
+    def test_successful_poll_after_a_delayed_wake_is_accepted(self):
+        clock, calls, error = self._run_acquire([BlockingIOError(), None], timeout=0.5)
+        self.assertIsNone(error)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(flags & fcntl.LOCK_NB for flags in calls))
+        self.assertEqual(clock.sleeps, [0.1])
+        self.assertEqual(clock.now, 30.0)
+
+    def test_failed_poll_after_a_delayed_wake_raises_lock_timeout(self):
+        clock, calls, error = self._run_acquire([BlockingIOError(), BlockingIOError()], timeout=0.5)
+        self.assertIsInstance(error, ao._LockTimeout)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(flags & fcntl.LOCK_NB for flags in calls))
+        self.assertEqual(clock.sleeps, [0.1])
+
+    def test_blocking_acquire_is_one_plain_flock_without_sleep(self):
+        clock, calls, error = self._run_acquire([None], timeout=None)
+        self.assertIsNone(error)
+        self.assertEqual(calls, [fcntl.LOCK_EX])
+        self.assertFalse(calls[0] & fcntl.LOCK_NB)
+        self.assertEqual(clock.sleeps, [])
+
+
 if __name__ == "__main__":
     unittest.main()

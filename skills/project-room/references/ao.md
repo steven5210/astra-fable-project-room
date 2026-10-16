@@ -651,8 +651,9 @@ during adapter acquisition keeps a waiting exclusive claim ahead of new shared
 entrants, and each holder keeps a flock-held record under `ao/locks/holders/` so
 a bounded wait names the verified holder. An older controller process that only
 takes `ao/.lock` exclusively still excludes every new holder. The AO postCreate
-preparation hook bounds its lock wait at 20 seconds and exits with that
-diagnosis instead of blocking until AO kills it. A durable intent with a native
+preparation hook waits for its locks on a best-effort 20-second budget and
+exits with that diagnosis under continued contention instead of blocking
+until AO kills it. A durable intent with a native
 `clientMessageId` is written before POST.
 Identical repeated calls read the saved record; they do not POST again. After a lost
 acknowledgement, sync requires the exact sent message on a turn that did not exist

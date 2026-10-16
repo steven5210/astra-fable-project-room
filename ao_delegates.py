@@ -17,9 +17,10 @@ import ao_routing
 
 
 # postCreate hook budget: AO runs the hook under the spawn request's client
-# timeout, so the bounded adapter-lock wait stays well below it and fails
-# loudly with a holder diagnosis instead of blocking silently until kill.
-# This is a calibration constant, not a configuration knob.
+# timeout, so the adapter-lock wait is a best-effort 20-second budget that
+# fails loudly with a holder diagnosis under continued contention instead of
+# blocking silently until kill. This is a calibration constant, not a
+# configuration knob.
 PREPARE_LOCK_WAIT_SECONDS = 20.0
 
 
