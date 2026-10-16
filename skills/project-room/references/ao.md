@@ -182,9 +182,12 @@ costs a full Astra model turn. The maximum is 45 seconds unless
 A code cell that calls `ao_room_sync` needs a `yield_time_ms` longer than
 `wait_seconds`. With a shorter yield, Codex returns the pending cell and each
 follow-up `wait` on it is another full model turn, which undoes the long wait.
-A `timeout` or `interrupted` wait reason is not a stall, failure or permission
-to replay. `settled` is true only when every owned request is terminal; an
-`uncertain` request still needs sync/recovery, never replay.
+A `timeout`, `budget` or `interrupted` wait reason is not a stall, failure or
+permission to replay. The wait is best-effort: it stops with `budget` instead of
+starting a reconciliation whose last measured iteration would overrun the
+requested wait, while the first iteration, lock acquisition or a slower later
+iteration can still exceed it. `settled` is true only when every owned request
+is terminal; an `uncertain` request still needs sync/recovery, never replay.
 Saved status remains readable while a verification gate holds the mutation lock.
 Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
 with explicit truncation. Check legacy `room_list` before treating an ambiguous
