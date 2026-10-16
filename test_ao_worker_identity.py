@@ -48,6 +48,20 @@ LEGACY_OUTCOME_KEYS = {"version", "room_id", "request_id", "receipt_sha256", "te
                        "provider_turn_id", "ao_terminal", "session_failures", "provider_failures", "native",
                        "outcome"}
 API_ERROR_DETAIL = "synthetic quota (error type rate_limit, HTTP 429)"
+# Exact pre-change vocabularies (05061e6) used to prove the 2.1.29x additions leave
+# legacy-transcript results byte-identical.
+BASE_ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot",
+                              "queue-operation", "ai-title", "atis-latch", "last-prompt",
+                              "mode"))
+BASE_CONTEXT_ATTACHMENT_TYPES = frozenset((
+    "total_tokens_reminder", "prompt_snapshot", "batching_reminder_sent", "deferred_tools_delta",
+    "session_context", "date", "environment", "model", "remote_session_change",
+    "mcp_instructions_delta", "instructions", "auto_mode", "deferred_tools_record",
+    "agent_listing_delta", "silent_turn_reminder", "task_status", "skill_listing",
+))
+# Digest of the path-free projection of observe_workers on the qualified fixture;
+# the 2.1.29x vocabulary addition must not alter legacy-transcript results.
+EXPECTED_LEGACY_RESULT_DIGEST = "77910e1d88b287f2637e9901c84497043826145331d2033a47ed7d46fb978726"
 API_ERROR_CONTENT = "Agent terminated early due to an API error: " + API_ERROR_DETAIL
 API_ERROR_RESULT = "Error: " + API_ERROR_CONTENT
 
@@ -846,6 +860,139 @@ class WorkerIdentityTests(unittest.TestCase):
         self.assertIsNotNone(scans[1].tool_entries["toolu_1"].occurrences[0].identity)
         annotated = ao_evidence_audit_native.launch_inventory(scans[0], interval)
         self.assertEqual([candidate.tool_id for candidate in annotated], ["toolu_1"])
+
+    # ---- Claude Code 2.1.29x transcript row vocabulary ------------------------------------
+    #
+    # 2.1.29x emits request-side accounting rows (api-request, api-request-shape,
+    # api-request-blob, cost-state) and three new context-attachment subtypes
+    # (credential_org, task_reminder, queued_command). Observed real key sets,
+    # values stripped: api-request{agentId?,base,cacheControl,id,keep,params,
+    # querySource,requestDigest,sessionId,shapeHash,tail,timestamp,type,version}
+    # carries only the REQUESTED model under params (never served identity);
+    # api-request-shape{agentId?,sessionId,shape,shapeHash,timestamp,type,version};
+    # api-request-blob{agentId?,hash,message,sessionId,type};
+    # cost-state{hasUnknownModelCost,modelUsage,sessionId,startTime,totalAPIDuration,
+    # totalAPIDurationWithoutRetries,totalCostUSD,totalDuration,totalLinesAdded,
+    # totalLinesRemoved,totalToolDuration,type}. None carries tool_use, a launch,
+    # or served-model attribution. credential_org's attachment payload is exactly
+    # {organizationUuid,type}: an org identifier, not credential material.
+
+    @staticmethod
+    def _row_2129x(kind, seconds=2.35, agent_id=None, **fields):
+        row = {"type": kind, "sessionId": NATIVE,
+               "timestamp": iso(CREATED_AT + seconds)}
+        if agent_id is not None:
+            row["agentId"] = agent_id
+        row.update(fields)
+        return row
+
+    @staticmethod
+    def _attachment_2129x(subtype, seconds=2.36, agent_id=None, **fields):
+        attachment = {"type": subtype}
+        attachment.update(fields)
+        row = {"type": "attachment", "sessionId": NATIVE, "cwd": None,
+               "uuid": "att-" + subtype, "timestamp": iso(CREATED_AT + seconds),
+               "isSidechain": agent_id is not None, "userType": "external",
+               "attachment": attachment}
+        row.pop("cwd")
+        if agent_id is not None:
+            row["agentId"] = agent_id
+        return row
+
+    def test_cc2129x_admin_and_attachment_rows_keep_complete_coverage(self):
+        agent_id = "agent-opus-1"
+        self.room.write_parent([
+            self.room.human(),
+            self._row_2129x("api-request", base=1, tail=1, keep=0, id="req-1",
+                            cacheControl=None, params={"model": "claude-fable-5-1",
+                                                       "max_tokens": 1024},
+                            querySource="repl", requestDigest="d" * 64,
+                            shapeHash="s" * 64, version=1),
+            self.room.launch("toolu_1", role="pr-opus"),
+            self._row_2129x("api-request-blob", hash="h" * 64, message="<blob>"),
+            self.room.result("toolu_1",
+                             structured=self.room.completed(agent_id)),
+            self._row_2129x("api-request-shape", shape={"n": 1},
+                            shapeHash="s" * 64, version=1),
+            self._row_2129x("cost-state", hasUnknownModelCost=False,
+                            modelUsage={"claude-fable-5-1": {}}, startTime=0,
+                            totalAPIDuration=1, totalAPIDurationWithoutRetries=1,
+                            totalCostUSD=0.0, totalDuration=1, totalLinesAdded=0,
+                            totalLinesRemoved=0, totalToolDuration=0),
+            self._attachment_2129x("credential_org",
+                                   organizationUuid="00000000-0000-4000-8000-000000000000"),
+            self._attachment_2129x("task_reminder", content="tasks pending",
+                                   itemCount=1),
+            self._attachment_2129x("queued_command", commandMode="queue",
+                                   delivery_id="d1", isMeta=False, origin="tui",
+                                   prompt="/compact", reminderId="r1",
+                                   source_uuid="u1", timestamp=iso(CREATED_AT)),
+        ])
+        self.room.write_child(agent_id, [
+            self._row_2129x("api-request", agent_id=agent_id, base=1, tail=1,
+                            keep=0, id="req-c1", cacheControl=None,
+                            params={"model": EXPECTED["pr-opus"]},
+                            querySource="repl", requestDigest="e" * 64,
+                            shapeHash="t" * 64, version=1),
+            self.room.child(agent_id),
+        ])
+        value = self.room.workers()
+        self.assertEqual(value["status"], "qualified")
+        self.assertTrue(value["qualified"])
+        self.assertEqual(value["coverage"], "complete")
+        self.assertEqual(value["reasons"], [])
+        self.assertEqual(value["observed_models"], [EXPECTED["pr-opus"]])
+        self.assertEqual(value["launches"][0]["outcome"], "qualified")
+
+    def test_unrecognised_future_row_type_still_degrades_coverage(self):
+        self.qualified()
+        self.room.write_parent([
+            self.room.human(),
+            self._row_2129x("some-future-type-we-do-not-know", invented=1),
+            self.room.launch("toolu_1", role="pr-opus"),
+            self.room.result("toolu_1",
+                             structured=self.room.completed("agent-opus-1")),
+        ])
+        value = self.room.workers()
+        self.assertFalse(value["qualified"])
+        self.assertEqual(value["coverage"], "incomplete")
+        self.assertIn("source_malformed", value["reasons"])
+
+    def test_legacy_vocabulary_result_is_unchanged(self):
+        # The qualification result for a transcript without the 2.1.29x rows is
+        # byte-identical to the pre-change controller: recomputing the same
+        # fixture with the constants restored to their exact base values must
+        # produce the same canonical bytes (source/expectation digests embed the
+        # temporary workspace path, so a literal whole-result digest cannot be
+        # pinned; a digest over the path-free projection is pinned below).
+        self.qualified()
+        value = self.room.workers()
+        with mock.patch.object(ao_evidence_audit_native, "ADMIN_TYPES",
+                               BASE_ADMIN_TYPES), \
+             mock.patch.object(ao_evidence_audit_native, "CONTEXT_ATTACHMENT_TYPES",
+                               BASE_CONTEXT_ATTACHMENT_TYPES):
+            legacy = self.room.workers()
+        self.assertEqual(json.dumps(legacy, sort_keys=True),
+                         json.dumps(value, sort_keys=True))
+        projection = {
+            "status": value["status"], "qualified": value["qualified"],
+            "coverage": value["coverage"], "reason": value["reason"],
+            "reasons": sorted(value["reasons"]),
+            "observed_models": value["observed_models"],
+            "executed_roles": value["executed_roles"],
+            "launches": [{"outcome": launch["outcome"], "agent_id": launch["agent_id"],
+                          "role": launch["role"], "name": launch["name"],
+                          "model": launch["model"],
+                          "reasons": sorted(launch["reasons"]),
+                          "background": launch["background"]}
+                         for launch in value["launches"]],
+            "executions": [{"agent_id": execution["agent_id"],
+                            "role": execution["role"],
+                            "model": execution["model"]}
+                           for execution in value["executions"]],
+        }
+        digest = hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest()
+        self.assertEqual(digest, EXPECTED_LEGACY_RESULT_DIGEST)
 
     def test_default_read_audit_report_output_is_unchanged(self):
         self.room.write_parent([self.room.human()])

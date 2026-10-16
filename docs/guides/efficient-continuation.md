@@ -622,6 +622,17 @@ working-directory overrides) still refuse as `launch_unsupported_override`, whil
 any other recorded key is listed as `extra_keys_ignored` and the child's own
 bounded evidence alone decides identity.
 
+The same audit's transcript-row coverage is version-aware: Claude Code 2.1.29x
+emits four additional administrative row types — `api-request` (request
+bookkeeping whose `params.model` names the *requested* model, never served
+identity), `api-request-shape` and `api-request-blob` (request digests and shape
+hashes), and `cost-state` (aggregate usage/cost accounting whose `modelUsage` is
+billing, not attribution) — plus the `credential_org` (an organisation UUID only,
+not credential material), `task_reminder` and `queued_command` context-attachment
+subtypes. These are recognized as ignorable because their observed shapes carry
+no tool_use, worker launch or served-model data; any other still-unknown row type
+continues to mark coverage incomplete and blocks qualification.
+
 New preparations and the audited routing refresh also pin
 `CLAUDE_CODE_ENABLE_TODO_TOOLS=true` in the ignored local settings: headless
 Claude Code offers the TaskCreate/TaskUpdate/TaskList/TaskGet tools to current
