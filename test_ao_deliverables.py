@@ -902,7 +902,10 @@ class RedactionPathTests(DeliverablesFixture):
         self.create('1', subject, metadata={'req': 'R1'})
         view = self.view()
         self.assertEqual(view['deliverables']['requirements'][0]['units'][0]['label'], subject)
-        self.assertIn({'label': subject, 'status': 'pending', 'stale_in_progress': False}, view['plan']['steps'])
+        step = {'label': subject, 'status': 'pending', 'stale_in_progress': False,
+                'execution': {'linkage': 'none', 'launches': 0, 'latest': None,
+                              'task_updated_after_latest_result': None}}
+        self.assertIn(step, view['plan']['steps'])
 
     def test_double_slash_runs_and_file_urls_are_redacted(self):  # T3
         self.create('1', 'R1-1: //leakprobe/secret/file.py', metadata={'req': 'R1'},

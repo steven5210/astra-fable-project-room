@@ -632,6 +632,8 @@ class PreCharterRefreshFramingTests(Fixture):
         texts[ao_residual_escalation.PART] = ao_residual_escalation.INSTRUCTION
         import lifecycle_closure
         texts[lifecycle_closure.PART] = lifecycle_closure.INSTRUCTION
+        import ao_execution_evidence
+        texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
         assembly = ao_prompt_metrics.PromptAssembly('\n')
         for name in request['carried']['parts']:
             assembly.add('workflow', texts[name])
