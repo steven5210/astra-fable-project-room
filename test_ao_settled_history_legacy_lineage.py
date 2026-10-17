@@ -223,6 +223,7 @@ class LegacyLineageFixture(PreAcceptanceFixture):
         self.service.ao_room_sync(self.room)
         self.final_request_id = _RESUME
         self.assertEqual(self.state()['requests'][self.final_request_id]['state'], 'completed')
+        self.exhaust_debate()
         self.register()
         self.assert_lineage_shape()
 

@@ -1,4 +1,5 @@
 """Offline spec-review debate-budget contracts; synthetic rooms and fake backends only."""
+import copy
 import hashlib
 import json
 import unittest
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 
 import ao_project_room as ao
 import ao_spec_review_budget as budget
+import ao_workflow
 from test_ao_normal import Fixture
 
 
@@ -57,6 +59,17 @@ class BudgetFixture(Fixture):
                                             'Continue once')
         self.assertEqual(self.state()['requests'][key]['state'], 'settled_failure')
 
+    def accept_review(self, key, drop=(), **changes):
+        """A completed review whose verdict defaults to a canonical strict accept of the current spec."""
+        spec = self.service.spec(self.directory(), self.state())
+        verdict = {'interpretation': 'Exact charter only.', 'findings': [], 'decision': 'accept',
+                   'spec_revision': spec['revision'], 'spec_sha256': spec['sha256'], **changes}
+        for field in drop:
+            verdict.pop(field)
+        self.send('spec_review', key)
+        self.fake.finish('engineer', json.dumps(verdict))
+        return self.service.ao_room_sync(self.room)
+
     def counted(self):
         state = self.state()
         return {request['request_id']: budget.counted_as(self.directory(), state, request)
@@ -82,7 +95,7 @@ class DebateBudgetTests(BudgetFixture):
         summary = status['spec_review_budget']
         self.assertEqual((summary['debate_attempts'], summary['dispatches']), (1, 4))
         self.assertEqual((summary['debate_limit'], summary['dispatch_ceiling']), (3, 5))
-        self.assertTrue(summary['ordinary_review_available'])
+        self.assertTrue(summary['ordinary_review_capacity'])
         self.assertEqual(self.counted(), {'review1': 'accepting', 'review2': 'accepting',
                                          'review3': 'debate', 'review4': 'dispatch_only'})
         # The admitted fourth review still leaves the unchanged five-dispatch ceiling in force.
@@ -130,7 +143,7 @@ class DebateBudgetTests(BudgetFixture):
         self.assertEqual(len(self.fake.posts), posts)
         summary = self.service.ao_room_status(self.room)['spec_review_budget']
         self.assertEqual((summary['debate_attempts'], summary['dispatches']), (3, 4))
-        self.assertFalse(summary['ordinary_review_available'])
+        self.assertFalse(summary['ordinary_review_capacity'])
 
     def test_five_dispatches_reach_the_hard_ceiling_even_when_all_accept(self):
         for number in range(1, 6):
@@ -142,7 +155,7 @@ class DebateBudgetTests(BudgetFixture):
         self.assertNotIn('review6', self.state()['requests'])
         summary = self.service.ao_room_status(self.room)['spec_review_budget']
         self.assertEqual((summary['debate_attempts'], summary['dispatches']), (0, 5))
-        self.assertFalse(summary['ordinary_review_available'])
+        self.assertFalse(summary['ordinary_review_capacity'])
 
     def test_accept_with_blocker_prose_only_and_quota_failure_classify_separately(self):
         # A completed accept whose findings carry a BLOCKER is debate, not accepting.
@@ -164,9 +177,54 @@ class DebateBudgetTests(BudgetFixture):
         before = self.digest()
         summary = self.service.ao_room_status(self.room)['spec_review_budget']
         self.assertEqual((summary['debate_attempts'], summary['dispatches']), (1, 3))
-        self.assertTrue(summary['ordinary_review_available'])
+        self.assertTrue(summary['ordinary_review_capacity'])
         self.assertEqual(self.digest(), before)
         self.assertEqual(self.send('spec_review', 'review4')['state'], 'submitted')
+
+    def test_invalid_accepts_count_as_debate_under_the_agreement_contract(self):
+        """Every deviation the agreement path refuses counts as debate under the same strict
+        contract, evaluated against each request's own immutable spec record."""
+        self.accept_review('review1')
+        self.accept_review('review2', drop=('interpretation',))
+        self.accept_review('review3', interpretation='   ')
+        self.accept_review('review4', interpretation=['Exact charter only.'])
+        self.assertEqual(self.counted(), {'review1': 'accepting', 'review2': 'debate',
+                                         'review3': 'debate', 'review4': 'debate'})
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted the debate budget'):
+            self.send('spec_review', 'review5')
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_boolean_revision_and_wrong_engineer_accepts_count_as_debate(self):
+        self.accept_review('review1', spec_revision=True)  # JSON true is never revision 1
+        self.accept_review('review2')
+        self.assertEqual(self.counted(), {'review1': 'debate', 'review2': 'accepting'})
+        # The bound-engineer check belongs to the same contract: a completed accept whose
+        # retained request identity no longer matches the bound session is debate.
+        state = self.state()
+        request = copy.deepcopy(state['requests']['review2'])
+        request['session_id'] = 'another-session'
+        state['requests']['review2'] = request
+        self.assertEqual(budget.counted_as(self.directory(), state, request), 'debate')
+
+    def test_two_debates_and_an_invalid_accept_still_refuse_the_ordinary_fourth(self):
+        self.verdict_review('review1')
+        self.verdict_review('review2')
+        self.accept_review('review3', interpretation='   ')  # completed, never an acceptance
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'exhausted the debate budget'):
+            self.send('spec_review', 'review4')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertNotIn('review4', self.state()['requests'])
+        self.assertEqual(self.counted(), {'review1': 'debate', 'review2': 'debate', 'review3': 'debate'})
+
+    def test_a_stale_spec_accept_stays_accepting_for_budget_while_agreement_refuses(self):
+        self.accept_review('review1')
+        self.spec(2)
+        request = self.state()['requests']['review1']
+        self.assertEqual(budget.counted_as(self.directory(), self.state(), request), 'accepting')
+        with self.assertRaisesRegex(ao.RoomError, 'current exact spec requires completed Fable agreement'):
+            ao_workflow.agreement(self.service, self.directory(), self.state())
 
     def test_a_damaged_completed_review_counts_as_debate_and_summary_survives(self):
         self.agree(key='review1')
@@ -181,6 +239,41 @@ class DebateBudgetTests(BudgetFixture):
         self.assertEqual(summary['debate_attempts'], 1)
         self.assertEqual(self.service.ao_room_status(self.room)['spec_review_budget']['reviews'],
                          summary['reviews'])
+
+
+from test_ao_spec_rereview import ReReviewFixture
+
+
+class HanCountingShapeTests(ReReviewFixture):
+    """The retained-room counting shape: two accepting reviews, one non-accepting review,
+    the consumed extension's noncanonical fourth review, and the re-review as the fifth
+    dispatch. Han's room reached its grant under the retired completed-review eligibility,
+    so ReReviewFixture mints it that way while every later validation runs the real
+    counters."""
+
+    def test_consumed_extension_and_rereview_count_like_the_retained_room(self):
+        audited, grant = self.granted()
+        self.send_rereview()
+        self.finish_rereview()
+        self.assertTrue(ao_workflow.agreement(self.service, self.directory(), self.state())['agreed'])
+        summary = budget.summary(self.directory(), self.state())
+        self.assertEqual((summary['debate_attempts'], summary['dispatches']), (2, 5))
+        self.assertFalse(summary['ordinary_review_capacity'])
+        rows = {row['request_id']: row['counted_as'] for row in summary['reviews']}
+        self.assertEqual(rows, {'charter-1': 'accepting', 'charter-2': 'debate', 'charter-3': 'accepting',
+                                'fourth': 'debate', 'spec-rereview': 'accepting'})
+        posts = len(self.fake.posts)
+        with self.assertRaisesRegex(ao.RoomError, 'one re-review intent is exhausted'):
+            self.service.ao_room_send(self.room, 'engineer', 'Review the charter again.', 'sixth',
+                                      purpose='spec_review')
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertNotIn('sixth', self.state()['requests'])
+        # The committed extension and the consumed re-review grant still validate under the
+        # new counters, including the rereview exclusion inside the granted-at window.
+        import ao_review_extension
+        import ao_spec_rereview
+        self.assertIsNotNone(ao_review_extension.validate(self.service, self.state()))
+        self.assertIsNotNone(ao_spec_rereview.validate(self.service, self.state()))
 
 
 if __name__ == '__main__':

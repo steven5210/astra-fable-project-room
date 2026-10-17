@@ -112,7 +112,9 @@ Dispose of each finding with evidence; a behavior change needs a newer revision.
 Only completed reviews that did not accept consume the 3-review debate budget;
 accepted reviews do not, and failed or uncertain dispatches count only toward
 the hard ceiling of 5 spec-review dispatches, with no automatic renewal. Room
-status reports both counters under `spec_review_budget`.
+status reports both counters under `spec_review_budget`; its
+`ordinary_review_capacity` flag reports budget capacity only — semantic holds,
+pending format recovery and other send gates can still refuse a review.
 **Stop:** debate budget or ceiling exhausted → bring the product tradeoff to the
 user; an extension needs [one-charter review extension](../../../docs/guides/one-charter-review-extension.md)
 (a room with zero acceptances and a completed `scope_change` report instead uses

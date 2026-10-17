@@ -30,7 +30,11 @@ class RetainedHistoryTests(unittest.TestCase):
         f.configure_runtime()
         f.room = f.open()
         f.spec()
-        f.observe_full_conversations()
+        f._install_raw_request()
+        for session in f.fake.sessions.values():
+            session['isTerminated'] = False
+        for snapshot in f.fake.snapshots.values():
+            snapshot.update(controller='ready', branchMaterialization={'strategy': 'native', 'replayTruncated': False})
         f.bind()
         f.accept_charter()
         f.target_spec = None

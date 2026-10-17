@@ -20,6 +20,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import ao_project_room as ao
+import ao_spec_review_budget as budget
 import ao_spec_rereview as rereview
 import ao_workflow
 import project_room
@@ -28,14 +29,22 @@ import project_room_runtime as runtime
 from test_ao_preacceptance_review_extension import PreAcceptanceFixture
 from test_ao_review_extension import ExecutableRuntimeMixin
 
-EXHAUSTED = 'fourth Fable review intent is exhausted'
+EXHAUSTED = 'additional Fable review intent is exhausted'
 REREVIEW_EXHAUSTED = 'one re-review intent is exhausted'
 
 
 class ReReviewFixture(PreAcceptanceFixture):
     """The consumed charter extension's fourth review completed with the noncanonical negative
     verdict; the operator then registered the corrected revision-3 charter whose first gate
-    declares a synthetic artifact path plus its bytes hash, exactly as an audited gate does."""
+    declares a synthetic artifact path plus its bytes hash, exactly as an audited gate does.
+
+    The counting shape is the retained one (as in Han's room): two accepting reviews, one
+    non-accepting review and the extension consumed as the fourth dispatch, so the re-review is
+    the fifth. The extension grant is minted under the retired completed-review eligibility --
+    the strict debate budget admits this shape's audit only with three non-accepting reviews,
+    while a retained grant minted under the old rule must still validate. The audit and extend
+    calls bind real evidence; only the eligibility counter is simulated, and every later
+    validation runs the real counters."""
 
     MESSAGE = 'Review the exact corrected specification revision 3.'
     REREVIEW_ID = 'spec-rereview'
@@ -49,12 +58,37 @@ class ReReviewFixture(PreAcceptanceFixture):
         self.spec3 = self.register_corrected()
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
         self.send('spec_review', 'fourth')
         self.fake.finish('engineer', json.dumps(self.source_verdict()))
         self.service.ao_room_sync(self.room)
+
+    def register(self):
+        if self.target_spec is None:
+            self.target_spec = self.service.ao_room_spec_put(self.room, 2,
+                'Review the newly authorized validation charter after the proposed scope change.',
+                self.gates, 'Astra approves this exact next charter under the actual scope decision')
+        return self.target_spec
+
+    def audit(self, **changes):
+        changes.setdefault('spec_revision', 2)
+        return super().audit(**changes)
+
+    def legacy_grant(self):
+        """Mint the one extension under the retained completed-review eligibility.
+
+        Three completed reviews stand where the strict debate budget sees only one
+        non-accepting review, exactly the position of a retained room whose grant predates
+        debate counting. The patched counter covers only the audit and grant calls; the bound
+        evidence, the consumption journal and every subsequent validation are real.
+        """
+        with patch.object(budget, 'debate_attempts', lambda directory, state: budget.DEBATE_LIMIT):
+            self.inputs = self.grant_inputs()
+            return self.service.ao_room_preacceptance_review_extend(**self.inputs)
 
     def source_verdict(self):
         """The retained noncanonical result: one JSON object, no canonical ``decision``."""
@@ -513,9 +547,11 @@ class ReReviewUnconsumedFixture(ReReviewFixture):
     """The extension is granted but the fourth intent was deliberately never sent."""
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
 
     def register_corrected(self):
         self.write_script()
@@ -534,9 +570,11 @@ class ReReviewProseSourceFixture(ReReviewFixture):
     """The fourth review finished as plain prose, never one JSON object."""
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
         self.send('spec_review', 'fourth')
         self.fake.finish('engineer', 'The charter is refused in plain words.')
         self.service.ao_room_sync(self.room)

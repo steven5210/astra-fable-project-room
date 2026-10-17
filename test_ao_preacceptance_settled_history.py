@@ -23,6 +23,7 @@ import ao_outcomes
 import ao_project_room as ao
 import ao_provider_transition
 import ao_review_extension as extension
+from test_ao_normal import Fixture
 from test_ao_preacceptance_review_extension import PreAcceptanceFixture, PreAcceptanceReviewerRecoveryFixture
 from test_ao_review_extension import ReviewExtensionFixture
 
@@ -56,9 +57,10 @@ class SettledHistoryFixture(PreAcceptanceFixture):
     later one to be purpose ``correction``, each only once its immediate predecessor has reached a
     terminal ``completed`` or ``settled_failure`` state. No cap on the number of corrections under
     one handoff was found by inspection (grepped ``ao_workflow.py``/``ao_project_room.py`` for a
-    correction-count bound); the one cited, verified cap that *does* apply is the charter-review
-    limit, ``extension.LIMIT = 3`` (checked by ``_inspect``), already satisfied by this fixture's
-    inherited three ``self.agree()`` charter rounds before any of this history is built.
+    correction-count bound); the one cited, verified cap that *does* apply is the debate budget,
+    ``budget.DEBATE_LIMIT = 3`` non-accepting reviews (checked by ``_inspect``), which this
+    fixture's ``exhaust_debate()`` call spends on revision 2 after the scope-change history is
+    built and before ``register()`` puts the next charter in place.
     """
 
     SETTLED_FAILURES_PER_CYCLE = 2
@@ -143,6 +145,7 @@ class SettledHistoryFixture(PreAcceptanceFixture):
         self.assertEqual(self.state()['requests'][self.final_request_id]['state'], 'completed')
         self.completed.append(self.final_request_id)
         self.assertEqual(len(self.completed), self.COMPLETED_TURNS)
+        self.exhaust_debate()
         self.register()
 
     def audit(self, **changes):
@@ -240,6 +243,7 @@ class BytesCompatibilityTests(PreAcceptanceFixture):
 
     def test_room_without_settled_failures_has_no_settled_failures_key(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         audit = self.audit()
         saved = ao.read(self.directory() / extension.BASE / 'audits' / (audit['audit_sha256'] + '.json'))
         native = saved['evidence']['native']
@@ -254,10 +258,29 @@ STRICT_MESSAGE = ('Native history contains a turn that is not completed \\(state
 class AcceptedSettledFailureFixture(ReviewExtensionFixture):
     """A normal, already-accepted room with one settled native quota failure in the engineer's
     history. Neither the accepted-candidate lane nor the acceptance-review-audit entry point ever
-    opts into settled-history admission, so both must keep refusing on it like the baseline."""
+    opts into settled-history admission, so both must keep refusing on it like the baseline.
+
+    ``setUp`` rebuilds ``ReviewExtensionFixture.setUp``'s steps instead of inheriting them so the
+    handoff and the settled failure land between ``accept_charter`` and ``exhaust_debate``: under
+    debate counting the exhausted rev2 charter ends with a rejecting latest review, and a later
+    ``ao_room_handoff`` could never reach agreement. The resumed correction is sent inside the
+    mocked inspection window and completed normally, exactly like ``_settle`` below, so the debate
+    exhaustion's own ``spec_review`` sends face no semantic hold.
+    """
 
     def setUp(self):
-        super().setUp()
+        Fixture.setUp(self)
+        self.configure_runtime()
+        self.room = self.open()
+        self.spec()
+        self._install_raw_request()
+        for session in self.fake.sessions.values():
+            session['isTerminated'] = False
+        for snapshot in self.fake.snapshots.values():
+            snapshot.update(controller='ready', branchMaterialization={'strategy': 'native', 'replayTruncated': False})
+        self.bind()
+        self.accept_charter()
+        self.target_spec = None
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('correction', 'post-accept-failure')
         self.fake.finish('engineer', state='failed')
@@ -270,7 +293,12 @@ class AcceptedSettledFailureFixture(ReviewExtensionFixture):
                 self.room, 'post-accept-failure', audit['outcome_sha256'], 'post-accept-resume',
                 'Native quota rejection identified at post-accept-failure; user confirmed availability.',
                 'User approved the exact one-time continuation for post-accept-failure.')
-        self.assertEqual(self.state()['requests']['post-accept-failure']['state'], 'settled_failure')
+            self.assertEqual(self.state()['requests']['post-accept-failure']['state'], 'settled_failure')
+            self.send('correction', 'post-accept-resume')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['post-accept-resume']['state'], 'completed')
+        self.exhaust_debate()
 
 
 class AcceptedCandidateLaneScopingTests(AcceptedSettledFailureFixture):
@@ -618,6 +646,7 @@ class TruncatedSettledFailureFixture(PreAcceptanceFixture):
         self.service.ao_room_sync(self.room)
         self.final_request_id = 'truncated-resume'
         self.assertEqual(self.state()['requests'][self.final_request_id]['state'], 'completed')
+        self.exhaust_debate()
         self.register()
 
     def audit(self, **changes):
@@ -792,6 +821,7 @@ class RenewedTruncatedSettledFailureFixture(PreAcceptanceFixture):
         self.service.ao_room_sync(self.room)
         self.final_request_id = 'truncated-resume'
         self.assertEqual(self.state()['requests'][self.final_request_id]['state'], 'completed')
+        self.exhaust_debate()
         self.register()
         # The superseded outcome O1 retained the raw provider text; P1 bound only its stripped identity.
         o1 = ao.read(self.directory() / 'outcomes' / 'truncated-failure' / (self.o1 + '.json'))

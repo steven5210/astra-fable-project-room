@@ -28,6 +28,7 @@ class RecoveredContextWithoutProofTests(PreAcceptanceFixture):
 
     def test_recovered_turn_without_proof_refuses_with_its_exact_state(self):
         self.propose_scope_change()
+        self.exhaust_debate()
         self.fake.snapshots['engineer']['turns'].append(
             {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1', 'state': 'recovered'})
         with self.assertRaisesRegex(ao.RoomError, 'not completed \\(state recovered\\)'):
@@ -67,6 +68,7 @@ class RecoveredContextWithProofWithoutSettledFailureTests(PreAcceptanceFixture):
         with patch.object(native_outcome, 'inspect', return_value=native):
             self.service.ao_room_sync(self.room)
         self.assertEqual(self.state()['requests']['implementation']['state'], 'completed')
+        self.exhaust_debate()
         self.register()
 
     def test_recovered_turn_with_compaction_import_proof_without_settled_failures_refuses_the_audit(self):
