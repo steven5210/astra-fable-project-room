@@ -1,4 +1,5 @@
 """Bounded local Claude error evidence. Reads no account settings or credentials."""
+import array
 from datetime import datetime
 import hashlib
 import json
@@ -546,6 +547,260 @@ def validate_source(state, source, role='engineer'):
     return owner
 
 
+MAX_TRANSCRIPT_BYTES = 256_000_000          # complete-history physical cap, bytes
+# Headroom, estimated not measured: one Claude Code row can carry several base64 images (API images
+# run up to 5 MB each; AO browser screenshots read through the Read tool land in tool_result rows),
+# so the previous 4 MiB cap risked refusing legitimate histories that the old 64,000,000-byte
+# whole-file read accepted. 16 MiB still bounds one record's pending buffer and parse while
+# MAX_TRANSCRIPT_BYTES bounds the total.
+MAX_TRANSCRIPT_RECORD_BYTES = 16_777_216     # one JSONL record (line) excluding its terminator
+MAX_TRANSCRIPT_RECORDS = 2_000_000          # non-blank records
+TRANSCRIPT_READ_CHUNK = 1_048_576
+TRANSCRIPT_RECORD_BYTES_REFUSAL = 'Native transcript record exceeds the finite record budget'
+TRANSCRIPT_RECORD_COUNT_REFUSAL = 'Native transcript exceeds the finite record count budget'
+TRANSCRIPT_MALFORMED_REFUSAL = 'Native transcript contains a malformed record'
+_read_chunk = os.read  # module attribute, test seam only
+_LINE_BREAK = re.compile(br'[\r\n]+')
+
+
+def iter_transcript_records(chunks, *, max_record_bytes=MAX_TRANSCRIPT_RECORD_BYTES,
+                            max_records=MAX_TRANSCRIPT_RECORDS, malformed_message=TRANSCRIPT_MALFORMED_REFUSAL):
+    """Stream ``(start, end, row)`` records out of an iterable of byte chunks, bytes.splitlines()-exact.
+
+    ``start``/``end`` are absolute byte offsets of the record text (``end`` excludes the line
+    terminator: one of ``\\n``, ``\\r``, ``\\r\\n``, including a terminator split across a chunk
+    boundary). Blank/whitespace-only lines are skipped and never counted. One record (including an
+    unterminated pending tail) longer than ``max_record_bytes`` refuses immediately -- before EOF and
+    before parsing -- so one record's memory stays bounded; the per-file non-blank record count is
+    checked, in order, before that record is parsed. ``json.loads`` runs exactly as the legacy
+    per-line parse (bytes input; a malformed row or pathological nesting refuses as
+    ``malformed_message``); a parsed non-dict row is yielded unchanged so each caller keeps its own
+    shape refusal.
+
+    Terminator *runs* (one or more consecutive ``\\r``/``\\n`` bytes, in any mixture) are matched and
+    skipped in one step rather than one byte at a time, so a flood of bare blank lines no longer costs
+    one Python-level loop iteration per character; every zero-length "line" a run collapses was always
+    blank and discarded either way, so this changes no yielded row, offset or refusal. A pending
+    (unterminated) record that keeps growing across many small chunks is also not rescanned from its
+    own start on every new chunk: a carried-forward scan position only ever advances. A whitespace-only
+    but non-empty line (for example a lone space before its terminator) still costs one iteration of
+    the outer per-record bookkeeping below, because its content must still be sliced and stripped
+    before it can be discarded -- but, matching the legacy per-line parse, it is still never counted
+    toward ``max_records``.
+
+    The pending buffer for one in-progress (not yet terminator-closed) record is bounded by
+    ``max_record_bytes`` plus the size of one more incoming chunk, not by ``max_record_bytes`` alone:
+    the oversized-record refusal only fires once a whole chunk has been appended and rescanned, so
+    the buffer can briefly hold up to one chunk's worth more than the nominal budget before that is
+    caught. The ``max_record_bytes`` budget is checked against every physical line's raw length
+    before ``settle`` ever looks at its content, including a whitespace-only line: such a line longer
+    than ``max_record_bytes`` still refuses, even though a shorter whitespace-only line is silently
+    skipped and never counted toward ``max_records``. ``max_record_bytes`` and ``max_records`` must
+    each be a positive int; a non-positive or non-integer one raises ``ValueError`` (a programming
+    error, not a transcript defect) the first time this generator is advanced, before any chunk is
+    consumed.
+    """
+    if not isinstance(max_record_bytes, int) or max_record_bytes <= 0:
+        raise ValueError('iter_transcript_records requires a positive integer max_record_bytes')
+    if not isinstance(max_records, int) or max_records <= 0:
+        raise ValueError('iter_transcript_records requires a positive integer max_records')
+    buf = b''
+    buf_start = 0
+    count = 0
+    scanned = 0  # prefix length of buf already confirmed free of a terminator run
+
+    def settle(record_bytes, start_abs, end_abs):
+        nonlocal count
+        if not record_bytes.strip():
+            return None
+        count += 1
+        if count > max_records:
+            raise RoomError(TRANSCRIPT_RECORD_COUNT_REFUSAL)
+        try:
+            row = json.loads(record_bytes)
+        except (ValueError, RecursionError) as exc:
+            raise RoomError(malformed_message) from exc
+        return start_abs, end_abs, row
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buf += chunk
+        pos = 0
+        while True:
+            match = _LINE_BREAK.search(buf, scanned if scanned > pos else pos)
+            if match is None:
+                scanned = len(buf)
+                break
+            idx = match.start()
+            if idx - pos > max_record_bytes:
+                raise RoomError(TRANSCRIPT_RECORD_BYTES_REFUSAL)
+            record = settle(buf[pos:idx], buf_start + pos, buf_start + idx)
+            pos = match.end()
+            scanned = pos
+            if record is not None:
+                yield record
+        if len(buf) - pos > max_record_bytes:
+            raise RoomError(TRANSCRIPT_RECORD_BYTES_REFUSAL)
+        if pos:
+            buf = buf[pos:]
+            buf_start += pos
+            scanned -= pos
+    if buf:
+        if len(buf) > max_record_bytes:
+            raise RoomError(TRANSCRIPT_RECORD_BYTES_REFUSAL)
+        record = settle(buf, buf_start, buf_start + len(buf))
+        if record is not None:
+            yield record
+
+
+def _transcript_identity_recheck(descriptor, path, before, total=None):
+    """True while the open ``descriptor`` and the named ``path`` both still match the ``before`` fstat.
+
+    ``descriptor``'s own fstat must still show the same inode/size/mtime/ctime/uid/mode, and, only
+    when ``total`` is given (the read ran to completion), ``total`` must equal ``before.st_size`` as
+    well -- a mid-read exception recheck passes ``total=None`` because a short consumption so far is
+    not itself a sign of change. Comparing ``st_ctime_ns`` catches a same-size rewrite whose writer
+    restores ``st_mtime_ns`` with ``os.utime``; comparing ``st_uid``/``st_mode`` catches a
+    ``chown``/``chmod`` racing the read (each of which also bumps ``ctime`` on its own, but is named
+    explicitly so the refusal is traceable to the actual change). The named ``path`` is then
+    reverified by a separate ``lstat`` (still a regular file, same dev/ino/size/mtime/ctime/uid/mode);
+    an ``OSError`` there (removed, unreadable parent, ...) counts as changed, same as a mismatch.
+    """
+    after = os.fstat(descriptor)
+    if ((total is not None and total != before.st_size)
+            or (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_uid, before.st_mode)
+            != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_uid, after.st_mode)):
+        return False
+    try:
+        named = Path(path).lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(named.st_mode)
+            and (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns, named.st_ctime_ns, named.st_uid,
+                 named.st_mode)
+            == (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_uid,
+                before.st_mode))
+
+
+def read_complete_transcript(path, *, unsafe_message, changed_message, malformed_message=None,
+                             unavailable_message=None, prefix_bytes=None, max_bytes=None,
+                             max_record_bytes=None, max_records=None, chunk_bytes=None):
+    """Read one complete owned native transcript, streamed and finitely bounded, never ``os.fdopen``.
+
+    The single reader behind every production lane that needs a complete native history: an
+    ownership/identity-checked descriptor is opened once, read in ``chunk_bytes`` pieces into
+    ``iter_transcript_records`` while an incremental SHA-256 (and, when ``prefix_bytes`` is given, a
+    snapshot digest of exactly its first ``prefix_bytes`` bytes) accumulates, then descriptor identity
+    is reverified before and after the read and the named path is reverified once more. An identity or
+    mutation refusal always uses the caller's own ``unsafe_message``/``changed_message``; a malformed
+    row uses ``malformed_message`` (the caller's own when given, else the shared
+    ``TRANSCRIPT_MALFORMED_REFUSAL`` default); a record over ``max_record_bytes`` or a file over
+    ``max_records`` always raises one of the two shared module refusal strings
+    (``TRANSCRIPT_RECORD_BYTES_REFUSAL``/``TRANSCRIPT_RECORD_COUNT_REFUSAL``), never a caller-supplied
+    one. Any of ``malformed_message``/``max_bytes``/``max_record_bytes``/``max_records``/
+    ``chunk_bytes`` left at its ``None`` default resolves the current module constant at call time
+    (not at import time), so patching e.g. ``MAX_TRANSCRIPT_BYTES`` takes effect on the next call.
+    A parse refusal (malformed row, record-bytes or record-count budget) from ``iter_transcript_records``
+    is itself rechecked against the same identity before it is let through: a concurrent same-size
+    rewrite or a writer completing a torn final row after this read's own EOF can turn a row that
+    ``before`` never actually contained into one that fails to parse, and that must still be reported
+    as ``changed_message``, not misread as a malformed/oversized record of a file that never changed.
+    Returns ``{'sha256', 'size', 'records', 'events', 'offsets', 'ends', 'prefix_sha256'}``;
+    ``offsets``/``ends`` are ``array.array('q')`` parallel to ``events``, one absolute byte-offset
+    pair per yielded record.
+
+    When ``prefix_bytes`` is given but exceeds the file's own size, ``prefix_sha256`` stays
+    ``None`` -- there is no complete prefix of that length to digest; the format-recovery lane's own
+    commit already refuses on a retained-size mismatch before it would ever rely on that digest, so
+    this ``None`` is never mistaken for a valid proof of a short prefix. ``max_bytes``,
+    ``max_record_bytes``, ``max_records`` and ``chunk_bytes`` must each resolve to a positive int;
+    one that does not raises ``ValueError`` immediately, before ``path`` is even opened, because a
+    non-positive or non-integer budget is a programming error (for example ``chunk_bytes=0`` would
+    otherwise read zero bytes forever and misreport a healthy file as changed), never a transcript
+    defect to report through ``unsafe_message``/``changed_message``.
+    """
+    if malformed_message is None:
+        malformed_message = TRANSCRIPT_MALFORMED_REFUSAL
+    if max_bytes is None:
+        max_bytes = MAX_TRANSCRIPT_BYTES
+    if max_record_bytes is None:
+        max_record_bytes = MAX_TRANSCRIPT_RECORD_BYTES
+    if max_records is None:
+        max_records = MAX_TRANSCRIPT_RECORDS
+    if chunk_bytes is None:
+        chunk_bytes = TRANSCRIPT_READ_CHUNK
+    for _limit_name, _limit_value in (('max_bytes', max_bytes), ('max_record_bytes', max_record_bytes),
+                                       ('max_records', max_records), ('chunk_bytes', chunk_bytes)):
+        if not isinstance(_limit_value, int) or _limit_value <= 0:
+            raise ValueError('read_complete_transcript requires a positive integer ' + _limit_name)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as exc:
+        if unavailable_message is None:
+            raise
+        raise RoomError(unavailable_message) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022
+                or before.st_size > max_bytes):
+            raise RoomError(unsafe_message)
+        hasher = hashlib.sha256()
+        total = 0
+        prefix_sha256 = None
+
+        def chunks():
+            nonlocal total, prefix_sha256
+            while True:
+                chunk = _read_chunk(descriptor, chunk_bytes)
+                if not chunk:
+                    # A short read (fewer bytes than ``before.st_size`` before EOF) is a shrink
+                    # mid-observation. Catch it here, before any leftover unterminated buffer is
+                    # handed to iter_transcript_records as a final record: a truncation can cut a
+                    # record in half, and that half-record must surface as ``changed_message``, never
+                    # as a malformed-record refusal.
+                    if total != before.st_size:
+                        raise RoomError(changed_message)
+                    return
+                new_total = total + len(chunk)
+                if new_total > before.st_size:
+                    raise RoomError(changed_message)
+                if prefix_bytes is not None and prefix_sha256 is None and total + len(chunk) >= prefix_bytes:
+                    split = prefix_bytes - total
+                    hasher.update(chunk[:split])
+                    prefix_sha256 = hasher.copy().hexdigest()
+                    hasher.update(chunk[split:])
+                else:
+                    hasher.update(chunk)
+                total = new_total
+                yield chunk
+
+        events, offsets, ends = [], array.array('q'), array.array('q')
+        try:
+            for start, end, row in iter_transcript_records(chunks(), max_record_bytes=max_record_bytes,
+                                                            max_records=max_records, malformed_message=malformed_message):
+                events.append(row)
+                offsets.append(start)
+                ends.append(end)
+        except RoomError as exc:
+            # The parse refusal itself (malformed row, record-bytes or record-count budget) is only
+            # trustworthy against the file ``before`` described; a concurrent change that races the
+            # read can manufacture exactly this shape of failure out of bytes that never all
+            # coexisted in one consistent file. Re-run the identity check now, descriptor still open,
+            # and report the mutation instead of the parse symptom when identity moved.
+            if not _transcript_identity_recheck(descriptor, path, before):
+                raise RoomError(changed_message) from exc
+            raise
+        if prefix_bytes is not None and prefix_sha256 is None and prefix_bytes <= total:
+            prefix_sha256 = hasher.copy().hexdigest()
+        if not _transcript_identity_recheck(descriptor, path, before, total):
+            raise RoomError(changed_message)
+        return {'sha256': hasher.hexdigest(), 'size': total, 'records': len(events), 'events': events,
+                'offsets': offsets, 'ends': ends, 'prefix_sha256': prefix_sha256}
+    finally:
+        os.close(descriptor)
+
+
 def preflight_source(directory, state, database, transcript, role='engineer', workspace=None):
     """Pre-dispatch ownership preflight and source registration; no response or native event is required.
 
@@ -594,7 +849,7 @@ def preflight_source(directory, state, database, transcript, role='engineer', wo
     if path.exists():
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
-                or info.st_size > 64_000_000):
+                or info.st_size > MAX_TRANSCRIPT_BYTES):
             raise RoomError('Prospective native transcript file is unsafe')
     if role == 'engineer' and workspace is None:
         from ao_delegates import validate_preparation
@@ -624,7 +879,13 @@ def preflight_source(directory, state, database, transcript, role='engineer', wo
                      'provider and effective effort remain unobserved'}
 
 
-def validate_registered_source(directory, state, role='engineer', transcript_size_limit=64_000_000):
+_UNSET_TRANSCRIPT_SIZE_LIMIT = object()  # module-private sentinel: resolve MAX_TRANSCRIPT_BYTES at call
+# time, not at def-time, so a later `mock.patch.object(ao_native_outcome, 'MAX_TRANSCRIPT_BYTES', ...)`
+# takes effect on the next call instead of being baked into this function's own defaults tuple.
+
+
+def validate_registered_source(directory, state, role='engineer',
+                               transcript_size_limit=_UNSET_TRANSCRIPT_SIZE_LIMIT):
     """Full read-only verification of one already-registered prospective source before dispatch.
 
     Uses the existing owner database reader, the bound session and the prepared workspace the turn
@@ -632,8 +893,11 @@ def validate_registered_source(directory, state, role='engineer', transcript_siz
     exact owned non-symlink file for the retained provider conversation. This never calls a model
     and never requires a completed response; the first sync still requires the actual complete
     identity proof. ``transcript_size_limit`` bounds the accepted file size; ``None`` lifts it for
-    readers that only ever take a bounded tail window.
+    readers that only ever take a bounded tail window; leaving it unset resolves the current
+    ``MAX_TRANSCRIPT_BYTES`` at call time, not at this function's definition time.
     """
+    if transcript_size_limit is _UNSET_TRANSCRIPT_SIZE_LIMIT:
+        transcript_size_limit = MAX_TRANSCRIPT_BYTES
     from ao_native_identity import read_owner
     if role not in ('engineer', 'reviewer'):
         raise RoomError('Native outcome source requires an exact engineer or reviewer role')
@@ -688,7 +952,6 @@ def validate_registered_source(directory, state, role='engineer', transcript_siz
 
 
 def inspect(directory, state, request, source, snapshot):
-    from ao_project_room import digest
     role = request.get('role', 'engineer')
     owner = validate_source(state, source) if role == 'engineer' else validate_source(state, source, role)
     if role == 'reviewer':
@@ -719,33 +982,16 @@ def inspect(directory, state, request, source, snapshot):
     if (not path.is_absolute() or path.name != source['native_session_id'] + '.jsonl'
             or any(p.is_symlink() for p in (path, *path.parents))):
         raise RoomError('Use the exact owned native transcript without symlinks')
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, 'rb') as stream:
-        before = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022
-                or before.st_size > 64_000_000):
-            raise RoomError('Native transcript ownership or size is unsafe')
-        raw = stream.read(64_000_001)
-        after = os.fstat(stream.fileno())
-    if (len(raw) != before.st_size or (before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_ino, after.st_size, after.st_mtime_ns)):
-        raise RoomError('Native transcript changed while being observed')
-    try:
-        named = path.lstat()
-    except OSError as exc:
-        raise RoomError('Native transcript changed while being observed') from exc
-    if ((named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
-            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            or not stat.S_ISREG(named.st_mode)):
-        raise RoomError('Native transcript changed while being observed')
-    events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    reading = read_complete_transcript(path, unsafe_message='Native transcript ownership or size is unsafe',
+                                       changed_message='Native transcript changed while being observed')
+    events = reading['events']
     result = events_outcome(events, request, source['native_session_id'],
                             workspace=workspace if role == 'reviewer' else None)
     if role == 'engineer':
         proof = compaction_failure(events, request, source['native_session_id'], workspace, result)
         if proof is not None:
             result = {**result, 'compaction_failure': proof}
-    result = {**result, 'source': source, 'source_sha256': digest(raw),
+    result = {**result, 'source': source, 'source_sha256': reading['sha256'],
               'compaction_imports': compaction_imports(events, source['native_session_id'], snapshot)}
     if result.get('model_contradiction') is not None:
         # The observed identities, the expected qualification digest and the exact source digest are

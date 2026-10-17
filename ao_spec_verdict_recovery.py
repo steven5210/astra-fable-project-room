@@ -279,14 +279,14 @@ def _owner(state, target, actual):
     return owner
 
 
-def _children(directory, state):
+def _children(directory, state, prefix_bytes=None):
     from ao_engineering_transition import _read_transcript, child_evidence, _verified_guard_shas
     source = state["native_outcome_source"]
     prepared = ao_delegates.validate_preparation(directory, state, state["bindings"]["engineer"]["session_id"])
-    raw = _read_transcript(source["transcript"], source["native_session_id"])
-    children = child_evidence(raw, source["native_session_id"], prepared["worktree"],
+    reading = _read_transcript(source["transcript"], source["native_session_id"], prefix_bytes=prefix_bytes)
+    children = child_evidence(reading["events"], source["native_session_id"], prepared["worktree"],
                               _verified_guard_shas(directory, prepared.get("routing"), state.get("routing_refresh")))
-    return raw, children
+    return reading, children
 
 
 def _inspect(service, directory, state, target, pending=False):
@@ -322,7 +322,7 @@ def _inspect(service, directory, state, target, pending=False):
     if not isinstance(source, dict) or source.get("native_session_id") != target["native_session_id"]:
         raise RoomError("Registered native outcome evidence is required for format recovery")
     owner = _owner(state, target, actual)
-    native_raw, children = _children(directory, state)
+    native_reading, children = _children(directory, state)
     ledger_present, rows = _ledger_rows(service.root.parent, state["room_id"])
     _ledger_check(rows)
     raw, identity = _source_review(service, directory, state, source_request)
@@ -330,7 +330,8 @@ def _inspect(service, directory, state, target, pending=False):
             "spec_path": state["spec"], "spec_record_sha256": state["spec_record_sha256"],
             "candidate": candidate_snapshot(actual), "worktree": str(actual), "pins": _pins(directory, state),
             "native_owner": owner, "native_histories": histories, "native_rows": native_rows,
-            "native_transcript": {"sha256": ao.digest(native_raw), "bytes": len(native_raw), "children": children},
+            "native_transcript": {"sha256": native_reading["sha256"], "bytes": native_reading["size"],
+                                  "children": children},
             "delegates": {"ledger_present": ledger_present, "rows": rows},
             "requests": copy.deepcopy(state["requests"]),
             "history": {key: copy.deepcopy(state.get(key)) for key in ("acceptances", "verifications", "checkpoint", "checkpoint_sha256")}}
@@ -455,35 +456,42 @@ def capture(directory, state, request):
     return True
 
 
-def _allowed_tool_uses(native_raw, prior):
+def _allowed_tool_uses(reading, prior):
     """Distinct tool-use block identities the recovery turn added after the retained prefix.
 
     Only the native task-list tools may appear; any other tool, a malformed row or a
     sidechain/agent row refuses the one-use recovery. Rows whose uuid already exists in the
-    retained prefix are earlier evidence, not new tool use.
+    retained prefix are earlier evidence, not new tool use. A record is classified by its
+    absolute byte offsets against the retained prefix boundary: wholly before it (prefix,
+    already-proven evidence), wholly at or after it (suffix, candidate new tool use), or
+    straddling it (part of its bytes were already retained, part are newly appended) -- a
+    straddling record is never a clean member of either region and refuses outright.
     """
+    boundary = prior["bytes"]
     prefix_rows = set()
-    for line in native_raw[:prior["bytes"]].splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError as exc:
-            raise RoomError(TOOL_REFUSAL) from exc
-        if isinstance(row, dict) and isinstance(row.get("uuid"), str):
-            prefix_rows.add(row["uuid"])
+    suffix_rows = []
+    for row, start, end in zip(reading["events"], reading["offsets"], reading["ends"]):
+        if start >= boundary:
+            suffix_rows.append(row)
+        elif end <= boundary:
+            if isinstance(row, dict) and isinstance(row.get("uuid"), str):
+                prefix_rows.add(row["uuid"])
+        else:
+            raise RoomError(TOOL_REFUSAL)
     allowed = set()
-    for line in native_raw[prior["bytes"]:].splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError as exc:
-            raise RoomError(TOOL_REFUSAL) from exc
+    for row in suffix_rows:
         if (not isinstance(row, dict) or row.get("isSidechain") is True
                 or row.get("agentId") is not None or row.get("agent_id") is not None):
             raise RoomError(TOOL_REFUSAL)
-        if row.get("uuid") in prefix_rows or row.get("type") != "assistant":
+        try:
+            already_retained = row.get("uuid") in prefix_rows
+        except TypeError as exc:
+            # An unhashable uuid (a list/dict instead of the expected string or None) cannot be
+            # tested against the ``prefix_rows`` set; that is itself a malformed row, so it refuses
+            # exactly like any other TOOL_REFUSAL condition in this loop rather than escaping as a
+            # bare TypeError.
+            raise RoomError(TOOL_REFUSAL) from exc
+        if already_retained or row.get("type") != "assistant":
             continue
         message = row.get("message")
         content = message.get("content") if isinstance(message, dict) else None
@@ -541,14 +549,14 @@ def commit(service, directory, state, recovery_request_id, receipt_sha256, final
     ao_delegates.assert_settled(service.root.parent, copy.deepcopy(state), directory)
     if _owner(state, evidence["target"], actual) != evidence["native_owner"]:
         raise RoomError("Native owner changed during format recovery")
-    native_raw, children = _children(directory, state)
     prior_native = evidence["native_transcript"]
-    if (len(native_raw) < prior_native["bytes"] or ao.digest(native_raw[:prior_native["bytes"]]) != prior_native["sha256"]
+    native_reading, children = _children(directory, state, prefix_bytes=prior_native["bytes"])
+    if (native_reading["size"] < prior_native["bytes"] or native_reading["prefix_sha256"] != prior_native["sha256"]
             or {k: v for k, v in children.items() if k != "parent_tool_uses"}
                != {k: v for k, v in prior_native["children"].items() if k != "parent_tool_uses"}):
         raise RoomError("Retained native transcript prefix or read-only delegate/tool history changed")
     if (children["parent_tool_uses"] - prior_native["children"]["parent_tool_uses"]
-            != len(_allowed_tool_uses(native_raw, prior_native))):
+            != len(_allowed_tool_uses(native_reading, prior_native))):
         raise RoomError(TOOL_REFUSAL)
     from ao_provider_transition import _CompleteClient, _native, _ledger_rows, _ledger_check
     client = _CompleteClient(service.client(state))
