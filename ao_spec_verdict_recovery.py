@@ -6,7 +6,11 @@ re-asked once at any dispatch count; the re-ask consumes no review or dispatch
 budget and needs no human grant. New rooms keep one chain per source under
 spec-verdict-recovery/chains/<source_request_id>/; rooms created before this
 build keep their single flat chain under spec-verdict-recovery/. Create-once
-grant/intent/result records fail closed across every write boundary.
+grant/intent/result records fail closed across every write boundary. An exact
+identical grant, comparison or closure retry against a chain already rotated
+into retained history authenticates that finished chain by its exact inputs and
+returns its saved result; changed inputs refuse, and new sends or operations
+stay restricted to the active chain.
 """
 import copy
 import json
@@ -358,6 +362,22 @@ def agreed_sources(directory, state):
     return {chain["evidence"]["target"]["source_request_id"] for chain in chains if "agreement" in chain}
 
 
+def _own_chain(directory, state, recovery_request_id):
+    """The chain claiming this recovery request id, active or already in retained history.
+
+    ``journal`` validates the active chain first, so a damaged active chain still fails
+    closed even when the named request belongs to a finished history chain.
+    """
+    active = journal(directory, state, allow_pending=True)
+    if (active is not None
+            and active["evidence"]["target"]["recovery_request_id"] == recovery_request_id):
+        return active
+    for chain in history(directory, state):
+        if chain["evidence"]["target"]["recovery_request_id"] == recovery_request_id:
+            return chain
+    return None
+
+
 def _pins(directory, state):
     return {"bindings": copy.deepcopy(state["bindings"]), "delegate": copy.deepcopy(state["delegate"]),
             "preparation_sha256": state["preparation_sha256"], "model": model.current(directory, state),
@@ -502,6 +522,13 @@ def grant(service, directory, state, audit_sha256, authorization=None, authoriza
         if chain["grant"] != record:
             raise RoomError("The one format-recovery grant already belongs to different authorization/evidence")
         return _grant_result(chain)
+    for finished in history(directory, state):
+        if finished["grant"].get("audit_sha256") == audit_sha256:
+            # An exact identical retry of an older, already-rotated grant returns its
+            # saved result; the same audit under different authorization refuses.
+            if finished["grant"] != record:
+                raise RoomError("The one format-recovery grant already belongs to different authorization/evidence")
+            return _grant_result(finished)
     if chain is not None and chain["pending"]:
         raise RoomError(PENDING)
     evidence = _inspect(service, directory, state, saved["evidence"]["target"])
@@ -576,10 +603,12 @@ def consume(directory, state, request):
 
 
 def capture(directory, state, request):
-    chain = journal(directory, state, allow_pending=True)
+    chain = _own_chain(directory, state, request.get("request_id"))
     if chain is None or chain.get("request") is not request:
         raise RoomError(DAMAGED)
     if "completion" in chain or "agreement" in chain or "closure" in chain:
+        # A finished chain -- agreed, closed, or already rotated into retained history --
+        # is never recaptured; its request's pinned fields stay byte-identical.
         return False
     _, identity = _source(directory, request)
     record = {"version": 1, "room_id": state["room_id"], "intent_sha256": chain["pointer"]["intent_sha256"],
@@ -656,6 +685,22 @@ def commit(service, directory, state, recovery_request_id, receipt_sha256, final
         raise RoomError("The operator must compare both complete responses and explicitly confirm the same verdict with no additional requirements")
     chain = journal(directory, state, allow_pending=True)
     if chain is None or "completion" not in chain or chain["request"]["request_id"] != recovery_request_id:
+        for finished in history(directory, state):
+            if finished["evidence"]["target"]["recovery_request_id"] != recovery_request_id:
+                continue
+            if "agreement" in finished:
+                # An exact identical retry of an older chain's commit returns its saved
+                # agreement; changed comparison inputs refuse, never a second record.
+                expected = dict(recovery_request_id=recovery_request_id, receipt_sha256=receipt_sha256,
+                                final_text_sha256=final_text_sha256, astra_review=astra_review,
+                                confirm_same_verdict=True)
+                if finished["agreement"]["inputs"] != expected:
+                    raise RoomError("The immutable format comparison already has different inputs")
+                return {"agreed": True, "agreement_sha256": finished["pointer"]["agreement_sha256"],
+                        "model_dispatch": False}
+            if "closure" in finished:
+                raise RoomError("This format recovery was closed without agreement")
+            break
         raise RoomError("Format recovery needs its exact completed captured native result")
     if "closure" in chain:
         raise RoomError("This format recovery was closed without agreement")
@@ -721,6 +766,21 @@ def close(service, directory, state, recovery_request_id, receipt_sha256, final_
     ao.nonempty(astra_review, "astra_review", 6000)
     chain = journal(directory, state, allow_pending=True)
     if chain is None or "intent" not in chain or chain["request"]["request_id"] != recovery_request_id:
+        for finished in history(directory, state):
+            if finished["evidence"]["target"]["recovery_request_id"] != recovery_request_id:
+                continue
+            if "agreement" in finished:
+                raise RoomError("This format recovery already agreed; closure is impossible")
+            if "closure" in finished:
+                # An exact identical retry of an older chain's close returns its saved
+                # closure; changed comparison inputs refuse, never a second record.
+                expected = dict(recovery_request_id=recovery_request_id, receipt_sha256=receipt_sha256,
+                                final_text_sha256=final_text_sha256, astra_review=astra_review)
+                if finished["closure"]["inputs"] != expected:
+                    raise RoomError("The immutable format-recovery closure already has different inputs")
+                return {"closed": True, "closure_sha256": finished["pointer"]["closure_sha256"],
+                        "agreed": False, "model_dispatch": False}
+            break
         raise RoomError("Closure needs the completed native result; a failed turn settles through the outcome audit")
     if "agreement" in chain:
         raise RoomError("This format recovery already agreed; closure is impossible")

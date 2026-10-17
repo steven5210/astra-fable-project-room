@@ -2,6 +2,7 @@
 import copy
 import json
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import ao_project_room as ao
 import ao_spec_review_budget as budget
@@ -241,6 +242,139 @@ class FormatReaskTests(ReaskFixture):
         self.assertFalse(status['agreement']['agreed'])
         with self.assertRaisesRegex(ao.RoomError, 'missing, changed or unclaimed'):
             recovery.journal(self.directory(), self.state())
+
+    def _closed_first_chain_after_rotation(self):
+        """format1 finished with a transient capture error, closed, and rotated by a
+        granted format2 chain on a later prose source. Returns (granted2, pinned request)."""
+        self.dispatch()
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        original = recovery._source
+        def flaky(directory, request):
+            if request is not None and request.get('purpose') == recovery.PURPOSE:
+                raise ao.RoomError('injected transient capture failure')
+            return original(directory, request)
+        with patch.object(recovery, '_source', flaky):
+            self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['format1']
+        self.assertEqual(request['state'], 'completed')
+        self.assertEqual(request['spec_verdict_recovery_error'], 'injected transient capture failure')
+        self.assertNotIn('spec_verdict_recovery_completion_sha256', request)
+        self.assertTrue(self.close()['closed'])
+        self.spec(revision=3)
+        self.prose_source('review4', 'I accept the exact current specification. No change is required.')
+        audited = self.audit_for('review4', 'format2')
+        granted2 = self.service.ao_room_spec_verdict_recovery_grant(self.room, audited['audit_sha256'])
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_verdict_recovery']['status'], 'granted')
+        return granted2, copy.deepcopy(self.state()['requests']['format1'])
+
+    def test_capture_retry_resolves_a_finished_chains_own_request_after_rotation(self):
+        granted2, pinned = self._closed_first_chain_after_rotation()
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['format1'], pinned)
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_verdict_recovery']['status'], 'granted')
+        self.assertEqual(status['spec_verdict_recovery']['history'],
+                         [{'source_request_id': 'review3', 'recovery_request_id': 'format1', 'status': 'closed'}])
+        self.assertEqual(self.service.ao_room_send(**granted2['send_args'])['state'], 'submitted')
+
+    def test_capture_retry_resolves_a_finished_chain_across_controller_restart(self):
+        granted2, pinned = self._closed_first_chain_after_rotation()
+        self.service = ao.Service(self.home, lambda url: self.fake)
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['format1'], pinned)
+        self.assertEqual(self.service.ao_room_status(self.room)['spec_verdict_recovery']['status'], 'granted')
+        self.assertEqual(self.service.ao_room_send(**granted2['send_args'])['state'], 'submitted')
+
+    def _format2_send_and_commit(self, granted2):
+        self.service.ao_room_send(**granted2['send_args'])
+        self.note_native_turn('format2')
+        self.fake.finish('engineer', json.dumps(self.verdict_for('review4')))
+        self.service.ao_room_sync(self.room)
+        request2 = self.state()['requests']['format2']
+        raw2 = ao_workflow.raw_final_text(self.directory(), request2)
+        return self.service.ao_room_spec_verdict_recovery_commit(
+            self.room, 'format2', request2['receipt_sha256'], ao.digest(raw2.encode()),
+            'I compared both complete native responses. The structured response preserves the original '
+            'exact-spec agreement with no new findings or scope.', True)
+
+    def test_finished_chain_grant_commit_and_close_retries_reconcile_on_exact_inputs(self):
+        audit1 = self.audit()
+        granted1 = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit1['audit_sha256'])
+        self.service.ao_room_send(**granted1['send_args'])
+        self.note_native_turn('format1')
+        self.fake.finish('engineer', json.dumps(self.verdict()))
+        self.service.ao_room_sync(self.room)
+        committed = self.commit()
+        self.assertTrue(committed['agreed'])
+        self.spec(revision=3)
+        self.prose_source('review4', 'I accept the exact current specification. No change is required.')
+        audit2 = self.audit_for('review4', 'format2')
+        granted2 = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit2['audit_sha256'])
+
+        posts = len(self.fake.posts)
+        # While format2's chain is still pending, exact retries of format1's finished
+        # chain authenticate against retained history; changed inputs refuse; no POSTs.
+        retry = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit1['audit_sha256'])
+        self.assertEqual(retry['grant_sha256'], granted1['grant_sha256'])
+        self.assertEqual((retry['request_id'], retry['consumed'], retry['model_dispatch']), ('format1', True, False))
+        with self.assertRaisesRegex(ao.RoomError, 'already belongs to different'):
+            self.service.ao_room_spec_verdict_recovery_grant(
+                self.room, audit1['audit_sha256'], 'Different authorization', 'different-reference')
+        self.assertEqual(self.commit(), committed)
+        with self.assertRaisesRegex(ao.RoomError, 'already has different inputs'):
+            self.commit(astra_review='A changed comparison text')
+        with self.assertRaisesRegex(ao.RoomError, 'already agreed; closure is impossible'):
+            self.close()
+        self.assertEqual(len(self.fake.posts), posts)
+
+        self.assertTrue(self._format2_send_and_commit(granted2)['agreed'])
+        posts = len(self.fake.posts)
+        # After format2's chain finishes, the same retries still reconcile, never re-mint.
+        self.assertEqual(self.service.ao_room_spec_verdict_recovery_grant(
+            self.room, audit1['audit_sha256'])['grant_sha256'], granted1['grant_sha256'])
+        self.assertEqual(self.commit(), committed)
+        with self.assertRaisesRegex(ao.RoomError, 'already has different inputs'):
+            self.commit(astra_review='A changed comparison text')
+        with self.assertRaisesRegex(ao.RoomError, 'already agreed; closure is impossible'):
+            self.close()
+        self.assertEqual(len(self.fake.posts), posts)
+
+    def test_finished_closed_chain_retries_reconcile_on_exact_inputs(self):
+        audit1 = self.audit()
+        granted1 = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit1['audit_sha256'])
+        self.service.ao_room_send(**granted1['send_args'])
+        self.note_native_turn('format1')
+        self.fake.finish('engineer', json.dumps(self.verdict(
+            decision='changes_required', findings=['Required new behavior'], meaning_unchanged=False)))
+        self.service.ao_room_sync(self.room)
+        with self.assertRaisesRegex(ao.RoomError, 'changed meaning'):
+            self.commit()
+        closed = self.close()
+        self.assertTrue(closed['closed'])
+        self.spec(revision=3)
+        self.prose_source('review4', 'I accept the exact current specification. No change is required.')
+        audit2 = self.audit_for('review4', 'format2')
+        granted2 = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit2['audit_sha256'])
+
+        posts = len(self.fake.posts)
+        # While format2's chain is pending, format1's closed chain reconciles retries.
+        retry = self.service.ao_room_spec_verdict_recovery_grant(self.room, audit1['audit_sha256'])
+        self.assertEqual((retry['grant_sha256'], retry['consumed']), (granted1['grant_sha256'], True))
+        self.assertEqual(self.close(), closed)
+        with self.assertRaisesRegex(ao.RoomError, 'already has different inputs'):
+            self.close(astra_review='A changed comparison is a different closure')
+        with self.assertRaisesRegex(ao.RoomError, 'closed without agreement'):
+            self.commit()
+        self.assertEqual(len(self.fake.posts), posts)
+
+        self.assertTrue(self._format2_send_and_commit(granted2)['agreed'])
+        posts = len(self.fake.posts)
+        self.assertEqual(self.close(), closed)
+        with self.assertRaisesRegex(ao.RoomError, 'already has different inputs'):
+            self.close(astra_review='A changed comparison is a different closure')
+        with self.assertRaisesRegex(ao.RoomError, 'closed without agreement'):
+            self.commit()
+        self.assertEqual(len(self.fake.posts), posts)
 
     def test_grant_authorization_shape_validation_and_version_records(self):
         audit = self.audit()
