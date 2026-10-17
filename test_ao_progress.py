@@ -1570,6 +1570,13 @@ class ExecutionFixture(Fixture):
             self._assistant('list', stamp, [self._use(use, 'TaskList', {})]),
             self._result('list-r', stamp, use, '\n'.join(lines))]
 
+    def todo_write(self, todos, stamp):
+        use = 'tu-w-' + str(self._seq)
+        self._seq += 1
+        self.native_events += [
+            self._assistant('todo', stamp, [self._use(use, 'TodoWrite', {'todos': todos})]),
+            self._result('todo-r', stamp, use, 'Todos have been modified successfully')]
+
     def launch(self, label, stamp, given, result=None, result_stamp=None, is_error=False, top=None):
         use = 'tu-a-' + label
         rows = [self._assistant('agent-' + label, stamp, [self._use(use, 'Agent', given)])]
@@ -1873,6 +1880,85 @@ class ExecutionEvidenceTests(ExecutionFixture):
         self.assertTrue(second['turn']['anchor_found'])
         self.assertEqual(second['handoff_checks']['completed_after_failed_launch'], 0)
         self.assertNotIn('completed_after_failed_launch', second['handoff_checks']['warnings'])
+
+    def test_an_update_whose_time_is_unparseable_makes_the_comparison_unknown(self):
+        # A linked handback followed only by an in-turn update whose own timestamp cannot be
+        # parsed is unknown evidence, never "no update": the comparison cannot be made, so the
+        # launch is counted under update_time_unknown and the next-launch bound is unknown too.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.update('1', 'bad-time', subject='EXIT-1: unit renamed')
+        self.launch('w2', self.at(2.0), {'subagent_type': 'Explore',
+                                         'description': 'unrelated review'},
+                    result='done', result_stamp=self.at(2.5))
+        view = self.view()
+        self.assertIsNone(self.step(view, 'EXIT-1')['execution']
+                          ['task_updated_after_latest_result'])
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertEqual(checks['update_time_unknown'], 1)
+        # The later launch is not a launch-before-update: the bound is unknown, never a verdict.
+        self.assertEqual(checks['next_launch_before_task_update'], 0)
+        self.assertNotIn('returned_units_not_updated', checks['warnings'])
+        self.assertNotIn('launch_before_unit_update', checks['warnings'])
+
+    def test_a_known_update_after_an_unknown_one_still_measures(self):
+        # The unparseable update stays unknown evidence, but a second in-turn update with a
+        # parseable time at or after the handback settles the comparison as true.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.update('1', 'bad-time', subject='EXIT-1: unit renamed')
+        self.update('1', self.at(1.05), subject='EXIT-1: unit renamed again')
+        view = self.view()
+        self.assertIs(self.step(view, 'EXIT-1')['execution']
+                      ['task_updated_after_latest_result'], True)
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertEqual(checks['update_time_unknown'], 0)
+
+    def test_a_todo_write_marks_a_positional_row_as_updated_in_turn(self):
+        # A TodoWrite rewrite is an in-turn update of its positional todo-<index> rows: a launch
+        # linked to todo-0 followed by a rewrite that marks it completed reads as updated.
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'completed',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.1))
+        view = self.view()
+        step = self.step(view, 'EXIT-1')
+        self.assertEqual(step['status'], 'completed')
+        self.assertIs(step['execution']['task_updated_after_latest_result'], True)
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 0)
+
+    def test_a_todo_write_completion_never_proves_a_transition(self):
+        # Positional identity across rewrites is not established: a TodoWrite that shows the
+        # linked todo completed after a failed launch is not a provable completion transition,
+        # while the engineer-authored status itself is unchanged evidence.
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker exploded', result_stamp=self.at(1.0), is_error=True)
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'completed',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.1))
+        view = self.view()
+        self.assertEqual(self.step(view, 'EXIT-1')['status'], 'completed')
+        checks = view['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_todo_write_before_the_handback_does_not_count_as_an_update(self):
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker handback', result_stamp=self.at(2.0))
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'in_progress',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.0))
+        view = self.view()
+        self.assertIs(self.step(view, 'EXIT-1')['execution']
+                      ['task_updated_after_latest_result'], False)
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 1)
 
     def test_a_superseded_unit_keeps_its_execution_evidence(self):
         # (j) Execution evidence describes the launch, not the unit's disposition: a superseded

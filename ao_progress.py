@@ -558,9 +558,17 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                     for index, todo in enumerate(todos):
                         if isinstance(todo, dict):
                             key = "todo-" + str(index)
+                            status = todo.get("status") or "pending"
                             steps[key] = {"id": key, "subject": todo.get("content"),
                                           "activeForm": todo.get("activeForm"),
-                                          "status": todo.get("status") or "pending"}
+                                          "status": status}
+                            # A rewrite is an in-turn update of its positional todo-<index>
+                            # rows; status_before stays None because positional identity
+                            # across rewrites is not established, so a TodoWrite never
+                            # proves a completion transition.
+                            events.setdefault(key, []).append(
+                                {"row": row, "stamp": stamp, "status_before": None,
+                                 "status_after": status})
                     kind = "todo_write"
             elif block.get("type") == "tool_use" and block.get("name") == "TaskCreate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -686,7 +694,7 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
     # transition here. The whole-window fold above still serves the plan, deliverables and the
     # stale rule exactly as before.
     turn_row_ids = {id(turn_row) for turn_row in turn_rows or ()}
-    turn_updates, turn_completed_at = {}, {}
+    turn_updates, turn_completed_at, turn_update_unknown = {}, {}, {}
     for task_id, task_events in events.items():
         epochs = []
         for event in task_events:
@@ -694,15 +702,20 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                 continue
             epoch = _epoch_or_none(event["stamp"])
             if epoch is None:
+                turn_update_unknown[task_id] = True
                 continue
             epochs.append(epoch)
-            if (event["status_after"] == "completed" and event["status_before"] != "completed"
+            # A completion transition needs a known before-status: status_before None (a
+            # TodoWrite rewrite, where positional identity is not established) never proves one.
+            if (event["status_after"] == "completed"
+                    and event["status_before"] not in (None, "completed")
                     and task_id not in turn_completed_at):
                 turn_completed_at[task_id] = epoch
         if epochs:
             turn_updates[task_id] = sorted(epochs)
     execution = {step["id"]: _execution(step["id"], linked.get(step["id"]),
-                                        turn_updates.get(step["id"]))
+                                        turn_updates.get(step["id"]),
+                                        turn_update_unknown.get(step["id"], False))
                  for step in steps.values()}
     # Computed once for every tracked step (not just the shown ones) so the deliverables
     # projection can reuse the exact same staleness the operator sees in the shown steps.
@@ -734,7 +747,8 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                   "supersession": supersession, "updated_row": updated_row,
                   "execution": execution, "step_updated": step_updated,
                   "step_updates": step_updates, "events": events,
-                  "turn_updates": turn_updates, "turn_completed_at": turn_completed_at}
+                  "turn_updates": turn_updates, "turn_completed_at": turn_completed_at,
+                  "turn_update_unknown": turn_update_unknown}
 
 
 def _turn_window(rows, request, start, end):
@@ -846,14 +860,16 @@ def _launches(uses, results, request_state):
     return rows
 
 
-def _execution(task_id, linked_launches, turn_epochs):
+def _execution(task_id, linked_launches, turn_epochs, update_unknown=False):
     """One step's execution evidence: its explicitly task=-linked launches, in transcript order.
 
     latest is the last linked launch's status with completed mapped to returned (a handback is
     evidence received, not a completed unit); task_updated_after_latest_result is null when the
     latest launch is no returned handback (running, launched, unreturned or unknown all count as
     none) or its own ended_at is unparseable, and otherwise whether the task has an update event
-    in the selected turn at or after that ended_at. The engineer's own status is never changed.
+    in the selected turn at or after that ended_at — null again (unknown, never a verdict) when
+    the only in-turn evidence is an event whose own time is unparseable. The engineer's own
+    status is never changed.
     """
     if not linked_launches:
         return {"linkage": "none", "launches": 0, "latest": None,
@@ -864,7 +880,12 @@ def _execution(task_id, linked_launches, turn_epochs):
     if status in ("completed", "error"):
         ended_epoch = _epoch_or_none(latest.get("ended_at"))
         if ended_epoch is not None:
-            updated = any(epoch >= ended_epoch for epoch in turn_epochs or ())
+            if any(epoch >= ended_epoch for epoch in turn_epochs or ()):
+                updated = True
+            elif update_unknown:
+                updated = None
+            else:
+                updated = False
     return {"linkage": "explicit", "launches": len(linked_launches),
             "latest": "returned" if status == "completed" else status,
             "task_updated_after_latest_result": updated}
@@ -1602,9 +1623,9 @@ MAX_DEFECT_AREAS = 8
 HANDOFF_BASIS = ("explicit task= references in Agent launch descriptions and native task-tool rows of "
                  "the selected request's turn, plus the request's saved state; nothing is inferred from labels")
 HANDOFF_MEANING = ("Mechanical hygiene signals from the selected turn's own evidence; a missing task= "
-                   "reference or an unparseable handback result time is reported as unknown, never as a "
-                   "compliance verdict, and nothing here completes a unit, releases a hold or replaces "
-                   "review.")
+                   "reference or an unparseable handback or task-update time is reported as unknown, "
+                   "never as a compliance verdict, and nothing here completes a unit, releases a hold or "
+                   "replaces review.")
 
 
 def _handoff_checks(available, launches, shown, fold_extra, directory, request):
@@ -1638,6 +1659,7 @@ def _handoff_checks(available, launches, shown, fold_extra, directory, request):
     checks["routing_log"]["launches_in_turn"] = counts["total"]
     turn_updates = extra.get("turn_updates") or {}
     turn_completed_at = extra.get("turn_completed_at") or {}
+    turn_update_unknown = extra.get("turn_update_unknown") or {}
     started_epochs = [_epoch_or_none(launch.get("started_at")) for launch in launches]
     returned_without, update_unknown, next_before = 0, 0, 0
     completed_after_failed, unreturned = 0, 0
@@ -1649,20 +1671,26 @@ def _handoff_checks(available, launches, shown, fold_extra, directory, request):
         task_id = launch.get("_raw_ref")
         epochs = turn_updates.get(task_id) or ()
         ended = _epoch_or_none(launch.get("ended_at"))
-        # update_time_unknown names a handback whose own result time cannot be parsed, so the
-        # at-or-after comparison cannot be made; a task with no event in this turn is simply
-        # not updated here — the anchored turn's window is complete.
+        # update_time_unknown names a returned handback whose update comparison cannot be made:
+        # its own result time is unparseable, or the task's only at-or-after candidate is an
+        # in-turn event whose own time is unparseable. A task with no event in this turn is
+        # simply not updated here — the anchored turn's window is complete.
         if ended is None:
             update_unknown += 1
             continue
-        if not any(epoch >= ended for epoch in epochs):
+        future = [epoch for epoch in epochs if epoch >= ended]
+        bound = min(future) if future else None
+        if bound is None:
+            if turn_update_unknown.get(task_id):
+                # The update's timing is unknown, so neither the no-update count nor the
+                # next-launch bound can be measured: unknown is never a verdict.
+                update_unknown += 1
+                continue
             returned_without += 1
         # Another launch of any linkage started strictly after this handback and before the
         # task's earliest in-turn update at or after it (or with no such update at all) is a
         # launch dispatched before the unit's evidence was recorded; one started at or before
         # the handback (a parallel worker) never counts.
-        future = [epoch for epoch in epochs if epoch >= ended]
-        bound = min(future) if future else None
         for other, started in zip(launches, started_epochs):
             if other is launch or started is None or started <= ended:
                 continue
