@@ -16,14 +16,28 @@ import re
 import ao_evidence_audit_io as audit_io
 
 
+# Claude Code 2.1.29x adds "api-request" (request bookkeeping; params.model records the
+# REQUESTED model, never served identity, so like every other field on these rows it is
+# never read as attribution), "api-request-shape"/"api-request-blob" (request digests and
+# shape hashes) and "cost-state" (usage/cost accounting; modelUsage is aggregate billing,
+# not an attribution). None carries tool_use, a worker launch or a stop, so they are admin
+# rows; any other still-unknown shape must degrade coverage, not mint identity.
 ADMIN_TYPES = frozenset(("summary", "system", "progress", "file-history-snapshot", "queue-operation",
-                         "ai-title", "atis-latch", "last-prompt", "mode"))
+                         "ai-title", "atis-latch", "last-prompt", "mode", "api-request",
+                         "api-request-shape", "api-request-blob", "cost-state"))
 ATTACHMENT_TYPE = "attachment"
 CONTEXT_ATTACHMENT_TYPES = frozenset((
     "total_tokens_reminder", "prompt_snapshot", "batching_reminder_sent", "deferred_tools_delta",
     "session_context", "date", "environment", "model", "remote_session_change", "mcp_instructions_delta",
     "instructions", "auto_mode", "deferred_tools_record", "agent_listing_delta", "silent_turn_reminder",
     "task_status", "skill_listing",
+    # 2.1.29x context attachments: credential_org carries only {organizationUuid, type}
+    # (an organisation identifier, not credential material); task_reminder carries
+    # {content, itemCount}; queued_command carries queued-prompt bookkeeping
+    # ({commandMode, delivery_id, isMeta, origin, prompt, reminderId, source_uuid,
+    # timestamp}). All three arrive inside the normal attachment envelope and carry
+    # no tool_use, launch or served-model data.
+    "credential_org", "task_reminder", "queued_command",
 ))
 FILE_ATTACHMENT_TYPES = frozenset(("file", "edited_text_file", "compact_file_reference", "read_truncation_notice"))
 MESSAGE_TYPES = frozenset(("user", "assistant"))
