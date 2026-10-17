@@ -98,6 +98,65 @@ class NativeCorrelationTests(unittest.TestCase):
         result = native.events_outcome([queue, self.anchor, self.error], self.request, 'native')
         self.assertEqual(result['anchor_uuid'], 'anchor'); self.assertEqual(len(result['errors']), 1)
 
+    # Result digests computed on the unmodified base (c66130f): every emitted error entry keeps
+    # exactly its uuid/error/http_status keys, so legacy proofs and digests are byte-identical.
+    QUOTA_RESULT_SHA256 = 'eedb67466c5ddcbf37f98e25bba8ef14f5134e051fab83bbb8130b2a6ff60dab'
+    NO_STATUS_RESULT_SHA256 = 'f72e3a9d12b2dc895cdf0df4e9a2fcb15bfad4efc6698d0d09381b135d054083'
+
+    def test_error_envelope_legacy_and_21301_shapes_share_exact_result_bytes(self):
+        # Legacy absent apiError; legacy nested dict (flat apiErrorStatus wins, then nested status).
+        for error in (self.error,
+                      {**self.error, 'apiError': {'status': 500, 'type': 'other'}},
+                      {key: value for key, value in self.error.items() if key != 'apiErrorStatus'} | {'apiError': {'status': 429}}):
+            result = native.events_outcome([self.anchor, error], self.request, 'native')
+            self.assertEqual(ao.digest(result), self.QUOTA_RESULT_SHA256)
+            self.assertEqual(list(result['errors'][0]), ['uuid', 'error', 'http_status'])
+        # Claude Code >=2.1.29x writes apiError as a string code; its structured detail in
+        # apiErrorParams/quotaLimits is never read, so the result is byte-identical to legacy.
+        for detail in ({}, {'apiErrorParams': {'rate_limit_info': {'status': 'rejected', 'rateLimitType': 'five_hour',
+                                                                   'resetsAt': 1792123800, 'overageStatus': 'rejected'}},
+                            'quotaLimits': {'rateLimitType': 'five_hour', 'resetsAt': 1792123800,
+                                            'status': 'rejected', 'upgradePaths': ['upgrade_plan', 'overage']}}):
+            error = {**self.error, 'apiError': 'usage_limit_reached', **detail}
+            result = native.events_outcome([self.anchor, error], self.request, 'native')
+            self.assertEqual(ao.digest(result), self.QUOTA_RESULT_SHA256)
+        # A string apiError with no flat or nested status reads http_status None, exactly like a
+        # legacy row that never carried a status.
+        bare = {key: value for key, value in self.error.items() if key != 'apiErrorStatus'}
+        for error in (bare, {**bare, 'apiError': 'usage_limit_reached'}):
+            result = native.events_outcome([self.anchor, error], self.request, 'native')
+            self.assertEqual(ao.digest(result), self.NO_STATUS_RESULT_SHA256)
+
+    def test_non_dict_non_string_api_error_still_refuses(self):
+        for bad in ([1], 5, True):
+            with self.subTest(apiError=bad):
+                error = {**self.error, 'apiError': bad}
+                with self.assertRaisesRegex(ao.RoomError, 'Malformed native API error'):
+                    native.events_outcome([self.anchor, error], self.request, 'native')
+                self.assertFalse(native._same_error_envelope(error))
+
+    def test_21301_sideband_row_types_are_not_turns_or_errors(self):
+        # Minimal synthetic versions of the record types Claude Code 2.1.301 writes between the
+        # caller row and the assistant error row; none is user/assistant evidence.
+        sideband = [
+            {'type': 'queue-operation', 'operation': 'enqueue', 'sessionId': 'native',
+             'timestamp': self.anchor['timestamp']},
+            {'type': 'atis-latch', 'atis': '', 'sessionId': 'native'},
+            {'type': 'attachment', 'uuid': 'att-1', 'sessionId': 'native', 'isSidechain': False,
+             'timestamp': '1970-01-01T00:16:42Z', 'attachment': {'type': 'environment'}},
+            {'type': 'api-request-shape', 'sessionId': 'native', 'shape': {}, 'shapeHash': 'a' * 64,
+             'timestamp': '1970-01-01T00:16:42Z'},
+            {'type': 'api-request-blob', 'hash': 'b' * 64, 'sessionId': 'native',
+             'message': {'content': [{'type': 'text', 'text': 'blob'}]}},
+            {'type': 'api-request', 'id': 'req-1', 'sessionId': 'native', 'params': {},
+             'timestamp': '1970-01-01T00:16:42Z'},
+            {'type': 'last-prompt', 'lastPrompt': 'Continue.', 'leafUuid': 'leaf', 'sessionId': 'native'},
+        ]
+        result = native.events_outcome([*sideband, self.anchor, *sideband, self.error, *sideband],
+                                       self.request, 'native')
+        self.assertEqual(ao.digest(result), self.QUOTA_RESULT_SHA256)
+        self.assertEqual((result['anchor_uuid'], result['next_human_uuid']), ('anchor', None))
+
     def test_native_retry_success_settles_only_errors_before_its_final(self):
         final = {'type':'assistant', 'uuid':'final', 'sessionId':'native', 'timestamp':'1970-01-01T00:16:44Z',
                  'message':{'model':'fable','id':'answer','stop_reason':'end_turn'}}
@@ -237,6 +296,54 @@ class OutcomeWorkflowTests(Fixture):
             self.assertTrue(resume_text.endswith('Continue.'))
             request = self.state()['requests']['implementation']
             self.assertEqual(ao.read(self.directory() / request['receipt'])['turn']['state'], 'failed')
+
+    def test_21301_string_api_error_quota_settles_through_the_real_transcript(self):
+        """Claude Code >=2.1.29x writes apiError as a string code with its structured detail in
+        apiErrorParams/quotaLimits; the real bounded reader must still correlate the typed quota
+        failure so the audited settlement lane works unchanged."""
+        from datetime import datetime, timezone
+        self.send('implementation')
+        # A quota-rejected turn produced no reply: replace this request's synthetic success row
+        # with the observed 2.1.301 envelope (string apiError; detail the reader never consumes).
+        self.native_events = [row for row in self.native_events
+                              if row.get('uuid') != 'implementation-reply']
+        self.native_events.append({
+            'type': 'assistant', 'uuid': 'implementation-error', 'sessionId': self.NATIVE,
+            'timestamp': datetime.now(timezone.utc).isoformat(), 'cwd': self.native_row_workspace(),
+            'isSidechain': False, 'isApiErrorMessage': True, 'error': 'rate_limit',
+            'apiErrorStatus': 429, 'apiError': 'usage_limit_reached',
+            'apiErrorParams': {'rate_limit_info': {'status': 'rejected', 'rateLimitType': 'five_hour',
+                                                   'resetsAt': 1792123800, 'overageStatus': 'rejected'}},
+            'quotaLimits': {'rateLimitType': 'five_hour', 'resetsAt': 1792123800,
+                            'status': 'rejected', 'upgradePaths': ['upgrade_plan', 'overage']},
+            'message': {'role': 'assistant', 'model': '<synthetic>', 'id': 'implementation-e0',
+                        'stop_reason': 'stop_sequence',
+                        'content': [{'type': 'text', 'text': 'You hit your session limit'}]}})
+        self.transcript.write_text(''.join(json.dumps(row) + '\n' for row in self.native_events))
+        self.fake.finish('engineer', state='failed')
+        self.service.ao_room_sync(self.room)
+        self.assertEqual(self.state()['requests']['implementation']['state'], 'uncertain')
+        audited = self.service.ao_room_outcome_audit(self.room)
+        self.assertEqual(audited['outcome']['kind'], 'quota_limit')
+        self.assertTrue(audited['resume_eligible'])
+        self.assertEqual(audited['native']['errors'], [{'uuid': 'implementation-error',
+                                                      'error': 'rate_limit', 'http_status': 429}])
+        # The explicit-path audit reads the same real bytes without the tolerant wrapper.
+        explicit = self.service.ao_room_outcome_audit(
+            self.room, ao_database_path=str(self.root / 'owner.db'),
+            native_transcript_path=str(self.transcript))
+        self.assertEqual(explicit['outcome']['kind'], 'quota_limit')
+        posts = len(self.fake.posts)
+        # The fresh audit's outcome digest authorizes the settlement (the explicit audit moved
+        # the verified source evidence, minting the current outcome record).
+        self.service.ao_room_outcome_resume(self.room, 'implementation', explicit['outcome_sha256'],
+            'post-quota-successor', 'Correlated native quota rejection; user confirmed availability',
+            'Continue once after the reset')
+        self.assertEqual(self.state()['requests']['implementation']['state'], 'settled_failure')
+        self.send('correction', 'post-quota-successor')
+        with self.assertRaisesRegex(ao.RoomError, 'semantic hold|active or uncertain'):
+            self.send('correction', 'unauthorized-another')
+        self.assertEqual(len(self.fake.posts), posts + 1)
 
     def test_typed_ao_failure_activity_blocks_even_when_transport_and_json_look_complete(self):
         self.failed(json.dumps(self.report()))
