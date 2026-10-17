@@ -5,6 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+import ao_execution_evidence
 import ao_progress
 import ao_project_room as ao
 import ao_read_admission
@@ -69,19 +70,20 @@ class SessionWindowTests(Fixture):
     def test_new_parts_arrive_last_in_a_new_session_with_pinned_digests(self):
         carried = self.state()['requests']['spec_review']['carried']
         # progress_plan_v2 is now superseded by progress_plan_v3 and is never carried to any session;
-        # the last three delivered parts are residual_escalation_v1, lifecycle_closure_v1, then the
-        # new successor (which consolidates v1/v2 and is appended last in ao_workflow.PARTS).
+        # the last three delivered parts are lifecycle_closure_v1, then the successor (which
+        # consolidates v1/v2), then execution_evidence_v1, appended last in ao_workflow.PARTS.
         self.assertEqual(carried['parts'][-3:],
-                         [ao_residual_escalation.PART, lifecycle_closure.PART, ao_progress.PART_V3])
+                         [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART])
         self.assertNotIn(ao_progress.PART_V2, carried['parts'])
         self.assertEqual(carried['part_sha256'][ao_progress.PART_V3], ao_progress.INSTRUCTION_V3_SHA256)
-        self.assertEqual(carried['part_sha256'][ao_residual_escalation.PART],
-                         ao_residual_escalation.INSTRUCTION_SHA256)
+        self.assertEqual(carried['part_sha256'][ao_execution_evidence.PART],
+                         ao_execution_evidence.INSTRUCTION_SHA256)
         self.assertEqual(carried['part_sha256'][lifecycle_closure.PART], lifecycle_closure.INSTRUCTION_SHA256)
         impl = self.state()['requests']['impl-1']['carried']
         self.assertNotIn(ao_progress.PART_V3, impl['parts'])
         self.assertNotIn(ao_residual_escalation.PART, impl['parts'])
         self.assertNotIn(lifecycle_closure.PART, impl['parts'])
+        self.assertNotIn(ao_execution_evidence.PART, impl['parts'])
 
     def test_a_completed_previous_request_carries_no_notice(self):
         text, carried = self.packet()

@@ -175,6 +175,24 @@ in a room only after the updated plugin has been installed or resynced (see
 [Install and authenticate](../../README.md#install-and-authenticate)); existing
 room snapshots and already-delivered workflow-part records are not rewritten.
 
+The one-time `execution_evidence_v1` amendment is carried through
+`ao_workflow.PARTS` exactly the same way — appended last, once per AO engineer
+session, fail closed: a new session receives it in its first packet, a retained
+session receives it once on its next engineer send, and it stays under
+`undelivered_parts` until a `completed` or `settled_failure` engineer turn's
+verified receipt shows it was actually carried. It asks the engineer to put the
+explicit `task=<id>` token in each Agent launch description so the read-only
+progress view can pair a launch with its unit by that reference alone; it is
+delivered text only and grants nothing. See the
+[Fable policy reference's matching section](../../skills/project-room/references/fable-policy.md#execution-evidence-one-time-part-execution_evidence_v1)
+for the exact delivered text. Rollback window: before the first engineer
+send after install, resyncing the previous plugin is safe; after a
+completed or settled engineer turn has carried this part, the previous
+controller's delivered-context check refuses that session's history
+because its `ao_workflow.PARTS` vocabulary does not contain the name —
+recovery is a forward fix on a controller that keeps the name, never a
+rewrite or removal of the delivered record.
+
 ## Progress-plan successor delivery (AO rooms)
 
 The one-time `progress_plan_v3` part is carried through `ao_workflow.PARTS`

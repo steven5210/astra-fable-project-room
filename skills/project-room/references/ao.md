@@ -201,7 +201,18 @@ turn's elapsed time, assistant rows, served-model and stop-reason histograms,
 tool-call counts, API errors, compactions and guard refusals, each Agent launch
 with its type, description, status and duration, the engineer's task list folded
 from TaskCreate/TaskUpdate/TaskList/TodoWrite with pending, in-progress and
-completed counts, and the last assistant text. An additive, read-only
+completed counts, and the last assistant text. Launch states are evidenced:
+`running` only while the request is live, `unreturned` when a terminal turn ended
+without the worker's handback, `launched` for a bare background acknowledgement,
+`completed` for a returned result (evidence received, not a completed unit) and
+`error` with a `guard_refusal`/`early_exit`/`tool_error` kind. Each launch's
+`task_ref` and each plan step's `execution` pair launches with units only through
+an explicit `task=<id>` token in the launch description — never a matching label —
+and the additive `handoff_checks` object counts mechanical hygiene signals
+(returned units without a task update, launches dispatched before a unit's
+update, unreturned launches, repeated defect areas, an empty routing log) as
+warnings, never a verdict (see
+[launches, execution and handoff checks](../../../docs/reference/progress.md#launches-execution-and-handoff-checks)). An additive, read-only
 `deliverables` object folds the same task rows into a lineage and closure
 projection (see [deliverables](../../../docs/reference/progress.md#deliverables-lineage-and-closure)).
 Additive `provenance` and `stages` objects, computed before the transcript is read

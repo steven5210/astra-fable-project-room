@@ -136,6 +136,9 @@ _DESC_TOKEN = re.compile(r"(?:^|\s)(req|kind|from|blocker|superseded_by)=(\S*)")
 # reason= consumes the rest of its line as free text, so it must be the last token on that
 # line; every other key (including blocker) is a single whitespace-delimited key=value token.
 _DESC_LINE_REST = re.compile(r"(?:^|\s)reason=(.*)")
+# The explicit launch-to-unit reference: a whitespace-delimited task=<id> token inside an
+# Agent launch description. It is the only linkage token; a matching label is never a link.
+_TASK_REF = re.compile(r"(?:^|\s)task=(\S+)")
 _DECLARED_LABEL = re.compile(r"^([A-Z]{1,4}[0-9]{1,3})\s+[—–:-]\s", re.MULTILINE)
 # A path or URL run ends at whitespace, an ASCII or typographic quote, a backtick or a bracket-like
 # delimiter; every other character (including ')', ',', ':', ';', '=' and '*') stays inside the run.
@@ -240,14 +243,24 @@ def _tools(rows):
     uses, results = {}, {}
     for row in rows:
         stamp = row.get("timestamp")
-        for block in _blocks(row):
+        blocks = _blocks(row)
+        result_blocks = [block for block in blocks if isinstance(block, dict)
+                         and block.get("type") == "tool_result"
+                         and isinstance(block.get("tool_use_id"), str)]
+        row_result = row.get("toolUseResult")
+        # The row-level toolUseResult is the launch acknowledgement record; it is attributed
+        # only to its own row's single tool_result block, never to neighbouring tool calls.
+        async_ack = (len(result_blocks) == 1 and isinstance(row_result, dict)
+                     and row_result.get("status") == "async_launched")
+        for block in blocks:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
                 uses[block["id"]] = {"name": block.get("name"), "input": block.get("input"), "timestamp": stamp}
             elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
                 results[block["tool_use_id"]] = {"text": _result_text(block.get("content")),
-                                                 "is_error": block.get("is_error") is True, "timestamp": stamp}
+                                                 "is_error": block.get("is_error") is True, "timestamp": stamp,
+                                                 "async_launched": async_ack}
     return uses, results
 
 
@@ -497,8 +510,16 @@ def _supersession(steps, lineage):
             for task_id in steps}
 
 
-def _stale(step, step_updated, launch_codes, now, launches_known):
-    """in_progress, its leading code unmatched by a launch, last update older than the stale bound."""
+def _stale(step, step_updated, launch_codes, now, launches_known, linked_active=False):
+    """in_progress, its leading code unmatched by a launch, last update older than the stale bound.
+
+    The leading-code match is a hygiene heuristic only and is never shown as linkage: a launch
+    whose description happens to open with the same unit code is not evidence about that unit.
+    The only true link is the explicit task= token, and a step is not stale while an explicitly
+    linked launch is running or launched; a returned, errored or unreturned link protects nothing.
+    """
+    if linked_active:
+        return False
     status = step.get("status")
     code = _leading_code(step.get("subject"))
     if not (launches_known and status == "in_progress" and code is not None
@@ -512,8 +533,11 @@ def _stale(step, step_updated, launch_codes, now, launches_known):
     return updated_epoch is not None and now - updated_epoch > STALE_IN_PROGRESS_SECONDS
 
 
-def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=False):
-    steps, step_updated = {}, {}
+def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=False, turn_rows=None):
+    steps, step_updated, step_updates = {}, {}, {}
+    # Per-task event log for turn-scoped evidence: every successful create/update of a tracked
+    # task and every TaskList-observed status change, in fold order, tied to its own row.
+    events = {}
     lineage, window = {}, {"created": 0, "completed": 0, "superseded": 0}
     completed_seen = set()
     source, updated_at = "none", None
@@ -529,13 +553,22 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             if block.get("type") == "tool_use" and block.get("name") == "TodoWrite":
                 todos = (block.get("input") or {}).get("todos") if isinstance(block.get("input"), dict) else None
                 if isinstance(todos, list):
-                    steps, step_updated, lineage = {}, {}, {}
+                    steps, step_updated, step_updates, lineage = {}, {}, {}, {}
+                    events = {}
                     for index, todo in enumerate(todos):
                         if isinstance(todo, dict):
                             key = "todo-" + str(index)
+                            status = todo.get("status") or "pending"
                             steps[key] = {"id": key, "subject": todo.get("content"),
                                           "activeForm": todo.get("activeForm"),
-                                          "status": todo.get("status") or "pending"}
+                                          "status": status}
+                            # A rewrite is an in-turn update of its positional todo-<index>
+                            # rows; status_before stays None because positional identity
+                            # across rewrites is not established, so a TodoWrite never
+                            # proves a completion transition.
+                            events.setdefault(key, []).append(
+                                {"row": row, "stamp": stamp, "status_before": None,
+                                 "status_after": status})
                     kind = "todo_write"
             elif block.get("type") == "tool_use" and block.get("name") == "TaskCreate":
                 given = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -545,6 +578,9 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                     steps[task_id] = {"id": task_id, "subject": given.get("subject"),
                                       "activeForm": given.get("activeForm"), "status": "pending"}
                     step_updated[task_id] = stamp
+                    step_updates[task_id] = [stamp]
+                    events[task_id] = [{"row": row, "stamp": stamp, "status_before": None,
+                                        "status_after": "pending"}]
                     window["created"] += 1
                     entry = {"metadata": {}, "description": None}
                     _merge_metadata(entry["metadata"], given.get("metadata"))
@@ -561,13 +597,20 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                         if key in steps:
                             del steps[key]
                             step_updated.pop(key, None)
+                            step_updates.pop(key, None)
+                            events.pop(key, None)
                             lineage.pop(key, None)
                             kind = "task_tools"
                     elif key in steps:
+                        events.setdefault(key, []).append(
+                            {"row": row, "stamp": stamp,
+                             "status_before": steps[key].get("status"),
+                             "status_after": given.get("status")})
                         for field in ("subject", "activeForm", "status"):
                             if given.get(field) is not None:
                                 steps[key][field] = given[field]
                         step_updated[key] = stamp
+                        step_updates.setdefault(key, []).append(stamp)
                         if given.get("status") == "completed":
                             completed_seen.add(key)
                         entry = lineage.setdefault(key, {"metadata": {}, "description": None})
@@ -580,18 +623,27 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                 if use is not None and use.get("name") == "TaskList":
                     items = _task_list(_result_text(block.get("content")))
                     if items is not None:
-                        previous, previous_updated = steps, step_updated
+                        previous, previous_updated, previous_updates = steps, step_updated, step_updates
+                        previous_events, events = events, {}
                         steps = {item["id"]: item for item in items}
-                        step_updated = {}
+                        step_updated, step_updates = {}, {}
                         for item in items:
                             key = item["id"]
                             before = previous.get(key)
                             if before is None:
                                 continue  # First seen in the list: its update time is unknown.
+                            if key in previous_events:
+                                events[key] = list(previous_events[key])
                             if before.get("status") != item.get("status"):
                                 step_updated[key] = stamp
+                                step_updates[key] = [stamp]
+                                events.setdefault(key, []).append(
+                                    {"row": row, "stamp": stamp,
+                                     "status_before": before.get("status"),
+                                     "status_after": item.get("status")})
                             elif key in previous_updated:
                                 step_updated[key] = previous_updated[key]
+                                step_updates[key] = previous_updates.get(key, [])
                         lineage = {key: value for key, value in lineage.items() if key in steps}
                         kind = "task_tools"
             if kind is not None:
@@ -612,11 +664,64 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
         pending = [step for step in ordered if step.get("status") not in ("in_progress", "completed")]
         completed = [step for step in ordered if step.get("status") == "completed"]
         chosen = (active + pending[::-1] + completed[::-1])[:MAX_STEPS]
-    launch_codes = {_leading_code(launch.get("description")) for launch in launches or ()}
+    # The leading-code hygiene rule keeps its existing basis: only the launches the view
+    # shows (the turn's last MAX_LAUNCHES), and only the code at the start of a launch
+    # description, which is never a link. Explicit task= references below are resolved over
+    # every launch of the turn so linkage and execution cover unshown launches too.
+    launch_codes = {_leading_code(launch.get("description"))
+                    for launch in (launches or ())[-MAX_LAUNCHES:]}
     launch_codes.discard(None)
+    # Explicit linkage, resolved only now that the fold's tracked steps are final: a single
+    # normalized task= value is explicit iff it is a tracked step id, unobserved otherwise;
+    # zero values are none and two or more distinct values are ambiguous. Never inferred.
+    linked = {}
+    for launch in launches or ():
+        refs = launch.get("_task_refs") or ()
+        launch["_raw_ref"] = refs[0] if len(refs) == 1 else None
+        linkage = ("none" if not refs else "ambiguous" if len(refs) > 1
+                   else "explicit" if refs[0] in steps else "unobserved")
+        launch["_linkage"] = linkage
+        if linkage == "explicit":
+            linked.setdefault(refs[0], []).append(launch)
+    # A step is not stale while an explicitly linked launch is running or launched; a
+    # returned, errored or unreturned linked launch does not protect it.
+    linked_active = {task_id for task_id, items in linked.items()
+                     if any(item.get("status") in ("running", "launched") for item in items)}
+    # Turn-scoped task evidence by row identity against the selected turn's rows — the same
+    # membership check _observe_provenance uses. turn_updates holds each task's in-turn event
+    # epochs; turn_completed_at holds every in-turn transition epoch into completed, sorted —
+    # a completion merely revealed by a TaskList read (no known before) or recorded in another
+    # turn is no transition here. The whole-window fold above still serves the plan,
+    # deliverables and the stale rule exactly as before.
+    turn_row_ids = {id(turn_row) for turn_row in turn_rows or ()}
+    turn_updates, turn_completed_at, turn_update_unknown = {}, {}, {}
+    for task_id, task_events in events.items():
+        epochs = []
+        for event in task_events:
+            if id(event["row"]) not in turn_row_ids:
+                continue
+            epoch = _epoch_or_none(event["stamp"])
+            if epoch is None:
+                turn_update_unknown[task_id] = True
+                continue
+            epochs.append(epoch)
+            # A completion transition needs a known before-status: status_before None (a
+            # TodoWrite rewrite, where positional identity is not established) never proves one.
+            if (event["status_after"] == "completed"
+                    and event["status_before"] not in (None, "completed")):
+                turn_completed_at.setdefault(task_id, []).append(epoch)
+        if epochs:
+            turn_updates[task_id] = sorted(epochs)
+        if task_id in turn_completed_at:
+            turn_completed_at[task_id].sort()
+    execution = {step["id"]: _execution(step["id"], linked.get(step["id"]),
+                                        turn_updates.get(step["id"]),
+                                        turn_update_unknown.get(step["id"], False))
+                 for step in steps.values()}
     # Computed once for every tracked step (not just the shown ones) so the deliverables
     # projection can reuse the exact same staleness the operator sees in the shown steps.
-    stale_by_id = {step["id"]: _stale(step, step_updated, launch_codes, now, launches_known)
+    stale_by_id = {step["id"]: _stale(step, step_updated, launch_codes, now, launches_known,
+                                     step["id"] in linked_active)
                    for step in steps.values()}
     output, shown = [], {status: 0 for status in _STEP_STATUSES}
     for step in chosen:
@@ -625,7 +730,8 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             shown[status] += 1
         output.append({"label": _step_label(step),
                        "status": status if status is not None else "pending",
-                       "stale_in_progress": stale_by_id[step["id"]]})
+                       "stale_in_progress": stale_by_id[step["id"]],
+                       "execution": execution[step["id"]]})
     window["completed"] = len(completed_seen)
     # closure.window.created/completed count transitions seen anywhere in the bounded transcript
     # tail; closure.window.superseded is the final evaluation over the currently tracked ids. Lineage
@@ -639,7 +745,11 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             "omitted": {status: counts[status] - shown[status] for status in _STEP_STATUSES},
             "groups": _plan_groups(steps.values())}
     return plan, {"steps": steps, "lineage": lineage, "stale": stale_by_id, "window": window,
-                  "supersession": supersession, "updated_row": updated_row}
+                  "supersession": supersession, "updated_row": updated_row,
+                  "execution": execution, "step_updated": step_updated,
+                  "step_updates": step_updates, "events": events,
+                  "turn_updates": turn_updates, "turn_completed_at": turn_completed_at,
+                  "turn_update_unknown": turn_update_unknown}
 
 
 def _turn_window(rows, request, start, end):
@@ -676,7 +786,38 @@ def _turn_window(rows, request, start, end):
     return rows[anchor], window
 
 
-def _launches(uses, results):
+def _task_refs(description):
+    """Distinct normalized task= token values of one launch description, in first-seen order.
+
+    Each value is stripped, exactly one leading '#' removed, and empty results dropped; a
+    non-string description (or a non-dict launch input, handled by the caller) yields none.
+    Identity keeps the raw normalized value; only the display copy is redacted and bounded.
+    """
+    values = []
+    for match in _TASK_REF.finditer(description if isinstance(description, str) else ""):
+        value = match.group(1).strip()
+        if value.startswith("#"):
+            value = value[1:]
+        if value and value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def _epoch_or_none(value):
+    """One recorded timestamp as an epoch second; a missing or unparseable stamp is None."""
+    try:
+        return ao_native_outcome.timestamp(value)
+    except RoomError:
+        return None
+
+
+# Request states in which a result-less launch is unreturned: the turn ended without the
+# worker's handback. Kept equal to ao_project_room.TERMINAL; ao_project_room is imported
+# lazily by this module, so the set is pinned here and a test pins the equality.
+_TERMINAL_REQUEST_STATES = {"completed", "failed", "cancelled", "interrupted", "settled_failure"}
+
+
+def _launches(uses, results, request_state):
     rows = []
     for identity, use in uses.items():
         if use.get("name") != "Agent":
@@ -684,12 +825,27 @@ def _launches(uses, results):
         given = use.get("input") if isinstance(use.get("input"), dict) else {}
         result = results.get(identity)
         started, ended, duration = use.get("timestamp"), None, None
-        status = "running"
-        if result is not None:
+        error_kind = None
+        if result is None:
+            # A launch without a result is running while its request is live, unreturned once
+            # the request is terminal, and unknown for any other recorded request state.
+            status = ("running" if request_state in _LIVE_REQUEST_STATES
+                      else "unreturned" if request_state in _TERMINAL_REQUEST_STATES else "unknown")
+        else:
             ended = result.get("timestamp")
             text = result.get("text")
-            status = "error" if result.get("is_error") or (isinstance(text, str) and text.startswith(EARLY_EXIT)) \
-                else "completed"
+            if result.get("is_error") or (isinstance(text, str) and text.startswith(EARLY_EXIT)):
+                status = "error"
+                error_kind = ("guard_refusal" if isinstance(text, str) and text.startswith(GUARD_REFUSAL)
+                              else "early_exit" if isinstance(text, str) and text.startswith(EARLY_EXIT)
+                              else "tool_error")
+            elif given.get("run_in_background") is True or result.get("async_launched"):
+                # A background acknowledgement is a launch, not a handback: older unguarded
+                # preparations still surface it through the input flag or the result row's
+                # own async_launched status. An error result always wins over launched.
+                status = "launched"
+            else:
+                status = "completed"
             try:
                 duration = ao_native_outcome.timestamp(ended) - ao_native_outcome.timestamp(started)
             except RoomError:
@@ -699,8 +855,41 @@ def _launches(uses, results):
                      "description": (_redact(description)[:MAX_DESCRIPTION_CHARS]
                                      if description is not None else None),
                      "started_at": started, "ended_at": ended, "status": status,
-                     "duration_seconds": duration})
+                     "error_kind": error_kind,
+                     "duration_seconds": duration,
+                     "_task_refs": _task_refs(description)})
     return rows
+
+
+def _execution(task_id, linked_launches, turn_epochs, update_unknown=False):
+    """One step's execution evidence: its explicitly task=-linked launches, in transcript order.
+
+    latest is the last linked launch's status with completed mapped to returned (a handback is
+    evidence received, not a completed unit); task_updated_after_latest_result is null when the
+    latest launch is no returned handback (running, launched, unreturned or unknown all count as
+    none) or its own ended_at is unparseable, and otherwise whether the task has an update event
+    in the selected turn at or after that ended_at — null again (unknown, never a verdict) when
+    the only in-turn evidence is an event whose own time is unparseable. The engineer's own
+    status is never changed.
+    """
+    if not linked_launches:
+        return {"linkage": "none", "launches": 0, "latest": None,
+                "task_updated_after_latest_result": None}
+    latest = linked_launches[-1]
+    status = latest.get("status")
+    updated = None
+    if status in ("completed", "error"):
+        ended_epoch = _epoch_or_none(latest.get("ended_at"))
+        if ended_epoch is not None:
+            if any(epoch >= ended_epoch for epoch in turn_epochs or ()):
+                updated = True
+            elif update_unknown:
+                updated = None
+            else:
+                updated = False
+    return {"linkage": "explicit", "launches": len(linked_launches),
+            "latest": "returned" if status == "completed" else status,
+            "task_updated_after_latest_result": updated}
 
 
 def _bump(histogram, key):
@@ -1427,6 +1616,165 @@ def _stages(directory, state, requests, request, anchor):
             "truncated": engineering_clipped or verification_clipped or acceptance_clipped}
 
 
+# Handoff checks (additive, read-only): mechanical counters over the selected turn's own
+# evidence — every Agent launch of the anchored turn, its explicit task= reference as resolved
+# by the fold, the task-tool update stamps, and the completed request's saved routing_log report.
+# They never infer a link from a label, never complete a unit and never release a hold.
+MAX_DEFECT_AREAS = 8
+HANDOFF_BASIS = ("explicit task= references in Agent launch descriptions and native task-tool rows of "
+                 "the selected request's turn, plus the request's saved state; nothing is inferred from labels")
+HANDOFF_MEANING = ("Mechanical hygiene signals from the selected turn's own evidence; a missing task= "
+                   "reference or an unparseable handback or task-update time is reported as unknown, "
+                   "never as a compliance verdict, and nothing here completes a unit, releases a hold or "
+                   "replaces review.")
+
+
+def _handoff_checks(available, launches, shown, fold_extra, directory, request):
+    """The read-only handoff_checks object; an unavailable basis forces the exact zero shape."""
+    checks = {"version": 1, "available": bool(available), "basis": HANDOFF_BASIS,
+              "launches": {"total": 0, "shown": shown, "linked": 0, "unlinked": 0,
+                           "ambiguous": 0, "unobserved": 0},
+              "returned_without_task_update": 0, "update_time_unknown": 0,
+              "next_launch_before_task_update": 0, "completed_after_failed_launch": 0,
+              "unreturned_at_turn_end": 0, "areas_with_repeated_defects": [], "areas_truncated": False,
+              "routing_log": {"status": "unavailable", "entries": None, "launches_in_turn": 0},
+              "warnings": [], "meaning": HANDOFF_MEANING}
+    if not available:
+        return checks
+    extra = fold_extra or {}
+    steps, lineage = extra.get("steps") or {}, extra.get("lineage") or {}
+    launches = launches or ()
+    counts = checks["launches"]
+    counts["total"] = len(launches)
+    linked_by_step = {}
+    for launch in launches:
+        linkage = launch.get("_linkage", "none")
+        if linkage == "explicit":
+            counts["linked"] += 1
+            linked_by_step.setdefault(launch.get("_raw_ref"), []).append(launch)
+        elif linkage == "ambiguous":
+            counts["ambiguous"] += 1
+        elif linkage == "unobserved":
+            counts["unobserved"] += 1
+    counts["unlinked"] = counts["total"] - counts["linked"]
+    checks["routing_log"]["launches_in_turn"] = counts["total"]
+    turn_updates = extra.get("turn_updates") or {}
+    turn_completed_at = extra.get("turn_completed_at") or {}
+    turn_update_unknown = extra.get("turn_update_unknown") or {}
+    started_epochs = [_epoch_or_none(launch.get("started_at")) for launch in launches]
+    returned_without, update_unknown, next_before = 0, 0, 0
+    completed_after_failed, unreturned = 0, 0
+    for launch in launches:
+        if launch.get("status") == "unreturned":
+            unreturned += 1
+        if launch.get("_linkage") != "explicit" or launch.get("status") != "completed":
+            continue
+        task_id = launch.get("_raw_ref")
+        epochs = turn_updates.get(task_id) or ()
+        ended = _epoch_or_none(launch.get("ended_at"))
+        # update_time_unknown names a returned handback whose update comparison cannot be made:
+        # its own result time is unparseable, or the task's only at-or-after candidate is an
+        # in-turn event whose own time is unparseable. A task with no event in this turn is
+        # simply not updated here — the anchored turn's window is complete.
+        if ended is None:
+            update_unknown += 1
+            continue
+        future = [epoch for epoch in epochs if epoch >= ended]
+        bound = min(future) if future else None
+        if bound is None:
+            if turn_update_unknown.get(task_id):
+                # The update's timing is unknown, so neither the no-update count nor the
+                # next-launch bound can be measured: unknown is never a verdict.
+                update_unknown += 1
+                continue
+            returned_without += 1
+        # Another launch of any linkage started strictly after this handback and before the
+        # task's earliest in-turn update at or after it (or with no such update at all) is a
+        # launch dispatched before the unit's evidence was recorded; one started at or before
+        # the handback (a parallel worker) never counts.
+        for other, started in zip(launches, started_epochs):
+            if other is launch or started is None or started <= ended:
+                continue
+            if bound is None or started < bound:
+                next_before += 1
+                break
+    checks["returned_without_task_update"] = returned_without
+    checks["update_time_unknown"] = update_unknown
+    checks["next_launch_before_task_update"] = next_before
+    checks["unreturned_at_turn_end"] = unreturned
+    for task_id, items in linked_by_step.items():
+        step = steps.get(task_id)
+        if not isinstance(step, dict) or step.get("status") != "completed":
+            continue
+        latest = items[-1]
+        latest_status = latest.get("status")
+        if latest_status == "error":
+            reference = _epoch_or_none(latest.get("ended_at"))
+        elif latest_status == "unreturned":
+            reference = _epoch_or_none(latest.get("started_at"))
+        else:
+            continue
+        # The comparison is against the task's completion transitions observed in this turn,
+        # not its last edit: a completion only revealed by a TaskList read or recorded in
+        # another turn is unknown here and never counts.
+        transitions = turn_completed_at.get(task_id) or ()
+        if reference is not None and any(epoch >= reference for epoch in transitions):
+            completed_after_failed += 1
+    checks["completed_after_failed_launch"] = completed_after_failed
+    defect_groups = {}
+    for task_id, step in steps.items():
+        if _resolve_unit(lineage.get(task_id))["kind"] == "defect":
+            defect_groups.setdefault(_group_key(step.get("subject")), []).append(task_id)
+    areas = []
+    for key, task_ids in defect_groups.items():
+        if len(task_ids) < 2:
+            continue
+        tiers = {}
+        for task_id in task_ids:
+            for launch in linked_by_step.get(task_id, ()):
+                tier = launch.get("subagent_type")
+                tier = tier[:MAX_KEY_CHARS] if isinstance(tier, str) else "unknown"
+                tiers[tier] = tiers.get(tier, 0) + 1
+        areas.append({"key": key, "defect_units": len(task_ids), "launch_tiers": tiers})
+    areas.sort(key=lambda area: (-area["defect_units"], area["key"]))
+    checks["areas_truncated"] = len(areas) > MAX_DEFECT_AREAS
+    checks["areas_with_repeated_defects"] = [
+        {"key": _display_key(area["key"]), "defect_units": area["defect_units"],
+         "launch_tiers": area["launch_tiers"]}
+        for area in areas[:MAX_DEFECT_AREAS]]
+    if request.get("state") == "completed":
+        # Only a completed request has a captured engineering report to restate; every other
+        # state, unreadable receipt or unparsable final text reports unavailable, never raises.
+        import ao_workflow
+        from ao_response_normalization import ResponseFormatError
+        try:
+            report = ao_workflow.final_json(directory, request)
+        except _STAGE_ERRORS + (ResponseFormatError,):
+            report = None
+        entries = report.get("routing_log") if isinstance(report, dict) else None
+        if isinstance(entries, list):
+            checks["routing_log"] = {"status": "reported" if entries else "empty",
+                                     "entries": len(entries),
+                                     "launches_in_turn": counts["total"]}
+    warnings = []
+    if returned_without:
+        warnings.append("returned_units_not_updated")
+    if next_before:
+        warnings.append("launch_before_unit_update")
+    if completed_after_failed:
+        warnings.append("completed_after_failed_launch")
+    if unreturned:
+        warnings.append("unreturned_launches")
+    if checks["areas_with_repeated_defects"]:
+        warnings.append("repeated_defects_in_area")
+    if checks["routing_log"]["status"] == "empty" and counts["total"]:
+        warnings.append("routing_log_empty_with_launches")
+    if counts["unlinked"]:
+        warnings.append("launches_without_task_reference")
+    checks["warnings"] = sorted(warnings)
+    return checks
+
+
 def inspect(directory, state, request_id=None, max_text_chars=400):
     """One request's bounded progress view; a validation failure yields controller facts only."""
     if (not isinstance(max_text_chars, int) or isinstance(max_text_chars, bool)
@@ -1450,6 +1798,7 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
                                      "omitted": {status: 0 for status in _STEP_STATUSES},
                                      "groups": []},
             "malformed_rows": 0}
+    view["handoff_checks"] = _handoff_checks(False, (), 0, None, directory, request)
     outcome_source = state.get("native_outcome_source") or {}
     view["rate_limits"] = ao_rate_limits.latest(outcome_source.get("database"), request.get("session_id"))
     anchor, anchor_notes, anchor_truncated = _spec_anchor(directory, state)
@@ -1492,10 +1841,11 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     view["malformed_rows"] = malformed
     anchor_row, turn_rows = _turn_window(rows, request, start, end)
     view["turn"] = {"anchor_found": False} if anchor_row is None else _turn(anchor_row, turn_rows)
+    turn_launches = []
     if anchor_row is not None:
         # Launches belong to the request's own turn; without an anchor nothing is attributable.
         launch_uses, launch_results = _tools(turn_rows)
-        view["launches"] = _launches(launch_uses, launch_results)[-MAX_LAUNCHES:]
+        turn_launches = _launches(launch_uses, launch_results, request.get("state"))
     # Staleness measures against the transcript's own clock — the turn's last activity —
     # the same clock the view uses for elapsed_seconds.
     plan_now = None
@@ -1503,8 +1853,22 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         plan_now = ao_native_outcome.timestamp(view["turn"].get("last_activity_at"))
     except RoomError:
         plan_now = None
-    view["plan"], fold_extra = _fold_plan(rows, uses, results, launches=view["launches"], now=plan_now,
-                                          launches_known=bool(view["turn"].get("anchor_found")))
+    view["plan"], fold_extra = _fold_plan(rows, uses, results, launches=turn_launches, now=plan_now,
+                                          launches_known=bool(view["turn"].get("anchor_found")),
+                                          turn_rows=turn_rows)
+    # Linkage is resolved inside the fold, where the final tracked steps are known; the raw
+    # normalized id is kept only internally and the emitted task_ref carries the display form.
+    shown_launches = turn_launches[-MAX_LAUNCHES:]
+    view["handoff_checks"] = _handoff_checks(
+        bool(view["source"].get("available")) and bool(view["turn"].get("anchor_found")),
+        turn_launches, len(shown_launches), fold_extra, directory, request)
+    for launch in turn_launches:
+        raw_ref = launch.pop("_raw_ref")
+        linkage = launch.pop("_linkage")
+        launch.pop("_task_refs")
+        task_id, _ = _display_id(raw_ref) if raw_ref is not None else (None, False)
+        launch["task_ref"] = {"task_id": task_id, "linkage": linkage}
+    view["launches"] = shown_launches
     available = bool(view["source"].get("available")) and view["plan"]["source"] != "none"
     reason = None if available else "no task tool activity observed"
     view["deliverables"] = _deliverables(available, fold_extra, anchor, anchor_notes, anchor_truncated,

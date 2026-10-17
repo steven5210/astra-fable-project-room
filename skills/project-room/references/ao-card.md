@@ -32,7 +32,13 @@ Rules for every phase:
 - For a progress update at a breakpoint or when the user asks, call
   `ao_room_progress` (read-only: the engineer's task list, Agent launches,
   served models, errors, last message) and format the checklist from it plus
-  the last report; never read the native transcript yourself. Report the
+  the last report; never read the native transcript yourself. Read
+  `plan.steps[].execution` and `handoff_checks.warnings` for the launch
+  evidence: a step's `latest: returned` with `task_updated_after_latest_result`
+  false is a handback awaiting Fable's judgment, not a completed unit;
+  `unreturned` means the turn ended without a handback; the warnings are
+  hygiene signals, never a verdict, and a launch links to a unit only through
+  its explicit `task=` reference. Report the
   rate-limit window label, its used percent or `not reported`, and its reset
   time; treat the reading as advisory, never as headroom.
 - `ao_room_progress.deliverables` (additive, read-only) folds the same task list

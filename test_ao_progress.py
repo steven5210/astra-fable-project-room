@@ -12,6 +12,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
+import ao_execution_evidence
 import ao_native_outcome
 import ao_progress
 import ao_project_room as ao
@@ -241,7 +242,10 @@ class ProgressViewTests(Fixture):
                                ao_native_outcome.timestamp(self.last_row['timestamp'])
                                - ao_native_outcome.timestamp(self.anchor['timestamp']), places=6)
         launches = view['launches']
-        self.assertEqual([launch['status'] for launch in launches], ['completed', 'error', 'error', 'running'])
+        # The result-less launch in a terminal (completed) turn is unreturned, not running:
+        # the turn ended without its handback. running is reserved for live requests.
+        self.assertEqual([launch['status'] for launch in launches],
+                         ['completed', 'error', 'error', 'unreturned'])
         self.assertEqual([launch['subagent_type'] for launch in launches],
                          ['Explore', 'general-purpose', 'Explore', 'Plan'])
         self.assertEqual(launches[1]['description'], 'd' * 120)
@@ -251,10 +255,14 @@ class ProgressViewTests(Fixture):
         self.assertAlmostEqual(launches[0]['duration_seconds'],
                                ao_native_outcome.timestamp(launches[0]['ended_at'])
                                - ao_native_outcome.timestamp(launches[0]['started_at']), places=6)
+        unlinked = {'linkage': 'none', 'launches': 0, 'latest': None,
+                    'task_updated_after_latest_result': None}
         self.assertEqual(view['plan'], {
             'source': 'task_tools', 'updated_at': self.task_list_result['timestamp'],
-            'steps': [{'label': 'Implement parser', 'status': 'completed', 'stale_in_progress': False},
-                      {'label': 'Gate evidence', 'status': 'pending', 'stale_in_progress': False}],
+            'steps': [{'label': 'Implement parser', 'status': 'completed',
+                       'stale_in_progress': False, 'execution': unlinked},
+                      {'label': 'Gate evidence', 'status': 'pending',
+                       'stale_in_progress': False, 'execution': unlinked}],
             'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
             'total': 2, 'shown': 2,
             'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
@@ -346,6 +354,9 @@ class ProgressViewTests(Fixture):
         self.assertEqual(printed['request']['request_id'], 'impl-1')
         self.assertEqual(printed['source'], {'available': True})
         self.assertEqual(printed['plan'], self.view()['plan'])
+        # The CLI prints the identical view, execution evidence and read-only checks included.
+        self.assertEqual(printed['handoff_checks'], self.view()['handoff_checks'])
+        self.assertIn('execution', printed['plan']['steps'][0])
         self.assertNotIn(str(self.transcript), stdout.getvalue())
 
     def test_view_writes_no_state(self):
@@ -423,7 +434,8 @@ class ProgressViewTests(Fixture):
         self.assertEqual(len(launches), 64)
         self.assertEqual(launches[0]['description'], 'unit 6')
         self.assertEqual(launches[-1]['description'], 'unit 69')
-        self.assertEqual(launches[0]['status'], 'running')
+        # No result and the request is terminal: unreturned, not running.
+        self.assertEqual(launches[0]['status'], 'unreturned')
 
     def test_source_reason_never_names_a_path(self):
         with patch.object(ao_native_outcome, 'validate_registered_source',
@@ -478,10 +490,14 @@ class ProgressViewTests(Fixture):
         ]
         self.native_events[self.native_events.index(self.trailing):0] = failures
         self._write_transcript()
+        unlinked = {'linkage': 'none', 'launches': 0, 'latest': None,
+                    'task_updated_after_latest_result': None}
         self.assertEqual(self.view()['plan'], {
             'source': 'task_tools', 'updated_at': self.task_list_result['timestamp'],
-            'steps': [{'label': 'Implement parser', 'status': 'completed', 'stale_in_progress': False},
-                      {'label': 'Gate evidence', 'status': 'pending', 'stale_in_progress': False}],
+            'steps': [{'label': 'Implement parser', 'status': 'completed',
+                       'stale_in_progress': False, 'execution': unlinked},
+                      {'label': 'Gate evidence', 'status': 'pending',
+                       'stale_in_progress': False, 'execution': unlinked}],
             'counts': {'pending': 1, 'in_progress': 0, 'completed': 1},
             'total': 2, 'shown': 2,
             'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
@@ -651,8 +667,9 @@ class ProgressViewTests(Fixture):
         self.native_events[self.native_events.index(self.trailing):0] = rows
         self._write_transcript()
         view = self.view()
-        self.assertIn({'label': 'Fix <path> and src/a.ts', 'status': 'pending',
-                       'stale_in_progress': False}, view['plan']['steps'])
+        step = next(step for step in view['plan']['steps'] if step['label'] == 'Fix <path> and src/a.ts')
+        self.assertEqual(step['status'], 'pending')
+        self.assertIs(step['stale_in_progress'], False)
         self.assertIn('Open <path> and src/b.ts',
                       [launch['description'] for launch in view['launches']])
         self.assertEqual(view['last_text'], 'Wrote <path> then src/c.ts')
@@ -895,11 +912,14 @@ class TodoWritePlanTests(Fixture):
         self.native_events.append(row)
         self.transcript.write_text(''.join(json.dumps(event) + '\n' for event in self.native_events))
         view = ao_progress.inspect(self.directory(), self.state())
+        unlinked = {'linkage': 'none', 'launches': 0, 'latest': None,
+                    'task_updated_after_latest_result': None}
         self.assertEqual(view['plan'], {
             'source': 'todo_write', 'updated_at': stamp,
             'steps': [{'label': 'Reading the evidence', 'status': 'in_progress',
-                       'stale_in_progress': False},
-                      {'label': 'Write the report', 'status': 'pending', 'stale_in_progress': False}],
+                       'stale_in_progress': False, 'execution': unlinked},
+                      {'label': 'Write the report', 'status': 'pending',
+                       'stale_in_progress': False, 'execution': unlinked}],
             'counts': {'pending': 1, 'in_progress': 1, 'completed': 0},
             'total': 2, 'shown': 2,
             'omitted': {'pending': 0, 'in_progress': 0, 'completed': 0},
@@ -927,8 +947,11 @@ class SuccessorDigestAndSupersessionTests(unittest.TestCase):
 
     def test_v3_is_appended_last_and_v1_v2_keep_their_historical_positions_in_parts(self):
         # ao_workflow.PARTS' exact order/length is independently pinned in test_lifecycle_closure.py;
-        # this only checks the three facts this unit's own correctness depends on.
-        self.assertEqual(ao_workflow.PARTS[-1], ao_progress.PART_V3)
+        # this only checks the facts this unit's own correctness depends on. execution_evidence_v1
+        # was appended after progress_plan_v3, so v3 is now second to last.
+        import ao_execution_evidence
+        self.assertEqual(ao_workflow.PARTS[-2], ao_progress.PART_V3)
+        self.assertEqual(ao_workflow.PARTS[-1], ao_execution_evidence.PART)
         self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART), 10)
         self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART_V2), 12)
         self.assertEqual(len(ao_workflow.PARTS), len(set(ao_workflow.PARTS)))
@@ -1190,14 +1213,20 @@ class UpgradingSessionSuccessorDeliveryTests(Fixture):
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
-        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3])
-        self.assertEqual(request['carried']['part_sha256'], {ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256})
+        # execution_evidence_v1 is new to this retained session too, so the correction carries
+        # it together with the successor, in PARTS order.
+        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3, ao_execution_evidence.PART])
+        self.assertEqual(request['carried']['part_sha256'],
+                         {ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256,
+                          ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
+        self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
 
         # Already upgraded: a further completed request leaves nothing left to send.
         text2, carried2 = self.packet()
         self.assertEqual(carried2['parts'], [])
         self.assertNotIn(ao_progress.INSTRUCTION_V3, text2)
+        self.assertNotIn(ao_execution_evidence.INSTRUCTION, text2)
 
 
 class UncertainSuccessorDeliveryTests(Fixture):
@@ -1225,7 +1254,9 @@ class UncertainSuccessorDeliveryTests(Fixture):
         request = self.state()['requests']['corr-uncertain']
         self.assertEqual(request['state'], 'uncertain')
         self.assertNotIn('receipt', request)
-        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3])
+        # execution_evidence_v1 is new to this retained session too, so the same uncertain turn
+        # carries it together with the successor, in PARTS order.
+        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3, ao_execution_evidence.PART])
 
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertNotIn(ao_progress.PART_V3, held['parts'])
@@ -1448,6 +1479,816 @@ class MalformedCarriedRecordSuccessorDeliveryTests(Fixture):
             self.assertEqual(ao_workflow.context_summary(tampered, None)['progress_plan'], plan)
         finally:
             self.service.save(self.directory(), original)
+
+
+# The exact handoff_checks zero shape: an unavailable source or an unfound anchor yields it whole.
+ZERO_HANDOFF = {'version': 1, 'available': False, 'basis': ao_progress.HANDOFF_BASIS,
+                'launches': {'total': 0, 'shown': 0, 'linked': 0, 'unlinked': 0,
+                             'ambiguous': 0, 'unobserved': 0},
+                'returned_without_task_update': 0, 'update_time_unknown': 0,
+                'next_launch_before_task_update': 0, 'completed_after_failed_launch': 0,
+                'unreturned_at_turn_end': 0, 'areas_with_repeated_defects': [],
+                'areas_truncated': False,
+                'routing_log': {'status': 'unavailable', 'entries': None, 'launches_in_turn': 0},
+                'warnings': [], 'meaning': ao_progress.HANDOFF_MEANING}
+
+
+class ExecutionFixture(Fixture):
+    """A bound room whose impl-1 request and whole turn are authored by each test.
+
+    impl-1's caller/reply pair anchors the turn; every row a test appends lands inside
+    it. FINISH subclasses leave the request submitted (live); the default completes it
+    with the standard report (whose routing_log is empty) so a saved receipt exists.
+    """
+
+    FINISH = True
+
+    def setUp(self):
+        super().setUp()
+        self.room = self.open(); self.spec(); self.bind(); self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.send('implementation', 'impl-1')
+        self.request = self.state()['requests']['impl-1']
+        self.workspace = self.native_row_workspace()
+        self.base = self.request['created_at'] + 1.0
+        self._seq = 0
+        if self.FINISH:
+            self.complete()
+
+    def at(self, offset):
+        return _iso(self.base + offset)
+
+    def _use(self, tool_use_id, name, tool_input):
+        return {'type': 'tool_use', 'id': tool_use_id, 'name': name, 'input': tool_input}
+
+    def _assistant(self, label, stamp, content, model=MODEL, stop='tool_use'):
+        message = {'role': 'assistant', 'model': model, 'id': label + '-m', 'content': content}
+        if stop is not None:
+            message['stop_reason'] = stop
+        return {'type': 'assistant', 'uuid': 'impl-1-' + label + '-' + _identity(), 'sessionId': self.NATIVE,
+                'timestamp': stamp, 'cwd': self.workspace, 'isSidechain': False, 'message': message}
+
+    def _result(self, label, stamp, tool_use_id, text, is_error=False, top=None):
+        row = {'type': 'user', 'uuid': 'impl-1-' + label + '-' + _identity(), 'sessionId': self.NATIVE,
+               'timestamp': stamp, 'cwd': self.workspace, 'isSidechain': False,
+               'message': {'role': 'user', 'content': [
+                   {'type': 'tool_result', 'tool_use_id': tool_use_id, 'content': text,
+                    'is_error': is_error}]}}
+        if top:
+            row.update(top)
+        return row
+
+    def create(self, task_id, subject, stamp, metadata=None, description=None, active_form=None):
+        use = 'tu-c' + task_id + '-' + str(self._seq)
+        self._seq += 1
+        given = {'subject': subject}
+        if active_form is not None:
+            given['activeForm'] = active_form
+        if metadata is not None:
+            given['metadata'] = metadata
+        if description is not None:
+            given['description'] = description
+        self.native_events += [
+            self._assistant('create-' + task_id, stamp, [self._use(use, 'TaskCreate', given)]),
+            self._result('create-' + task_id + '-r', stamp, use,
+                         'Task #' + task_id + ' created successfully')]
+
+    def update(self, task_id, stamp, **fields):
+        use = 'tu-u' + task_id + '-' + str(self._seq)
+        self._seq += 1
+        given = {'taskId': task_id}
+        given.update(fields)
+        self.native_events += [
+            self._assistant('update-' + task_id, stamp, [self._use(use, 'TaskUpdate', given)]),
+            self._result('update-' + task_id + '-r', stamp, use,
+                         'Task #' + task_id + ' updated successfully')]
+
+    def task_list(self, lines, stamp):
+        use = 'tu-list-' + str(self._seq)
+        self._seq += 1
+        self.native_events += [
+            self._assistant('list', stamp, [self._use(use, 'TaskList', {})]),
+            self._result('list-r', stamp, use, '\n'.join(lines))]
+
+    def todo_write(self, todos, stamp):
+        use = 'tu-w-' + str(self._seq)
+        self._seq += 1
+        self.native_events += [
+            self._assistant('todo', stamp, [self._use(use, 'TodoWrite', {'todos': todos})]),
+            self._result('todo-r', stamp, use, 'Todos have been modified successfully')]
+
+    def launch(self, label, stamp, given, result=None, result_stamp=None, is_error=False, top=None):
+        use = 'tu-a-' + label
+        rows = [self._assistant('agent-' + label, stamp, [self._use(use, 'Agent', given)])]
+        if result is not None:
+            rows.append(self._result('agent-' + label + '-r', result_stamp or stamp, use, result,
+                                     is_error=is_error, top=top))
+        self.native_events += rows
+
+    def write(self):
+        self.transcript.write_text(''.join(json.dumps(event) + '\n' for event in self.native_events))
+
+    def complete(self, **report_changes):
+        self.write()
+        self.fake.finish('engineer', json.dumps(self.report(**report_changes)))
+        self.service.ao_room_sync(self.room)
+
+    def set_request(self, **changes):
+        state = self.state()
+        state['requests']['impl-1'].update(changes)
+        ao.atomic(self.directory() / 'state.json', state)
+
+    def rewrite_receipt(self, final_text):
+        """Replace the saved receipt's last assistant text, keeping its recorded digest honest."""
+        state = self.state()
+        request = state['requests']['impl-1']
+        receipt = ao.read(self.directory() / request['receipt'])
+        finals = [m for m in receipt['messages']
+                  if m.get('role') == 'assistant' and not m.get('streaming')
+                  and isinstance(m.get('text'), str) and m['text'].strip()]
+        finals[-1]['text'] = final_text
+        ao.atomic(self.directory() / request['receipt'], receipt)
+        request['receipt_sha256'] = ao.digest(receipt)
+        ao.atomic(self.directory() / 'state.json', state)
+
+    def view(self, **kwargs):
+        self.write()
+        return ao_progress.inspect(self.directory(), self.state(), **kwargs)
+
+    def step(self, view, task_label):
+        return next(step for step in view['plan']['steps'] if task_label in step['label'])
+
+
+class LiveExecutionFixture(ExecutionFixture):
+    """The same room with impl-1 left submitted: a live request for running/launched statuses."""
+
+    FINISH = False
+
+
+class ExecutionEvidenceTests(ExecutionFixture):
+    """Explicit task= linkage, evidenced launch states and the read-only handoff_checks."""
+
+    def test_returned_launch_without_a_task_update_is_a_hygiene_signal(self):
+        # (a) A returned handback is evidence received, never a completed unit: task 1's last
+        # update is ~3700s before the turn, the linked worker returned at base+1, and no task
+        # update followed. Its code differs from the launch's, so only the explicit rule applies.
+        old, returned = self.at(-3700), self.at(1.0)
+        self.create('1', 'UI-9: build the panel', old)
+        self.update('1', old, status='in_progress')
+        self.launch('w1', self.at(0.5),
+                    {'subagent_type': 'Explore', 'description': 'EXIT-9: implement task=1'},
+                    result='worker handback', result_stamp=returned)
+        view = self.view()
+        step = self.step(view, 'UI-9')
+        self.assertEqual(step['status'], 'in_progress')  # the engineer's status is never changed
+        self.assertIs(step['stale_in_progress'], True)   # a returned link protects nothing
+        self.assertEqual(step['execution'], {'linkage': 'explicit', 'launches': 1,
+                                             'latest': 'returned',
+                                             'task_updated_after_latest_result': False})
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 1)
+        self.assertIn('returned_units_not_updated', checks['warnings'])
+        self.assertEqual(checks['launches']['linked'], 1)
+        self.assertEqual(view['launches'][0]['task_ref'],
+                         {'task_id': '1', 'linkage': 'explicit'})
+        self.assertEqual(view['deliverables']['closure']['completed'], 0)
+
+    def test_error_results_classify_by_kind_and_never_count_as_returned(self):
+        # (c) is_error, a guard refusal and an early exit are three distinct error kinds; a linked
+        # task keeps its own status and an error never counts as a returned handback.
+        self.create('1', 'EXIT-9: unit work', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'unit task=1'},
+                    result='worker exploded', result_stamp=self.at(0.9), is_error=True)
+        self.launch('w2', self.at(1.0), {'subagent_type': 'Explore', 'description': 'denied'},
+                    result='Project Room routing guard: root execution is denied (orchestrator)',
+                    result_stamp=self.at(1.1), is_error=True)
+        self.launch('w3', self.at(1.2), {'subagent_type': 'Explore', 'description': 'cut off'},
+                    result='Agent terminated early: context limit reached',
+                    result_stamp=self.at(1.3))
+        view = self.view()
+        self.assertEqual([(launch['status'], launch['error_kind']) for launch in view['launches']],
+                         [('error', 'tool_error'), ('error', 'guard_refusal'), ('error', 'early_exit')])
+        step = self.step(view, 'EXIT-9')
+        self.assertEqual(step['status'], 'pending')
+        self.assertEqual(step['execution']['latest'], 'error')
+        # An errored launch still has an ended_at, so the update stamp is compared (False: the
+        # task's only stamp predates the failure); null is reserved for result-less launches.
+        self.assertIs(step['execution']['task_updated_after_latest_result'], False)
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertNotIn('returned_units_not_updated', checks['warnings'])
+
+    def test_an_unreturned_linked_launch_reports_its_unit_unfinished(self):
+        # (d) A quota-settled terminal request whose linked worker never returned: unreturned,
+        # the unit stays unfinished, and the warning names the turn's stranded launch.
+        self.set_request(state='settled_failure',
+                         semantic_status={'kind': 'quota_limit', 'hold': True,
+                                          'reason': 'quota exhausted'})
+        self.create('1', 'EXIT-9: unit work', self.at(0.1))
+        self.update('1', self.at(0.2), status='in_progress')
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'unit task=1'})
+        view = self.view()
+        self.assertEqual(view['launches'][0]['status'], 'unreturned')
+        self.assertEqual(view['launches'][0]['task_ref'], {'task_id': '1', 'linkage': 'explicit'})
+        step = self.step(view, 'EXIT-9')
+        self.assertEqual(step['status'], 'in_progress')
+        self.assertEqual(step['execution']['latest'], 'unreturned')
+        checks = view['handoff_checks']
+        self.assertEqual(checks['unreturned_at_turn_end'], 1)
+        self.assertIn('unreturned_launches', checks['warnings'])
+
+    def test_an_uncertain_request_marks_a_resultless_launch_unknown(self):
+        # (e) Neither live nor terminal: the launch's outcome is simply unknown.
+        self.set_request(state='uncertain')
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'unit task=1'})
+        view = self.view()
+        self.assertEqual(view['launches'][0]['status'], 'unknown')
+        self.assertEqual(view['handoff_checks']['unreturned_at_turn_end'], 0)
+
+    def test_reference_token_vocabulary(self):
+        # (g) Only the explicit task= token links; distinct multiple tokens are ambiguous, a token
+        # naming an untracked id is unobserved, and a matching label is never a link.
+        self.create('1', 'FIRST: unit one', self.at(0.1))
+        self.create('2', 'SECOND: unit two', self.at(0.2))
+        self.create('3', 'EXIT-9: unit three', self.at(0.3))
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore', 'description': 'work task=1 task=2'},
+                    result='done', result_stamp=self.at(0.45))
+        self.launch('w2', self.at(0.5), {'subagent_type': 'Explore', 'description': 'work task=#7'},
+                    result='done', result_stamp=self.at(0.55))
+        # The description's code matches task 3's subject code, but a label is never a link.
+        self.launch('w3', self.at(0.6), {'subagent_type': 'Explore',
+                                         'description': 'EXIT-9: same code as the task subject'},
+                    result='done', result_stamp=self.at(0.65))
+        self.launch('w4', self.at(0.7), {'subagent_type': 'Explore', 'description': 'task= task=#'},
+                    result='done', result_stamp=self.at(0.75))
+        self.launch('w5', self.at(0.8), {'subagent_type': 'Explore'},
+                    result='done', result_stamp=self.at(0.85))
+        self.launch('w6', self.at(0.9), 'not a dict', result='done', result_stamp=self.at(0.95))
+        view = self.view()
+        self.assertEqual([launch['task_ref'] for launch in view['launches']],
+                         [{'task_id': None, 'linkage': 'ambiguous'},
+                          {'task_id': '7', 'linkage': 'unobserved'},
+                          {'task_id': None, 'linkage': 'none'},
+                          {'task_id': None, 'linkage': 'none'},
+                          {'task_id': None, 'linkage': 'none'},
+                          {'task_id': None, 'linkage': 'none'}])
+        for label in ('FIRST', 'SECOND', 'EXIT-9'):
+            self.assertEqual(self.step(view, label)['execution']['linkage'], 'none')
+        counts = view['handoff_checks']['launches']
+        self.assertEqual((counts['linked'], counts['ambiguous'], counts['unobserved']), (0, 1, 1))
+        self.assertEqual(counts['unlinked'], 6)
+        self.assertIn('launches_without_task_reference', view['handoff_checks']['warnings'])
+
+    def test_a_hash_prefixed_reference_links_to_the_bare_task_id(self):
+        # (h) task=#1 normalizes to the raw id '1' and links like task=1.
+        self.create('1', 'EXIT-9: unit work', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=#1'},
+                    result='done', result_stamp=self.at(0.3))
+        self.update('1', self.at(0.4), subject='EXIT-9: unit work')
+        view = self.view()
+        self.assertEqual(view['launches'][0]['task_ref'], {'task_id': '1', 'linkage': 'explicit'})
+        self.assertEqual(self.step(view, 'EXIT-9')['execution'],
+                         {'linkage': 'explicit', 'launches': 1, 'latest': 'returned',
+                          'task_updated_after_latest_result': True})
+
+    def test_task_refs_survive_compaction_and_stay_turn_scoped(self):
+        # (i) A compaction row inside the turn breaks neither the fold nor a task= link, and a
+        # second request on the same session counts only its own turn's launches.
+        self.create('1', 'EXIT-9: unit work', self.at(0.1))
+        self.native_events.append(
+            {'type': 'user', 'uuid': _identity(), 'sessionId': self.NATIVE, 'timestamp': self.at(0.2),
+             'cwd': self.workspace, 'isSidechain': False,
+             'isCompactSummary': True, 'isVisibleInTranscriptOnly': True,
+             'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'Earlier work summarized'}]}})
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'unit task=1'},
+                    result='done', result_stamp=self.at(0.4))
+        # A second request on the same session, its own caller and one unlinked launch.
+        state = self.state()
+        first = state['requests']['impl-1']
+        state['requests']['impl-2'] = dict(first, request_id='impl-2',
+                                         created_order=first['created_order'] + 1,
+                                         created_at=first['created_at'] + 10.0)
+        ao.atomic(self.directory() / 'state.json', state)
+        self.native_events += [
+            {'type': 'user', 'uuid': 'impl-2-caller', 'sessionId': self.NATIVE,
+             'timestamp': _iso(first['created_at'] + 10.5), 'cwd': self.workspace,
+             'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': first['text']}},
+            self._assistant('impl-2-agent', _iso(first['created_at'] + 10.6),
+                            [self._use('tu-a2', 'Agent', {'subagent_type': 'Explore',
+                                                        'description': 'second turn launch'})])]
+        first_view = self.view(request_id='impl-1')
+        self.assertEqual(first_view['handoff_checks']['launches']['total'], 1)
+        self.assertEqual(first_view['handoff_checks']['launches']['linked'], 1)
+        self.assertEqual(self.step(first_view, 'EXIT-9')['execution']['linkage'], 'explicit')
+        second_view = self.view(request_id='impl-2')
+        self.assertTrue(second_view['turn']['anchor_found'])
+        second_counts = second_view['handoff_checks']['launches']
+        self.assertEqual(second_counts['total'], 1)
+        self.assertEqual(second_counts['linked'], 0)
+        self.assertEqual(second_counts['unlinked'], 1)
+
+    def _second_turn(self, offset=10.0):
+        """Add a same-session impl-2 request and anchor it, returning its turn's base time."""
+        state = self.state()
+        first = state['requests']['impl-1']
+        state['requests']['impl-2'] = dict(first, request_id='impl-2',
+                                         created_order=first['created_order'] + 1,
+                                         created_at=first['created_at'] + offset)
+        ao.atomic(self.directory() / 'state.json', state)
+        base = first['created_at'] + offset
+        self.native_events.append(
+            {'type': 'user', 'uuid': 'impl-2-caller', 'sessionId': self.NATIVE,
+             'timestamp': _iso(base + 0.5), 'cwd': self.workspace,
+             'isSidechain': False, 'origin': {'kind': 'human'},
+             'message': {'role': 'user', 'content': first['text']}})
+        return base
+
+    def test_a_later_turns_update_never_rewrites_the_selected_turns_evidence(self):
+        # Turn A returns a linked handback with no task update; a later turn's subject-only
+        # update of the same task is that turn's own evidence and changes nothing in turn A.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        first = self.view(request_id='impl-1')
+        self.assertEqual(first['handoff_checks']['returned_without_task_update'], 1)
+        self.assertIs(self.step(first, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      False)
+        self.assertEqual(first['handoff_checks']['next_launch_before_task_update'], 0)
+
+        base = self._second_turn()
+        self.update('1', _iso(base + 0.6), subject='EXIT-1: unit renamed')
+        again = self.view(request_id='impl-1')
+        self.assertEqual(again['handoff_checks']['returned_without_task_update'], 1)
+        self.assertEqual(again['handoff_checks']['next_launch_before_task_update'], 0)
+        self.assertIs(self.step(again, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      False)
+        self.assertIn('returned_units_not_updated', again['handoff_checks']['warnings'])
+        # Turn B reads only its own turn: the update is in the plan, but it holds no launches.
+        second = self.view(request_id='impl-2')
+        self.assertTrue(second['turn']['anchor_found'])
+        self.assertEqual(second['handoff_checks']['launches']['total'], 0)
+        self.assertEqual(second['handoff_checks']['returned_without_task_update'], 0)
+        self.assertEqual(self.step(second, 'EXIT-1')['execution']['linkage'], 'none')
+
+    def test_an_update_in_the_same_turn_after_the_handback_clears_the_signal(self):
+        # The in-turn update counts only against the handback that precedes it.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        self.update('1', self.at(0.4), subject='EXIT-1: unit done')
+        view = self.view()
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 0)
+        self.assertIs(self.step(view, 'EXIT-1')['execution']['task_updated_after_latest_result'],
+                      True)
+
+    def test_a_completion_before_the_failure_never_counts_despite_a_later_edit(self):
+        # The completion transition is compared, not the last edit: the unit completed before
+        # the linked launch failed, and a subject-only edit afterwards changes nothing.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'review task=1'},
+                    result='review exploded', result_stamp=self.at(0.4), is_error=True)
+        self.update('1', self.at(0.5), subject='EXIT-1: unit renamed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_tasklist_observed_completion_after_the_failure_counts(self):
+        # A TaskList status change is an observed transition too: a unit the list first shows
+        # moved to completed after the linked launch's error counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.15), status='in_progress')
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.3), is_error=True)
+        self.task_list(['#1 [completed] EXIT-1: unit'], self.at(0.4))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_an_earlier_turns_completion_never_counts_in_this_turn(self):
+        # The linked launch's turn observed no completion transition: the unit completed in the
+        # previous turn, so the count stays zero even though a same-turn edit follows the error.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        base = self._second_turn()
+        self.launch('w2', _iso(base + 0.6), {'subagent_type': 'Explore',
+                                             'description': 'retry task=1'},
+                    result='worker exploded', result_stamp=_iso(base + 0.7), is_error=True)
+        self.update('1', _iso(base + 0.8), subject='EXIT-1: unit renamed')
+        second = self.view(request_id='impl-2')
+        self.assertTrue(second['turn']['anchor_found'])
+        self.assertEqual(second['handoff_checks']['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', second['handoff_checks']['warnings'])
+
+    def test_an_update_whose_time_is_unparseable_makes_the_comparison_unknown(self):
+        # A linked handback followed only by an in-turn update whose own timestamp cannot be
+        # parsed is unknown evidence, never "no update": the comparison cannot be made, so the
+        # launch is counted under update_time_unknown and the next-launch bound is unknown too.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.update('1', 'bad-time', subject='EXIT-1: unit renamed')
+        self.launch('w2', self.at(2.0), {'subagent_type': 'Explore',
+                                         'description': 'unrelated review'},
+                    result='done', result_stamp=self.at(2.5))
+        view = self.view()
+        self.assertIsNone(self.step(view, 'EXIT-1')['execution']
+                          ['task_updated_after_latest_result'])
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertEqual(checks['update_time_unknown'], 1)
+        # The later launch is not a launch-before-update: the bound is unknown, never a verdict.
+        self.assertEqual(checks['next_launch_before_task_update'], 0)
+        self.assertNotIn('returned_units_not_updated', checks['warnings'])
+        self.assertNotIn('launch_before_unit_update', checks['warnings'])
+
+    def test_a_known_update_after_an_unknown_one_still_measures(self):
+        # The unparseable update stays unknown evidence, but a second in-turn update with a
+        # parseable time at or after the handback settles the comparison as true.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.update('1', 'bad-time', subject='EXIT-1: unit renamed')
+        self.update('1', self.at(1.05), subject='EXIT-1: unit renamed again')
+        view = self.view()
+        self.assertIs(self.step(view, 'EXIT-1')['execution']
+                      ['task_updated_after_latest_result'], True)
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertEqual(checks['update_time_unknown'], 0)
+
+    def test_a_todo_write_marks_a_positional_row_as_updated_in_turn(self):
+        # A TodoWrite rewrite is an in-turn update of its positional todo-<index> rows: a launch
+        # linked to todo-0 followed by a rewrite that marks it completed reads as updated.
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker handback', result_stamp=self.at(1.0))
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'completed',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.1))
+        view = self.view()
+        step = self.step(view, 'EXIT-1')
+        self.assertEqual(step['status'], 'completed')
+        self.assertIs(step['execution']['task_updated_after_latest_result'], True)
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 0)
+
+    def test_a_todo_write_completion_never_proves_a_transition(self):
+        # Positional identity across rewrites is not established: a TodoWrite that shows the
+        # linked todo completed after a failed launch is not a provable completion transition,
+        # while the engineer-authored status itself is unchanged evidence.
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker exploded', result_stamp=self.at(1.0), is_error=True)
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'completed',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.1))
+        view = self.view()
+        self.assertEqual(self.step(view, 'EXIT-1')['status'], 'completed')
+        checks = view['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_todo_write_before_the_handback_does_not_count_as_an_update(self):
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore',
+                                         'description': 'work task=todo-0'},
+                    result='worker handback', result_stamp=self.at(2.0))
+        self.todo_write([{'content': 'EXIT-1: unit', 'status': 'in_progress',
+                          'activeForm': 'Working on EXIT-1'}], self.at(1.0))
+        view = self.view()
+        self.assertIs(self.step(view, 'EXIT-1')['execution']
+                      ['task_updated_after_latest_result'], False)
+        self.assertEqual(view['handoff_checks']['returned_without_task_update'], 1)
+
+    def test_a_recompletion_after_the_failure_counts(self):
+        # Every in-turn transition into completed is kept: a unit completed, reopened, failed
+        # under its linked launch, then completed again — the later transition at .6 counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.6), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_recompletion_before_the_failure_never_counts(self):
+        # The same open-close-open sequence, but the last transition precedes the error: no
+        # transition at or after the failure exists.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.45), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_subject_edit_after_reopen_and_failure_never_counts(self):
+        # Completed, reopened, launch error, then only a subject edit: no transition into
+        # completed follows the failure, so nothing counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.6), subject='EXIT-1: unit renamed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_superseded_unit_keeps_its_execution_evidence(self):
+        # (j) Execution evidence describes the launch, not the unit's disposition: a superseded
+        # task still shows its linked launch while the deliverables identities are unchanged.
+        self.create('1', 'EXIT-1: old unit', self.at(0.1),
+                    metadata={'req': 'R1', 'superseded_by': '2'})
+        self.create('2', 'EXIT-2: replacement unit', self.at(0.2), metadata={'req': 'R1'})
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'unit task=1'},
+                    result='done', result_stamp=self.at(0.4))
+        view = self.view()
+        step = self.step(view, 'EXIT-1')
+        self.assertEqual(step['execution'], {'linkage': 'explicit', 'launches': 1,
+                                             'latest': 'returned',
+                                             'task_updated_after_latest_result': False})
+        deliverables = view['deliverables']
+        self.assertEqual(deliverables['closure']['superseded'], 1)
+        self.assertEqual([entry['id'] for entry in deliverables['superseded']], ['1'])
+        from test_ao_deliverables import DeliverablesFixture
+        DeliverablesFixture.assert_reconciles(self, deliverables)
+
+    def _launch_before_update(self, second_start, update_offset):
+        self.create('1', 'EXIT-1: first unit', self.at(0.1))
+        self.create('2', 'EXIT-2: second unit', self.at(0.2))
+        # The linked first-unit handback ends at base+1.
+        self.launch('w1', self.at(0.5), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(1.0))
+        if update_offset is not None:
+            self.update('1', self.at(update_offset), subject='EXIT-1: first unit')
+        self.launch('w2', self.at(second_start), {'subagent_type': 'Explore', 'description': 'work task=2'},
+                    result='done', result_stamp=self.at(second_start + 0.2))
+        return self.view()['handoff_checks']
+
+    def test_a_next_launch_before_the_units_update_counts(self):
+        # (k) Launch 2 started after unit 1's handback but before its first update at or after the
+        # handback: the next unit's work began before the returned unit's evidence was recorded.
+        checks = self._launch_before_update(1.1, 2.0)
+        self.assertEqual(checks['next_launch_before_task_update'], 1)
+        self.assertIn('launch_before_unit_update', checks['warnings'])
+
+    def test_a_parallel_launch_started_before_the_handback_never_counts(self):
+        checks = self._launch_before_update(0.9, 2.0)
+        self.assertEqual(checks['next_launch_before_task_update'], 0)
+        self.assertNotIn('launch_before_unit_update', checks['warnings'])
+
+    def test_an_update_before_the_next_launch_never_counts(self):
+        checks = self._launch_before_update(1.1, 1.05)
+        self.assertEqual(checks['next_launch_before_task_update'], 0)
+        self.assertNotIn('launch_before_unit_update', checks['warnings'])
+
+    def test_a_unit_completed_after_its_failed_launch_counts(self):
+        # (l) A unit completed at or after its latest linked launch's failure is disclosed, not judged.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(1.0), is_error=True)
+        self.update('1', self.at(2.0), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_later_returned_launch_absorbs_the_failed_one(self):
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(1.0), is_error=True)
+        self.launch('w2', self.at(1.1), {'subagent_type': 'Explore', 'description': 'retry task=1'},
+                    result='done', result_stamp=self.at(1.5))
+        self.update('1', self.at(2.0), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_unit_completed_after_its_unreturned_launch_counts(self):
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(1.0), {'subagent_type': 'Explore', 'description': 'work task=1'})
+        self.update('1', self.at(2.0), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_unit_completed_before_its_unreturned_launch_does_not_count(self):
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.5), status='completed')
+        self.launch('w1', self.at(1.0), {'subagent_type': 'Explore', 'description': 'work task=1'})
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+
+    def test_a_unit_completed_at_an_unknown_time_does_not_count(self):
+        # Task 9 first appears in a TaskList read, so its update time is unknown: never counted.
+        self.task_list(['#9 [completed] EXIT-9: listed unit'], self.at(0.5))
+        self.launch('w1', self.at(1.0), {'subagent_type': 'Explore', 'description': 'work task=9'},
+                    result='worker exploded', result_stamp=self.at(1.5), is_error=True)
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+
+    def test_repeated_defect_units_in_one_area_aggregate(self):
+        # (m) Three defect units in one area aggregate with the tiers of their linked launches.
+        for task_id, subject in (('1', 'EXIT-4: first'), ('2', 'EXIT-5: second'), ('3', 'EXIT-6: third')):
+            self.create(task_id, subject, self.at(0.1), metadata={'req': 'R1', 'kind': 'defect'})
+            self.launch('w' + task_id, self.at(0.5),
+                        {'subagent_type': 'pr-sonnet', 'description': 'unit task=' + task_id},
+                        result='done', result_stamp=self.at(0.6))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['areas_with_repeated_defects'],
+                         [{'key': 'EXIT', 'defect_units': 3, 'launch_tiers': {'pr-sonnet': 3}}])
+        self.assertIn('repeated_defects_in_area', checks['warnings'])
+
+    def test_defect_units_in_distinct_areas_do_not_aggregate(self):
+        self.create('1', 'EXIT-4: first', self.at(0.1), metadata={'req': 'R1', 'kind': 'defect'})
+        self.create('2', 'UI-2: second', self.at(0.2), metadata={'req': 'R1', 'kind': 'defect'})
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['areas_with_repeated_defects'], [])
+        self.assertIs(checks['areas_truncated'], False)
+        self.assertNotIn('repeated_defects_in_area', checks['warnings'])
+
+    def test_more_than_eight_repeated_defect_areas_truncate(self):
+        task_id = 0
+        for area in ('AA', 'BB', 'CC', 'DD', 'EE', 'FF', 'GG', 'HH', 'II'):
+            for unit in (1, 2):
+                task_id += 1
+                self.create(str(task_id), area + '-' + str(unit) + ': defect', self.at(0.1),
+                            metadata={'req': 'R1', 'kind': 'defect'})
+        checks = self.view()['handoff_checks']
+        self.assertEqual(len(checks['areas_with_repeated_defects']), 8)
+        self.assertIs(checks['areas_truncated'], True)
+        self.assertTrue(all(entry['defect_units'] == 2 for entry in checks['areas_with_repeated_defects']))
+
+    def test_an_empty_routing_log_with_launches_reports_empty(self):
+        # (n) A completed request whose captured report routed nothing although the turn launched.
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['routing_log'], {'status': 'empty', 'entries': 0, 'launches_in_turn': 1})
+        self.assertIn('routing_log_empty_with_launches', checks['warnings'])
+
+    def test_a_reported_routing_log_counts_its_entries(self):
+        report = dict(self.report(routing_log=[{'unit': 'EXIT-1', 'worker': 'delegate'},
+                                               {'unit': 'EXIT-2', 'worker': 'delegate'}]))
+        self.rewrite_receipt(json.dumps(report))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['routing_log'], {'status': 'reported', 'entries': 2,
+                                                 'launches_in_turn': 1})
+        self.assertNotIn('routing_log_empty_with_launches', checks['warnings'])
+
+    def test_a_receipt_whose_final_text_is_not_json_reports_unavailable(self):
+        # (n) A completed request whose saved final text cannot be parsed: unavailable, never a raise.
+        self.rewrite_receipt('plain prose, not a JSON report')
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.3))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['routing_log'], {'status': 'unavailable', 'entries': None,
+                                                 'launches_in_turn': 1})
+
+    def test_handoff_checks_report_the_zero_shape_when_unavailable(self):
+        # (o) Source unavailable and anchor-not-found both yield the exact zero shape, never a raise.
+        state = self.state()
+        del state['native_outcome_source']
+        ao.atomic(self.directory() / 'state.json', state)
+        view = self.view()
+        self.assertFalse(view['source']['available'])
+        self.assertEqual(view['handoff_checks'], ZERO_HANDOFF)
+
+        state = self.state()
+        state['requests']['impl-1']['text_sha256'] = '0' * 64
+        ao.atomic(self.directory() / 'state.json', state)
+        view = self.view()
+        self.assertFalse(view['turn']['anchor_found'])
+        self.assertEqual(view['handoff_checks'], ZERO_HANDOFF)
+
+    def test_a_view_with_linked_evidence_writes_no_state(self):
+        # (p) Linked launches, errors and a captured report change nothing: the state file and the
+        # transcript bytes are exactly what they were before the read.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.3), is_error=True)
+        self.launch('w2', self.at(0.4), {'subagent_type': 'Explore', 'description': 'work task=1'},
+                    result='done', result_stamp=self.at(0.5))
+        self.write()
+        state_before = (self.directory() / 'state.json').read_bytes()
+        transcript_before = self.transcript.read_bytes()
+        view = ao_progress.inspect(self.directory(), self.state())
+        self.assertEqual(view['handoff_checks']['launches']['linked'], 2)
+        self.assertTrue(view['handoff_checks']['available'])
+        self.assertEqual((self.directory() / 'state.json').read_bytes(), state_before)
+        self.assertEqual(self.transcript.read_bytes(), transcript_before)
+
+    def test_launches_without_references_warn_and_never_link(self):
+        # (q) Older records: launches with no task= tokens stay unlinked on every step, and the
+        # warning names exactly that. A reported routing_log leaves it the only warning.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.15), status='completed')
+        report = dict(self.report(routing_log=[{'unit': 'EXIT-1', 'worker': 'delegate'}]))
+        self.rewrite_receipt(json.dumps(report))
+        for index in range(3):
+            self.launch('w' + str(index), self.at(0.2 + index / 10),
+                        {'subagent_type': 'Explore', 'description': 'EXIT-1: launched work ' + str(index)},
+                        result='done', result_stamp=self.at(0.25 + index / 10))
+        view = self.view()
+        self.assertTrue(all(launch['task_ref'] == {'task_id': None, 'linkage': 'none'}
+                            for launch in view['launches']))
+        self.assertTrue(all(step['execution']['linkage'] == 'none' for step in view['plan']['steps']))
+        self.assertEqual(view['handoff_checks']['launches']['unlinked'], 3)
+        self.assertEqual(view['handoff_checks']['warnings'], ['launches_without_task_reference'])
+
+    def test_task_ids_and_descriptions_redact_paths(self):
+        # (s) Raw ids link; the emitted task_id, description and labels are redacted and bounded.
+        leak = '/leakprobe/secret/file.py'
+        use = 'tu-cleak'
+        self.native_events += [
+            self._assistant('create-leak', self.at(0.1),
+                            [self._use(use, 'TaskCreate', {'subject': 'Fix ' + leak})]),
+            self._result('create-leak-r', self.at(0.1), use,
+                         'Task #' + leak + ' created successfully')]
+        self.launch('w1', self.at(0.2),
+                    {'subagent_type': 'Explore', 'description': 'Open ' + leak + ' task=' + leak},
+                    result='done', result_stamp=self.at(0.3))
+        view = self.view()
+        self.assertEqual(view['launches'][0]['task_ref'], {'task_id': '<path>', 'linkage': 'explicit'})
+        self.assertEqual(view['launches'][0]['description'], 'Open <path> task=<path>')
+        serialized = json.dumps(view)
+        self.assertNotIn('/leakprobe', serialized)
+        self.assertIn('<path>', serialized)
+        self.assertEqual(view['handoff_checks']['launches']['linked'], 1)
+
+
+class LiveExecutionTests(LiveExecutionFixture):
+    """Live-request launch states: running while submitted, and the launched acknowledgement."""
+
+    def test_a_running_linked_launch_keeps_its_unit_unstale(self):
+        # (b) The request is live and the linked worker has no result yet: running, the unit is
+        # protected from staleness by the explicit link alone (the launch has no shared code),
+        # and nothing counts as unreturned.
+        old = self.at(-3700)
+        self.create('1', 'QUIET-1: quiet unit', old)
+        self.update('1', old, status='in_progress')
+        self.launch('w1', self.at(0.3), {'subagent_type': 'Explore', 'description': 'worker for task=1'})
+        view = self.view()
+        self.assertEqual(view['launches'][0]['status'], 'running')
+        self.assertEqual(view['launches'][0]['task_ref'], {'task_id': '1', 'linkage': 'explicit'})
+        step = self.step(view, 'QUIET-1')
+        self.assertIs(step['stale_in_progress'], False)
+        self.assertEqual(step['execution'], {'linkage': 'explicit', 'launches': 1,
+                                             'latest': 'running',
+                                             'task_updated_after_latest_result': None})
+        checks = view['handoff_checks']
+        self.assertEqual(checks['unreturned_at_turn_end'], 0)
+        self.assertNotIn('unreturned_launches', checks['warnings'])
+
+    def test_a_background_acknowledgement_is_launched_not_returned(self):
+        # (f) Both acknowledgement forms are a launch, not a handback: the input flag and the
+        # result row's own top-level async_launched status. Neither counts as returned.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.15), status='in_progress')
+        self.launch('w1', self.at(0.2),
+                    {'subagent_type': 'Explore', 'description': 'work task=1',
+                     'run_in_background': True},
+                    result='worker launched', result_stamp=self.at(0.25))
+        self.launch('w2', self.at(0.3),
+                    {'subagent_type': 'Explore', 'description': 'again task=1'},
+                    result='async handle', result_stamp=self.at(0.35),
+                    top={'toolUseResult': {'status': 'async_launched'}})
+        view = self.view()
+        self.assertEqual([launch['status'] for launch in view['launches']], ['launched', 'launched'])
+        step = self.step(view, 'EXIT-1')
+        self.assertEqual(step['execution'], {'linkage': 'explicit', 'launches': 2,
+                                             'latest': 'launched',
+                                             'task_updated_after_latest_result': None})
+        self.assertIs(step['stale_in_progress'], False)
+        checks = view['handoff_checks']
+        self.assertEqual(checks['returned_without_task_update'], 0)
+        self.assertNotIn('returned_units_not_updated', checks['warnings'])
+
+    def test_a_live_request_reports_routing_log_unavailable(self):
+        # (n) Only a completed request restates a routing_log; a live one reports unavailable.
+        self.launch('w1', self.at(0.2), {'subagent_type': 'Explore', 'description': 'work'},
+                    result='done', result_stamp=self.at(0.3))
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['routing_log'], {'status': 'unavailable', 'entries': None,
+                                                 'launches_in_turn': 1})
+
+
+class VocabularyPinTests(unittest.TestCase):
+    """The launch/terminal vocabularies are pinned to the controller's own constants."""
+
+    def test_terminal_request_states_match_the_room_vocabulary(self):
+        # (r) ao_progress keeps its own copy because ao_project_room is imported lazily; the two
+        # must stay equal forever, or unreturned and terminal would drift apart.
+        self.assertEqual(ao_progress._TERMINAL_REQUEST_STATES, set(ao.TERMINAL))
 
 
 if __name__ == '__main__':

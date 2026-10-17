@@ -194,6 +194,8 @@ class NormalSendProjectionTests(NormalProjectionFixture):
         texts[ao_residual_escalation.PART] = ao_residual_escalation.INSTRUCTION
         import lifecycle_closure
         texts[lifecycle_closure.PART] = lifecycle_closure.INSTRUCTION
+        import ao_execution_evidence
+        texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
         sections = [texts[name] for name in ao_workflow.PARTS if name in carried["parts"]]
         spec = ao.read(directory / state["spec"])
         if carried["spec_delivery"] == "full":
