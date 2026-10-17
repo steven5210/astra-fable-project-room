@@ -23,8 +23,9 @@ issue → approval → specification workflow.
 
 ## Standing authorization boundary
 
-The user granted this boundary once; the grant is recorded in the issue that
-approved it (#194). Without per-incident approval the maintainer may:
+When the user explicitly adopts this maintenance policy, record that approval
+and its scope. Within that recorded authorization, the maintainer may perform
+the following actions without asking again for each incident:
 
 - open the GitHub issue, or use the existing one;
 - create an isolated worktree at an exact base commit
