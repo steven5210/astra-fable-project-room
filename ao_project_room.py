@@ -1424,7 +1424,8 @@ class Service:
             attempt = "verify-" + uuid.uuid4().hex
             results = []
             state["checkpoint"] = None
-            state["verifications"].append({"id": attempt, "state": "running", "candidate_sha256": before["sha256"]})
+            state["verifications"].append({"id": attempt, "state": "running", "candidate_sha256": before["sha256"],
+                                           "started_at": time.time()})
             self.save(directory, state)
             for index, argv in enumerate(spec["gates"]):
                 relative = f"verification/{attempt}/{index}.log"
@@ -1462,7 +1463,8 @@ class Service:
                           "passed": len(results) == len(spec["gates"]) and all(r["return_code"] == 0 for r in results) and before == after}
             relative = f"verification/{attempt}/checkpoint.json"
             atomic(directory / relative, checkpoint)
-            state["verifications"][-1].update(state="passed" if checkpoint["passed"] else "failed", path=relative)
+            state["verifications"][-1].update(state="passed" if checkpoint["passed"] else "failed", path=relative,
+                                              finished_at=time.time())
             if checkpoint["passed"]:
                 state.update(checkpoint=relative, checkpoint_sha256=digest(checkpoint))
             self.save(directory, state)
@@ -1690,6 +1692,14 @@ class Service:
         return ao_progress.inspect(directory, read(directory / "state.json"), request_id=request_id,
                                    max_text_chars=max_text_chars)
 
+    def ao_room_timing(self, room_id):
+        # Read-only like status and progress: one bounded fold of saved records, never a write.
+        directory = self.root / "rooms" / identifier(room_id)
+        if not (directory / "state.json").is_file():
+            raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
+        import ao_timing
+        return ao_timing.inspect(directory, read(directory / "state.json"))
+
     def ao_room_list(self, project_path=None):
         selected = str(globals()["project_path"](project_path)) if project_path is not None else None
         items = []
@@ -1757,6 +1767,7 @@ TOOL_SCHEMAS = {
     "ao_room_sync": ("Reconcile owned AO turns and archive attributable per-turn usage. GET requests only; does not invoke models. Saves local receipts; reports unknown when delivery/usage cannot be proven. Within one reconciliation each bound session's identity and history are observed once per reader policy and reused for every request's checks. Optional wait_seconds (up to the listed maximum: 45 by default, or sync_wait_max_seconds from the private AO config) repeats this bounded reconciliation every 5 seconds without holding the room lock between polls, returning early when no owned turn is submitted/running, any request state changes, or another MCP message arrives. The wait is best-effort: it stops with reason budget instead of starting a reconciliation the last iteration's duration shows would overrun the requested wait, while the first iteration, lock acquisition or a slower later iteration can still exceed it; wait reports iterations, elapsed_seconds, iteration_seconds and lock_wait_seconds. Wait with the listed maximum instead of polling from shell commands or scripts.", schema({**R, "wait_seconds": {"type": "number", "minimum": 0, "maximum": 45}}, ["room_id"])),
     "ao_room_status": ("Read saved AO room status and primary usage subtotal without AO/network/model calls. Historical acceptance does not attest current filesystem bytes; use accept to revalidate. The optional view enum selects the full status (default) or a compact projection with the latest request per role, request counts and delegate job/routing summaries.", schema({**R, "view": {"type": "string", "enum": ["full", "compact"]}}, ["room_id"])),
     "ao_room_progress": ("Read one request's saved progress view (the latest by default): its engineer task list folded from native task-tool rows, Agent launches, served-model and stop-reason histograms, error and refusal counts, and the bounded last assistant text, plus the request's recorded state. Launches carry evidenced states (running, unreturned, unknown, launched, completed, error) with error kinds and explicit task= references, each plan step carries its execution fold, and additive read-only handoff_checks report mechanical hygiene counters and warnings from the turn's own evidence — never a verdict. Additive provenance says who authored the plan and last text and whether the selected request can refresh them; additive stages report the saved engineering, verification and acceptance records checked against their recorded digests, comparing saved identities only, never the live worktree. Bounded local reads only; no AO/network/model calls, no state change; an unavailable native source reports its reason instead of failing.", schema({**R, "request_id": S, "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 2000}}, ["room_id"])),
+    "ao_room_timing": ("Read-only delivery timing view of one AO room: wall-clock intervals per saved request and verification attempt, gaps classified only from saved semantic holds (quota_wait, hold_wait, unattributed, unknown_bounds), overlap reported separately and never added, closure facts from saved verification and acceptance records. Bounded local reads only; no AO/network/model calls, no transcript or rate-limit reads, no state change; malformed saved data degrades to limitation codes.", schema({**R}, ["room_id"])),
     "ao_room_verify": ("Run the spec's authorized argv gates locally and bind logs to the exact Git candidate. Does not invoke a model. Failed/mutating verification cannot be accepted.", schema({**R, "candidate_path": S, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200}}, ["room_id", "candidate_path"])),
     "ao_room_spec_verdict_recovery_audit": ("Audit the latest completed prose-only Fable specification verdict after exactly three ordinary reviews. Binds exact source receipt/text, current spec/candidate, native owner, complete settled histories and delegate ledger. Preserves earlier authenticated quota settlements, refuses held/uncertain work. No grant or model call.", schema({**R, "source_request_id": S, "recovery_request_id": S, "native_owner_database": S, "native_session_id": S})),
     "ao_room_spec_verdict_recovery_grant": ("Record actual human authorization and provenance for this room's sole format-recovery request against the fresh exact audit. No extra substantive review or acceptance allowance. Returns fixed ao_room_send inputs. An immutable intent consumes the grant before POST; unknown delivery is never replayed. Authorization text is an operator assertion, not authentication.", schema({**R, "audit_sha256": S, "authorization": S, "authorization_reference": S})),

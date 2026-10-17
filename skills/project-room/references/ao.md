@@ -232,6 +232,18 @@ handoff evidence level exists, from a received result to independent acceptance.
 never re-sent or backfilled. The view never changes room state, never releases a hold
 and never replaces the receipts, the outcome audit or the report.
 
+`ao_room_timing` is the read-only delivery timing view of one room: it folds the saved
+request, verification, acceptance and terminal-receipt records into wall-clock
+intervals and the gaps between them, so elapsed delivery time can be attributed without
+opening a transcript. Each gap is classified only from saved evidence — `quota_wait`
+after a held quota-limit engineer turn, `hold_wait` after any other held terminal
+engineer turn, `unattributed` otherwise and `unknown_bounds` when the preceding end is
+unknown — and parallel intervals' overlap is reported separately, never added. Its
+`closure` section restates saved verification and acceptance facts; task counts are not
+closure, gap kinds name evidence not causes, and nothing in it is quota headroom, a
+stall verdict or a speed-up claim (see
+[delivery timing view](../../../docs/reference/diagnostics.md#delivery-timing-view)).
+
 If the current task still has an older tool inventory, use the installed plugin's
 CLI: `python3 project_room.py call ao_room_status --args-file /absolute/args.json`.
 The CLI exposes all `ao_room_*` operations using the same schemas as MCP. A new
