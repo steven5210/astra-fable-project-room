@@ -164,8 +164,27 @@ class IterTranscriptRecordsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.args[0], ano.TRANSCRIPT_MALFORMED_REFUSAL)
 
     def test_pathological_nesting_raises_recursion_error_as_malformed(self):
-        depth = 3000
-        blob = b'[' * depth + b']' * depth + b'\n'
+        # CPython's C-accelerated json scanner recurses once per array-nesting level without
+        # going through the ordinary per-call Python frame machinery, so the nesting depth
+        # needed to trip its own recursion guard is not governed by sys.setrecursionlimit()
+        # and has moved sharply across CPython versions: measured directly, a fixed depth of
+        # 3000 reliably overflowed it on CPython 3.11 (threshold ~996, scales with
+        # sys.setrecursionlimit()) but parsed clean through on CPython 3.12 (threshold ~9998,
+        # unaffected by sys.setrecursionlimit()) -- the CI failure this guards against. A
+        # single hardcoded depth is therefore not a reliable probe across interpreters. Grow
+        # the nesting in-process until this interpreter's own json.loads actually refuses it,
+        # then prove iter_transcript_records converts that refusal into the caller's
+        # RoomError, the same way it does for any other malformed row.
+        depth = 1000
+        while True:
+            blob = b'[' * depth + b']' * depth
+            try:
+                json.loads(blob)
+            except RecursionError:
+                break
+            depth *= 2
+            self.assertLess(depth, 1 << 22, 'json.loads never refused any nesting depth tried')
+        blob += b'\n'
         with self.assertRaises(RoomError) as ctx:
             self._records([blob], max_record_bytes=len(blob), malformed_message='too deep')
         self.assertEqual(ctx.exception.args[0], 'too deep')
