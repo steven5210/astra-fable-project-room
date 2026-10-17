@@ -108,6 +108,45 @@ class TimingViewTests(Fixture):
         self.assertEqual(view['totals']['gaps']['quota_wait'], 10.0)
         self.assertEqual(view['totals']['gaps']['unknown_bounds'], 2)
 
+    def test_an_open_predecessor_survives_later_unknown_intervals(self):
+        # An open interval stays unresolved across a later terminal interval whose own end is
+        # unknown: the unknown end bounds only its one gap and never clears the open
+        # predecessor, so every gap after the open interval stays unmeasured.
+        t = self.base
+        self.add_request('live', req_state='running', created=t, order=1)
+        self.add_request('mid', req_state='failed', created=t + 20, receipt='missing/never.json',
+                         order=2)
+        self.add_request('c', created=t + 30, completed=t + 40, order=3)
+        self.add_request('d', created=t + 50, completed=t + 60, order=4)
+        view = self.view()
+        self.assertEqual([(g['after'], g['before'], g['kind'], g['after_end_basis'])
+                          for g in view['gaps']],
+                         [('live', 'mid', 'unknown_bounds', 'open'),
+                          ('mid', 'c', 'unknown_bounds', 'unknown'),
+                          ('live', 'd', 'unknown_bounds', 'open')])
+        self.assertEqual(view['totals']['gaps']['unknown_bounds'], 3)
+        self.assertEqual(view['totals']['gaps']['unattributed'], 0.0)
+        self.assertEqual(view['totals']['gaps']['quota_wait'], 0.0)
+
+    def test_an_open_predecessor_survives_later_anomaly_intervals(self):
+        # The same with an inverted end: the anomaly bounds its one gap, then the still-open
+        # predecessor names the next — nothing is measured.
+        t = self.base
+        self.add_request('live', req_state='running', created=t, order=1)
+        self.add_request('mid', req_state='failed', created=t + 20, started=t + 20,
+                         completed=t + 10, order=2)
+        self.add_request('c', created=t + 30, completed=t + 40, order=3)
+        self.add_request('d', created=t + 50, completed=t + 60, order=4)
+        view = self.view()
+        self.assertIn('clock_anomaly', view['limitations'])
+        self.assertEqual([(g['after'], g['before'], g['kind'], g['after_end_basis'])
+                          for g in view['gaps']],
+                         [('live', 'mid', 'unknown_bounds', 'open'),
+                          ('mid', 'c', 'unknown_bounds', 'anomaly'),
+                          ('live', 'd', 'unknown_bounds', 'open')])
+        self.assertEqual(view['totals']['gaps']['unknown_bounds'], 3)
+        self.assertEqual(view['totals']['gaps']['unattributed'], 0.0)
+
     def test_a_terminal_unknown_end_bounds_only_the_next_gap(self):
         t = self.base
         # Completed with neither a provider completedAt nor a readable receipt.

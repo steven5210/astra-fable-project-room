@@ -228,8 +228,10 @@ predecessor's unresolved basis `unknown`, `anomaly` or `open` — when the prece
 interval's end is unknown, inverted or still open. A terminal predecessor's unknown or
 inverted end is bounded by the next later activity (a new send requires a settled
 room), so only that one gap is unmeasured and measurement resumes from the next known
-end; an open predecessor stays unresolved and every later gap stays unmeasured. An open
-interval never becomes a frontier. Measured gaps carry `after_end_basis: null` so every
+end; the first open interval stays unresolved and every later gap stays unmeasured,
+even across later terminal intervals whose own ends are unknown or inverted — later
+activity never proves an open interval ended. An open interval never becomes a
+frontier. Measured gaps carry `after_end_basis: null` so every
 gap row has the same shape. `totals.gaps` sums the seconds per gap kind.
 
 `totals.by_category` sums interval seconds per category, `totals.by_purpose` sums them

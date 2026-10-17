@@ -241,24 +241,36 @@ def _gaps(timeline):
     """Chronological gaps between the sorted intervals, classified only from saved evidence.
 
     The frontier is the furthest known valid end (end >= start) and its interval; an interval
-    whose end is open, unknown or inverted is a pending unresolved predecessor, never a
-    frontier. A terminal predecessor's unknown or inverted end is bounded by the next later
-    activity (a new send requires a settled room), so only that one gap is unmeasurable; an
-    open predecessor stays unresolved and every later gap stays unmeasured.
+    whose end is open, unknown or inverted is an unresolved predecessor, never a frontier.
+    Two markers: a transient one for the last terminal interval whose end is unknown or
+    inverted — bounded by the next later activity (a new send requires a settled room), so
+    only that one gap is unmeasured — and a sticky one for the first open interval, which
+    stays unresolved across every later interval because activity never proves it ended.
     """
     gaps = []
     frontier, frontier_source = None, None
-    pending = None
+    transient = None
+    open_source = None
     for interval in timeline:
         start, end = interval["_start"], interval["_end"]
-        if pending is not None:
-            gaps.append({"kind": "unknown_bounds", "after": pending["source"]["_id"],
+        if transient is not None:
+            # A terminal predecessor's unknown or inverted end is bounded by this later
+            # activity (a new send requires a settled room), so only this one gap is
+            # unmeasured; the sticky open predecessor still names its own gaps afterwards.
+            gaps.append({"kind": "unknown_bounds", "after": transient["source"]["_id"],
                          "before": interval["_id"], "started_at": None,
                          "ended_at": _iso(start), "seconds": None,
-                         "semantic_kind": pending["source"].get("semantic_kind"),
-                         "after_end_basis": pending["basis"]})
-            if pending["basis"] != "open":
-                pending = None
+                         "semantic_kind": transient["source"].get("semantic_kind"),
+                         "after_end_basis": transient["basis"]})
+            transient = None
+        elif open_source is not None:
+            # The first open interval stays unresolved: later activity never proves it
+            # ended, so every later gap stays unmeasured, named after it.
+            gaps.append({"kind": "unknown_bounds", "after": open_source["_id"],
+                         "before": interval["_id"], "started_at": None,
+                         "ended_at": _iso(start), "seconds": None,
+                         "semantic_kind": open_source.get("semantic_kind"),
+                         "after_end_basis": "open"})
         elif frontier is not None and start > frontier:
             kind = "unattributed"
             if (frontier_source["kind"] == "request" and frontier_source["_raw_role"] == "engineer"
@@ -272,11 +284,12 @@ def _gaps(timeline):
                          "semantic_kind": frontier_source.get("semantic_kind"),
                          "after_end_basis": None})
         if interval["end_basis"] == "open":
-            pending = {"source": interval, "basis": "open"}
+            if open_source is None:
+                open_source = interval
         elif end is None:
-            pending = {"source": interval, "basis": "unknown"}
+            transient = {"source": interval, "basis": "unknown"}
         elif end < start:
-            pending = {"source": interval, "basis": "anomaly"}
+            transient = {"source": interval, "basis": "anomaly"}
         elif frontier is None or end > frontier:
             frontier, frontier_source = end, interval
     return gaps
