@@ -598,6 +598,15 @@ class LegacyHeadFixture(LegacyLineageFixture):
                 return super().send(purpose, key)
         return super().send(purpose, key)
 
+    def exhaust_debate(self):
+        # The same deliberately bypassed send-time lane as in send(): the deliberately
+        # legacy-shaped head is this fixture's point, and ao_quality_review's own narrower
+        # current-head check (a different lane covered elsewhere) would refuse the debate sends.
+        minimal = {'source': None, 'pending': [], 'equivalence': None,
+                   'equivalent_amendment_sha256': []}
+        with patch('ao_quality_review.inspect', return_value=minimal):
+            super().exhaust_debate()
+
 
 class LegacyHeadTests(LegacyHeadFixture):
     def test_legacy_shaped_current_proof_refuses(self):

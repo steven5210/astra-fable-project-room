@@ -42,33 +42,24 @@ class RecoveredContextWithProofWithoutSettledFailureTests(PreAcceptanceFixture):
     opt-in (``settled_history=True``) is what admits a proven recovered import at all, and C2
     gates that opt-in on the engineer session owning at least one settled_failure request."""
 
-    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + ('recovered_turn',)
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + ('splice', 'recovered_turn')
 
     def build_template(self):
         super().build_template()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation')
-        self.recovered_turn = {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1',
-                               'state': 'recovered'}
         self.fake.finish('engineer', json.dumps(self.scope_change_report()))
-        # Appended only after finish() so FakeAO.finish's own turns[-1] lookup (test_ao_project_room.py:65)
-        # completes 'implementation's own turn, not this one; this is exactly the unexplained extra
-        # turn known_compaction_turns' proof must name to be admitted (if the opt-in were active).
-        self.fake.snapshots['engineer']['turns'].append(self.recovered_turn)
-        # ao_worker_identity._collect (ao_worker_identity.py:443) independently re-scans this same
-        # transcript for 'implementation's W3 worker-identity evidence and refuses with 'source_changed'
-        # unless this matches the transcript's real bytes digest exactly as ao_native_outcome.inspect
-        # itself computes it (ao_native_outcome.py:723); an arbitrary placeholder is not accepted.
-        native = {'anchor_uuid': 'owned-native-packet-implementation', 'next_human_uuid': None,
-                  'errors': [], 'stop_reasons': ['end_turn'], 'source_sha256': ao.digest(self.transcript.read_bytes()),
-                  'source': self.state()['native_outcome_source'],
-                  'compaction_imports': [{'turn_id': 'recovered-turn-1',
-                                          'turn_sha256': ao.digest(self.recovered_turn),
-                                          'messages_sha256': ao.digest([])}]}
-        with patch.object(native_outcome, 'inspect', return_value=native):
-            self.service.ao_room_sync(self.room)
+        self.service.ao_room_sync(self.room)
         self.assertEqual(self.state()['requests']['implementation']['state'], 'completed')
+        # Every later send must complete before the recovered turn enters live history: with no
+        # settled failure in this room the context-import opt-in is inactive, so the send gates
+        # refuse it exactly like an unexplained extra turn.
         self.exhaust_debate()
+        # The identical proof mechanism RecoveredContextWithProofTests splices onto the latest
+        # engineer request's own record -- present but ignored by the strict evaluation.
+        self.splice = _splice_compaction_import_proof(
+            self, ao_outcomes.latest_for_role(self.state(), 'engineer')['request_id'])
+        self.recovered_turn = self.splice['recovered_turn']
         self.register()
 
     def test_recovered_turn_with_compaction_import_proof_without_settled_failures_refuses_the_audit(self):
@@ -76,19 +67,25 @@ class RecoveredContextWithProofWithoutSettledFailureTests(PreAcceptanceFixture):
             self.audit()
 
 
-def _splice_compaction_import_proof(fixture):
+def _splice_compaction_import_proof(fixture, request_id=None):
     """Append a 'recovered' engineer turn and splice a verified compaction-import proof for it onto
     the latest engineer request's own semantic-outcome record, content-addressed under its own new
     digest, re-pointing ``semantic_outcome``/``semantic_outcome_sha256`` to it. Shared by
     ``RecoveredContextWithProofTests`` and ``RecoveredContextLifecycleTests`` below.
 
-    Returns a dict with ``recovered_turn`` (the exact object living in
-    ``fixture.fake.snapshots['engineer']['turns']``, so mutating it in place drifts the live
-    history), ``original``/``original_path``/``original_sha256`` (the pre-splice record and its own
-    still-valid content-addressed pointer) and ``modified``/``new_path``/``new_sha256`` (the spliced
-    record this function wrote and pointed the request to).
+    ``known_compaction_turns`` only ever reads ``latest_for_role(state, 'engineer')``'s own
+    semantic-outcome record (ao_outcomes.py:1152+1161), so ``request_id`` must name that latest
+    engineer request -- after ``exhaust_debate()`` that is the last debate review, not
+    ``fixture.final_request_id``. Callers pass it explicitly.
+
+    Returns a dict with ``request_id`` (the spliced request), ``recovered_turn`` (the exact object
+    living in ``fixture.fake.snapshots['engineer']['turns']``, so mutating it in place drifts the
+    live history), ``original``/``original_path``/``original_sha256`` (the pre-splice record and its
+    own still-valid content-addressed pointer) and ``modified``/``new_path``/``new_sha256`` (the
+    spliced record this function wrote and pointed the request to).
     """
-    request = fixture.state()['requests'][fixture.final_request_id]
+    request_id = request_id or fixture.final_request_id
+    request = fixture.state()['requests'][request_id]
     original_path, original_sha256 = request['semantic_outcome'], request['semantic_outcome_sha256']
     original = ao.read(fixture.directory() / original_path)
     recovered_turn = {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1',
@@ -100,13 +97,14 @@ def _splice_compaction_import_proof(fixture):
          'messages_sha256': ao.digest([])}]}
     new_sha256 = ao.digest(modified)
     fixture.assertNotEqual(new_sha256, original_sha256)
-    new_path = 'outcomes/' + fixture.final_request_id + '/' + new_sha256 + '.json'
+    new_path = 'outcomes/' + request_id + '/' + new_sha256 + '.json'
     ao.atomic(fixture.directory() / new_path, modified)
     tampered = copy.deepcopy(fixture.state())
-    tampered['requests'][fixture.final_request_id]['semantic_outcome'] = new_path
-    tampered['requests'][fixture.final_request_id]['semantic_outcome_sha256'] = new_sha256
+    tampered['requests'][request_id]['semantic_outcome'] = new_path
+    tampered['requests'][request_id]['semantic_outcome_sha256'] = new_sha256
     ao.atomic(fixture.directory() / 'state.json', tampered)
-    return {'recovered_turn': recovered_turn, 'original': original, 'original_path': original_path,
+    return {'request_id': request_id, 'recovered_turn': recovered_turn,
+            'original': original, 'original_path': original_path,
             'original_sha256': original_sha256, 'modified': modified, 'new_path': new_path,
             'new_sha256': new_sha256}
 
@@ -132,18 +130,23 @@ class RecoveredContextWithProofTests(SettledHistoryFixture):
     module -- reaches the identical admission path a real compaction-import turn would.
     """
 
-    TEMPLATE_ATTRS = SettledHistoryFixture.TEMPLATE_ATTRS + ('recovered_turn',)
+    TEMPLATE_ATTRS = SettledHistoryFixture.TEMPLATE_ATTRS + ('splice', 'recovered_turn')
 
     def build_template(self):
         super().build_template()
-        self.recovered_turn = _splice_compaction_import_proof(self)['recovered_turn']
+        # The proof must sit on the record ``known_compaction_turns`` reads: after
+        # ``exhaust_debate()`` that is the last debate review, not ``self.final_request_id``.
+        self.splice = _splice_compaction_import_proof(
+            self, ao_outcomes.latest_for_role(self.state(), 'engineer')['request_id'])
+        self.recovered_turn = self.splice['recovered_turn']
 
     def after_restore(self):
-        # Re-bind ``self.recovered_turn`` to the live snapshot row; a deepcopy restores it detached.
+        # Re-bind both names to the live snapshot row: a deepcopy restores them detached.
         super().after_restore()
-        self.recovered_turn = next(
-            turn for turn in self.fake.snapshots['engineer']['turns']
-            if turn['id'] == 'recovered-turn-1')
+        live = next(turn for turn in self.fake.snapshots['engineer']['turns']
+                    if turn['id'] == 'recovered-turn-1')
+        self.splice['recovered_turn'] = live
+        self.recovered_turn = live
 
     def test_recovered_turn_with_compaction_import_proof_is_admitted_and_excluded_from_unowned(self):
         audit = self.audit()
@@ -181,7 +184,8 @@ class RecoveredContextLifecycleTests(SettledHistoryFixture):
 
     def build_template(self):
         super().build_template()
-        self.splice = _splice_compaction_import_proof(self)
+        self.splice = _splice_compaction_import_proof(
+            self, ao_outcomes.latest_for_role(self.state(), 'engineer')['request_id'])
         self.recovered_turn = self.splice['recovered_turn']
 
     def after_restore(self):
@@ -218,7 +222,7 @@ class RecoveredContextLifecycleTests(SettledHistoryFixture):
         self.assertIn('fourth', self.state()['requests'])
         self.finish_fourth()
         self.assertEqual(self.state()['requests']['fourth']['state'], 'completed')
-        with self.assertRaisesRegex(ao.RoomError, 'exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'ceiling'):
             self.send('spec_review', 'fifth')
         self.assertEqual(len(self.fake.posts), posts_before_send + 1)
 
@@ -231,11 +235,11 @@ class RecoveredContextLifecycleTests(SettledHistoryFixture):
         drifted['native']['compaction_imports'][0]['messages_sha256'] = ao.digest(['a-drifted-message'])
         new_sha256 = ao.digest(drifted)
         self.assertNotEqual(new_sha256, self.splice['new_sha256'])
-        new_path = 'outcomes/' + self.final_request_id + '/' + new_sha256 + '.json'
+        new_path = 'outcomes/' + self.splice['request_id'] + '/' + new_sha256 + '.json'
         ao.atomic(self.directory() / new_path, drifted)
         tampered = copy.deepcopy(self.state())
-        tampered['requests'][self.final_request_id]['semantic_outcome'] = new_path
-        tampered['requests'][self.final_request_id]['semantic_outcome_sha256'] = new_sha256
+        tampered['requests'][self.splice['request_id']]['semantic_outcome'] = new_path
+        tampered['requests'][self.splice['request_id']]['semantic_outcome_sha256'] = new_sha256
         ao.atomic(self.directory() / 'state.json', tampered)
         before_files = self.room_files()
         with patch.object(native_outcome, 'inspect', return_value=drifted['native']):
@@ -261,15 +265,15 @@ class RecoveredContextLifecycleTests(SettledHistoryFixture):
         dispatches exactly once."""
         self.grant()
         tampered = copy.deepcopy(self.state())
-        tampered['requests'][self.final_request_id]['semantic_outcome'] = self.splice['original_path']
-        tampered['requests'][self.final_request_id]['semantic_outcome_sha256'] = self.splice['original_sha256']
+        tampered['requests'][self.splice['request_id']]['semantic_outcome'] = self.splice['original_path']
+        tampered['requests'][self.splice['request_id']]['semantic_outcome_sha256'] = self.splice['original_sha256']
         ao.atomic(self.directory() / 'state.json', tampered)
         posts = len(self.fake.posts)
         with patch.object(native_outcome, 'inspect', return_value=self.splice['modified']['native']):
             self.send('spec_review', 'fourth')
         self.assertEqual(len(self.fake.posts), posts + 1)
         self.assertEqual(len(extension._consumptions(self.directory())), 1)
-        request = self.state()['requests'][self.final_request_id]
+        request = self.state()['requests'][self.splice['request_id']]
         self.assertEqual(request['semantic_outcome'], self.splice['new_path'])
         self.assertEqual(request['semantic_outcome_sha256'], self.splice['new_sha256'])
 

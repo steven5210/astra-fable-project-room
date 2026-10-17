@@ -233,7 +233,7 @@ class SettledHistoryPositiveTests(SettledHistoryFixture):
         self.finish_fourth()
         self.assertEqual(self.state()['requests']['fourth']['state'], 'completed')
         # The single fourth-review slot is now consumed; a fifth attempt is refused, not dispatched.
-        with self.assertRaisesRegex(ao.RoomError, 'exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'ceiling'):
             self.send('spec_review', 'fifth')
         self.assertEqual(len(self.fake.posts), posts_before_send + 1)
 
@@ -926,7 +926,7 @@ class SettledHistoryDurabilityAndConcurrencyTests(SettledHistoryFixture):
         self.assertEqual(len(self.fake.posts), posts + 1)
         self.finish_fourth()
         self.assertEqual(self.state()['requests']['fourth']['state'], 'completed')
-        with self.assertRaisesRegex(ao.RoomError, 'exhausted'):
+        with self.assertRaisesRegex(ao.RoomError, 'ceiling'):
             self.send('spec_review', 'fifth')
         self.assertEqual(len(self.fake.posts), posts + 1)
 
