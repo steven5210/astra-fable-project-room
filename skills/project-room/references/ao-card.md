@@ -133,9 +133,12 @@ the spec, policy, gates or summaries. Sync to terminal. The final report needs
 `outcome`, `implementation_complete`, `changes`, `tests_reported`,
 `review_findings`, `remaining_gaps`, `backlog`, `routing_log` and the exact
 spec, baseline and SHA fields. Read full receipts, not previews. In status,
-inspect `review_followups`, `enhancement_proposals` and `operator_requests`.
-Pending operator requests block acceptance: do only the authorized execution,
-return the evidence, then get Fable's next judgment.
+inspect `review_followups`, `enhancement_proposals` and `operator_requests`;
+`findings` projects the engineer's provenance tokens read-only — read
+`required_open` and `preexisting_required_open` as required work (a preexisting
+defect that blocks the approved behavior is required, not cleanup), and the
+projection grants nothing. Pending operator requests block acceptance: do only
+the authorized execution, return the evidence, then get Fable's next judgment.
 **Stop:** `scope_change` → a revised, agreed spec first: register the exact next
 charter revision and reach Fable's renewed exact-spec agreement on it before any
 new handoff or implementation. With the room's three charter reviews already

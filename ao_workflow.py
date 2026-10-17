@@ -23,7 +23,7 @@ DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_request
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
          "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
          "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1", "progress_plan_v3",
-         "execution_evidence_v1")
+         "execution_evidence_v1", "finding_provenance_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -897,6 +897,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[lifecycle_closure.PART] = lifecycle_closure.INSTRUCTION
     import ao_execution_evidence
     texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
+    import ao_finding_provenance
+    texts[ao_finding_provenance.PART] = ao_finding_provenance.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)

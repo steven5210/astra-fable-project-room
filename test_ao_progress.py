@@ -947,11 +947,14 @@ class SuccessorDigestAndSupersessionTests(unittest.TestCase):
 
     def test_v3_is_appended_last_and_v1_v2_keep_their_historical_positions_in_parts(self):
         # ao_workflow.PARTS' exact order/length is independently pinned in test_lifecycle_closure.py;
-        # this only checks the facts this unit's own correctness depends on. execution_evidence_v1
-        # was appended after progress_plan_v3, so v3 is now second to last.
+        # this only checks the facts this unit's own correctness depends on.
+        # execution_evidence_v1 and finding_provenance_v1 were appended after
+        # progress_plan_v3, so v3 is now third to last.
         import ao_execution_evidence
-        self.assertEqual(ao_workflow.PARTS[-2], ao_progress.PART_V3)
-        self.assertEqual(ao_workflow.PARTS[-1], ao_execution_evidence.PART)
+        import ao_finding_provenance
+        self.assertEqual(ao_workflow.PARTS[-3], ao_progress.PART_V3)
+        self.assertEqual(ao_workflow.PARTS[-2], ao_execution_evidence.PART)
+        self.assertEqual(ao_workflow.PARTS[-1], ao_finding_provenance.PART)
         self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART), 10)
         self.assertEqual(ao_workflow.PARTS.index(ao_progress.PART_V2), 12)
         self.assertEqual(len(ao_workflow.PARTS), len(set(ao_workflow.PARTS)))
@@ -1184,7 +1187,8 @@ class UpgradingSessionSuccessorDeliveryTests(Fixture):
     """A session retained with both v1 and v2 already delivered, fully caught up through
     lifecycle_closure_v1, gets only the new successor once, then nothing further (already-upgraded)."""
 
-    # The real 15-name PARTS tuple immediately before this unit (everything except progress_plan_v3).
+    # The real PARTS prefix as it stood immediately before progress_plan_v3 (everything except
+    # progress_plan_v3 and the parts appended after it).
     PARTS_BEFORE_V3 = ao_workflow.PARTS[:15]
 
     def setUp(self):
@@ -1213,20 +1217,26 @@ class UpgradingSessionSuccessorDeliveryTests(Fixture):
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
-        # execution_evidence_v1 is new to this retained session too, so the correction carries
-        # it together with the successor, in PARTS order.
-        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3, ao_execution_evidence.PART])
+        # execution_evidence_v1 and finding_provenance_v1 are new to this retained session too,
+        # so the correction carries them together with the successor, in PARTS order.
+        import ao_finding_provenance
+        self.assertEqual(request['carried']['parts'],
+                         [ao_progress.PART_V3, ao_execution_evidence.PART,
+                          ao_finding_provenance.PART])
         self.assertEqual(request['carried']['part_sha256'],
                          {ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256,
-                          ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256})
+                          ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256,
+                          ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
         self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
 
         # Already upgraded: a further completed request leaves nothing left to send.
         text2, carried2 = self.packet()
         self.assertEqual(carried2['parts'], [])
         self.assertNotIn(ao_progress.INSTRUCTION_V3, text2)
         self.assertNotIn(ao_execution_evidence.INSTRUCTION, text2)
+        self.assertNotIn(ao_finding_provenance.INSTRUCTION, text2)
 
 
 class UncertainSuccessorDeliveryTests(Fixture):
@@ -1254,14 +1264,18 @@ class UncertainSuccessorDeliveryTests(Fixture):
         request = self.state()['requests']['corr-uncertain']
         self.assertEqual(request['state'], 'uncertain')
         self.assertNotIn('receipt', request)
-        # execution_evidence_v1 is new to this retained session too, so the same uncertain turn
-        # carries it together with the successor, in PARTS order.
-        self.assertEqual(request['carried']['parts'], [ao_progress.PART_V3, ao_execution_evidence.PART])
+        # execution_evidence_v1 and finding_provenance_v1 are new to this retained session too,
+        # so the same uncertain turn carries them together with the successor, in PARTS order.
+        import ao_finding_provenance
+        self.assertEqual(request['carried']['parts'],
+                         [ao_progress.PART_V3, ao_execution_evidence.PART,
+                          ao_finding_provenance.PART])
 
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertNotIn(ao_progress.PART_V3, held['parts'])
         summary = ao_workflow.context_summary(self.state(), self.directory())
         self.assertIn(ao_progress.PART_V3, summary['undelivered_parts'])
+        self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
         self.assertEqual(summary['progress_plan']['successor_delivery'], 'undelivered')
         # A directory was given and its own receipt chain authenticated cleanly, so this "undelivered"
         # (unlike the no-directory case) is still receipt-verified history, just not yet satisfied.
@@ -1282,8 +1296,10 @@ class UncertainSuccessorDeliveryTests(Fixture):
 
         held2 = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertIn(ao_progress.PART_V3, held2['parts'])
+        self.assertIn(ao_finding_provenance.PART, held2['parts'])
         summary2 = ao_workflow.context_summary(self.state(), self.directory())
         self.assertNotIn(ao_progress.PART_V3, summary2['undelivered_parts'])
+        self.assertNotIn(ao_finding_provenance.PART, summary2['undelivered_parts'])
         self.assertEqual(summary2['progress_plan']['successor_delivery'], 'verified_delivered')
         self.assertEqual(summary2['progress_plan']['delivered_history'], 'receipt_verified')
         self.assertTrue(summary2['progress_plan']['superseded'][ao_progress.PART]['satisfied'])

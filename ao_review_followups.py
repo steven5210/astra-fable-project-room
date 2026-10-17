@@ -122,6 +122,8 @@ def latest_summary(service, directory, state, purposes):
             report = ao_workflow.engineering_report(directory, state, request)
             fields = FIELDS
             result['pending_operator_work_reported_by'] = pending_operator_work(directory, state, request, report)
+            import ao_findings
+            result['findings'] = ao_findings.project(report)
         return {**result, 'status': 'reported', **{field: preview(report, field) for field in fields}}
     except (RoomError, OSError, ValueError, KeyError, TypeError) as exc:
         return {**result, 'status': 'unavailable', 'reason': str(exc)[:500]}

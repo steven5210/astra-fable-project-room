@@ -132,6 +132,27 @@ complete receipt and digest. A pending, stale or unusable latest result is expli
 status never falls back to an older all-clear. Previews are not complete task inputs,
 scope decisions or live candidate verification.
 
+### Finding provenance tokens
+
+Inside the same engineering report's `review_findings`, `remaining_gaps` and
+`backlog` string entries, Fable may record whitespace-free `key=value` tokens
+with the lifecycle task-description grammar: `origin=introduced|preexisting|integration`,
+`scope=required|optional`, `disposition=fixed|open|deferred|decision_needed`,
+and when known `invariant=<name>`, `evidence=<reference>` and
+`owner=<unit or area>`. The last occurrence of a key wins and an empty value
+counts as absent. Saved `review_followups.engineering.findings` projects those
+tokens read-only: per-field and overall present/total/tagged/untagged/malformed
+counts, the `by_origin`, `by_scope` and `by_disposition` histograms, the
+`required_open`, `preexisting_required_open`, `unknown_scope_open` and
+`decision_needed` counters, and up to 16 redacted items carrying their parsed
+keys and token-stripped text. A vocabulary value outside the lists above reads
+as `unknown` with the raw value kept bounded, and an untagged entry counts as
+`unknown` everywhere, never as resolved or optional. The projection grants
+nothing: a tagged `remaining_gaps` entry still blocks acceptance exactly like an
+untagged one, a preexisting or integration issue that prevents the approved
+behavior is `scope=required`, not cleanup, and no token changes scope, resolves
+a finding or authorizes implementation or publication.
+
 `delegate.routing.worker_recovery` distinguishes verified current guard capability
 from unverified, historical or unconfigured routing. Only configured or verified routing with
 preparation routing version 2 or 3 and an effective guard digest matching the
@@ -176,7 +197,7 @@ in a room only after the updated plugin has been installed or resynced (see
 room snapshots and already-delivered workflow-part records are not rewritten.
 
 The one-time `execution_evidence_v1` amendment is carried through
-`ao_workflow.PARTS` exactly the same way — appended last, once per AO engineer
+`ao_workflow.PARTS` exactly the same way — once per AO engineer
 session, fail closed: a new session receives it in its first packet, a retained
 session receives it once on its next engineer send, and it stays under
 `undelivered_parts` until a `completed` or `settled_failure` engineer turn's
@@ -192,6 +213,33 @@ controller's delivered-context check refuses that session's history
 because its `ao_workflow.PARTS` vocabulary does not contain the name —
 recovery is a forward fix on a controller that keeps the name, never a
 rewrite or removal of the delivered record.
+
+## Finding-provenance delivery (AO rooms)
+
+The one-time `finding_provenance_v1` amendment is carried through
+`ao_workflow.PARTS` exactly like `lifecycle_closure_v1`, and only in AO rooms: a
+new AO engineer session receives it in its first packet, and a retained AO
+engineer session receives it once, carried on its next engineer send
+(`spec_review`, `implementation`, or `correction`). Saved `context_summary`/status
+lists it under `undelivered_parts` until a `completed` or `settled_failure`
+engineer turn's verified immutable receipt shows it was actually carried; an
+`uncertain`, `failed`, `interrupted` or otherwise unsettled turn never counts as
+delivery, so the part is carried again on the next send rather than assumed sent
+(fail closed, like the rest of `delivered()`). This delivery mechanism adds no
+repeated consent step: an ordinary continuation remains exactly `Continue.` or
+the caller's actual new instruction, and the controller — not the human turn —
+appends the undelivered part. The instruction itself is delivered text only: it
+grants no scope, execution permission, recovery or review allowance and changes
+no model, guard, budget or authority. See the [Fable policy reference's matching
+section](../../skills/project-room/references/fable-policy.md#finding-provenance-one-time-part-finding_provenance_v1)
+for the exact delivered text, and [finding provenance
+tokens](#finding-provenance-tokens) for the read-only projection it feeds.
+Rollback window: before the first engineer send after install, resyncing the
+previous plugin is safe; after a completed or settled engineer turn has carried
+this part, the previous controller's delivered-context check refuses that
+session's history because its `ao_workflow.PARTS` vocabulary does not contain
+the name — recovery is a forward fix on a controller that keeps the name, never
+a rewrite or removal of the delivered record.
 
 ## Progress-plan successor delivery (AO rooms)
 
