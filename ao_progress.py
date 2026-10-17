@@ -689,10 +689,10 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
                      if any(item.get("status") in ("running", "launched") for item in items)}
     # Turn-scoped task evidence by row identity against the selected turn's rows — the same
     # membership check _observe_provenance uses. turn_updates holds each task's in-turn event
-    # epochs; turn_completed_at is the first in-turn transition into completed — a completion
-    # merely revealed by a TaskList read (no known before) or recorded in another turn is no
-    # transition here. The whole-window fold above still serves the plan, deliverables and the
-    # stale rule exactly as before.
+    # epochs; turn_completed_at holds every in-turn transition epoch into completed, sorted —
+    # a completion merely revealed by a TaskList read (no known before) or recorded in another
+    # turn is no transition here. The whole-window fold above still serves the plan,
+    # deliverables and the stale rule exactly as before.
     turn_row_ids = {id(turn_row) for turn_row in turn_rows or ()}
     turn_updates, turn_completed_at, turn_update_unknown = {}, {}, {}
     for task_id, task_events in events.items():
@@ -708,11 +708,12 @@ def _fold_plan(rows, uses, results, launches=None, now=None, launches_known=Fals
             # A completion transition needs a known before-status: status_before None (a
             # TodoWrite rewrite, where positional identity is not established) never proves one.
             if (event["status_after"] == "completed"
-                    and event["status_before"] not in (None, "completed")
-                    and task_id not in turn_completed_at):
-                turn_completed_at[task_id] = epoch
+                    and event["status_before"] not in (None, "completed")):
+                turn_completed_at.setdefault(task_id, []).append(epoch)
         if epochs:
             turn_updates[task_id] = sorted(epochs)
+        if task_id in turn_completed_at:
+            turn_completed_at[task_id].sort()
     execution = {step["id"]: _execution(step["id"], linked.get(step["id"]),
                                         turn_updates.get(step["id"]),
                                         turn_update_unknown.get(step["id"], False))
@@ -1713,11 +1714,11 @@ def _handoff_checks(available, launches, shown, fold_extra, directory, request):
             reference = _epoch_or_none(latest.get("started_at"))
         else:
             continue
-        # The comparison is against the task's completion transition observed in this turn, not
-        # its last edit: a completion only revealed by a TaskList read or recorded in another
-        # turn is unknown here and never counts.
-        completed_at = turn_completed_at.get(task_id)
-        if reference is not None and completed_at is not None and completed_at >= reference:
+        # The comparison is against the task's completion transitions observed in this turn,
+        # not its last edit: a completion only revealed by a TaskList read or recorded in
+        # another turn is unknown here and never counts.
+        transitions = turn_completed_at.get(task_id) or ()
+        if reference is not None and any(epoch >= reference for epoch in transitions):
             completed_after_failed += 1
     checks["completed_after_failed_launch"] = completed_after_failed
     defect_groups = {}

@@ -1960,6 +1960,48 @@ class ExecutionEvidenceTests(ExecutionFixture):
                       ['task_updated_after_latest_result'], False)
         self.assertEqual(view['handoff_checks']['returned_without_task_update'], 1)
 
+    def test_a_recompletion_after_the_failure_counts(self):
+        # Every in-turn transition into completed is kept: a unit completed, reopened, failed
+        # under its linked launch, then completed again — the later transition at .6 counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.6), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 1)
+        self.assertIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_recompletion_before_the_failure_never_counts(self):
+        # The same open-close-open sequence, but the last transition precedes the error: no
+        # transition at or after the failure exists.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.45), status='completed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
+    def test_a_subject_edit_after_reopen_and_failure_never_counts(self):
+        # Completed, reopened, launch error, then only a subject edit: no transition into
+        # completed follows the failure, so nothing counts.
+        self.create('1', 'EXIT-1: unit', self.at(0.1))
+        self.update('1', self.at(0.2), status='completed')
+        self.update('1', self.at(0.3), status='in_progress')
+        self.launch('w1', self.at(0.4), {'subagent_type': 'Explore',
+                                         'description': 'work task=1'},
+                    result='worker exploded', result_stamp=self.at(0.5), is_error=True)
+        self.update('1', self.at(0.6), subject='EXIT-1: unit renamed')
+        checks = self.view()['handoff_checks']
+        self.assertEqual(checks['completed_after_failed_launch'], 0)
+        self.assertNotIn('completed_after_failed_launch', checks['warnings'])
+
     def test_a_superseded_unit_keeps_its_execution_evidence(self):
         # (j) Execution evidence describes the launch, not the unit's disposition: a superseded
         # task still shows its linked launch while the deliverables identities are unchanged.
