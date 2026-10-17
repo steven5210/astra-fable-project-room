@@ -102,7 +102,9 @@ def _api_error_nested(row):
     Claude Code >=2.1.29x writes apiError as a string such as "usage_limit_reached" and
     moves the structured detail to apiErrorParams and quotaLimits; those fields are never
     read for classification — apiErrorStatus and error still carry the typed failure.
-    Older versions used a nested dict or omitted the field entirely.'''
+    Older versions used a nested dict or omitted the field entirely. The string->{} folding
+    serves outcome classification only: envelope-equality and thrashing-proof sites reject a
+    string apiError before reaching this helper.'''
     nested = row.get('apiError') or {}
     if isinstance(nested, str):
         return {}
@@ -111,6 +113,11 @@ def _api_error_nested(row):
 
 def _same_error_envelope(row):
     """Later same-id synthetic records must not contradict the exact typed error."""
+    # A string apiError carries a 2.1.29x code we cannot equate with the legacy
+    # dict envelope; envelope equality stays legacy-only until a qualified
+    # 2.1.29x thrashing row exists.
+    if isinstance(row.get('apiError'), str):
+        return False
     nested = _api_error_nested(row)
     if not isinstance(nested, dict):
         return False
@@ -181,6 +188,11 @@ def compaction_failure(events, request, session_id, workspace, outcome):
     if message.get('model') != '<synthetic>' or message.get('stop_reason') != 'stop_sequence':
         return None
     if _message_text(message) != COMPACTION_THRASHING_TEXT:
+        return None
+    # Same rule as _same_error_envelope: a string apiError of any value makes the
+    # row ineligible — the thrashing proof stays legacy-envelope-only until a
+    # qualified 2.1.29x thrashing row exists.
+    if isinstance(error_row.get('apiError'), str):
         return None
     nested = _api_error_nested(error_row)
     if not isinstance(nested, dict):

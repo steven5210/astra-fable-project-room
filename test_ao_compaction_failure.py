@@ -100,6 +100,28 @@ class NativeCompactionProofTests(unittest.TestCase):
                 error = {**self.error, **change}
                 self.assertIsNone(self.proof([self.anchor, error]))
 
+    def test_string_api_error_contradicts_the_legacy_envelope(self):
+        # 2.1.29x string codes on the primary error row make the row ineligible for the
+        # legacy-envelope thrashing proof — even a contradictory quota code such as
+        # usage_limit_reached must not mint it.
+        for code in ('usage_limit_reached', 'other'):
+            with self.subTest(apiError=code):
+                error = {**self.error, 'apiError': code}
+                self.assertIsNone(self.proof([self.anchor, error]))
+
+    def test_string_api_error_continuation_is_not_same_envelope(self):
+        # A same-message-id continuation carrying a string code and no typed error is not the
+        # same legacy envelope and cannot continue the proof.
+        error = {**self.error, 'message': {**self.error['message'], 'id': 'err-msg'}}
+        continuation = {'type': 'assistant', 'uuid': 'continuation', 'sessionId': 'native',
+                        'cwd': WORKSPACE, 'timestamp': '1970-01-01T00:16:44Z',
+                        'apiError': 'usage_limit_reached',
+                        'message': {'role': 'assistant', 'model': '<synthetic>',
+                                    'id': 'err-msg', 'stop_reason': 'stop_sequence',
+                                    'content': [{'type': 'text', 'text': ''}]}}
+        self.assertFalse(native._same_error_envelope(continuation))
+        self.assertIsNone(self.proof([self.anchor, error, continuation]))
+
     def test_later_refusal_or_safety_stop_is_ineligible(self):
         for stop in ('refusal', 'safety'):
             later = {'type': 'assistant', 'uuid': 'later-refusal', 'sessionId': 'native', 'cwd': WORKSPACE,

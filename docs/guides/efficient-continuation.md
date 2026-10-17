@@ -438,6 +438,13 @@ status; the string form is classified by the row's `apiErrorStatus` and typed
 `error` exactly like a legacy row, and the supplementary detail fields are
 never read. Any other `apiError` shape still refuses as malformed.
 
+The string form is accepted only for outcome classification. Envelope-equality
+(the same-error continuation check) and the autocompact-thrashing proof still
+require the legacy absent-or-object envelope: a string `apiError` of any value
+makes the row ineligible, so a contradictory quota code cannot mint a thrashing
+proof. The thrashing proof stays legacy-envelope-only until a qualified
+2.1.29x thrashing row is observed and captured as a reference.
+
 The explicit operator-supplied read-only owner storage and matching transcript are
 the first reviewer workspace trust anchor. This is not an independent preexisting
 room proof or a candidate-directory inference, and the workspace need not still
