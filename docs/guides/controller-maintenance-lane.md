@@ -27,6 +27,11 @@ When the user explicitly adopts this maintenance policy, record that approval
 and its scope. Within that recorded authorization, the maintainer may perform
 the following actions without asking again for each incident:
 
+The adoption record is a comment by the repository owner on the lane's
+tracking issue (#194) that names this guide, its commit and the adopted scope.
+Merging, installing or reading this guide is not that record. Until the record
+exists, every step below needs per-incident authorization.
+
 - open the GitHub issue, or use the existing one;
 - create an isolated worktree at an exact base commit
   (`git worktree add ... origin/main`);
