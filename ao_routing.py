@@ -832,10 +832,19 @@ def rules_match(observed, snapshot):
 def context(service, directory, state):
     from ao_project_room import read
     room = read(directory / "settings.json") if (directory / "settings.json").exists() else {}
+    pin = (state or {}).get("account_profile") if isinstance(state, dict) else None
+    if pin:
+        import ao_account_profiles
+        ao_account_profiles.check_context(room, pin)
     controller_path = service.root.parent / "config.json"
     controller = read(controller_path) if controller_path.exists() else {}
-    override = room.get("claude_config_dir_override") or controller.get("claude_config_dir_override")
-    recorded = room.get("claude_config_dir") or controller.get("claude_config_dir")
+    if pin:
+        # A pinned room's saved choice wins by key presence, including a null override.
+        override = room.get("claude_config_dir_override")
+        recorded = room.get("claude_config_dir")
+    else:
+        override = room.get("claude_config_dir_override") or controller.get("claude_config_dir_override")
+        recorded = room.get("claude_config_dir") or controller.get("claude_config_dir")
     candidates = {str(Path(value).expanduser().resolve()) for value in (override, recorded) if isinstance(value, str) and value}
     if len(candidates) > 1:
         if isinstance(override, str) and not Path(override).expanduser().is_absolute():
@@ -1175,6 +1184,14 @@ def observe_on_sync(service, directory, state):
         state["routing_rules"] = {"observed_at": time.time(), "source": "sync", "consistent": False, "error": str(exc)[:1000]}
         service.save(directory, state)
         return
+    if state.get("account_profile"):
+        import ao_account_profiles
+        error = ao_account_profiles.observe_sync(service, state)
+        if error:
+            record_observation(service, directory, state, observed, "sync", False)
+            state["routing_rules"]["error"] = error[:1000]
+            service.save(directory, state)
+            return
     record_observation(service, directory, state, observed, "sync", rules_match(observed, routing["rules"]))
 
 
