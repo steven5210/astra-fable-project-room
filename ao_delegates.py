@@ -37,17 +37,28 @@ def initialize(service, directory, state, provider):
     from ao_project_room import atomic, digest
     if provider not in ("deepseek", "none"):
         raise RoomError("New AO rooms require deepseek or explicit none; legacy Qwen rooms remain unchanged")
+    pin = state.get("account_profile")
     if provider == "deepseek":
         from project_room import Service
         controller = Service(service.root.parent)
         settings = controller.settings()
         settings = {**settings, "delegate_provider": provider}
+        if pin:
+            settings.update(claude_config_dir=pin["claude_config_dir"],
+                            claude_config_dir_override=pin["config_dir_exact"],
+                            account_profile=pin)
         controller._profiles(directory, state["project_path"], settings)
         settings = json.loads((directory / "settings.json").read_text())
         inventory = settings["provider_inventory"]
     else:
         inventory = None
-        atomic(directory / "settings.json", {"delegate_provider": "none"})
+        if pin:
+            atomic(directory / "settings.json", {"delegate_provider": "none",
+                                                 "claude_config_dir": pin["claude_config_dir"],
+                                                 "claude_config_dir_override": pin["config_dir_exact"],
+                                                 "account_profile": pin})
+        else:
+            atomic(directory / "settings.json", {"delegate_provider": "none"})
     policy = directory / "delegate-policy.txt"
     policy.write_text(POLICIES[provider])
     paths = [directory / "settings.json", policy]
@@ -190,6 +201,10 @@ def prepare(service, directory, state, worktree_path):
         server = {**server, "env": {"PROJECT_ROOM_WORKTREE": str(worktree)}}
         prepared.update(launcher_path=str(launcher), launcher_sha256=launcher_hash, registry_path=str(registry),
                         registry_project=project, registration=registration, server=server)
+    if state.get("account_profile"):
+        import ao_account_profiles
+        claude_bin = ao_routing.context(service, directory, state)["claude_bin"]
+        prepared["account_profile"] = ao_account_profiles.at_prepare(service, state, worktree, claude_bin)
     # Native routing files are written and snapshotted before the record exists,
     # so a refused routing setup leaves the room unprepared and the spawn aborted.
     ao_routing.prepare(service, directory, state, worktree, prepared)

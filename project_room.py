@@ -282,7 +282,8 @@ class Service:
             raise room.RoomError(f"This installation requires the configured Fable model {MODEL}")
         return value
 
-    def setup(self, claude_bin=None, qwen_config=None, deepseek_config=None, delegate_provider=None):
+    def setup(self, claude_bin=None, qwen_config=None, deepseek_config=None, delegate_provider=None,
+              claude_profile=None, config_dir=None):
         """Persist the private controller configuration for future rooms.
 
         Provider selection is compatible with the documented flows: a `delegate_provider` recorded in config.json is
@@ -300,6 +301,13 @@ class Service:
                 raise room.RoomError("The existing configuration is not valid JSON; move " + str(target) + " aside before running setup") from exc
             if not isinstance(prior, dict):
                 raise room.RoomError("The existing configuration is not a JSON object; move " + str(target) + " aside before running setup")
+            enrolled = None
+            if claude_profile is not None:
+                if config_dir is None:
+                    raise room.RoomError("--claude-profile requires --config-dir")
+                import ao_account_profiles
+                # Enroll before anything is written so a refusal leaves no partial configuration.
+                enrolled = ao_account_profiles.enroll(self.home, claude_profile, config_dir, prior)
             executable = str(Path(claude_bin).expanduser().resolve()) if claude_bin else prior.get("claude_bin") or discover_claude()
             if not Path(executable).is_file() or not os.access(executable, os.X_OK):
                 raise room.RoomError("claude_bin must name an executable file")
@@ -368,9 +376,14 @@ class Service:
             if selected is not None:
                 config["delegate_provider"] = selected
             atomic_json(target, config)
-            return {"configured": True, "config_path": str(target), "model": MODEL, "delegate_provider": provider,
-                    "delegate_provider_selected": selected is not None, "qwen_configured": bool(qwen), "deepseek_configured": bool(deepseek),
-                    "existing_rooms_unchanged": True}
+            import ao_account_profiles
+            result = {"configured": True, "config_path": str(target), "model": MODEL, "delegate_provider": provider,
+                      "delegate_provider_selected": selected is not None, "qwen_configured": bool(qwen), "deepseek_configured": bool(deepseek),
+                      "existing_rooms_unchanged": True,
+                      "claude_profiles": sorted(ao_account_profiles.load(self.home)["profiles"])}
+            if enrolled is not None:
+                result["enrolled_profile"] = enrolled["name"]
+            return result
 
     def _deepseek_config(self, path):
         import deepseek_adapter
@@ -1975,6 +1988,8 @@ def main(argv=None):
     setup.add_argument("--qwen-config")
     setup.add_argument("--deepseek-config", help="absolute path to a private key-free DeepSeek provider configuration")
     setup.add_argument("--delegate-provider", choices=PROVIDERS, help="provider snapshotted into NEW rooms; existing rooms keep their pins")
+    setup.add_argument("--claude-profile", help="enroll a fixed Claude account profile under this name for new AO rooms")
+    setup.add_argument("--config-dir", help="exact private CLAUDE_CONFIG_DIR for --claude-profile (mode 0700, owned, already resolved)")
     commands.add_parser("doctor")
     audit = commands.add_parser("transcript-audit", help="read-only tool-use count of one attempt's exact session transcript and its subagent files; no model, no network")
     audit.add_argument("--room", required=True)
@@ -2058,7 +2073,8 @@ def main(argv=None):
             return 0 if result["coverage"] == "complete" else 1
         service = Service(args.home)
         if args.command == "setup":
-            result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider)
+            result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider,
+                                   claude_profile=args.claude_profile, config_dir=args.config_dir)
         elif args.command == "doctor":
             result = service.room_doctor()
         elif args.command == "call":

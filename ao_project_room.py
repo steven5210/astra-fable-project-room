@@ -692,7 +692,8 @@ class Service:
         return ao_release_check.check(self.root, ao_url)
 
     def ao_room_open(self, project_path, feature, ao_project_id, authorization, ao_url=None,
-                     workflow=None, exception_authorization=None, delegate_provider=None, engineering_model=None):
+                     workflow=None, exception_authorization=None, delegate_provider=None, engineering_model=None,
+                     account_profile=None):
         path = globals()["project_path"](project_path)
         feature = nonempty(feature, "feature", 256)
         authorization = nonempty(authorization, "authorization")
@@ -724,6 +725,8 @@ class Service:
                 if engineering_model is not None and (not ao_workflow.normal(state)
                         or engineering_model != ao_engineering_model.initial(directory, state)["configured_model"]):
                     raise RoomError("Existing room engineering model is immutable; use the audited engineering model transition")
+                if account_profile is not None and account_profile != (state.get("account_profile") or {}).get("name"):
+                    raise RoomError("Existing room account profile is immutable")
             else:
                 preferences = read(self.root / "config.json") if (self.root / "config.json").exists() else {}
                 if workflow is None:
@@ -738,6 +741,8 @@ class Service:
                         raise RoomError("The Astra-led exception does not attach Fable delegates")
                     if engineering_model is not None:
                         raise RoomError("The Astra-led exception configures no engineering orchestrator model")
+                    if account_profile is not None:
+                        raise RoomError("The Astra-led exception binds no Claude engineer; account_profile is for normal rooms")
                 elif exception_authorization is not None:
                     raise RoomError("Exception authorization belongs only to an Astra-led task")
                 if workflow == "fable_engineering" and delegate_provider is None:
@@ -750,6 +755,12 @@ class Service:
                          "workflow": workflow, "authorization": authorization, "bindings": {}, "requests": {},
                          "exception_authorization": exception_authorization,
                          "verifications": [], "acceptances": [], "created_at": time.time()}
+                if account_profile is not None:
+                    import ao_account_profiles
+                    controller_config = self.root.parent / "config.json"
+                    state["account_profile"] = ao_account_profiles.pin(
+                        self.root.parent, account_profile,
+                        read(controller_config) if controller_config.exists() else {})
                 if workflow == "fable_engineering":  # Qualify the selector before any room directory exists.
                     state[ao_engineering_model.SELECTION_KEY] = ao_engineering_model.selection(engineering_model, self.root)
                 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -828,6 +839,9 @@ class Service:
                 if role == "engineer":
                     fable_reason = fable_reason or "Designated Fable engineering role"
                     prepared = ao_delegates.validate_preparation(directory, state, session_id)
+                    if state.get("account_profile"):
+                        import ao_account_profiles
+                        ao_account_profiles.at_bind(self, state, prepared)
                     ao_engineering_model.require_executable(directory, state, prepared, model, configured["qualification"])
             elif harness == "claude-code":
                 nonempty(fable_reason, "fable_reason: why Fable is actually needed")
@@ -1150,6 +1164,9 @@ class Service:
                 request["native_worker_expectations"] = worker_expectations
             if ao_workflow.normal(state):
                 request["purpose"] = purpose
+                if role == "engineer" and state.get("account_profile"):
+                    import ao_account_profiles
+                    request["account_profile"] = ao_account_profiles.attribution(state["account_profile"])
                 if state.get("provider_transition"):
                     request["provider_epoch"] = 2
                 if purpose in ("implementation", "correction"):
@@ -1555,7 +1572,7 @@ class Service:
                   "spec_verdict_recovery_intent_sha256", "spec_verdict_recovery_completion_sha256",
                   "spec_verdict_recovery_error")
         fields += ('semantic_outcome', 'semantic_outcome_sha256', 'semantic_status', 'outcome_resume', 'outcome_resume_sha256',
-                   "standing_policy")
+                   "standing_policy", "account_profile")
         result = {k: request[k] for k in fields if k in request}
         if isinstance(request.get("observed_turn"), dict):
             result["ao_turn_state"] = request["observed_turn"].get("state")
@@ -1586,7 +1603,8 @@ class Service:
                     totals[field] += usage[field]
             else:
                 unknown.append(request["request_id"])
-        extra = {"exception_authorization": state.get("exception_authorization")}
+        extra = {"exception_authorization": state.get("exception_authorization"),
+                 "account_profile": state.get("account_profile") or "unrecorded"}
         if ao_workflow.normal(state):
             import ao_provider_transition
             import ao_review_extension
@@ -1706,7 +1724,9 @@ class Service:
         for path in (self.root / "rooms").glob("*/state.json"):
             state = read(path)
             if selected is None or state["project_path"] == selected:
-                items.append({key: state[key] for key in ("room_id", "project_path", "feature", "workflow", "created_at")})
+                item = {key: state[key] for key in ("room_id", "project_path", "feature", "workflow", "created_at")}
+                item["account_profile"] = (state.get("account_profile") or {}).get("name") or "unrecorded"
+                items.append(item)
         items.sort(key=lambda item: item["created_at"], reverse=True)
         return {"rooms": items[:50], "count": len(items), "truncated": len(items) > 50}
 
@@ -1737,7 +1757,7 @@ TOOL_SCHEMAS = {
     "ao_room_outcome_audit": ("Read and preserve the latest owned terminal outcome without inference. Correlate typed errors before truncation or formatting. Optional explicit AO database and Claude transcript paths bind native evidence to the exact retained engineer or Astra-led Claude reviewer; role sources stay separate and unknown evidence holds. Does not establish a quota reset or resume work.", schema({**R, "role": ROLE, "ao_database_path": S, "native_transcript_path": S}, ['room_id'])),
     "ao_room_outcome_resume": ("Record actual authorization for one new continuation after a freshly audited quota, provider, output-truncation or settled served-model-mismatch failure. Keep the same session, raw failures, specification and consumed review attempts. No model call; only the named unused successor request may pass this hold, and a served-model mismatch successor is admitted only after an audited transition commits an exact identifier (the qualified expected model or another qualified exact identifier, never a family alias). Unknown delivery cannot be released. An exactly correlated native quota rejection may settle its known AO failed turn, retaining the original failure. A fresh authorization may supersede an unused release only for the same successor.", schema({**R, "request_id": S, "outcome_sha256": S, "resume_request_id": S, "diagnosis": S, "authorization": S})),
     "ao_room_list": ("Discover saved AO rooms, optionally for one exact Git project. Bounded metadata only; no AO/network/model calls.", schema({"project_path": S}, [])),
-    "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Optional engineering_model pins this room's engineering orchestrator selector: an engineer-role family alias (default fable; also opus), meaning the latest available member of that family at MAX, whose exact model is recorded only from verified native evidence, or a qualified exact identifier. A private operator-selected family qualification, when configured, pins each qualified family's exact expected model before inference from retained source evidence. Qualification is not provider availability. Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}, "engineering_model": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
+    "ao_room_open": ("Open a normal Fable-engineering/Astra-acceptance room on stock AO. An Astra-led exception requires the actual per-task authorization. Optional engineering_model pins this room's engineering orchestrator selector: an engineer-role family alias (default fable; also opus), meaning the latest available member of that family at MAX, whose exact model is recorded only from verified native evidence, or a qualified exact identifier. A private operator-selected family qualification, when configured, pins each qualified family's exact expected model before inference from retained source evidence. Qualification is not provider availability. Optional account_profile pins the room to one enrolled Claude account profile, or to `default` for the saved default login; the AO project environment must then carry exactly that CLAUDE_CONFIG_DIR (none for `default`). Existing rooms never migrate.", schema({"project_path": S, "feature": S, "ao_project_id": S, "authorization": S, "ao_url": S, "workflow": {"type": "string", "enum": ["fable_engineering", "astra_led"]}, "exception_authorization": S, "delegate_provider": {"type": "string", "enum": ["deepseek", "none"]}, "engineering_model": S, "account_profile": S}, ["project_path", "feature", "ao_project_id", "authorization"])),
     "ao_room_spec_put": ("Pin immutable spec, argv gates and Astra approval. Normal rooms also need the actual Fable verdict for these exact bytes before handoff.", schema({**R, "revision": {"type": "integer", "minimum": 1}, "content": S, "gates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": S}}, "approval": S})),
     "ao_room_prepare": ("Prepare one native Fable workspace BEFORE launching its controller, normally via the AO postCreate helper (which waits for the adapter lock on a best-effort 20-second budget and reports the verified holder under continued contention; the tool itself blocks). Pins private delegate configuration and workspace, writes and snapshots ignored native routing files and the native auto-compaction window (default 250000; private AO config auto_compact_window changes future preparations only). Existing preparations stay unchanged. Invokes Claude configuration only, never inference; actual compaction requires native observation. No candidate files are written.", schema({**R, "worktree_path": S})),
     "ao_room_bind": ("Bind an idle native AO chat session and its exact configured model value/effort. Normal roles require the room's configured engineering orchestrator value (its family alias or exact identifier) and separate Codex/Astra reviewer at max effort. Bindings are immutable.", schema({**R, "role": ROLE, "session_id": S, "model": S, "reasoning_effort": S, "fable_reason": S}, ["room_id", "role", "session_id", "model", "reasoning_effort"])),
