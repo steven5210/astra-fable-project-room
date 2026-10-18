@@ -22,6 +22,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import re
 import statistics
 import subprocess
@@ -38,6 +39,11 @@ WEIGHTS_FILE = ROOT / "tests" / "shard_weights.json"
 WEIGHTS_FORMAT = "project_room_shard_weights_v2"
 COMBINED_FORMAT = "project_room_timing_combined_v1"
 MAX_COMBINED_BYTES = 8 * 1024 * 1024
+# Modules that launch the legacy controller's verification job: its gate
+# observation and cleanup scan every same-user process through /proc on
+# Linux and treat an unreadable transient process as inspection_incomplete,
+# so a worker pool must schedule them alone (see run_shard_workers).
+EXCLUSIVE_MODULES = frozenset({"test_verification", "test_verification_matrix"})
 REFRESH_PLATFORM = ("macos", "3.11")
 
 
@@ -378,7 +384,18 @@ def run_shard_workers(index, shards, group, weights, args):
     the per-module records (under ``DIR/workers/shard-I-of-N/``) are merged
     into the shard record at ``DIR/shard-I-of-N.json``.
     """
-    queue = sorted(group, key=lambda m: (-float(weights[m]), m))
+    # Modules that launch the legacy controller's verification job must run
+    # alone in the pool: its gate observation and cleanup scan every same-user
+    # process through /proc on Linux, so a transient process of another worker
+    # (between exit and reap, or mid-exec) reads as inspection_incomplete and
+    # the fail-closed tests observe refusals. On macOS the scan only covers
+    # the process's own children (ps -E) and cannot be incomplete, so the
+    # exclusivity applies on Linux only.
+    exclusive = (set(group) & EXCLUSIVE_MODULES
+                 if platform.system() == "Linux" else set())
+    queue = (sorted(exclusive, key=lambda m: (-float(weights[m]), m))
+             + sorted(set(group) - exclusive,
+                      key=lambda m: (-float(weights[m]), m)))
     workers_dir = record_dir = None
     if args.record:
         record_dir = Path(args.record)
@@ -410,7 +427,13 @@ def run_shard_workers(index, shards, group, weights, args):
             sys.stdout.flush()
             harvested = True
         while pending and len(running) < args.workers:
-            module = pending.pop(0)
+            module = pending[0]
+            if module in exclusive:
+                if running:
+                    break
+            elif any(item[0] in exclusive for item in running.values()):
+                break
+            pending.pop(0)
             log_path = log_dir / f"{module}.log"
             record = (workers_dir / f"{module}.json"
                       if workers_dir is not None else None)
@@ -444,6 +467,7 @@ def run_shard_workers(index, shards, group, weights, args):
                                 wall_seconds=time.monotonic() - started,
                                 modules_requested=list(group),
                                 workers=args.workers,
+                                exclusive=sorted(exclusive),
                                 worker_runs=worker_runs))
     bad = total = 0
     print(f"{'module':<40}{'ran':<33}{'result':<22}{'exit':<6}log")

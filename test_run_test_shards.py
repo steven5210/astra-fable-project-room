@@ -48,6 +48,10 @@ class _WorkerProc:
         self.module = argv[-1]
         self.returncode = None
         self.polls = 0
+        # Modules still running at launch (a proc keeps returncode None until
+        # its scripted deadline poll).
+        self.peers = {proc.module for proc in script.launched
+                      if proc.returncode is None}
         script.launched.append(self)
         script.alive += 1
         script.max_alive = max(script.max_alive, script.alive)
@@ -432,6 +436,76 @@ class RunTestShardsTests(unittest.TestCase):
         self.assertIn("total: 5 tests", text)
         self.assertIn("Ran 1 tests", text)
         self.assertLess(text.index("=== wl"), text.index("=== wm"))
+
+    def test_exclusive_modules_run_alone_on_linux(self):
+        group = ["wc", "test_verification", "wa", "test_verification_matrix",
+                 "wb"]
+        weights = {"test_verification": 5, "test_verification_matrix": 4,
+                   "wa": 30, "wb": 20, "wc": 10}
+        # wa holds its slot so the non-exclusive tail still overlaps.
+        script = _WorkerScript(
+            deadlines={"wa": 4},
+            records={module: json.dumps(
+                {"complete": True, "python": "fake", "os": "linux",
+                 "summary": {"ran": 1, "was_successful": True},
+                 "modules": {module: {"tests": 1}}, "tests": []})
+                for module in group})
+        with tempfile.TemporaryDirectory() as tmp:
+            args = run_test_shards.parse_args(
+                ["--shard", "0", "--workers", "3", "--record", tmp])
+            with mock.patch.object(run_test_shards.subprocess, "Popen",
+                                   side_effect=script.popen), \
+                    mock.patch.object(run_test_shards.platform, "system",
+                                      return_value="Linux"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = run_test_shards.run_shard_workers(
+                    0, 5, group, weights, args)
+            merged = json.loads(
+                (Path(tmp) / "shard-0-of-5.json").read_text())
+        self.assertEqual(code, 0)
+        # Exclusive modules dispatch first (heavier one first), each with
+        # zero overlap; nothing else sees them alive either.
+        self.assertEqual([proc.module for proc in script.launched[:2]],
+                         ["test_verification", "test_verification_matrix"])
+        for proc in script.launched:
+            if proc.module in run_test_shards.EXCLUSIVE_MODULES:
+                self.assertEqual(proc.peers, set())
+            else:
+                self.assertFalse(
+                    proc.peers & run_test_shards.EXCLUSIVE_MODULES)
+        self.assertEqual(script.max_alive, 3)
+        self.assertEqual(merged["exclusive"],
+                         ["test_verification", "test_verification_matrix"])
+
+    def test_exclusive_modules_interleave_normally_on_macos(self):
+        group = ["test_verification", "wa", "wb", "wc"]
+        weights = {"test_verification": 40, "wa": 30, "wb": 20, "wc": 10}
+        script = _WorkerScript(
+            deadlines={"test_verification": 4},
+            records={module: json.dumps(
+                {"complete": True, "python": "fake", "os": "macos",
+                 "summary": {"ran": 1, "was_successful": True},
+                 "modules": {module: {"tests": 1}}, "tests": []})
+                for module in group})
+        with tempfile.TemporaryDirectory() as tmp:
+            args = run_test_shards.parse_args(
+                ["--shard", "0", "--workers", "3", "--record", tmp])
+            with mock.patch.object(run_test_shards.subprocess, "Popen",
+                                   side_effect=script.popen), \
+                    mock.patch.object(run_test_shards.platform, "system",
+                                      return_value="Darwin"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = run_test_shards.run_shard_workers(
+                    0, 5, group, weights, args)
+            merged = json.loads(
+                (Path(tmp) / "shard-0-of-5.json").read_text())
+        self.assertEqual(code, 0)
+        # On macOS the verification module is a normal pool member: it runs
+        # alongside the other workers while it is still alive.
+        self.assertTrue(any("test_verification" in proc.peers
+                            for proc in script.launched))
+        self.assertEqual(script.max_alive, 3)
+        self.assertEqual(merged["exclusive"], [])
 
     def test_shard_workers_exit_codes_and_missing_ran_lines(self):
         weights = {"wa": 10, "wb": 5}

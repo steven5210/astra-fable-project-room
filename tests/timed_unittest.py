@@ -342,8 +342,8 @@ def merge_records(records, **provenance):
     is a worker that produced no record -- it still appears in ``worker_runs``
     and makes ``complete`` (and ``was_successful``) false. Provenance fields are
     copied from the first present record; ``wall_seconds`` is the caller's own
-    shard wall time, and ``modules_requested``/``workers``/``worker_runs`` are
-    passed through from ``provenance``.
+    shard wall time, and ``modules_requested``/``workers``/``exclusive``/
+    ``worker_runs`` are passed through from ``provenance``.
     """
     present = [record for record in records if isinstance(record, dict)]
     summary = {key: sum(record.get("summary", {}).get(key, 0)
@@ -373,6 +373,7 @@ def merge_records(records, **provenance):
               "modules": modules,
               "tests": tests,
               "workers": provenance["workers"],
+              "exclusive": list(provenance.get("exclusive") or []),
               "worker_runs": list(provenance["worker_runs"])}
     if truncated:
         record["tests_truncated"] = True
