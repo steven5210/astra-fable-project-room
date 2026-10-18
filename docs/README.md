@@ -19,6 +19,7 @@ Project Room's documents are grouped into guides, references and operations runb
 ## Reference
 
 - [Architecture](reference/architecture.md) — the runtime module map and component responsibilities.
+- [AO lifecycle contract and coverage map](reference/lifecycle-contract.md) — supported room and request states, transitions, required evidence, the enforcing checks, and the open gaps the lifecycle harness pins.
 - [MCP runtime lifetime](reference/connector-runtime.md) — how the connector retains a coherent runtime outside the replaceable plugin cache.
 - [DeepSeek delegate](reference/deepseek.md) — setup, invocation and evidence reference for the optional DeepSeek delegate provider.
 - [Text delegate profiles](reference/text-delegate.md) — profile schema, transport rules and the standalone text delegate's bounded state.
