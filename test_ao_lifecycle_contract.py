@@ -287,6 +287,8 @@ class NormalCompletionTests(AgreedRoomFixture):
         for request in full['requests']:
             counts[request['state']] = counts.get(request['state'], 0) + 1
         self.assertEqual(compact['request_counts'], counts)
+        self.assertEqual(compact['engineering_capture'], full['engineering_capture'])
+        self.assertEqual(full['engineering_capture']['status'], 'captured')
         self.assertFalse(full['requests_truncated'])
         # The compact view keeps only the latest request per role, so "truncated" means exactly this.
         self.assertEqual(compact['requests_truncated'],
@@ -382,10 +384,13 @@ class MalformedReportTests(AgreedRoomFixture):
         self.assertEqual(request['semantic_status']['kind'], 'final_available')
         self.assertRegex(request['engineering_error'], 'Engineering report is incomplete')
         self.assertNotIn('engineering_record', request)
-        # Observed baseline: verification itself refuses before the gates run because no completed
-        # engineering result exists, so the acceptance-review attempt can never be dispatched.
-        self.refuses('Acceptance requires a captured completed engineering result',
+        # Verification itself refuses before the gates run because no completed engineering result
+        # exists, and names the failed capture; the acceptance-review attempt can never be dispatched.
+        self.refuses('Verification requires a captured completed engineering result; request '
+                     'implementation recorded engineering_error: Engineering report is incomplete',
                      self.service.ao_room_verify, self.room, str(self.repo))
+        self.assertEqual(self.service.ao_room_status(self.room)['engineering_capture']['status'],
+                         'capture_failed')
         self.refuses('Create a passed verification checkpoint first', self.send, 'acceptance_review')
         self.refuses('Acceptance requires a captured completed engineering result',
                      self.service.ao_room_accept, self.room, 'acceptance_review')

@@ -1416,7 +1416,15 @@ class Service:
             if directory.is_relative_to(candidate):
                 raise RoomError("Room state must be outside the candidate")
             if ao_workflow.normal(state):
-                ao_workflow.engineering_ready(self, directory, state)
+                try:
+                    ao_workflow.engineering_ready(self, directory, state)
+                except RoomError as exc:
+                    capture = ao_workflow.engineering_capture(state)
+                    if str(exc) == ao_workflow.CAPTURE_REQUIRED and capture.get("status") == "capture_failed":
+                        raise RoomError("Verification requires a captured completed engineering result; request "
+                                        + capture["request_id"] + " recorded engineering_error: "
+                                        + capture["engineering_error"]) from exc
+                    raise
                 if str(candidate) != ao_workflow.handoff_record(directory, state)["worktree"]:
                     raise RoomError("Verify only the bound engineer candidate")
             before = candidate_snapshot(candidate)
@@ -1612,6 +1620,7 @@ class Service:
                          spec_verdict_recovery_attempts=sum(r.get("purpose") == "spec_verdict_repair" for r in ordered),
                          spec_verdict_recovery=ao_spec_verdict_recovery.summary(directory, state),
                          engineer_context=ao_workflow.context_summary(state, directory),
+                         engineering_capture=ao_workflow.engineering_capture(state),
                          review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],

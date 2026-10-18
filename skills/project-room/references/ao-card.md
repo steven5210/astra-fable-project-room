@@ -135,7 +135,8 @@ the spec, policy, gates or summaries. Sync to terminal. The final report needs
 `outcome`, `implementation_complete`, `changes`, `tests_reported`,
 `review_findings`, `remaining_gaps`, `backlog`, `routing_log` and the exact
 spec, baseline and SHA fields. Read full receipts, not previews. In status,
-inspect `review_followups`, `enhancement_proposals` and `operator_requests`;
+inspect `review_followups`, `enhancement_proposals`, `operator_requests` and
+`engineering_capture` (the latest engineering request's read-only capture status);
 `findings` projects the engineer's provenance tokens read-only — read
 `required_open` and `preexisting_required_open` as required work (a preexisting
 defect that blocks the approved behavior is required, not cleanup), and the

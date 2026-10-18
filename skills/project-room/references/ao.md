@@ -710,7 +710,13 @@ still exist; an observation timeout does not prove primary completion or cancel 
 
 Run `ao_room_verify` on the intended candidate worktree. It must belong to the
 room's Git repository. Normal rooms require the unchanged captured Fable candidate
-in its bound worktree and a complete engineering report. This runs the spec's argv gates (no implicit shell) with a
+in its bound worktree and a complete engineering report. Status projects the latest
+implementation/correction request's capture result read-only as `engineering_capture`:
+`none` (no such request), `pending` (still active), `held` (semantic hold or
+observation error), `capture_failed` (an `engineering_error` was recorded, which the
+verification refusal names), `captured` or `unobserved`; its `current` flags only
+compare the request's saved handoff and spec-record digests against the room's
+present values, and the projection grants nothing. This runs the spec's argv gates (no implicit shell) with a
 pinned per-gate timeout, default 120 seconds, maximum 7200. Supply a larger budget
 when the known suite requires it. Gate programs are trusted authorized project
 commands, not a sandbox; do not put model calls or publication commands in them.

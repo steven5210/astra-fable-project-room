@@ -18,6 +18,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
 DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
                         "operator work with operator_requests ([] or valid entries); omission cannot clear it")
+CAPTURE_REQUIRED = "Acceptance requires a captured completed engineering result"
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
@@ -400,7 +401,7 @@ def engineering_ready(service, directory, state):
     ao_delegates.assert_settled(service.root.parent, state, directory)
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
-        raise RoomError("Acceptance requires a captured completed engineering result")
+        raise RoomError(CAPTURE_REQUIRED)
     if state.get("provider_transition") and request.get("provider_epoch") != 2:
         raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     from ao_outcomes import usable, observe
@@ -427,6 +428,35 @@ def engineering_ready(service, directory, state):
     if state.get("provider_transition") and record.get("provider_epoch") != request.get("provider_epoch"):
         raise RoomError("Captured engineering result belongs to another provider epoch")
     return request
+
+
+def engineering_capture(state):
+    """Read-only projection of the latest implementation/correction request's capture result.
+
+    Derived only from saved request fields: reads no file, runs no gate, observes nothing and
+    grants nothing. status is one of none, pending, held, capture_failed, captured, unobserved."""
+    request = latest(state, {"implementation", "correction"})
+    if request is None:
+        return {"status": "none"}
+    semantic = request.get("semantic_status") if isinstance(request.get("semantic_status"), dict) else {}
+    result = {"request_id": request["request_id"], "purpose": request.get("purpose"),
+              "request_state": request["state"],
+              "current": {"handoff": request.get("handoff_sha256") == state.get("handoff_sha256"),
+                          "spec_record": request.get("spec_record_sha256") == state.get("spec_record_sha256")}}
+    if request.get("engineering_record"):
+        result.update(status="captured", engineering_record_sha256=request.get("engineering_record_sha256"),
+                      result_candidate_sha256=request.get("result_candidate_sha256"))
+    elif request["state"] in ("submitted", "running"):
+        result["status"] = "pending"
+    elif request["state"] != "completed" or semantic.get("hold") or request.get("semantic_observation_error"):
+        result.update(status="held", semantic_kind=semantic.get("kind"))
+        if request.get("semantic_observation_error"):
+            result["semantic_observation_error"] = str(request["semantic_observation_error"])[:500]
+    elif request.get("engineering_error"):
+        result.update(status="capture_failed", engineering_error=str(request["engineering_error"])[:500])
+    else:
+        result["status"] = "unobserved"
+    return result
 
 
 def part_texts(prepared, policy):
