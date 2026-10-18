@@ -168,7 +168,12 @@ evidence, repeat retained instructions, or lower Fable MAX to reduce context.
 
 Call `ao_room_open` with the actual project path, stable feature name, existing AO
 project ID and the user's existing implementation authorization. Reopening returns
-the same room. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
+the same room. An optional `account_profile` pins the room to one enrolled Claude
+account profile (see [AO setup](../../../docs/guides/ao-setup.md)), or to `default`
+for the saved default login; the AO project environment must then carry exactly that
+`CLAUDE_CONFIG_DIR` string — none for `default` — and preparation, bind and every
+engineer send refuse conflicting credential sources or a changed account identity.
+Rooms without a pin are unchanged. Save its `room_id` and `room_path`. Inspect `ao_room_status`; use
 `ao_room_sync` to reconcile active work. Status reads saved facts without network
 access. `ao_room_status` accepts `view` `compact` for a reduced projection: the latest
 request per role, per-state request counts, and delegate job and routing summaries
