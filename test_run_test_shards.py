@@ -263,6 +263,16 @@ class RunTestShardsTests(unittest.TestCase):
                     found.append(item.id())
             return found
 
+        discovered_ids = ids(discovered)
+        counts = Counter(discovered_ids)
+        duplicates = sorted(name for name, count in counts.items() if count > 1)
+        self.assertEqual(duplicates, [],
+                         'discovery must collect each test id exactly once')
+        executable_ids = [name for name in discovered_ids
+                          if '.ExtensionExecutableEvolutionTests.' in name]
+        self.assertEqual(len(executable_ids), 4)
+        self.assertTrue(all(name.startswith('test_ao_review_extension.')
+                            for name in executable_ids))
         modules = run_test_shards.test_modules()
         groups, _ = run_test_shards.assign(
             modules, 5, run_test_shards.load_weights())
@@ -270,7 +280,7 @@ class RunTestShardsTests(unittest.TestCase):
         union = []
         for group in groups:
             union.extend(ids(loader.loadTestsFromNames(group)))
-        self.assertEqual(Counter(union), Counter(ids(discovered)))
+        self.assertEqual(Counter(union), counts)
 
     def test_shard_mode_invokes_unittest_with_the_assigned_modules(self):
         modules = run_test_shards.test_modules()

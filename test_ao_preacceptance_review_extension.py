@@ -1729,7 +1729,7 @@ class PreAcceptanceLiveRoutingRepairTests(PreAcceptanceLiveRoutingFixture):
     TEMPLATE_ATTRS = PreAcceptanceLiveRoutingFixture.TEMPLATE_ATTRS + ('original_executable',)
 
     def configure_runtime(self):
-        # Mirrors ``test_ao_review_extension.ExtensionExecutableEvolutionTests.configure_runtime``.
+        # Mirrors ``test_ao_review_extension.ExecutableRuntimeMixin.configure_runtime``.
         self.original_executable = self.root / 'original-claude'
         self.original_executable.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.original_executable.chmod(0o700)

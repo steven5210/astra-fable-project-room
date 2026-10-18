@@ -26,7 +26,7 @@ import project_room
 import project_room_mcp
 import project_room_runtime as runtime
 from test_ao_preacceptance_review_extension import PreAcceptanceFixture
-from test_ao_review_extension import ExtensionExecutableEvolutionTests
+from test_ao_review_extension import ExecutableRuntimeMixin
 
 EXHAUSTED = 'fourth Fable review intent is exhausted'
 REREVIEW_EXHAUSTED = 'one re-review intent is exhausted'
@@ -131,6 +131,25 @@ class ReReviewFixture(PreAcceptanceFixture):
     def granted(self):
         audited = self.rereview_audit()
         return audited, self.rereview_grant(audit=audited)
+
+
+class ModuleDiscoveryTests(unittest.TestCase):
+    """No foreign ``TestCase`` class is collected under this module's own name.
+
+    Importing a TestCase class for reuse (the pre-mixin ``configure_runtime`` source) makes
+    ``loadTestsFromNames`` collect that class's tests a second time under this module.
+    """
+
+    def test_every_collected_test_is_defined_in_this_module(self):
+        suite = unittest.TestLoader().loadTestsFromName('test_ao_spec_rereview')
+        stack, foreign = [suite], []
+        while stack:
+            item = stack.pop()
+            if isinstance(item, unittest.TestSuite):
+                stack.extend(item)
+            elif item.__class__.__module__ != 'test_ao_spec_rereview':
+                foreign.append(item.id())
+        self.assertEqual(sorted(foreign), [])
 
 
 class ReReviewBaselineTests(ReReviewFixture):
@@ -1126,11 +1145,10 @@ class ReReviewSourceRecordTests(ReReviewFixture):
         self.assertEqual(len(self.fake.posts), posts)
 
 
-class ReReviewExecutableFixture(ReReviewFixture):
+class ReReviewExecutableFixture(ExecutableRuntimeMixin, ReReviewFixture):
     """The same room, but the AO engineer executable can break and be repaired through its journal."""
 
     TEMPLATE_ATTRS = ReReviewFixture.TEMPLATE_ATTRS + ('original_executable',)
-    configure_runtime = ExtensionExecutableEvolutionTests.configure_runtime
 
 
 class ReReviewExecutableTests(ReReviewExecutableFixture):
