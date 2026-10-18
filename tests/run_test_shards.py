@@ -12,9 +12,13 @@ instead of `python -m unittest` and writes a per-test timing record to
 DIR/shard-I-of-N.json with the shard index in PROJECT_ROOM_TIMING_SHARD.
 `--check-weights` verifies coverage, `--refresh-weights FILE...` rewrites the
 weights from timing-summary combined artifacts, and `--measure MODULE...`
-pins a local estimate for new modules.
+pins a local estimate for new modules. `--workers K` (with `--shard` or
+`--jobs`) runs each shard's modules through up to K worker processes, longest
+module first, and merges the per-module timing records into the shard record;
+the default K=1 keeps the single-process shard unchanged.
 """
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -23,6 +27,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -139,6 +144,14 @@ def unittest_cmd(modules, verbose, record=None):
     if verbose:
         cmd.append("-v")
     return cmd + modules
+
+
+def _timed_unittest():
+    spec = importlib.util.spec_from_file_location(
+        "timed_unittest", ROOT / "tests" / "timed_unittest.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def check_weights():
@@ -325,6 +338,9 @@ def parse_args(argv):
                         help="pin MODULE weights from one local run (samples 0)")
     parser.add_argument("--refresh-weights", nargs="+", metavar="FILE",
                         help="refresh weights from timing-summary combined files")
+    parser.add_argument("--workers", type=int, default=1, metavar="K",
+                        help="run each shard's modules through up to K worker "
+                             "processes (with --shard or --jobs; default: 1)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="pass -v to unittest")
     args = parser.parse_args(argv)
@@ -334,12 +350,16 @@ def parse_args(argv):
     if modes.count(True) != 1:
         parser.exit(2, "error: choose exactly one of --list, --shard, --jobs, "
                     "--check-weights, --measure or --refresh-weights\n")
+    if args.workers < 1:
+        parser.exit(2, "error: --workers must be >= 1\n")
+    if args.workers > 1 and args.shard is None and args.jobs is None:
+        parser.exit(2, "error: --workers is only valid with --shard or --jobs\n")
     return args
 
 
 def log_summary(log_path):
     ran_line, result_line, count = "-", "-", 0
-    for line in reversed(log_path.read_text().splitlines()):
+    for line in reversed(log_path.read_text(errors="replace").splitlines()):
         ran = RAN_RE.match(line)
         if ran_line == "-" and ran:
             ran_line, count = line, int(ran.group(1))
@@ -348,6 +368,95 @@ def log_summary(log_path):
         if ran_line != "-" and result_line != "-":
             break
     return ran_line, result_line, count
+
+
+def run_shard_workers(index, shards, group, weights, args):
+    """Run one shard's modules through up to ``args.workers`` child processes.
+
+    The queue is longest-module-first by pinned weight; each child's full
+    output is replayed as one block in completion order, and with ``--record``
+    the per-module records (under ``DIR/workers/shard-I-of-N/``) are merged
+    into the shard record at ``DIR/shard-I-of-N.json``.
+    """
+    queue = sorted(group, key=lambda m: (-float(weights[m]), m))
+    workers_dir = record_dir = None
+    if args.record:
+        record_dir = Path(args.record)
+        workers_dir = record_dir / "workers" / f"shard-{index}-of-{shards}"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, PROJECT_ROOM_TIMING_SHARD=f"{index}/{shards}")
+    log_dir = Path(tempfile.mkdtemp(
+        prefix=f"project-room-shard-{index}-workers-"))
+    started = time.monotonic()
+    pending, running, finished = list(queue), {}, {}
+    while pending or running:
+        harvested = False
+        for proc, (module, log_path, handle,
+                   child_started) in list(running.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            handle.close()
+            del running[proc]
+            seconds = time.monotonic() - child_started
+            finished[module] = (code, seconds, log_path)
+            print(f"=== {module}: exit {code}, {seconds:.1f}s ===", flush=True)
+            out = getattr(sys.stdout, "buffer", None)
+            if out is not None:
+                out.write(log_path.read_bytes())
+                out.flush()
+            else:
+                sys.stdout.write(log_path.read_text(errors="replace"))
+            sys.stdout.flush()
+            harvested = True
+        while pending and len(running) < args.workers:
+            module = pending.pop(0)
+            log_path = log_dir / f"{module}.log"
+            record = (workers_dir / f"{module}.json"
+                      if workers_dir is not None else None)
+            handle = open(log_path, "wb")
+            proc = subprocess.Popen(
+                unittest_cmd([module], args.verbose, record),
+                cwd=ROOT, env=env,
+                stdout=handle, stderr=subprocess.STDOUT)
+            running[proc] = (module, log_path, handle, time.monotonic())
+        if not harvested:
+            time.sleep(0.1)
+    if record_dir is not None:
+        timed = _timed_unittest()
+        records, worker_runs = [], []
+        for module in queue:
+            code, seconds, _ = finished[module]
+            record = None
+            path = workers_dir / f"{module}.json"
+            if path.is_file():
+                try:
+                    record = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    record = None
+            worker_runs.append({"module": module, "exit_code": code,
+                                "seconds": round(seconds, 3),
+                                "record": record is not None})
+            records.append(record)
+        timed.write_record(
+            record_dir / f"shard-{index}-of-{shards}.json",
+            timed.merge_records(records,
+                                wall_seconds=time.monotonic() - started,
+                                modules_requested=list(group),
+                                workers=args.workers,
+                                worker_runs=worker_runs))
+    bad = total = 0
+    print(f"{'module':<40}{'ran':<33}{'result':<22}{'exit':<6}log")
+    for module in sorted(group):
+        code, seconds, log_path = finished[module]
+        ran_line, result_line, count = log_summary(log_path)
+        total += count
+        if code != 0 or ran_line == "-":
+            bad += 1
+        print(f"{module:<40}{ran_line:<33}{result_line:<22}"
+              f"{code:<6}{log_path}")
+    print(f"total: {total} tests")
+    return 1 if bad else 0
 
 
 def run_all(args, groups):
@@ -370,14 +479,27 @@ def run_all(args, groups):
     for i, group in enumerate(groups):
         log_path = log_dir / f"shard-{i}.log"
         handle = open(log_path, "w")
-        record, env = None, None
-        if record_dir is not None:
-            record = record_dir / f"shard-{i}-of-{len(groups)}.json"
-            env = dict(os.environ,
-                       PROJECT_ROOM_TIMING_SHARD=f"{i}/{len(groups)}")
-        proc = subprocess.Popen(unittest_cmd(group, args.verbose, record),
-                                cwd=ROOT, env=env,
-                                stdout=handle, stderr=subprocess.STDOUT)
+        if args.workers >= 2:
+            # Each shard job runs its own bounded worker pool internally.
+            cmd = [sys.executable, "-B",
+                   str(ROOT / "tests" / "run_test_shards.py"),
+                   "--shard", str(i), "--shards", str(len(groups)),
+                   "--workers", str(args.workers)]
+            if record_dir is not None:
+                cmd += ["--record", str(record_dir)]
+            if args.verbose:
+                cmd.append("-v")
+            proc = subprocess.Popen(cmd, cwd=ROOT,
+                                    stdout=handle, stderr=subprocess.STDOUT)
+        else:
+            record, env = None, None
+            if record_dir is not None:
+                record = record_dir / f"shard-{i}-of-{len(groups)}.json"
+                env = dict(os.environ,
+                           PROJECT_ROOM_TIMING_SHARD=f"{i}/{len(groups)}")
+            proc = subprocess.Popen(unittest_cmd(group, args.verbose, record),
+                                    cwd=ROOT, env=env,
+                                    stdout=handle, stderr=subprocess.STDOUT)
         running.append((i, group, log_path, handle, proc))
     bad = total = 0
     print(f"{'shard':<6}{'modules':<9}{'ran':<33}{'result':<22}{'exit':<6}log")
@@ -438,6 +560,9 @@ def main(argv=None):
             print(f"error: shard {args.shard} is empty "
                   f"({len(modules)} modules over {shards} shards)", file=sys.stderr)
             return 2
+        if args.workers >= 2:
+            return run_shard_workers(args.shard, shards, groups[args.shard],
+                                     weights, args)
         record, env = None, None
         if args.record:
             record_dir = Path(args.record)

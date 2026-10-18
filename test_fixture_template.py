@@ -2,6 +2,7 @@
 workflow once into a class-owned snapshot, then every test restores pristine disk bytes at the same
 paths and fresh in-memory state from the snapshot."""
 import json
+from pathlib import Path
 import subprocess
 import unittest
 
@@ -82,6 +83,20 @@ class FixtureTemplateTests(unittest.TestCase):
         self.assertNotEqual(len(three['state']['fake']['snapshots']['reviewer']['turns']),
                             len(two['state']['fake']['snapshots']['reviewer']['turns']))
         self.assertNotEqual(three['state']['attrs']['room'], two['state']['attrs']['room'])
+
+    def test_class_cleanups_remove_a_dynamically_created_template_dir(self):
+        # OracleParityTests-style use: a variant class built at call time owns its
+        # template dir through addClassCleanup, which fixture.doCleanups alone
+        # never runs.
+        variant = type('DynamicTemplate', (AcceptanceContinuationFixture,), {})
+        fixture = variant('runTest')
+        fixture.setUp()
+        path = Path(fixture.temp.name)
+        self.assertTrue(path.is_dir())
+        fixture.doCleanups()
+        self.assertTrue(path.is_dir())
+        variant.doClassCleanups()
+        self.assertFalse(path.exists())
 
     def test_settled_history_template_restores_room_fake_state_and_the_real_owner_reader(self):
         class Probe(SettledHistoryFixture):

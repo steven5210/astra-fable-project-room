@@ -206,9 +206,12 @@ class TimedUnittestTests(unittest.TestCase):
         self.assertGreaterEqual(ok["setup_seconds"], 0.04)
         self.assertGreaterEqual(ok["body_seconds"], 0.04)
         self.assertGreaterEqual(ok["teardown_seconds"], 0.04)
+        # Each field is rounded to 3 decimals; the rounded phase sum can exceed
+        # the rounded total by up to ~1.5 ms.
         self.assertGreaterEqual(
             ok["seconds"],
-            ok["setup_seconds"] + ok["body_seconds"] + ok["teardown_seconds"])
+            ok["setup_seconds"] + ok["body_seconds"] + ok["teardown_seconds"]
+            - 0.002)
         module = data["modules"]["timed_synth_outcomes"]
         self.assertEqual(module["tests"], 8)
         self.assertEqual(module["outcomes"], {
@@ -348,6 +351,74 @@ class TimedUnittestTests(unittest.TestCase):
         self.assertEqual(data["revision"], "abc1234")
         self.assertEqual(data["run_id"], "4242")
         self.assertEqual(data["modules_requested"], ["timed_synth_pass"])
+
+    def _worker_record(self, module, ran, failures=0, rows=(), complete=True):
+        return {"format": timed_unittest.FORMAT, "complete": complete,
+                "python": "3.11.9", "python_minor": "3.11",
+                "implementation": "CPython", "os": "macos",
+                "platform": "worker-platform", "machine": "arm64",
+                "revision": "rev1", "run_id": "run1",
+                "started_at": "2026-10-18T00:00:00+00:00",
+                "shard": {"index": 4, "count": 5},
+                "summary": {"ran": ran, "failures": failures, "errors": 0,
+                            "skipped": 0, "expected_failures": 0,
+                            "unexpected_successes": 0,
+                            "was_successful": failures == 0},
+                "modules": {module: {"tests": ran, "wall_seconds": 1.0}},
+                "tests": list(rows)}
+
+    def test_merge_records_unions_modules_sums_counts_and_flags_incomplete(self):
+        row_a = {"id": "a.C.t1", "module": "a", "seconds": 0.1}
+        row_b = {"id": "b.C.t1", "module": "b", "seconds": 0.2}
+        records = [self._worker_record("a", 1, rows=[row_a]),
+                   self._worker_record("b", 2, failures=1, rows=[row_b]),
+                   None]
+        merged = timed_unittest.merge_records(
+            records, wall_seconds=12.34567, modules_requested=["a", "b", "c"],
+            workers=3,
+            worker_runs=[{"module": "a", "exit_code": 0, "seconds": 1.0,
+                          "record": True},
+                         {"module": "b", "exit_code": 1, "seconds": 2.0,
+                          "record": True},
+                         {"module": "c", "exit_code": 1, "seconds": 0.5,
+                          "record": False}])
+        self.assertEqual(merged["format"], timed_unittest.FORMAT)
+        self.assertFalse(merged["complete"])          # one worker record missing
+        self.assertEqual(merged["summary"],
+                         {"ran": 3, "failures": 1, "errors": 0, "skipped": 0,
+                          "expected_failures": 0, "unexpected_successes": 0,
+                          "was_successful": False})
+        self.assertEqual(set(merged["modules"]), {"a", "b"})
+        self.assertEqual([row["id"] for row in merged["tests"]],
+                         ["a.C.t1", "b.C.t1"])        # queue order
+        self.assertEqual(merged["wall_seconds"], 12.346)
+        self.assertEqual(merged["modules_requested"], ["a", "b", "c"])
+        self.assertEqual(merged["workers"], 3)
+        self.assertEqual(merged["worker_runs"][2]["record"], False)
+        self.assertEqual(merged["python"], "3.11.9")  # first worker's provenance
+        self.assertEqual(merged["platform"], "worker-platform")
+        self.assertEqual(merged["shard"], {"index": 4, "count": 5})
+        self.assertNotIn("tests_truncated", merged)
+
+    def test_merge_records_marks_truncation_and_survives_zero_records(self):
+        rows = [{"id": f"m.C.t{i}", "module": "m"} for i in range(3)]
+        one = self._worker_record("m", 3, rows=rows)
+        with mock.patch.object(timed_unittest, "MAX_TEST_ROWS", 2):
+            merged = timed_unittest.merge_records(
+                [one, one], wall_seconds=1.0, modules_requested=["m", "n"],
+                workers=2, worker_runs=[])
+        self.assertTrue(merged["tests_truncated"])
+        self.assertEqual(len(merged["tests"]), 2)
+        self.assertEqual(merged["summary"]["ran"], 6)
+        empty = timed_unittest.merge_records(
+            [None], wall_seconds=0.5, modules_requested=["x"], workers=2,
+            worker_runs=[{"module": "x", "exit_code": 1, "seconds": 0.5,
+                          "record": False}])
+        self.assertFalse(empty["complete"])
+        self.assertFalse(empty["summary"]["was_successful"])
+        self.assertEqual(empty["summary"]["ran"], 0)
+        self.assertEqual(empty["modules"], {})
+        self.assertIn("python", empty)  # provenance filled like build_record
 
 
 if __name__ == "__main__":

@@ -312,6 +312,73 @@ def write_record(path, record):
     os.replace(tmp, path)
 
 
+_SUMMARY_KEYS = ("ran", "failures", "errors", "skipped",
+                 "expected_failures", "unexpected_successes")
+_PROVENANCE_KEYS = ("python", "python_minor", "implementation", "os", "platform",
+                    "machine", "revision", "run_id", "started_at", "shard")
+
+
+def _merge_provenance(first):
+    """Provenance for a merged record: copied from the first worker record, or
+    filled exactly as build_record does when no worker produced one."""
+    if first is not None:
+        return {key: first.get(key) for key in _PROVENANCE_KEYS}
+    return {"python": platform.python_version(),
+            "python_minor": ".".join(map(str, sys.version_info[:2])),
+            "implementation": platform.python_implementation(),
+            "os": _os_name(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "revision": os.environ.get("PROJECT_ROOM_TIMING_REVISION"),
+            "run_id": os.environ.get("PROJECT_ROOM_TIMING_RUN_ID"),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "shard": _shard_env()}
+
+
+def merge_records(records, **provenance):
+    """Merge per-module worker records into one shard record.
+
+    ``records`` holds worker records in dispatch-queue order; a ``None`` entry
+    is a worker that produced no record -- it still appears in ``worker_runs``
+    and makes ``complete`` (and ``was_successful``) false. Provenance fields are
+    copied from the first present record; ``wall_seconds`` is the caller's own
+    shard wall time, and ``modules_requested``/``workers``/``worker_runs`` are
+    passed through from ``provenance``.
+    """
+    present = [record for record in records if isinstance(record, dict)]
+    summary = {key: sum(record.get("summary", {}).get(key, 0)
+                      for record in present) for key in _SUMMARY_KEYS}
+    summary["was_successful"] = (
+        len(present) == len(records)
+        and all(record.get("summary", {}).get("was_successful") is True
+                for record in present))
+    modules, tests, truncated = {}, [], False
+    for record in present:
+        modules.update(record.get("modules") or {})
+        if record.get("tests_truncated"):
+            truncated = True
+        for row in record.get("tests") or []:
+            if len(tests) < MAX_TEST_ROWS:
+                tests.append(row)
+            else:
+                truncated = True
+    record = {"format": FORMAT,
+              "complete": (len(present) == len(records)
+                           and all(worker.get("complete") is True
+                                   for worker in present)),
+              **_merge_provenance(present[0] if present else None),
+              "modules_requested": list(provenance["modules_requested"]),
+              "wall_seconds": round(provenance["wall_seconds"], 3),
+              "summary": summary,
+              "modules": modules,
+              "tests": tests,
+              "workers": provenance["workers"],
+              "worker_runs": list(provenance["worker_runs"])}
+    if truncated:
+        record["tests_truncated"] = True
+    return record
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="timed_unittest.py",

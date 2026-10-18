@@ -46,7 +46,7 @@ jobs:
           GIT_CONFIG_NOSYSTEM: "1"
           PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           PROJECT_ROOM_TIMING_RUN_ID: ${{ github.run_id }}
-        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 -v --record "$RUNNER_TEMP/timing"
+        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 --workers 3 -v --record "$RUNNER_TEMP/timing"
       - name: Run Linux tests in an isolated process namespace
         if: runner.os == 'Linux'
         env:
@@ -73,7 +73,7 @@ jobs:
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
             --env PROJECT_ROOM_TIMING_REVISION --env PROJECT_ROOM_TIMING_RUN_ID \
-            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 -v --record /timing
+            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 --workers 4 -v --record /timing
       - name: Upload per-test timing record
         uses: actions/upload-artifact@v4
         if: always()

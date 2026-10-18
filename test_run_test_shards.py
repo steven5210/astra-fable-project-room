@@ -22,6 +22,51 @@ run_test_shards = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(run_test_shards)
 
 
+class _WorkerScript:
+    """A controllable Popen factory: each child writes its scripted log body to
+    the stdout handle at launch and finishes after a scripted number of polls,
+    writing its scripted timing record (if any) at finish."""
+
+    def __init__(self, logs=None, records=None, exits=None, deadlines=None):
+        self.logs = logs or {}
+        self.records = records or {}
+        self.exits = exits or {}
+        self.deadlines = deadlines or {}
+        self.launched = []
+        self.alive = 0
+        self.max_alive = 0
+
+    def popen(self, argv, **kwargs):
+        return _WorkerProc(self, argv, kwargs)
+
+
+class _WorkerProc:
+    def __init__(self, script, argv, kwargs):
+        self.script = script
+        self.argv = argv
+        self.kwargs = kwargs
+        self.module = argv[-1]
+        self.returncode = None
+        self.polls = 0
+        script.launched.append(self)
+        script.alive += 1
+        script.max_alive = max(script.max_alive, script.alive)
+        log = script.logs.get(self.module, "Ran 1 tests in 0.001s\nOK\n")
+        kwargs["stdout"].write(log if isinstance(log, bytes) else log.encode())
+
+    def poll(self):
+        self.polls += 1
+        if (self.returncode is None
+                and self.polls >= self.script.deadlines.get(self.module, 1)):
+            self.returncode = self.script.exits.get(self.module, 0)
+            self.script.alive -= 1
+            record = self.script.records.get(self.module)
+            if record is not None and "--record" in self.argv:
+                path = Path(self.argv[self.argv.index("--record") + 1])
+                path.write_text(record)
+        return self.returncode
+
+
 class RunTestShardsTests(unittest.TestCase):
     def test_real_modules_partition_exactly_once_and_deterministically(self):
         modules = run_test_shards.test_modules()
@@ -338,6 +383,130 @@ class RunTestShardsTests(unittest.TestCase):
                       call.kwargs["env"]["PROJECT_ROOM_TIMING_SHARD"]))
         self.assertEqual(seen,
                          {(f"shard-{i}-of-5.json", f"{i}/5") for i in range(5)})
+
+    def test_shard_workers_dispatch_longest_first_and_merge_the_records(self):
+        group = ["wm", "wl", "wk", "wj", "wi"]
+        weights = {"wm": 50, "wl": 40, "wk": 30, "wj": 20, "wi": 10}
+        # wm holds a worker slot longest, so every later dispatch is observable.
+        script = _WorkerScript(
+            deadlines={"wm": 4},
+            records={module: json.dumps(
+                {"complete": True, "python": "fake", "os": "macos",
+                 "summary": {"ran": 1, "was_successful": True},
+                 "modules": {module: {"tests": 1}},
+                 "tests": [{"id": f"{module}.C.t", "module": module}]})
+                for module in group})
+        with tempfile.TemporaryDirectory() as tmp:
+            args = run_test_shards.parse_args(
+                ["--shard", "0", "--workers", "2", "--record", tmp])
+            out = io.StringIO()
+            with mock.patch.object(run_test_shards.subprocess, "Popen",
+                                   side_effect=script.popen), \
+                    contextlib.redirect_stdout(out):
+                code = run_test_shards.run_shard_workers(0, 5, group, weights,
+                                                         args)
+            merged = json.loads(
+                (Path(tmp) / "shard-0-of-5.json").read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual([proc.module for proc in script.launched],
+                         ["wm", "wl", "wk", "wj", "wi"])  # longest first
+        self.assertEqual(script.max_alive, 2)
+        for proc in script.launched:
+            record = (Path(tmp) / "workers" / "shard-0-of-5"
+                      / f"{proc.module}.json")
+            self.assertEqual(
+                proc.argv,
+                run_test_shards.unittest_cmd([proc.module], False, record))
+            self.assertEqual(proc.kwargs["cwd"], run_test_shards.ROOT)
+            self.assertEqual(
+                proc.kwargs["env"]["PROJECT_ROOM_TIMING_SHARD"], "0/5")
+        self.assertEqual(merged["workers"], 2)
+        self.assertEqual([run["module"] for run in merged["worker_runs"]],
+                         ["wm", "wl", "wk", "wj", "wi"])
+        self.assertTrue(all(run["record"] for run in merged["worker_runs"]))
+        self.assertTrue(merged["complete"])
+        self.assertEqual(set(merged["modules"]), set(group))
+        self.assertEqual(merged["summary"]["ran"], 5)
+        self.assertEqual(merged["python"], "fake")
+        text = out.getvalue()
+        self.assertIn("total: 5 tests", text)
+        self.assertIn("Ran 1 tests", text)
+        self.assertLess(text.index("=== wl"), text.index("=== wm"))
+
+    def test_shard_workers_exit_codes_and_missing_ran_lines(self):
+        weights = {"wa": 10, "wb": 5}
+        args = run_test_shards.parse_args(["--shard", "0", "--workers", "2"])
+        cases = [("a child exit 1 fails the shard",
+                  _WorkerScript(exits={"wb": 1}), 1),
+                 ("a child log without a Ran line fails the shard",
+                  _WorkerScript(logs={"wb": "no summary here\n"}), 1),
+                 ("clean children pass", _WorkerScript(), 0)]
+        for name, script, expected in cases:
+            with self.subTest(case=name):
+                out = io.StringIO()
+                with mock.patch.object(run_test_shards.subprocess, "Popen",
+                                       side_effect=script.popen), \
+                        contextlib.redirect_stdout(out):
+                    code = run_test_shards.run_shard_workers(
+                        0, 5, ["wa", "wb"], weights, args)
+                self.assertEqual(code, expected)
+                self.assertIn("total: ", out.getvalue())
+                if expected:
+                    self.assertIn("=== wb: exit ", out.getvalue())
+
+    def test_worker_log_with_non_utf8_bytes_still_summarizes(self):
+        weights = {"wa": 10}
+        args = run_test_shards.parse_args(["--shard", "0", "--workers", "2"])
+        script = _WorkerScript(
+            logs={"wa": b"\xff\xfe\nRan 1 test in 0.001s\n\nOK\n"})
+        out = io.StringIO()
+        with mock.patch.object(run_test_shards.subprocess, "Popen",
+                               side_effect=script.popen), \
+                contextlib.redirect_stdout(out):
+            code = run_test_shards.run_shard_workers(
+                0, 5, ["wa"], weights, args)
+        self.assertEqual(code, 0)
+        self.assertIn("Ran 1 test in 0.001s", out.getvalue())
+
+    def test_workers_one_keeps_the_single_process_shard_command(self):
+        modules = run_test_shards.test_modules()
+        groups, _ = run_test_shards.assign(
+            modules, 5, run_test_shards.load_weights())
+        for argv in (["--shard", "1", "--shards", "5"],
+                     ["--shard", "1", "--shards", "5", "--workers", "1"]):
+            runner = mock.Mock(return_value=mock.Mock(returncode=0))
+            with mock.patch.object(run_test_shards.subprocess, "run", runner):
+                code = run_test_shards.main(argv)
+            self.assertEqual(code, 0)
+            self.assertEqual(runner.call_args.args[0],
+                             run_test_shards.unittest_cmd(groups[1], False))
+            self.assertIsNone(runner.call_args.kwargs["env"])
+
+    def test_jobs_mode_with_workers_runs_each_shard_as_a_pool(self):
+        def fake_popen(argv, **kwargs):
+            kwargs["stdout"].write("Ran 1 tests in 0.001s\nOK\n")
+            return mock.Mock(wait=lambda: 0)
+
+        with mock.patch.object(run_test_shards.subprocess, "Popen",
+                               side_effect=fake_popen) as popen, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = run_test_shards.main(["--jobs", "5", "--workers", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(popen.call_args_list), 5)
+        for index, call in enumerate(popen.call_args_list):
+            argv = call.args[0]
+            self.assertEqual(argv[:5], [sys.executable, "-B",
+                                        str(ROOT / "tests" / "run_test_shards.py"),
+                                        "--shard", str(index)])
+            self.assertEqual(argv[argv.index("--workers") + 1], "3")
+
+    def test_workers_requires_a_shard_mode(self):
+        with self.assertRaises(SystemExit) as ctx:
+            run_test_shards.main(["--list", "--workers", "3"])
+        self.assertEqual(ctx.exception.code, 2)
+        with self.assertRaises(SystemExit) as ctx:
+            run_test_shards.main(["--shard", "0", "--workers", "0"])
+        self.assertEqual(ctx.exception.code, 2)
 
     def test_unittest_cmd_forms(self):
         self.assertEqual(

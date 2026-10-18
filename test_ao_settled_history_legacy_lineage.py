@@ -423,6 +423,9 @@ class OracleParityTests(unittest.TestCase):
         # mutating an attribute on a shared class would reuse the first provider's history.
         variant = type('ProviderTextVariant', (LegacyLineageFixture,),
                        {'PROVIDER_TEXT': provider_text})
+        # addCleanup pops LIFO: the class-owned template dir is removed after
+        # the instance cleanups, the same order unittest runs them.
+        self.addCleanup(variant.doClassCleanups)
         fixture = variant('runTest')
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
