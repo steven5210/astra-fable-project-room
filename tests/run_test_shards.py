@@ -6,9 +6,13 @@ in tests/shard_weights.json; a module missing from the file takes the median
 weight, and every module weighs 1.0 when the file is absent. CI runs one shard
 per job with `--shard I --shards N`; `--jobs J` runs all J shards concurrently
 on a developer machine and writes each shard's combined output to a log file.
+`--record DIR` runs each shard through tests/timed_unittest.py instead of
+`python -m unittest` and writes a per-test timing record to
+DIR/shard-I-of-N.json with the shard index in PROJECT_ROOM_TIMING_SHARD.
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -46,8 +50,16 @@ def assign(modules, shards, weights):
     return groups, loads
 
 
-def unittest_cmd(modules, verbose):
-    cmd = [sys.executable, "-B", "-m", "unittest"]
+def unittest_cmd(modules, verbose, record=None):
+    if record is None:
+        cmd = [sys.executable, "-B", "-m", "unittest"]
+        if verbose:
+            cmd.append("-v")
+        return cmd + modules
+    # Run the timing runner by path: a regular `tests` package on sys.path
+    # would shadow the namespace package that `-m tests.timed_unittest` needs.
+    cmd = [sys.executable, "-B", str(ROOT / "tests" / "timed_unittest.py"),
+           "--record", str(record)]
     if verbose:
         cmd.append("-v")
     return cmd + modules
@@ -62,6 +74,8 @@ def parse_args(argv):
                         help="run all J shards concurrently")
     parser.add_argument("--log-dir", metavar="DIR",
                         help="directory for --jobs shard logs")
+    parser.add_argument("--record", metavar="DIR",
+                        help="write a per-test timing record per shard to DIR")
     parser.add_argument("--list", action="store_true",
                         help="print each shard's modules and exit")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -97,11 +111,21 @@ def run_all(args, groups):
         log_dir.mkdir(parents=True, exist_ok=True)
     else:
         log_dir = Path(tempfile.mkdtemp(prefix="project-room-test-shards-"))
+    record_dir = None
+    if args.record:
+        record_dir = Path(args.record)
+        record_dir.mkdir(parents=True, exist_ok=True)
     running = []
     for i, group in enumerate(groups):
         log_path = log_dir / f"shard-{i}.log"
         handle = open(log_path, "w")
-        proc = subprocess.Popen(unittest_cmd(group, args.verbose), cwd=ROOT,
+        record, env = None, None
+        if record_dir is not None:
+            record = record_dir / f"shard-{i}-of-{len(groups)}.json"
+            env = dict(os.environ,
+                       PROJECT_ROOM_TIMING_SHARD=f"{i}/{len(groups)}")
+        proc = subprocess.Popen(unittest_cmd(group, args.verbose, record),
+                                cwd=ROOT, env=env,
                                 stdout=handle, stderr=subprocess.STDOUT)
         running.append((i, group, log_path, handle, proc))
     bad = total = 0
@@ -143,8 +167,15 @@ def main(argv=None):
             print(f"error: shard {args.shard} is empty "
                   f"({len(modules)} modules over {shards} shards)", file=sys.stderr)
             return 2
-        proc = subprocess.run(unittest_cmd(groups[args.shard], args.verbose),
-                              cwd=ROOT)
+        record, env = None, None
+        if args.record:
+            record_dir = Path(args.record)
+            record_dir.mkdir(parents=True, exist_ok=True)
+            record = record_dir / f"shard-{args.shard}-of-{shards}.json"
+            env = dict(os.environ,
+                       PROJECT_ROOM_TIMING_SHARD=f"{args.shard}/{shards}")
+        proc = subprocess.run(unittest_cmd(groups[args.shard], args.verbose,
+                                           record), cwd=ROOT, env=env)
         return proc.returncode
     return run_all(args, groups)
 

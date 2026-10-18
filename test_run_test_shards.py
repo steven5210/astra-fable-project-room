@@ -6,8 +6,10 @@ subprocess.run is replaced by a recorder.
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -55,6 +57,65 @@ class RunTestShardsTests(unittest.TestCase):
         argv = runner.call_args.args[0]
         self.assertEqual(argv[-len(groups[1]):], groups[1])
         self.assertEqual(argv[:4], [sys.executable, "-B", "-m", "unittest"])
+        self.assertIsNone(runner.call_args.kwargs["env"])
+
+    def test_shard_mode_with_record_invokes_the_timed_runner(self):
+        modules = run_test_shards.test_modules()
+        groups, _ = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        runner = mock.Mock(return_value=mock.Mock(returncode=0))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(run_test_shards.subprocess, "run", runner):
+                code = run_test_shards.main(
+                    ["--shard", "1", "--shards", "5", "--record", tmp])
+            self.assertEqual(code, 0)
+        argv = runner.call_args.args[0]
+        record = str(Path(tmp) / "shard-1-of-5.json")
+        self.assertEqual(argv[:5], [sys.executable, "-B",
+                                    str(ROOT / "tests" / "timed_unittest.py"),
+                                    "--record", record])
+        self.assertEqual(argv[5:], groups[1])
+        env = runner.call_args.kwargs["env"]
+        self.assertEqual(env["PROJECT_ROOM_TIMING_SHARD"], "1/5")
+        for key in ("PATH", "HOME"):
+            if key in os.environ:
+                self.assertEqual(env[key], os.environ[key])
+
+    def test_jobs_mode_with_record_gives_each_shard_a_record_and_env(self):
+        def fake_popen(argv, **kwargs):
+            kwargs["stdout"].write(
+                "x\n----------------------------------------------------------------------\n"
+                "Ran 1 tests in 0.001s\n\nOK\n")
+            return mock.Mock(wait=lambda: 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(run_test_shards.subprocess, "Popen",
+                                   side_effect=fake_popen) as popen, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = run_test_shards.main(
+                    ["--jobs", "5", "--record", tmp, "--log-dir", tmp])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(popen.call_args_list), 5)
+        seen = set()
+        for call in popen.call_args_list:
+            argv = call.args[0]
+            record = argv[argv.index("--record") + 1]
+            seen.add((Path(record).name,
+                      call.kwargs["env"]["PROJECT_ROOM_TIMING_SHARD"]))
+        self.assertEqual(seen,
+                         {(f"shard-{i}-of-5.json", f"{i}/5") for i in range(5)})
+
+    def test_unittest_cmd_forms(self):
+        self.assertEqual(
+            run_test_shards.unittest_cmd(["test_a", "test_b"], False),
+            [sys.executable, "-B", "-m", "unittest", "test_a", "test_b"])
+        self.assertEqual(
+            run_test_shards.unittest_cmd(["test_a"], True),
+            [sys.executable, "-B", "-m", "unittest", "-v", "test_a"])
+        record = Path("dir") / "shard-0-of-5.json"
+        self.assertEqual(
+            run_test_shards.unittest_cmd(["test_a"], True, record),
+            [sys.executable, "-B", str(ROOT / "tests" / "timed_unittest.py"),
+             "--record", str(record), "-v", "test_a"])
 
     def test_list_reports_each_shard_with_minutes_and_the_total(self):
         output = io.StringIO()
