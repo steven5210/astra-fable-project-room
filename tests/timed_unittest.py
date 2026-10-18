@@ -44,8 +44,18 @@ _PHASE_HOOKS = {"_callSetUp": "setup_seconds",
                 "_callTearDown": "teardown_seconds"}
 # Stack of per-run phase stores; the innermost in-process run owns the top, so
 # nested TimedTextTestRunner runs record their own ids and leave the outer
-# record untouched.
-_ACTIVE_PHASES = []
+# record untouched. It lives on unittest.TestCase rather than in this module so
+# that every copy of timed_unittest in the process (the shard runner's
+# __main__ and a test module's spec-loaded import) shares one stack.
+_STACK_ATTR = "_project_room_timing_stack"
+
+
+def _phase_stack():
+    stack = getattr(unittest.TestCase, _STACK_ATTR, None)
+    if stack is None:
+        stack = []
+        setattr(unittest.TestCase, _STACK_ATTR, stack)
+    return stack
 
 
 def _os_name():
@@ -77,8 +87,9 @@ def _phase_wrapper(name, original):
         try:
             return original(self, *args, **kwargs)
         finally:
-            if _ACTIVE_PHASES:
-                phases = _ACTIVE_PHASES[-1]["phases"].setdefault(self.id(), {})
+            stack = _phase_stack()
+            if stack:
+                phases = stack[-1]["phases"].setdefault(self.id(), {})
                 phases[field] = phases.get(field, 0.0) + (time.monotonic() - started)
 
     timed._project_room_phase_patch = True
@@ -89,7 +100,7 @@ def _phase_wrapper(name, original):
 def _phase_timing():
     hooks_ok = all(hasattr(unittest.TestCase, name) for name in _PHASE_HOOKS)
     ctx = {"phases": {}, "hooks": hooks_ok}
-    _ACTIVE_PHASES.append(ctx)
+    _phase_stack().append(ctx)
     originals = {}
     try:
         if hooks_ok:
@@ -105,7 +116,7 @@ def _phase_timing():
     finally:
         for name, original in originals.items():
             setattr(unittest.TestCase, name, original)
-        popped = _ACTIVE_PHASES.pop()
+        popped = _phase_stack().pop()
         assert popped is ctx
 
 
@@ -177,10 +188,11 @@ class TimedTextTestResult(unittest.TextTestResult):
             started = self._starts.pop(test_id, finished)
             module = _module_of(test_id)
             self.module_last[module] = finished
-            if _ACTIVE_PHASES and _ACTIVE_PHASES[-1]["hooks"]:
+            stack = _phase_stack()
+            if stack and stack[-1]["hooks"]:
                 # Pop, so a test id that runs twice in one process (the
                 # duplicate-discovery shape) gets two independent rows.
-                phases = _ACTIVE_PHASES[-1]["phases"].pop(test_id, {})
+                phases = stack[-1]["phases"].pop(test_id, {})
             else:
                 phases = None
             outcome = self._outcomes.pop(test_id, "ok")

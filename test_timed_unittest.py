@@ -264,11 +264,14 @@ class TimedUnittestTests(unittest.TestCase):
         self._write_module("timed_synth_pass", MOD_PASS)
         originals = {name: getattr(unittest.TestCase, name)
                      for name in timed_unittest._PHASE_HOOKS}
+        depth = len(getattr(unittest.TestCase,
+                           "_project_room_timing_stack", []))
         code, _, _ = self._run(["timed_synth_pass"])
         self.assertEqual(code, 0)
         for name, original in originals.items():
             self.assertIs(getattr(unittest.TestCase, name), original, name)
-        self.assertEqual(timed_unittest._ACTIVE_PHASES, [])
+        self.assertEqual(len(getattr(unittest.TestCase,
+                                     "_project_room_timing_stack", [])), depth)
 
     def test_the_row_cap_marks_truncation_but_counts_everything(self):
         self._write_module("timed_synth_outcomes", MOD_OUTCOMES)
