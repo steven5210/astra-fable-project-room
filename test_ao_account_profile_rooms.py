@@ -4,7 +4,6 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -144,7 +143,7 @@ class RoomOpenTests(AccountFixture):
         self.assertIsNone(settings["claude_config_dir_override"])
         self.spec()
         self.env()  # the default pin refuses any explicit key, so the project env carries none
-        prepared = self.prepare()
+        self.prepare()
         evidence = ao.read(self.directory() / "preparation.json")["account_profile"]
         self.assertEqual(evidence["name"], "default")
         self.assertIsNone(evidence["config_dir_exact"])
