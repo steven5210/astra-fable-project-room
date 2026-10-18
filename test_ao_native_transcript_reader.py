@@ -719,6 +719,20 @@ class IdentityRecheckCtimeOwnerModeTests(unittest.TestCase):
                     fh.write(original_content)
                 os.utime(self.path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
                 after_stat = self.path.stat()
+                # Linux inode timestamps are only as fine as the filesystem's own clock granularity
+                # (coarse on some kernels/filesystems), so a same-size rewrite with its mtime
+                # restored, performed within the same tick as the original write, can leave
+                # st_ctime_ns numerically unchanged even though real time has moved on. Wait for the
+                # tick to turn instead of racing it: between observations in production, the
+                # digest/size revalidation still applies regardless of this filesystem's granularity.
+                attempts = 0
+                while after_stat.st_ctime_ns == before_stat.st_ctime_ns:
+                    attempts += 1
+                    if attempts >= 1000:
+                        self.fail('ctime never advanced')
+                    time.sleep(0.002)
+                    os.utime(self.path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+                    after_stat = self.path.stat()
                 # Sanity: the restore worked (mtime back to the original) and ctime still moved --
                 # otherwise this test would not actually be exercising the ctime comparison at all.
                 if after_stat.st_mtime_ns != before_stat.st_mtime_ns or after_stat.st_ctime_ns == before_stat.st_ctime_ns:
