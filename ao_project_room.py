@@ -1190,7 +1190,9 @@ class Service:
         if invalid:
             raise RoomError("wait_seconds must be finite and between 0 and 45")
         if wait_seconds == 0:
-            return self._sync_once(room_id)[0]
+            summary = self._sync_once(room_id)[0]
+            self._sync_rate_limits(summary, room_id)
+            return summary
         config_warning = None
         try:
             maximum = sync_wait_max_seconds(self.root)
@@ -1258,6 +1260,7 @@ class Service:
         if config_warning is not None:
             wait["config_warning"] = config_warning
         summary["wait"] = wait
+        self._sync_rate_limits(summary, room_id)
         return summary
 
     def _capture_recovery(self, directory, state, request):
@@ -1666,22 +1669,43 @@ class Service:
                 delegate["routing"] = {key: routing[key] for key in
                                        ("status", "guard_sha256", "execution_policy", "agents")
                                        if key in routing}
+        result["rate_limits"] = self._rate_limits(state)
+        result["view"] = "compact"
+        return result
+
+    def _rate_limits(self, state):
+        """The provider's live rate-limit reading in the compact-status shape; advisory only.
+
+        Reads the registered native outcome source database for the latest engineer request's
+        session through ao_rate_limits.latest (already fail-soft). Never refuses, authorizes or
+        alters dispatch, holds or counters; an unavailable source reports its reason, never a guess.
+        """
         import ao_rate_limits
+        ordered = sorted(state["requests"].values(), key=ao_prompt_metrics.presentation_order)
+        latest = {}
+        for request in ordered:
+            latest[request["role"]] = request
         engineer = latest.get("engineer") or {}
         reading = ao_rate_limits.latest((state.get("native_outcome_source") or {}).get("database"),
                                         engineer.get("session_id"))
         if reading["available"]:
             window = reading["window"]
-            result["rate_limits"] = {"label": window["label"],
-                                     "used_percent": window["used_percent"] if window["reported"] else "not reported",
-                                     "resets_at": window["resets_at"],
-                                     "minutes_remaining_at_current_rate":
-                                         reading["burn"]["minutes_remaining_at_current_rate"],
-                                     "age_seconds": reading["age_seconds"]}
-        else:
-            result["rate_limits"] = {"unavailable_reason": reading["unavailable_reason"]}
-        result["view"] = "compact"
-        return result
+            return {"label": window["label"],
+                    "used_percent": window["used_percent"] if window["reported"] else "not reported",
+                    "resets_at": window["resets_at"],
+                    "minutes_remaining_at_current_rate":
+                        reading["burn"]["minutes_remaining_at_current_rate"],
+                    "age_seconds": reading["age_seconds"]}
+        return {"unavailable_reason": reading["unavailable_reason"]}
+
+    def _sync_rate_limits(self, summary, room_id):
+        """Attach the advisory rate-limit reading to one finished ao_room_sync result, once per call."""
+        try:
+            state = read(self.root / "rooms" / identifier(room_id) / "state.json")
+        except (OSError, ValueError):
+            summary["rate_limits"] = {"unavailable_reason": "room_state_unreadable"}
+            return
+        summary["rate_limits"] = self._rate_limits(state)
 
     def ao_room_status(self, room_id, view="full"):
         # State is atomically replaced, so status can remain available while a

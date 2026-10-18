@@ -42,7 +42,8 @@ Rules for every phase:
   went, call the read-only `ao_room_timing`; its gap kinds name saved evidence,
   never causes. Report the
   rate-limit window label, its used percent or `not reported`, and its reset
-  time; treat the reading as advisory, never as headroom.
+  time — the `ao_room_sync` result carries it, so no extra status call is
+  needed; treat the reading as advisory, never as headroom.
 - `ao_room_progress.deliverables` (additive, read-only) folds the same task list
   into requirement labels, lineage and closure. Read `closure` for measured
   counts and deltas (never a percentage), `blockers`/`blockers_total` for named

@@ -188,6 +188,9 @@ starting a reconciliation whose last measured iteration would overrun the
 requested wait, while the first iteration, lock acquisition or a slower later
 iteration can still exceed it. `settled` is true only when every owned request
 is terminal; an `uncertain` request still needs sync/recovery, never replay.
+The sync result also carries `rate_limits` in the compact-status shape, read
+once per call from the registered engineer's AO database — advisory only, never
+headroom and never authority.
 Saved status remains readable while a verification gate holds the mutation lock.
 Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
 with explicit truncation. Check legacy `room_list` before treating an ambiguous

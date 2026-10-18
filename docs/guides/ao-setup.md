@@ -68,6 +68,26 @@ For progress while a turn runs, `ao_room_progress` gives a read-only view of one
 
 Every step refuses rather than guesses: unknown delivery is never replayed, an AO failure without an observed native turn ID stays uncertain, an active or unresolved delegate job blocks the next phase, and exhausted review budgets surface the decision to you instead of opening another room. The full contract, including the exact result fields and the historical pilot rooms, is in [Project Room on Agent Orchestrator](../../skills/project-room/references/ao.md).
 
+### Verification gate recipes for new rooms
+
+Gates are argv arrays pinned per spec revision; `ao_room_verify` runs them in order, stops
+at the first failing gate and binds every log to the exact candidate by digest. Two measured
+recipes for a new controller room (an existing room keeps the gates its spec already pins):
+
+- Put the fast checks first: `["git", "diff", "--check"]` and
+  `["python3", "-B", "-m", "unittest", "test_ao_lifecycle_contract"]` (about 70 seconds)
+  before the full suite, so a lifecycle regression fails within two minutes instead of after
+  the full serial run (92–98 minutes for 3,300+ tests in two preserved formal logs).
+- Run the full suite through the module-level parallel runner on the operator machine:
+  `["python3", "tests/run_test_shards.py", "--jobs", "5"]`. It runs the same module set as
+  `python3 -m unittest discover` (the runner asserts full coverage and `test_run_test_shards.py`
+  pins it; on CI every platform's shard totals matched the discovery count exactly) in about
+  the longest shard's time rather than the serial total, which also keeps the gate inside the
+  7,200-second per-gate maximum as the suite grows. Size `timeout_seconds` for the longest
+  shard. The shards are separate processes, so record once per release one candidate that
+  passes both forms with identical test and skip counts; Linux CI is not a substitute for a
+  macOS gate because the two platforms skip different tests.
+
 ### CLI fallback
 
 The installed plugin's controller exposes every `ao_room_*` and legacy `room_*` operation with the MCP schemas, which lets an existing task with an older tool inventory continue a room without a new conversation:
