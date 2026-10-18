@@ -415,7 +415,7 @@ def baseline_stats(entries):
     median shard exec seconds.
     """
     module_runs, execs, runner_minutes = {}, {}, []
-    for entry in entries:
+    for run_index, entry in enumerate(entries):
         per_module = {}
         for module, seconds, kind in shardtools._combined_measurements(
                 entry["data"]):
@@ -425,7 +425,7 @@ def baseline_stats(entries):
             series = module_runs.setdefault(
                 module, {"process": [], "wall": []})
             for kind, values in kinds.items():
-                series[kind].append(statistics.median(values))
+                series[kind].append((run_index, statistics.median(values)))
         groups, total, counted = {}, 0.0, False
         for job in entry["data"].get("jobs", []):
             if not isinstance(job, dict) or job.get("name") == "timing-summary":
@@ -447,10 +447,16 @@ def baseline_stats(entries):
             runner_minutes.append(total / 60)
     modules = {}
     for module, series in module_runs.items():
-        modules[module] = {
-            kind: {"median": statistics.median(values), "n": len(values),
-                   "min": min(values), "max": max(values), "runs": values}
-            for kind, values in series.items() if values}
+        modules[module] = {}
+        for kind, values in series.items():
+            if not values:
+                continue
+            walls = [seconds for _index, seconds in values]
+            modules[module][kind] = {
+                "median": statistics.median(walls), "n": len(walls),
+                "min": min(walls), "max": max(walls),
+                # (run_index, seconds): run_index 0 is the newest main run.
+                "runs": values}
     return {"modules": modules, "execs": execs, "runner_minutes": runner_minutes}
 
 
@@ -530,9 +536,15 @@ def _build_warnings(records, jobs_metrics, baselines, weights_data):
                     f"inconclusive (n={series['n']} {kind}): slower than"
                     f" baseline {detail}")
                 continue
-            sustained = (series["n"] >= 5 and all(
+            # "sustained" requires the two newest main runs overall (run
+            # indices 0 and 1) to have measured this kind and to exceed the
+            # thresholds -- newer runs of another kind do not count.
+            sustained = (series["n"] >= 5
+                         and [index for index, _s in series["runs"][:2]]
+                         == [0, 1]
+                         and all(
                 historical > 1.5 * median and historical - median > 60
-                for historical in series["runs"][:2]))
+                for _index, historical in series["runs"][:2]))
             warnings.append("module slower than baseline: " + detail
                             + (" -- sustained" if sustained else ""))
         for kind in sorted(missing_kind):

@@ -464,6 +464,26 @@ class BaselineComparisonTests(unittest.TestCase):
                       " (n=5 runs", markdown)
         self.assertNotIn("sustained", markdown)
 
+    def test_sustained_requires_the_kind_in_the_two_newest_runs(self):
+        # Five process runs sit under two newer wall-only runs: the process
+        # series is five deep but its two newest entries are not the two
+        # newest main runs -- the warning stands without "sustained".
+        self._write_record("a", "shard-0-of-5.json", record(
+            "macos", "3.11", 0, modules={
+                "test_x": {"wall_seconds": 60, "process_seconds": 250}}))
+        self._write_jobs([])
+        for run_id in (107, 106):  # the two newest runs: wall only
+            self._write_baseline(run_id, [baseline_job({"test_x": 100})])
+        for run_id, process in [(105, 250), (104, 250), (103, 100),
+                                (102, 100), (101, 100)]:
+            self._write_baseline(run_id, [baseline_job(
+                {"test_x": {"wall_seconds": 60,
+                            "process_seconds": process}})])
+        markdown, _ = self._run()
+        self.assertIn("module slower than baseline: `test_x` 250s process"
+                      " vs baseline median 100s process (n=5 runs", markdown)
+        self.assertNotIn("sustained", markdown)
+
     def test_runner_minutes_excludes_the_timing_summary_job(self):
         self._write_record("a", "shard-0-of-5.json",
                            record("macos", "3.11", 0))
