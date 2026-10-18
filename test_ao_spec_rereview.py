@@ -40,8 +40,11 @@ class ReReviewFixture(PreAcceptanceFixture):
     MESSAGE = 'Review the exact corrected specification revision 3.'
     REREVIEW_ID = 'spec-rereview'
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + (
+        'spec2', 'extension_grant', 'spec3', 'script', 'script_sha256', 'inputs')
+
+    def build_template(self):
+        super().build_template()
         self.through_fourth()
         self.spec3 = self.register_corrected()
 
@@ -1126,6 +1129,7 @@ class ReReviewSourceRecordTests(ReReviewFixture):
 class ReReviewExecutableFixture(ReReviewFixture):
     """The same room, but the AO engineer executable can break and be repaired through its journal."""
 
+    TEMPLATE_ATTRS = ReReviewFixture.TEMPLATE_ATTRS + ('original_executable',)
     configure_runtime = ExtensionExecutableEvolutionTests.configure_runtime
 
 

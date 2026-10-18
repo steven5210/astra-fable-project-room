@@ -38,20 +38,20 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
     """
 
     CHARTER_REVIEWS = 3
+    TEMPLATE_SETUP = True
+    TEMPLATE_ATTRS = Fixture.TEMPLATE_ATTRS + ('room', 'target_spec')
 
     def setUp(self):
+        # Deliberately ``Fixture.setUp``, not ``super().setUp``: ReviewExtensionFixture.setUp's own
+        # implement/review/accept is exactly the work this fixture stops short of.
         Fixture.setUp(self)
+
+    def build_template(self):
+        super().build_template()
         self.configure_runtime()
         self.room = self.open()
         self.spec()
-        original_request = self.fake.request
-
-        def raw_request(method, path, payload=None):
-            if method == 'GET' and '/conversation?' in path:
-                return {**self.fake.conversation(path.split('/')[2]), 'hasMoreBefore': False}
-            return original_request(method, path, payload)
-
-        self.fake.request = raw_request
+        self._install_raw_request()
         for session in self.fake.sessions.values():
             session['isTerminated'] = False
         for snapshot in self.fake.snapshots.values():
@@ -60,6 +60,13 @@ class PreAcceptanceFixture(ReviewExtensionFixture):
         for number in range(1, self.CHARTER_REVIEWS + 1):
             self.agree(key='charter-' + str(number))
         self.target_spec = None
+
+    def after_restore(self):
+        # Deliberately not ``super().after_restore()``: that base hook patches
+        # ``ao_native_identity.read_owner`` whenever ``self.owner`` is set, and this family's real
+        # synthetic AO database must keep the genuine reader so owner/branch/workspace negatives
+        # observe real bytes. Only the fake's request closure needs re-binding after a restore.
+        self._install_raw_request()
 
     def room_files(self):
         """Every file under this room's own directory, keyed by its relative path.
@@ -1718,6 +1725,8 @@ class PreAcceptanceLiveRoutingPendingTests(PreAcceptanceLiveRoutingFixture):
 
 class PreAcceptanceLiveRoutingRepairTests(PreAcceptanceLiveRoutingFixture):
     """P1 (e): an authorized executable repair between the grant and the fourth send keeps routing valid."""
+
+    TEMPLATE_ATTRS = PreAcceptanceLiveRoutingFixture.TEMPLATE_ATTRS + ('original_executable',)
 
     def configure_runtime(self):
         # Mirrors ``test_ao_review_extension.ExtensionExecutableEvolutionTests.configure_runtime``.

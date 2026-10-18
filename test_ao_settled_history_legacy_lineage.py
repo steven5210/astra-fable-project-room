@@ -157,8 +157,20 @@ class LegacyLineageFixture(PreAcceptanceFixture):
     def tail_oracle(self):
         return reconciliation._failed_inputs
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + (
+        'failed_turn', 'proofs', 'invalidations', 'outcomes', 'mint_args',
+        'final_request_id', 'referenced_outcomes')
+
+    def after_restore(self):
+        # Re-bind ``self.failed_turn`` to the live snapshot row: drift tests mutate it to change the
+        # live lineage, which a deepcopied attr could never reach.
+        super().after_restore()
+        turn_id = self.state()['requests'][_REQUEST]['turn_id']
+        self.failed_turn = next(
+            turn for turn in self.fake.snapshots['engineer']['turns'] if turn['id'] == turn_id)
+
+    def build_template(self):
+        super().build_template()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation', _REQUEST)
         snapshot = self.fake.snapshots['engineer']
@@ -407,8 +419,11 @@ class OracleParityTests(unittest.TestCase):
     """The frozen oracle reproduces the pre-#176 minting exactly."""
 
     def args(self, provider_text):
-        fixture = LegacyLineageFixture('runTest')
-        fixture.PROVIDER_TEXT = provider_text
+        # The template is bound to the exact class, so each provider text gets its own subclass;
+        # mutating an attribute on a shared class would reuse the first provider's history.
+        variant = type('ProviderTextVariant', (LegacyLineageFixture,),
+                       {'PROVIDER_TEXT': provider_text})
+        fixture = variant('runTest')
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
         return fixture.captured_inputs(), fixture

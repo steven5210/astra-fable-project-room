@@ -68,8 +68,11 @@ class SettledHistoryFixture(PreAcceptanceFixture):
     FINAL_COMPLETED_TURNS = 1  # The completed scope-change-report turn.
     COMPLETED_TURNS = COMPLETED_PER_CYCLE_TURNS + FINAL_COMPLETED_TURNS  # 13: >= the required 12.
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + (
+        'settled', 'completed', '_id_seq', 'final_request_id')
+
+    def build_template(self):
+        super().build_template()
         _build_settled_history(self)
 
     def _fresh_id(self):
@@ -578,8 +581,10 @@ class TruncatedSettledFailureFixture(PreAcceptanceFixture):
     a single dedicated failure rather than interleaved among many.
     """
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + ('proof_sha256', 'final_request_id')
+
+    def build_template(self):
+        super().build_template()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation', 'truncated-failure')
         snapshot = self.fake.snapshots['engineer']
@@ -719,13 +724,24 @@ class RenewedTruncatedSettledFailureFixture(PreAcceptanceFixture):
 
     PROVIDER_TEXT = 'API Error: Rate limit reached'
 
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + (
+        'failed_turn', 'p1', 'o1', 'inv1', 'p2', 'o2', 'final_request_id')
+
     def native(self, sha):
         return {'anchor_uuid': 'owned-native-packet-truncated-failure', 'next_human_uuid': None,
                 'errors': [{'uuid': 'native-quota-truncated-failure', 'error': 'rate_limit', 'http_status': 429}],
                 'stop_reasons': [], 'source_sha256': sha, 'source': self.state()['native_outcome_source']}
 
-    def setUp(self):
-        super().setUp()
+    def after_restore(self):
+        # A deepcopy restores ``self.failed_turn`` detached; re-bind it to the live snapshot row the
+        # settled request's recorded turn_id names so tests mutating it drift the live history.
+        super().after_restore()
+        turn_id = self.state()['requests']['truncated-failure']['turn_id']
+        self.failed_turn = next(
+            turn for turn in self.fake.snapshots['engineer']['turns'] if turn['id'] == turn_id)
+
+    def build_template(self):
+        super().build_template()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation', 'truncated-failure')
         snapshot = self.fake.snapshots['engineer']
@@ -859,8 +875,10 @@ class RecoveredContextWithProofWithoutSettledFailureTests(PreAcceptanceFixture):
     opt-in (``settled_history=True``) is what admits a proven recovered import at all, and C2
     gates that opt-in on the engineer session owning at least one settled_failure request."""
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = PreAcceptanceFixture.TEMPLATE_ATTRS + ('recovered_turn',)
+
+    def build_template(self):
+        super().build_template()
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation')
         self.recovered_turn = {'id': 'recovered-turn-1', 'providerTurnId': 'native-recovered-turn-1',
@@ -946,9 +964,18 @@ class RecoveredContextWithProofTests(SettledHistoryFixture):
     module -- reaches the identical admission path a real compaction-import turn would.
     """
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = SettledHistoryFixture.TEMPLATE_ATTRS + ('recovered_turn',)
+
+    def build_template(self):
+        super().build_template()
         self.recovered_turn = _splice_compaction_import_proof(self)['recovered_turn']
+
+    def after_restore(self):
+        # Re-bind ``self.recovered_turn`` to the live snapshot row; a deepcopy restores it detached.
+        super().after_restore()
+        self.recovered_turn = next(
+            turn for turn in self.fake.snapshots['engineer']['turns']
+            if turn['id'] == 'recovered-turn-1')
 
     def test_recovered_turn_with_compaction_import_proof_is_admitted_and_excluded_from_unowned(self):
         audit = self.audit()
@@ -982,10 +1009,21 @@ class RecoveredContextLifecycleTests(SettledHistoryFixture):
     lets the observation differ from the re-pointed record to show the gate replacing it.
     """
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = SettledHistoryFixture.TEMPLATE_ATTRS + ('splice', 'recovered_turn')
+
+    def build_template(self):
+        super().build_template()
         self.splice = _splice_compaction_import_proof(self)
         self.recovered_turn = self.splice['recovered_turn']
+
+    def after_restore(self):
+        # Re-bind both names to the live snapshot row: a test mutates ``splice['recovered_turn']``
+        # to drift the live history, which a deepcopied dict could never reach.
+        super().after_restore()
+        live = next(turn for turn in self.fake.snapshots['engineer']['turns']
+                    if turn['id'] == 'recovered-turn-1')
+        self.splice['recovered_turn'] = live
+        self.recovered_turn = live
 
     def test_grant_admits_the_proven_context_turn_and_the_fourth_send_consumes_it_once(self):
         """The recovered turn is counted in turn_count yet excluded from both owned_turns and
@@ -1371,8 +1409,10 @@ class PostConsumptionSettlementRetentionTests(SettledHistoryFixture):
     request -- is refused by that same pin with the settlement validator's own message.
     """
 
-    def setUp(self):
-        super().setUp()
+    TEMPLATE_ATTRS = SettledHistoryFixture.TEMPLATE_ATTRS + ('inputs',)
+
+    def build_template(self):
+        super().build_template()
         self.grant()
         self.send('spec_review', 'fourth')
         self.finish_fourth()
@@ -1483,7 +1523,7 @@ LIVE_ERROR_CONTRADICTION_MESSAGE = 'Settled native failure live error contradict
 LIVE_STATE_CONTRADICTION_MESSAGE = 'Settled native failure live state contradicts its settled receipt'
 
 
-class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
+class SettledFailureLiveErrorFixture(SettledHistoryFixture):
     """Group 13: a settled failed turn's live row is checked against that same request's
     authenticated, settled receipt before the pre-acceptance audit, the grant and the fourth-review
     send admit it. The live row must still read 'failed', as its receipt does: a row flipped to
@@ -1500,15 +1540,16 @@ class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
     ``fake.finish``'s own default 'failed' turn carries no errorMessage at all, so this class's
     ``_build_history`` override wraps ``fake.finish`` to stamp ``SAVED_ERROR_TEXT`` on the live
     turn the instant it is marked failed, before ``ao_room_sync`` reads it into the receipt. The one
-    test named in ``STOCK_FIXTURE_TEST`` keeps the unmodified stock fixture (saved errorMessage
-    ``None``) instead; its own ``assertIsNone`` precondition fails if that name ever drifts.
+    stock-fixture control test lives in the sibling class below, whose ``STAMPS_ERROR_TEXT = False``
+    keeps the unmodified stock fixture (saved errorMessage ``None``); the template builds the whole
+    class history once, so the per-test switch the old fixture used cannot survive templating.
     """
 
     SAVED_ERROR_TEXT = 'Rate limit'
-    STOCK_FIXTURE_TEST = 'test_nonempty_live_error_on_a_turn_settled_without_error_text_refuses_the_fourth_send'
+    STAMPS_ERROR_TEXT = True
 
     def _build_history(self):
-        if self._testMethodName == self.STOCK_FIXTURE_TEST:
+        if not self.STAMPS_ERROR_TEXT:
             super()._build_history()
             return
         finish = self.fake.finish
@@ -1543,6 +1584,8 @@ class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
         turn['state'] = 'completed'
         del turn['errorMessage']
 
+
+class SettledFailureLiveErrorContradictionTests(SettledFailureLiveErrorFixture):
     def test_different_live_error_before_audit_refuses_the_audit_without_mutation(self):
         self.assertEqual(self._saved_error_message(), self.SAVED_ERROR_TEXT)
         turn = self._settled_turn()
@@ -1572,15 +1615,6 @@ class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
         self._assert_fourth_send_refuses(LIVE_ERROR_CONTRADICTION_MESSAGE)
         self.assertEqual(self.room_files(), before_files)
         self.assertEqual(receipt_path.read_bytes(), original_receipt)
-
-    def test_nonempty_live_error_on_a_turn_settled_without_error_text_refuses_the_fourth_send(self):
-        self.assertIsNone(self._saved_error_message())
-        self.grant()
-        before_files = self.room_files()
-        turn = self._settled_turn()
-        turn['errorMessage'] = 'Permission denied'
-        self._assert_fourth_send_refuses(LIVE_ERROR_CONTRADICTION_MESSAGE)
-        self.assertEqual(self.room_files(), before_files)
 
     def test_original_live_error_text_still_audits_grants_and_sends_the_fourth_review_once(self):
         self.assertEqual(self._settled_turn()['errorMessage'], self.SAVED_ERROR_TEXT)
@@ -1647,3 +1681,20 @@ class SettledFailureLiveErrorContradictionTests(SettledHistoryFixture):
         self._assert_fourth_send_refuses(LIVE_STATE_CONTRADICTION_MESSAGE)
         self.assertEqual(self.room_files(), before_files)
         self.assertEqual(receipt_path.read_bytes(), original_receipt)
+
+
+class SettledFailureLiveErrorStockTests(SettledFailureLiveErrorFixture):
+    """The stock-fixture control from the class above, in its own template: ``STAMPS_ERROR_TEXT =
+    False`` leaves ``fake.finish`` unwrapped, so this room's settled turns keep the fake's default
+    no-errorMessage row and the ``assertIsNone`` precondition below stays a genuine precondition."""
+
+    STAMPS_ERROR_TEXT = False
+
+    def test_nonempty_live_error_on_a_turn_settled_without_error_text_refuses_the_fourth_send(self):
+        self.assertIsNone(self._saved_error_message())
+        self.grant()
+        before_files = self.room_files()
+        turn = self._settled_turn()
+        turn['errorMessage'] = 'Permission denied'
+        self._assert_fourth_send_refuses(LIVE_ERROR_CONTRADICTION_MESSAGE)
+        self.assertEqual(self.room_files(), before_files)

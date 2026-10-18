@@ -30,12 +30,9 @@ class ReviewExtensionFixture(Fixture):
 
     NATIVE = 'synthetic-native-owner'
 
-    def setUp(self):
-        super().setUp()
-        self.configure_runtime()
-        self.room = self.open()
-        self.spec()
-        original_request = self.fake.request
+    def _install_raw_request(self):
+        """Bind the closed-over request closure to the CURRENT fake; a deepcopy cannot carry it."""
+        original_request = type(self.fake).request.__get__(self.fake, type(self.fake))
 
         def raw_request(method, path, payload=None):
             if method == 'GET' and '/conversation?' in path:
@@ -43,6 +40,13 @@ class ReviewExtensionFixture(Fixture):
             return original_request(method, path, payload)
 
         self.fake.request = raw_request
+
+    def setUp(self):
+        super().setUp()
+        self.configure_runtime()
+        self.room = self.open()
+        self.spec()
+        self._install_raw_request()
         for session in self.fake.sessions.values():
             session['isTerminated'] = False
         for snapshot in self.fake.snapshots.values():
