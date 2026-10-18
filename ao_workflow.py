@@ -19,6 +19,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
                         "operator work with operator_requests ([] or valid entries); omission cannot clear it")
 CAPTURE_REQUIRED = "Acceptance requires a captured completed engineering result"
+REVIEW_TEXT_MAX_BYTES = 30000
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
@@ -463,8 +464,10 @@ def review_decision(directory, state, request):
     """Read-only: the preserved reviewer verdict's decision for one completed reviewer request.
 
     Reads the saved receipt through completed_receipt/final_json (digest-validated), compares the
-    verdict's identities with the request's bound review identities, and reports whether a saved
-    acceptance names the request. It never approves, rejects or accepts anything."""
+    verdict's identities with the request's bound review identities, requires the reviewer prompt's
+    mandatory review text, and reports whether a saved acceptance names the request. It never
+    approves, rejects or accepts anything; ao_room_accept itself only ever reads an approved
+    verdict's review text."""
     if request.get("role") != "reviewer" or request.get("state") != "completed":
         return None
     accepted = any(isinstance(a, dict) and a.get("request_id") == request.get("request_id")
@@ -479,6 +482,11 @@ def review_decision(directory, state, request):
         return {"decision": "invalid", "reason": "decision_missing", "accepted": accepted}
     if not isinstance(expected, dict) or not expected or any(verdict.get(k) != v for k, v in expected.items()):
         return {"decision": "invalid", "reason": "identities_mismatch", "accepted": accepted}
+    from ao_project_room import nonempty
+    try:
+        nonempty(verdict.get("review"), "review", REVIEW_TEXT_MAX_BYTES)
+    except RoomError:
+        return {"decision": "invalid", "reason": "review_text_invalid", "accepted": accepted}
     return {"decision": verdict["decision"], "accepted": accepted}
 
 

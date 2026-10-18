@@ -1547,7 +1547,7 @@ class Service:
                 raise RoomError("Reviewer final response must be one JSON verdict") from exc
             if not isinstance(verdict, dict) or verdict.get("decision") != "approved" or any(verdict.get(k) != v for k, v in expected.items()):
                 raise RoomError("Reviewer rejected or did not approve the exact identities; inspect its saved receipt")
-            nonempty(verdict.get("review"), "review", 30000)
+            nonempty(verdict.get("review"), "review", ao_workflow.REVIEW_TEXT_MAX_BYTES)
             acceptance = {**expected, "request_id": request_id, "reviewer_session": request["session_id"],
                           "reviewer_model": request["model"], "workflow": state["workflow"], "review": verdict["review"],
                           "receipt_sha256": request["receipt_sha256"]}

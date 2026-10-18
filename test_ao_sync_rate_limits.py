@@ -41,8 +41,10 @@ class SyncRateLimitsTests(AgreedRoomFixture):
         self.assertIsInstance(result['rate_limits']['age_seconds'], float)
         for key in AVAILABLE - {'age_seconds'}:
             self.assertEqual(result['rate_limits'][key], compact['rate_limits'][key])
+        # age_seconds is live (now minus the provider event time): the two calls read at
+        # different wall times, so pin it loosely; the other four keys pin the same reading.
         self.assertAlmostEqual(result['rate_limits']['age_seconds'],
-                               compact['rate_limits']['age_seconds'], places=0)
+                               compact['rate_limits']['age_seconds'], delta=60)
         through_mcp = self.mcp('ao_room_sync')
         self.assertEqual(set(through_mcp['rate_limits']), AVAILABLE)
         self.assertEqual(through_mcp['rate_limits']['used_percent'], 95)
@@ -72,7 +74,11 @@ class SyncRateLimitsTests(AgreedRoomFixture):
         before = self.effects()
         result = self.service.ao_room_sync(self.room)
         self.assertEqual(result['rate_limits']['used_percent'], 95)
-        self.assert_no_effects(before)  # a settled room: sync itself writes nothing durable
+        # The only durable write a settled-room sync makes is its own routing observation
+        # timestamp (REFUSAL_EFFECTS): the rate-limit read must add nothing beyond it.
+        diff = self._diff_effects(before, self.effects())
+        self.assertEqual(set(diff), {'state'})
+        self.assertEqual(set(diff['state']), {'routing_rules.observed_at'})
 
 
 class UnboundSourceTests(PreparedRoomFixture):

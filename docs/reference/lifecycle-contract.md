@@ -133,9 +133,12 @@ repeating the acceptance wording. Eligibility, ordering, counters and gates are 
   no spec, preparation, handoff, receipt, settlement or acceptance change. Whether a refusal
   also leaves an append-only diagnostic trace differs by operation; the table below is what
   the harness observed, where `refuses()` snapshots every durable effect (every file in the
-  room directory by digest except `state.json`, the saved request states, pointer fields and
-  field inventories, counters and POST count) before and after each refused call and requires
-  an empty difference unless an explicit allowance names the exact append.
+  room directory by digest, the complete parsed `state.json` compared value by value as dotted
+  paths, the review counters and the POST count) before and after each refused call and
+  requires an empty difference unless an explicit allowance names the exact paths and files
+  that may differ. The harness checks itself: a synthetic refusal that rewrites an existing
+  request's `spec_record_sha256` or an acceptance's `candidate_sha256` with no key or count
+  change must fail the snapshot (`HarnessSelfCheckTests`).
 
 | Refused operation (observed in `test_ao_lifecycle_contract.REFUSAL_EFFECTS`) | Durable effect of the refusal |
 | --- | --- |
@@ -147,13 +150,16 @@ repeating the acceptance wording. Eligibility, ordering, counters and gates are 
 | `ao_room_accept` (no captured engineering result; receipt bytes modified; prefix or foreign verdict identity; spec record changed) | none — `observe()` on identical reviewer evidence returns the existing record without minting |
 | `ao_room_outcome_audit` (owned request still uncertain; unowned completed turn) | none |
 | `ao_room_outcome_resume` (extra completed turn after the audit) | none |
-| `ao_room_outcome_resume` (the failed turn's own evidence changed after the audit) | append-only: `observe()` mints one new `outcomes/<request>/<sha>.json` and moves `semantic_outcome_sha256` before the digest check refuses with `Outcome evidence changed or does not establish an eligible diagnosed failure`; the request stays `uncertain`, no settlement is written |
+| `ao_room_outcome_resume` (the failed turn's own evidence changed after the audit) | append-only: `observe()` mints one new `outcomes/<request>/<sha>.json` and moves exactly `requests.<id>.semantic_outcome` and `requests.<id>.semantic_outcome_sha256` before the digest check refuses with `Outcome evidence changed or does not establish an eligible diagnosed failure`; the request stays `uncertain`, no settlement is written |
 
   A stronger "no write at all on refusal" target is therefore **unmet** for that last case
   and is left as observed: the appended record is evidence of what was seen, the original
-  failed receipt is unchanged, and no authority moved. Separately, any refused operation
-  inside `Service.locked` may invalidate a retained history-reconciliation proof; that write
-  lands in `state.json`, which the snapshot excludes for exactly that reason.
+  failed receipt is unchanged, and no authority moved. `Service.locked` can also invalidate a
+  retained history-reconciliation proof when an operation inside it refuses; no refusal in the
+  harness exercised that path, and if one did the whole-state snapshot would show its exact
+  paths and this table would have to name them. A successful `ao_room_sync` is not a refusal
+  and re-stamps `routing_rules.observed_at` on every iteration; the harness names that one
+  path wherever a measured span contains real syncs.
 - Uncertain delivery is held, never resent: an identical `ao_room_send` reads the saved
   record; a different payload under the same id refuses; nothing resends under a new id
   while a request is active or uncertain.

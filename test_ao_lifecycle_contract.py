@@ -76,7 +76,8 @@ REFUSAL_EFFECTS = {
     'ao_room_outcome_resume: extra completed turn after the audit': 'none',
     'ao_room_outcome_resume: failed-turn evidence drift after the audit': (
         "append-only: observe() mints one new outcomes/implementation/<sha>.json for the changed "
-        "evidence and moves semantic_outcome_sha256 before resume's digest check refuses"),
+        "evidence and moves requests.implementation.semantic_outcome + .semantic_outcome_sha256 "
+        "before resume's digest check refuses"),
     'ao_room_send: identical request_id with a different payload': 'none',
     'ao_room_send: unowned completed (automation-origin) turn': 'none',
     'ao_room_outcome_audit: unowned completed turn': 'none',
@@ -93,19 +94,15 @@ class LifecycleFixture(Fixture):
     """Shared lifecycle harness: durable-effect snapshots, exact refusals and the MCP boundary."""
     TEMPLATE_SETUP = True
 
-    POINTER_FIELDS = ('semantic_outcome_sha256', 'outcome_resume_sha256',
-                      'engineering_record_sha256', 'completion_candidate_sha256', 'receipt_sha256')
-
     def effects(self):
-        """Immutable durable evidence plus dispatch/counter surface.
+        """The whole durable state plus dispatch/counter surface.
 
-        artifacts binds the bytes of every regular file in the room directory except state.json (a
-        refused operation may legitimately rewrite it through reconciliation invalidation), so
-        outcomes/**, receipts/, engineering/, completion-candidates/, specs/, handoffs/, verification/,
-        preparation.json and audit files are all covered by exact bytes; semantic_pointers exposes
-        pointer moves and request_fields exposes request fields a refusal must never write.
+        artifacts binds the bytes of every regular file in the room directory except state.json
+        (outcomes/**, receipts/, engineering/, completion-candidates/, specs/, handoffs/,
+        verification/, preparation.json, audit and invalidation files); state is the complete parsed
+        state.json, so a refusal that changes an existing field's value is just as visible as one
+        that adds a field.
         """
-        state = self.state()
         directory = self.directory()
         artifacts = {path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in directory.rglob('*')
@@ -113,25 +110,32 @@ class LifecycleFixture(Fixture):
         status = self.service.ao_room_status(self.room)
         counters = {key: status[key] for key in
                     ('spec_review_attempts', 'acceptance_review_attempts', 'spec_verdict_recovery_attempts')}
-        return {'posts': len(self.fake.posts),
-                'request_states': {key: request['state'] for key, request in state['requests'].items()},
-                'semantic_pointers': {key: {name: request.get(name) for name in self.POINTER_FIELDS}
-                                      for key, request in state['requests'].items()},
-                'request_fields': {key: sorted(request) for key, request in state['requests'].items()},
-                'acceptances': len(state['acceptances']), 'verifications': len(state['verifications']),
-                'checkpoint_sha256': state.get('checkpoint_sha256'),
-                'spec_record_sha256': state.get('spec_record_sha256'),
-                'preparation_sha256': state.get('preparation_sha256'),
-                'handoff_sha256': state.get('handoff_sha256'),
-                'counters': counters, 'artifacts': artifacts}
+        return {'posts': len(self.fake.posts), 'counters': counters,
+                'artifacts': artifacts, 'state': self.state()}
 
     def assert_no_effects(self, before):
         self.assertEqual(self.effects(), before)
 
+    def _flatten_diff(self, before, after, prefix=''):
+        """Dotted-path diff of two nested JSON values; lists compare whole at their path."""
+        out = {}
+        if isinstance(before, dict) and isinstance(after, dict):
+            for key in sorted(set(before) | set(after)):
+                path = prefix + '.' + key if prefix else key
+                if key not in before:
+                    out[path] = {'before': None, 'after': after[key]}
+                elif key not in after:
+                    out[path] = {'before': before[key], 'after': None}
+                else:
+                    out.update(self._flatten_diff(before[key], after[key], path))
+            return out
+        if before != after:
+            out[prefix] = {'before': before, 'after': after}
+        return out
+
     def _diff_effects(self, before, after):
         diff = {}
-        for key in ('posts', 'acceptances', 'verifications', 'checkpoint_sha256',
-                    'spec_record_sha256', 'preparation_sha256', 'handoff_sha256', 'counters'):
+        for key in ('posts', 'counters'):
             if before[key] != after[key]:
                 diff[key] = {'before': before[key], 'after': after[key]}
         if before['artifacts'] != after['artifacts']:
@@ -141,11 +145,8 @@ class LifecycleFixture(Fixture):
                                        if before['artifacts'][key] != after['artifacts'][key])}
             if any(delta.values()):
                 diff['artifacts'] = delta
-        for key in ('request_states', 'semantic_pointers', 'request_fields'):
-            if before[key] != after[key]:
-                diff[key] = {rid: {'before': before[key].get(rid), 'after': after[key].get(rid)}
-                             for rid in set(before[key]) | set(after[key])
-                             if before[key].get(rid) != after[key].get(rid)}
+        if before['state'] != after['state']:
+            diff['state'] = self._flatten_diff(before['state'], after['state'])
         return diff
 
     def refuses(self, pattern, fn, *args, allow=None, **kwargs):
@@ -166,18 +167,17 @@ class LifecycleFixture(Fixture):
         return caught.exception
 
     def allow_only_new_outcome_record(self, request_id):
-        """Permit exactly the observe-then-refuse append: one new outcome record plus its pointer move."""
+        """Permit exactly the observe-then-refuse append: one new outcome record plus the exact
+        state paths it moves (the request's semantic_outcome path and digest), nothing else."""
         def check(diff, before, after):
-            self.assertEqual(set(diff), {'artifacts', 'semantic_pointers'})
-            sha = after['semantic_pointers'][request_id]['semantic_outcome_sha256']
+            self.assertEqual(set(diff), {'artifacts', 'state'})
+            sha = after['state']['requests'][request_id]['semantic_outcome_sha256']
             self.assertEqual(diff['artifacts'],
                              {'added': ['outcomes/' + request_id + '/' + sha + '.json'],
                               'removed': [], 'changed': []})
-            self.assertEqual(set(diff['semantic_pointers']), {request_id})
-            pointers = diff['semantic_pointers'][request_id]
-            changed = sorted(name for name, value in pointers['before'].items()
-                             if value != pointers['after'].get(name))
-            self.assertEqual(changed, ['semantic_outcome_sha256'])
+            self.assertEqual(set(diff['state']),
+                             {'requests.' + request_id + '.semantic_outcome',
+                              'requests.' + request_id + '.semantic_outcome_sha256'})
         return check
 
     def _mcp_call(self, name, arguments):
@@ -501,7 +501,11 @@ class InterruptedAndQuotaTests(AgreedRoomFixture):
         # Observed baseline: the audit refuses at the owned-request gate before any outcome judgment.
         self.refuses('An owned request is active or uncertain',
                      self.service.ao_room_outcome_audit, self.room)
-        self.assert_no_effects(before)
+        # The two real syncs in this span legitimately re-stamp routing_rules.observed_at
+        # (ao_routing.record_observation writes it on every _sync_once); nothing else may differ.
+        diff = self._diff_effects(before, self.effects())
+        self.assertEqual(set(diff), {'state'})
+        self.assertEqual(set(diff['state']), {'routing_rules.observed_at'})
 
     def test_resume_refuses_when_evidence_changed_after_the_audit(self):
         self.service.ao_room_send(self.room, 'engineer', 'Perform the exact authorized purpose.',
@@ -807,3 +811,33 @@ class GapRegistryTests(unittest.TestCase):
         text = path.read_text()
         for gap in OPEN_GAPS:
             self.assertIn(gap['id'], text)
+
+
+class HarnessSelfCheckTests(AgreedRoomFixture):
+    """The refusal-effects snapshot itself: same-key value drift must be detected, never passed."""
+
+    def test_refuses_detects_existing_request_identity_drift(self):
+        self.implement()
+
+        def mutate_then_refuse():
+            state = self.state()
+            state['requests']['implementation']['spec_record_sha256'] = 'f' * 64
+            self.service.save(self.directory(), state)
+            raise ao.RoomError('synthetic refusal after request identity drift')
+        with self.assertRaises(AssertionError) as caught:
+            self.refuses('synthetic refusal after request identity drift', mutate_then_refuse)
+        self.assertIn('requests.implementation.spec_record_sha256', str(caught.exception))
+
+    def test_refuses_detects_acceptance_content_drift(self):
+        self.implement()
+        self.review()
+        self.service.ao_room_accept(self.room, 'acceptance_review')
+
+        def mutate_then_refuse():
+            state = self.state()
+            state['acceptances'][0]['candidate_sha256'] = 'f' * 64
+            self.service.save(self.directory(), state)
+            raise ao.RoomError('synthetic refusal after acceptance content drift')
+        with self.assertRaises(AssertionError) as caught:
+            self.refuses('synthetic refusal after acceptance content drift', mutate_then_refuse)
+        self.assertIn('acceptances', str(caught.exception))

@@ -82,11 +82,14 @@ recipes for a new controller room (an existing room keeps the gates its spec alr
   `["python3", "tests/run_test_shards.py", "--jobs", "5"]`. It runs the same module set as
   `python3 -m unittest discover` (the runner asserts full coverage and `test_run_test_shards.py`
   pins it; on CI every platform's shard totals matched the discovery count exactly) in about
-  the longest shard's time rather than the serial total, which also keeps the gate inside the
-  7,200-second per-gate maximum as the suite grows. Size `timeout_seconds` for the longest
-  shard. The shards are separate processes, so record once per release one candidate that
-  passes both forms with identical test and skip counts; Linux CI is not a substitute for a
-  macOS gate because the two platforms skip different tests.
+  the longest shard's time rather than the serial total, and keeps a growing suite's gate wall
+  time nearer the longest shard than the serial total (the per-gate maximum is 7,200 seconds).
+  Size `timeout_seconds` for the longest shard. The shards are separate processes, so adopt the
+  runner as a room's gate only after one same-candidate, same-platform serial-versus-sharded
+  comparison with identical test and skip counts has been recorded for that release; equal
+  discovery counts alone do not prove equivalent behavior across separate processes (isolation
+  can hide cross-module leakage); Linux CI is not a substitute for a macOS gate because the two
+  platforms skip different tests.
 
 ### CLI fallback
 
