@@ -4,7 +4,9 @@ format, non-JSON), the queue/setup/exec definitions, record-to-job joining,
 the per-OS imbalance, the slowest-module table and the bounded combined JSON.
 Everything is faked on disk; nothing touches the network.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -222,6 +224,237 @@ class CiTimingSummaryTests(unittest.TestCase):
         self._write_jobs([{"jobs": []}])
         markdown, _ = self._run()
         self.assertIn("ignored `a/bad.json`: wrong format or field types", markdown)
+
+    def test_workers_subtree_records_are_ignored(self):
+        # A local --record run leaves per-module worker records under
+        # workers/shard-I-of-N/; only the merged shard record counts.
+        self._write_record("a", "shard-4-of-5.json",
+                           record("macos", "3.11", 4, ran=100))
+        self._write_record("a/workers/shard-4-of-5", "test_one.json",
+                           record("macos", "3.11", 4, ran=1))
+        self._write_record("a/workers/shard-4-of-5", "test_two.json",
+                           record("macos", "3.11", 4, ran=1))
+        self._write_jobs([{"jobs": []}])
+        markdown, _ = self._run()
+        self.assertIn("records: 1 found", markdown)
+        self.assertNotIn("test_one.json", markdown)
+        self.assertNotIn("test_two.json", markdown)
+
+
+def baseline_job(module_walls, exec_seconds=300, total_seconds=500,
+                 os_name="macos", python="3.11", shard=0):
+    return {"name": f"unittest ({os_name}-latest, {python}, {shard})",
+            "os": os_name, "python": python, "shard": shard,
+            "conclusion": "success",
+            "exec_seconds": exec_seconds, "total_seconds": total_seconds,
+            "record": {"complete": True,
+                       "modules": {module: {"wall_seconds": wall}
+                                   for module, wall in module_walls.items()}}}
+
+
+class BaselineComparisonTests(unittest.TestCase):
+    """Drift comparison against rolling main baselines and the weights file."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tmp = Path(self._tmpdir.name)
+        self.records_dir = self.tmp / "records"
+        self.records_dir.mkdir()
+        self.baselines_dir = self.tmp / "baselines"
+        self.baselines_dir.mkdir()
+
+    def _write_record(self, artifact, filename, data):
+        directory = self.records_dir / artifact
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_text(json.dumps(data))
+
+    def _write_baseline(self, run_id, jobs):
+        (self.baselines_dir / f"baseline-{run_id}.json").write_text(
+            json.dumps({"format": "project_room_timing_combined_v1",
+                        "run_id": str(run_id), "revision": f"r{run_id}",
+                        "generated_at": "2026-10-17T00:00:00Z",
+                        "jobs": jobs}))
+
+    def _write_weights(self, weights, samples):
+        path = self.tmp / "weights.json"
+        path.write_text(json.dumps(
+            {"_meta": {"format": "project_room_shard_weights_v2"},
+             "weights": weights, "samples": samples}))
+        return path
+
+    def _write_jobs(self, jobs):
+        path = self.tmp / "jobs.json"
+        path.write_text(json.dumps({"jobs": jobs}))
+        return path
+
+    def _run(self, baselines=True, weights=None, capture=False):
+        markdown = self.tmp / "summary.md"
+        combined = self.tmp / "combined.json"
+        argv = ["--records", str(self.records_dir),
+                "--jobs", str(self.tmp / "jobs.json"),
+                "--combined", str(combined), "--markdown", str(markdown)]
+        if baselines:
+            argv += ["--baselines", str(self.baselines_dir)]
+        if weights is not None:
+            argv += ["--weights", str(weights)]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = ci_summary.main(argv)
+        self.assertEqual(code, 0)
+        result = (markdown.read_text(), json.loads(combined.read_text()))
+        return result + (stdout.getvalue(),) if capture else result
+
+    def _fixtures(self):
+        """Current run: test_a 250s, test_b 200s, test_c 130s, test_stale
+        100s, test_local 50s, test_missing 70s on macOS; shard execs 60s and
+        480s (imbalanced), plus linux/3.12 execs 20s and 80s (ratio 1.6 but
+        only a 60s gap)."""
+        self._write_record("timing-macos-latest-py3.11-shard0",
+                           "shard-0-of-5.json", record(
+                               "macos", "3.11", 0, modules={
+                                   "test_a": {"wall_seconds": 250},
+                                   "test_b": {"wall_seconds": 200},
+                                   "test_c": {"wall_seconds": 130},
+                                   "test_stale": {"wall_seconds": 100},
+                                   "test_local": {"wall_seconds": 50},
+                                   "test_missing": {"wall_seconds": 70}}))
+        self._write_record("timing-ubuntu-latest-py3.12-shard0",
+                           "shard-0-of-5.json", record(
+                               "linux", "3.12", 0, modules={
+                                   "test_c": {"wall_seconds": 60}}))
+        self._write_jobs([
+            job("unittest (macos-latest, 3.11, 0)", "2026-10-17T00:00:00Z",
+                "2026-10-17T00:01:00Z", "2026-10-17T00:09:00Z",
+                [step("Run macOS tests", "2026-10-17T00:01:10Z",
+                      "2026-10-17T00:02:10Z")]),
+            job("unittest (macos-latest, 3.11, 1)", "2026-10-17T00:00:00Z",
+                "2026-10-17T00:01:00Z", "2026-10-17T00:09:00Z",
+                [step("Run macOS tests", "2026-10-17T00:01:00Z",
+                      "2026-10-17T00:09:00Z")]),
+            job("unittest (ubuntu-latest, 3.12, 0)", "2026-10-17T00:00:00Z",
+                "2026-10-17T00:01:00Z", "2026-10-17T00:03:00Z",
+                [step("Run Linux tests", "2026-10-17T00:01:00Z",
+                      "2026-10-17T00:01:20Z")]),
+            job("unittest (ubuntu-latest, 3.12, 1)", "2026-10-17T00:00:00Z",
+                "2026-10-17T00:01:00Z", "2026-10-17T00:03:00Z",
+                [step("Run Linux tests", "2026-10-17T00:01:00Z",
+                      "2026-10-17T00:02:20Z")]),
+        ])
+        # Five baseline runs, 105 newest: test_a regressed on the two newest
+        # (250 vs older 100), test_b measured by only two runs, test_c a
+        # steady 100.
+        self._write_baseline(105, [baseline_job({"test_a": 250, "test_c": 100},
+                                                exec_seconds=400)])
+        self._write_baseline(104, [baseline_job({"test_a": 250, "test_c": 100},
+                                                exec_seconds=380)])
+        self._write_baseline(103, [baseline_job(
+            {"test_a": 100, "test_b": 100, "test_c": 100}, exec_seconds=300)])
+        self._write_baseline(102, [baseline_job(
+            {"test_a": 100, "test_b": 100, "test_c": 100}, exec_seconds=310)])
+        self._write_baseline(101, [baseline_job({"test_a": 100, "test_c": 100},
+                                                exec_seconds=290)])
+        weights = {"test_a": 100, "test_b": 100, "test_c": 100,
+                   "test_stale": 40, "test_local": 50, "test_fine": 60}
+        samples = {"test_a": 3, "test_b": 3, "test_c": 3, "test_stale": 3,
+                   "test_local": 0, "test_fine": 2}
+        return self._write_weights(weights, samples)
+
+    def test_module_drift_imbalance_and_weights(self):
+        weights_path = self._fixtures()
+        markdown, combined, stdout = self._run(weights=weights_path,
+                                               capture=True)
+
+        self.assertIn("### Warnings", markdown)
+        # (a) test_a: 2.5x baseline, n=5, newest two runs also high.
+        self.assertIn("`test_a` 250s vs baseline median 100s"
+                      " (n=5 runs, range 100s-250s) -- sustained", markdown)
+        # (b) test_b: exceeds the magnitude but n=2 -> inconclusive only.
+        self.assertIn("inconclusive (n=2): slower than baseline `test_b`",
+                      markdown)
+        self.assertNotIn("warning title=Test timing::module slower than "
+                         "baseline: test_b", stdout)
+        # (c) test_c: 1.3x -> neither warning nor inconclusive.
+        self.assertNotIn("test_c` 130s", markdown)
+        # (d) macOS imbalance 1.78 with a 420s gap warns; linux/3.12 at
+        # ratio 1.6 with a 60s gap does not.
+        self.assertIn("shard imbalance macos/3.11: max/median 1.78,"
+                      " slowest shard 210s over median", markdown)
+        self.assertNotIn("imbalance linux/3.12", markdown)
+        # (e) weights: stale lists test_a (250 vs 100) and test_stale
+        # (100 vs 40); test_local is samples=0 and measured -> notice;
+        # test_missing has no weight.
+        self.assertIn("stale weight estimates: `test_a`, `test_stale`",
+                      markdown)
+        self.assertIn("local weight estimates measured on CI: `test_local`",
+                      markdown)
+        self.assertIn("modules without a pinned weight: `test_missing`",
+                      markdown)
+        self.assertIn("--refresh-weights <timing-combined.json ...>", markdown)
+        self.assertIn("--measure test_missing", markdown)
+
+        # (f) annotations: each warning/notice once, capped at 10.
+        annotations = [line for line in stdout.splitlines()
+                       if line.startswith("::warning") or line.startswith("::notice")]
+        self.assertLessEqual(len(annotations), 10)
+        self.assertTrue(any("module slower than baseline" in a
+                            and a.startswith("::warning title=Test timing::")
+                            for a in annotations))
+        self.assertTrue(any(a.startswith("::notice title=Test timing::")
+                            and "test_local" in a for a in annotations))
+
+        # Baseline context on the imbalance and runner-minutes lines.
+        self.assertIn("macos/3.11: exec max 8.0m, median 4.5m,"
+                      " max/median 1.78, sum 9.0m; baseline max 5.2m,"
+                      " median 5.2m (n=5 runs, range 4.8m-6.7m)", markdown)
+        self.assertIn("runner-minutes: 20 vs baseline median 8"
+                      " (n=5 runs, range 8-8)", markdown)
+        self.assertIn("linux/3.12: exec max 1.3m", markdown)
+        self.assertIn("baseline: none", markdown)  # no linux/3.12 baseline
+
+        # (g) combined JSON carries the runs used and the module count.
+        self.assertEqual(combined["baseline"]["runs"],
+                         ["105", "104", "103", "102", "101"])
+        self.assertEqual(combined["baseline"]["modules_n"], 3)
+
+    def test_annotations_capped_at_ten(self):
+        slow = {f"test_m{i}": {"wall_seconds": 300} for i in range(12)}
+        self._write_record("a", "shard-0-of-5.json",
+                           record("macos", "3.11", 0, modules=slow))
+        self._write_jobs([])
+        for run_id in range(101, 106):
+            self._write_baseline(run_id, [baseline_job(
+                {module: 100 for module in slow})])
+        _, _, stdout = self._run(capture=True)
+        annotations = [line for line in stdout.splitlines()
+                       if line.startswith("::warning")]
+        self.assertEqual(len(annotations), 10)
+
+    def test_no_baselines_dir_degrades(self):
+        self._write_record("a", "shard-0-of-5.json",
+                           record("macos", "3.11", 0))
+        self._write_jobs([])
+        markdown, combined = self._run(baselines=False)
+        self.assertIn("### Warnings\n\n- none", markdown)
+        self.assertIn("baseline: none", markdown)
+        self.assertEqual(combined["baseline"], {"runs": [], "modules_n": 0})
+
+    def test_empty_baselines_dir_degrades_to_note(self):
+        self._write_record("a", "shard-0-of-5.json",
+                           record("macos", "3.11", 0))
+        self._write_jobs([])
+        markdown, combined = self._run()  # dir exists but empty
+        self.assertIn("no usable baselines", markdown)
+        self.assertIn("baseline: none", markdown)
+        self.assertEqual(combined["baseline"]["runs"], [])
+
+    def test_unreadable_weights_degrades_to_note(self):
+        self._write_record("a", "shard-0-of-5.json",
+                           record("macos", "3.11", 0))
+        self._write_jobs([])
+        markdown, _ = self._run(baselines=False,
+                                weights=self.tmp / "absent.json")
+        self.assertIn("weights file unreadable", markdown)
 
 
 if __name__ == "__main__":

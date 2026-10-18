@@ -18,6 +18,7 @@ is not "skipped"; setup = that step's started_at - job started_at; exec = the
 step's duration; total = job completed_at - started_at.
 """
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -33,6 +34,11 @@ MAX_RECORD_BYTES = 8 * 1024 * 1024
 JOB_NAME_RE = re.compile(r"^unittest \((?P<os>[^,]+), (?P<py>[^,]+), (?P<shard>\d+)\)$")
 OS_LABELS = {"ubuntu-latest": "linux", "macos-latest": "macos"}
 FRACTION_CLIP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})\d+(.*)$")
+
+_shard_spec = importlib.util.spec_from_file_location(
+    "run_test_shards", Path(__file__).resolve().parent / "run_test_shards.py")
+shardtools = importlib.util.module_from_spec(_shard_spec)
+_shard_spec.loader.exec_module(shardtools)
 
 
 def _num(value):
@@ -139,7 +145,10 @@ def load_records(root):
     if not root.is_dir():
         ignored.append({"file": str(root), "reason": "records directory missing"})
         return records, ignored
-    for path in sorted(root.rglob("*.json")):
+    # A `workers/` subtree holds the per-module worker records of a local
+    # --record run; the merged shard record is the only one that counts.
+    for path in sorted(p for p in root.rglob("*.json")
+                       if "workers" not in p.relative_to(root).parts):
         name = str(path.relative_to(root))
         try:
             if path.stat().st_size > MAX_RECORD_BYTES:
@@ -262,7 +271,7 @@ def section_jobs(jobs_metrics, records_by_key):
     return "\n".join(lines)
 
 
-def section_imbalance(jobs_metrics):
+def section_imbalance(jobs_metrics, baselines=None):
     groups = {}
     for metrics in jobs_metrics:
         if metrics["os"] is None or metrics["exec"] is None:
@@ -275,11 +284,29 @@ def section_imbalance(jobs_metrics):
         execs = sorted(m["exec"] for m in groups[key])
         median = statistics.median(execs)
         ratio = execs[-1] / median if median else float("inf")
-        lines.append(f"- {key[0]}/{key[1]}: exec max {_minutes(execs[-1])},"
-                     f" median {_minutes(median)}, max/median {ratio:.2f},"
-                     f" sum {_minutes(sum(execs))}")
-    lines.append(f"- runner-minutes: {runner_minutes / 60:.0f};"
-                 f" max queue: {_minutes(max(queues) if queues else None)}")
+        line = (f"- {key[0]}/{key[1]}: exec max {_minutes(execs[-1])},"
+                f" median {_minutes(median)}, max/median {ratio:.2f},"
+                f" sum {_minutes(sum(execs))}")
+        baseline = baselines["execs"].get(key) if baselines else None
+        if baseline:
+            maxes, medians = baseline["max"], baseline["median"]
+            line += (f"; baseline max {_minutes(statistics.median(maxes))},"
+                     f" median {_minutes(statistics.median(medians))}"
+                     f" (n={len(maxes)} runs,"
+                     f" range {_minutes(min(maxes))}-{_minutes(max(maxes))})")
+        else:
+            line += "; baseline: none"
+        lines.append(line)
+    line = f"- runner-minutes: {runner_minutes / 60:.0f}"
+    if baselines and baselines["runner_minutes"]:
+        runs = baselines["runner_minutes"]
+        line += (f" vs baseline median {statistics.median(runs):.0f}"
+                 f" (n={len(runs)} runs,"
+                 f" range {min(runs):.0f}-{max(runs):.0f})")
+    else:
+        line += "; baseline: none"
+    line += f"; max queue: {_minutes(max(queues) if queues else None)}"
+    lines.append(line)
     return "\n".join(lines)
 
 
@@ -315,7 +342,192 @@ def section_slowest(records, top=15):
     return "\n".join(lines).rstrip()
 
 
-def section_notes(records, jobs_metrics, records_by_key):
+def load_baselines(root):
+    """Validated baseline-<run>.json combined files, newest run first.
+
+    Returns (entries, problems); entries are {"run_id", "data"} dicts. Every
+    input goes through the shard runner's combined-file validator."""
+    entries, problems = [], []
+    directory = Path(root)
+    if not directory.is_dir():
+        problems.append(f"baselines directory missing: {directory}")
+        return entries, problems
+    for path in sorted(directory.glob("*.json")):
+        _jobs, problem = shardtools._combined_jobs(path)
+        if problem is not None:
+            problems.append(f"ignored baseline `{_cell(path.name)}`: {problem}")
+            continue
+        try:
+            # The validator above already size- and format-checked the file.
+            data = json.loads(path.read_bytes())
+        except Exception as exc:
+            problems.append(f"ignored baseline `{_cell(path.name)}`: {exc}")
+            continue
+        run_id = data.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            stem = path.stem
+            run_id = stem.split("-", 1)[-1] if stem.startswith("baseline-") else stem
+        entries.append({"run_id": run_id, "data": data})
+
+    def newest_first(entry):
+        try:
+            return (0, -int(entry["run_id"]))
+        except ValueError:
+            return (1, entry["run_id"])
+
+    entries.sort(key=newest_first)
+    return entries, problems
+
+
+def baseline_stats(entries):
+    """Per-module and per-(os, python) baselines over the collected runs.
+
+    A module's baseline is the median of its per-run macOS/3.11 wall seconds;
+    runs are kept newest-first so the newest two can be checked for sustained
+    drift. execs: (os, py) -> per-run max and median shard exec seconds.
+    """
+    module_runs, execs, runner_minutes = {}, {}, []
+    for entry in entries:
+        per_module = {}
+        for module, wall in shardtools._combined_measurements(entry["data"]):
+            per_module.setdefault(module, []).append(wall)
+        for module, walls in per_module.items():
+            module_runs.setdefault(module, []).append(statistics.median(walls))
+        groups, total, counted = {}, 0.0, False
+        for job in entry["data"].get("jobs", []):
+            if not isinstance(job, dict):
+                continue
+            os_name, python = job.get("os"), job.get("python")
+            exec_seconds = _num(job.get("exec_seconds"))
+            if (isinstance(os_name, str) and isinstance(python, str)
+                    and exec_seconds is not None):
+                groups.setdefault((os_name, python), []).append(exec_seconds)
+            total_seconds = _num(job.get("total_seconds"))
+            if total_seconds is not None:
+                total += total_seconds
+                counted = True
+        for key, values in groups.items():
+            group = execs.setdefault(key, {"max": [], "median": []})
+            group["max"].append(max(values))
+            group["median"].append(statistics.median(values))
+        if counted:
+            runner_minutes.append(total / 60)
+    modules = {module: {"median": statistics.median(walls), "n": len(walls),
+                        "min": min(walls), "max": max(walls), "runs": walls}
+               for module, walls in module_runs.items()}
+    return {"modules": modules, "execs": execs, "runner_minutes": runner_minutes}
+
+
+def _current_module_walls(records, os_name=None, python=None):
+    walls = {}
+    for record in records:
+        if (os_name is not None
+                and (record["os"], record["python"]) != (os_name, python)):
+            continue
+        for module, stats in record["modules"].items():
+            wall = stats.get("wall_seconds")
+            if wall is not None:
+                walls[module] = max(wall, walls.get(module, 0.0))
+    return walls
+
+
+def _load_weights(path):
+    previous = shardtools.WEIGHTS_FILE
+    try:
+        shardtools.WEIGHTS_FILE = Path(path)
+        return shardtools.load_weights_file()
+    finally:
+        shardtools.WEIGHTS_FILE = previous
+
+
+REFRESH_CMD = ("python3 tests/run_test_shards.py --refresh-weights "
+               "<timing-combined.json ...>")
+
+
+def _build_warnings(records, jobs_metrics, baselines, weights_data):
+    """(warnings, notices, inconclusive) — warnings are annotatable, notices
+    are informational annotations, inconclusive lines stay in the summary."""
+    warnings, notices, inconclusive = [], [], []
+    groups = {}
+    for metrics in jobs_metrics:
+        if metrics["os"] is not None and metrics["exec"] is not None:
+            groups.setdefault((metrics["os"], metrics["python"]),
+                              []).append(metrics["exec"])
+    for (os_name, python), execs in sorted(groups.items()):
+        median = statistics.median(execs)
+        ratio = max(execs) / median if median else float("inf")
+        if ratio > 1.5 and max(execs) - median > 180:
+            warnings.append(
+                f"shard imbalance {os_name}/{python}: max/median {ratio:.2f},"
+                f" slowest shard {max(execs) - median:.0f}s over median"
+                f" -- refresh: {REFRESH_CMD}")
+    current_mac = _current_module_walls(records, "macos", "3.11")
+    if baselines is not None:
+        for module in sorted(current_mac):
+            base = baselines["modules"].get(module)
+            if base is None:
+                continue
+            wall = current_mac[module]
+            slower = wall > 1.5 * base["median"] and wall - base["median"] > 60
+            if not slower:
+                continue
+            detail = (f"`{_cell(module)}` {wall:.0f}s vs baseline median"
+                      f" {base['median']:.0f}s (n={base['n']} runs,"
+                      f" range {base['min']:.0f}s-{base['max']:.0f}s)")
+            if base["n"] < 3:
+                inconclusive.append(
+                    f"inconclusive (n={base['n']}): slower than baseline"
+                    f" {detail}")
+                continue
+            sustained = (base["n"] >= 5 and len(base["runs"]) >= 2
+                         and all(wall > 1.5 * base["median"]
+                                 and wall - base["median"] > 60
+                                 for wall in base["runs"][:2]))
+            warnings.append("module slower than baseline: " + detail
+                            + (" -- sustained" if sustained else ""))
+    if weights_data is not None:
+        weights = weights_data.get("weights", {})
+        samples = weights_data.get("samples", {})
+        stale = shardtools.stale_estimates(weights, current_mac)
+        if stale:
+            warnings.append("stale weight estimates: "
+                            + ", ".join(f"`{_cell(module)}`" for module in stale)
+                            + f" -- refresh: {REFRESH_CMD}")
+        local = sorted(module for module in weights
+                       if not _num(samples.get(module)) and module in current_mac)
+        if local:
+            notices.append("local weight estimates measured on CI: "
+                           + ", ".join(f"`{_cell(module)}`" for module in local)
+                           + f" -- refresh: {REFRESH_CMD}")
+        missing = sorted(set(_current_module_walls(records)) - set(weights))
+        if missing:
+            warnings.append("modules without a pinned weight: "
+                            + ", ".join(f"`{_cell(module)}`" for module in missing)
+                            + " -- run: python3 tests/run_test_shards.py"
+                            + " --measure " + " ".join(missing))
+    return warnings, notices, inconclusive
+
+
+def section_warnings(warnings, notices, inconclusive):
+    lines = ["", "### Warnings", ""]
+    if not warnings and not notices and not inconclusive:
+        lines.append("- none")
+    for line in warnings:
+        lines.append(f"- {line}")
+    for line in notices:
+        lines.append(f"- {line}")
+    for line in inconclusive:
+        lines.append(f"- {line}")
+    return "\n".join(lines)
+
+
+def _annotation(kind, text):
+    escaped = re.sub(r"[%\r\n]", lambda m: {"%": "%25", "\r": "%0D",
+                                            "\n": "%0A"}[m.group(0)], text)
+    return f"::{kind} title=Test timing::{escaped.replace('`', '')}"
+
+
+def section_notes(records, jobs_metrics, records_by_key, extra_notes=()):
     notes = ["", "### Measurement notes", ""]
     for record in records:
         if not record["complete"]:
@@ -327,12 +539,14 @@ def section_notes(records, jobs_metrics, records_by_key):
                if m["os"] is not None and _record_for(records_by_key, m) is None]
     if missing:
         notes.append("- jobs without records: " + ", ".join(_cell(n) for n in missing))
+    for note in extra_notes:
+        notes.append(f"- {_cell(note)}")
     if len(notes) == 3:
         notes.append("- none")
     return "\n".join(notes)
 
 
-def combined_payload(records, jobs_metrics, records_by_key):
+def combined_payload(records, jobs_metrics, records_by_key, baseline_info=None):
     revision, run_id, _ = _provenance(records)
     jobs = []
     for metrics in jobs_metrics:
@@ -353,6 +567,7 @@ def combined_payload(records, jobs_metrics, records_by_key):
             "run_id": run_id,
             "revision": revision,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "baseline": baseline_info or {"runs": [], "modules_n": 0},
             "jobs": jobs}
 
 
@@ -368,6 +583,11 @@ def parse_args(argv):
                         help="write the combined JSON summary here")
     parser.add_argument("--markdown", required=True, metavar="FILE",
                         help="append the Markdown summary here")
+    parser.add_argument("--baselines", metavar="DIR",
+                        help="directory of baseline-<run>.json combined files "
+                             "from recent main runs")
+    parser.add_argument("--weights", metavar="FILE",
+                        help="tests/shard_weights.json for drift checks")
     return parser.parse_args(argv)
 
 
@@ -388,12 +608,38 @@ def main(argv=None):
         # Prefer a complete record when a key appears twice.
         if key not in records_by_key or (record["complete"] and not records_by_key[key]["complete"]):
             records_by_key[key] = record
+    extra_notes, baselines, baseline_runs = [], None, []
+    if args.baselines:
+        entries, problems = load_baselines(args.baselines)
+        extra_notes.extend(problems)
+        if entries:
+            baselines = baseline_stats(entries)
+            baseline_runs = [entry["run_id"] for entry in entries]
+        else:
+            extra_notes.append("no usable baselines")
+    weights_data = None
+    if args.weights:
+        try:
+            weights_data = _load_weights(args.weights)
+        except Exception as exc:
+            extra_notes.append(
+                f"weights file unreadable: {type(exc).__name__}")
+    warnings, notices, inconclusive = [], [], []
+    try:
+        warnings, notices, inconclusive = _build_warnings(
+            records, jobs_metrics, baselines, weights_data)
+    except Exception as exc:
+        extra_notes.append(f"warnings unavailable: {type(exc).__name__}")
+    for kind, line in ([("warning", line) for line in warnings]
+                       + [("notice", line) for line in notices])[:10]:
+        print(_annotation(kind, line))
     sections = []
     for title, builder in (("header", lambda: section_header(records, ignored, jobs_metrics)),
+                           ("warnings", lambda: section_warnings(warnings, notices, inconclusive)),
                            ("jobs", lambda: section_jobs(jobs_metrics, records_by_key)),
-                           ("imbalance", lambda: section_imbalance(jobs_metrics)),
+                           ("imbalance", lambda: section_imbalance(jobs_metrics, baselines)),
                            ("slowest", lambda: section_slowest(records)),
-                           ("notes", lambda: section_notes(records, jobs_metrics, records_by_key))):
+                           ("notes", lambda: section_notes(records, jobs_metrics, records_by_key, extra_notes))):
         try:
             sections.append(builder())
         except Exception as exc:
@@ -409,8 +655,11 @@ def main(argv=None):
         combined_path = Path(args.combined)
         combined_path.parent.mkdir(parents=True, exist_ok=True)
         combined_path.write_text(
-            json.dumps(combined_payload(records, jobs_metrics, records_by_key),
-                       indent=1, sort_keys=True) + "\n")
+            json.dumps(combined_payload(
+                records, jobs_metrics, records_by_key,
+                {"runs": [str(run)[:100] for run in baseline_runs],
+                 "modules_n": len(baselines["modules"]) if baselines else 0}),
+                indent=1, sort_keys=True) + "\n")
     except Exception as exc:
         print(f"ci_timing_summary: combined record not written: {type(exc).__name__}", file=sys.stderr)
     return 0

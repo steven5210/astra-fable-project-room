@@ -24,12 +24,11 @@ jobs:
           - os: macos-latest
             python: "3.12"
     runs-on: ${{ matrix.os }}
-    # The offline suite (about 3,200 tests) runs as five module-level shards balanced by
-    # measured duration (tests/shard_weights.json). Measured on run 39056172645 (main
-    # 6351285, 2026-10-17): macOS shard execution took 9.4-31.9 min and Linux 6.2-20.6 min
-    # before the balance refresh. macOS runs Python 3.11 only because the account runs
-    # about five macOS jobs at a time and 3.11 is the production interpreter. This is a CI
-    # budget, not a Fable, model or gate deadline.
+    # The offline suite runs as five module-level shards balanced by the pinned
+    # per-module weights in tests/shard_weights.json; each shard job runs its
+    # modules through a bounded worker pool (3 on macOS, 4 on Linux). Timing
+    # records and the diagnostic summary job are never required checks.
+    # 45 minutes is a CI budget, not a Fable, model or gate deadline.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -108,10 +107,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" > "$RUNNER_TEMP/jobs.json"
+      - name: Fetch recent main baselines
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tests/ci_timing_baseline.py --repo "${{ github.repository }}" --workflow tests.yml --out "$RUNNER_TEMP/baselines" --skip-run-id "${{ github.run_id }}"
       - name: Build the timing summary
         env:
           PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 tests/ci_timing_summary.py --records "$RUNNER_TEMP/timing-artifacts" --jobs "$RUNNER_TEMP/jobs.json" --combined "$RUNNER_TEMP/timing-combined.json" --markdown "$GITHUB_STEP_SUMMARY"
+        run: python3 tests/ci_timing_summary.py --records "$RUNNER_TEMP/timing-artifacts" --jobs "$RUNNER_TEMP/jobs.json" --combined "$RUNNER_TEMP/timing-combined.json" --markdown "$GITHUB_STEP_SUMMARY" --baselines "$RUNNER_TEMP/baselines" --weights tests/shard_weights.json
       - name: Upload combined timing summary
         uses: actions/upload-artifact@v4
         if: always()
