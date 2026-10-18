@@ -1555,7 +1555,7 @@ class Service:
                 self.save(directory, state)
             return acceptance | {"accepted": True, "publication": "not performed"}
 
-    def request_summary(self, request):
+    def request_summary(self, request, directory=None, state=None):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
@@ -1573,6 +1573,9 @@ class Service:
             result["model_identity"] = "contradicted"
             result["model_reroute"] = {k: str(v)[:500] for k, v in request["model_reroute"].items()
                                       if k in ("fromModel", "toModel", "providerTurnId", "reason", "at")}
+        if (directory is not None and state is not None and request.get("role") == "reviewer"
+                and request.get("state") == "completed"):
+            result["review_decision"] = ao_workflow.review_decision(directory, state, request)
         return result
 
     def summary(self, directory, state):
@@ -1627,7 +1630,7 @@ class Service:
                 "spec": state.get("spec"), "bindings": state["bindings"],
                 "latest_prompt": ao_prompt_metrics.latest_prompt(directory, state),
                 "reviewer_recovery": recovery_summary(self, state),
-                "requests": [self.request_summary(r) for r in visible],
+                "requests": [self.request_summary(r, directory, state) for r in visible],
                 "requests_truncated": len(state["requests"]) > 20, "checkpoint": state.get("checkpoint"),
                 "latest_verification": state["verifications"][-1] if state["verifications"] else None,
                 "latest_acceptance": state["acceptances"][-1] if state["acceptances"] else None,
@@ -1637,7 +1640,7 @@ class Service:
                           "includes_delegates": False, "is_context_occupancy": False,
                           "limitation": "AO-reported native counters, not subscription quota or billing. Delegate ledgers remain separate."}}
 
-    def _compact_status(self, result, state):
+    def _compact_status(self, result, state, directory):
         """The ``view="compact"`` projection: the same object minus the request and delegate bulk."""
         ordered = sorted(state["requests"].values(), key=ao_prompt_metrics.presentation_order)
         latest = {}
@@ -1647,7 +1650,7 @@ class Service:
         counts = {}
         for request in ordered:
             counts[request["state"]] = counts.get(request["state"], 0) + 1
-        result["requests"] = [self.request_summary(request) for request in selected]
+        result["requests"] = [self.request_summary(request, directory, state) for request in selected]
         result["request_counts"] = counts
         result["requests_truncated"] = len(ordered) > len(selected)
         delegate = result.get("delegate")
@@ -1690,7 +1693,7 @@ class Service:
             raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
         state = read(directory / "state.json")
         result = self.summary(directory, state)
-        return self._compact_status(result, state) if view == "compact" else result
+        return self._compact_status(result, state, directory) if view == "compact" else result
 
     def ao_room_progress(self, room_id, request_id=None, max_text_chars=400):
         # Read-only like status: one bounded observation, never a state write.

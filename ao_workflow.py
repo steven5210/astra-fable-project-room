@@ -459,6 +459,29 @@ def engineering_capture(state):
     return result
 
 
+def review_decision(directory, state, request):
+    """Read-only: the preserved reviewer verdict's decision for one completed reviewer request.
+
+    Reads the saved receipt through completed_receipt/final_json (digest-validated), compares the
+    verdict's identities with the request's bound review identities, and reports whether a saved
+    acceptance names the request. It never approves, rejects or accepts anything."""
+    if request.get("role") != "reviewer" or request.get("state") != "completed":
+        return None
+    accepted = any(isinstance(a, dict) and a.get("request_id") == request.get("request_id")
+                   for a in state.get("acceptances") or [])
+    from ao_response_normalization import ResponseFormatError
+    try:
+        verdict = final_json(directory, request)
+    except (RoomError, ResponseFormatError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {"decision": "unavailable", "reason": str(exc)[:200], "accepted": accepted}
+    expected = request.get("review")
+    if not isinstance(verdict, dict) or verdict.get("decision") not in ("approved", "rejected"):
+        return {"decision": "invalid", "reason": "decision_missing", "accepted": accepted}
+    if not isinstance(expected, dict) or not expected or any(verdict.get(k) != v for k, v in expected.items()):
+        return {"decision": "invalid", "reason": "identities_mismatch", "accepted": accepted}
+    return {"decision": verdict["decision"], "accepted": accepted}
+
+
 def part_texts(prepared, policy):
     """The pinned one-time workflow parts for this room, keyed by stable part name."""
     from ao_quality_review import PART as QUALITY_PART, INSTRUCTION as QUALITY_INSTRUCTION

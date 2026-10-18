@@ -176,6 +176,8 @@ Do not erase it or relaunch.
 `ao_room_send` role `reviewer`, purpose `acceptance_review`, with a focused
 request; sync to terminal. Read Fable's routing report against the actual ledger
 facts. On `rejected`, investigate, correct, reverify and send a new review.
+`review_decision` on each reviewer status row shows the saved verdict and whether
+it was accepted.
 `ao_room_accept` with that review's `request_id`. There are 3
 acceptance-review requests per room.
 **Stop:** allowance exhausted → [acceptance-review continuation](../../../docs/guides/acceptance-review-continuation.md),

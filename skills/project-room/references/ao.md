@@ -750,7 +750,12 @@ must inspect independently, stay read-only, and finish with one JSON object:
 ```
 
 Use `rejected` with actionable findings when appropriate. Sync its terminal native
-response, investigate findings, repair and reverify if needed. `ao_room_accept`
+response, investigate findings, repair and reverify if needed. Reviewer rows in
+status carry `review_decision`: `approved`, `rejected`, `invalid` (with reason
+`identities_mismatch` or `decision_missing`) or `unavailable` (with the refusal
+reason), plus `accepted` — derived read-only from the digest-validated saved
+verdict and the bound identities, so a completed reviewer turn by itself is
+neither. `ao_room_accept`
 accepts only an actual completed independent reviewer response with matching
 identities, intact logs and unchanged candidate bytes. The ordinary allowance is
 three acceptance-review requests per room across revisions. Further necessary

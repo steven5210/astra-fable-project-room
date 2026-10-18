@@ -104,9 +104,10 @@ later syncs do not retry or upgrade it (`MalformedReportTests`). Downstream work
 refused before it costs anything: `ao_room_verify` calls `engineering_ready` before any gate
 runs (`Acceptance requires a captured completed engineering result`), the reviewer send
 needs a passed checkpoint, and `ao_room_accept` repeats the readiness check. No review
-attempt is consumed. What remains open is visibility, not detection: the operator must read
-`requests[].engineering_error` to learn why verification refuses, and the verify-time
-refusal is worded as an acceptance message.
+attempt is consumed. Detection therefore needed no change; visibility did: status now carries
+`engineering_capture` (the latest engineering request's capture status, its `engineering_error`
+and currentness), and the verify-time refusal names the request and its error instead of
+repeating the acceptance wording. Eligibility, ordering, counters and gates are unchanged.
 
 ### Bounds the harness pins as observed behavior, not as contract
 
@@ -237,17 +238,19 @@ that change's own modules and are not duplicated by the harness.
 
 ## Status distinctions (input to the minimum-correction step)
 
-What a reader must look at today to tell these apart; a blank cell is a distinction status
-does not make on its own.
+What a reader must look at to tell these apart. `engineering_capture` and the reviewer rows'
+`review_decision` are the two additive, read-only projections this work added; both derive
+from saved fields and the digest-validated receipt, grant nothing, and appear identically in
+the full and compact views.
 
 | Operator question | Where the answer is in `ao_room_status` |
 | --- | --- |
 | running | `requests[].state` `submitted`/`running`; `ao_room_sync.wait.settled` false |
-| waiting for the provider (quota or provider hold) | `requests[].state` `uncertain` + `ao_turn_state` `failed` + `semantic_status.kind` after an audit |
-| worker returned, awaiting Fable's judgment | not a room state: `ao_room_progress.plan.steps[].execution.latest` `returned` with `task_updated_after_latest_result` false |
-| invalid report | `requests[].engineering_error` on a `completed` request; `ao_room_verify` refuses with an acceptance-worded message |
+| waiting for the provider (quota or provider hold) | `requests[].state` `uncertain` + `ao_turn_state` `failed`; `engineering_capture.status` `held` with `semantic_kind` once audited |
+| worker returned, awaiting Fable's judgment | not a room state: `ao_room_progress.plan.steps[].execution.latest` `returned` with `task_updated_after_latest_result` false; `engineering_capture.status` stays `pending` while the turn runs |
+| invalid report | `engineering_capture.status` `capture_failed` with the request id and its `engineering_error`; `ao_room_verify` refuses with a verification-worded message naming both |
 | verification failure | `latest_verification.state` `failed`; `checkpoint` null |
-| review rejection | the reviewer request is `completed` and no `latest_acceptance` names it; the verdict is only in the receipt |
+| review rejection | the reviewer row's `review_decision` (`rejected`; `approved` with `accepted` false is approved-but-not-accepted; `invalid`/`unavailable` when the saved verdict or its identities do not validate), derived read-only from the digest-validated receipt |
 | accepted | `latest_acceptance` |
 | installed | not representable (see room-level states) |
 
