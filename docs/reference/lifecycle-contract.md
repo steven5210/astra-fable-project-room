@@ -128,10 +128,31 @@ refusal is worded as an acceptance message.
 
 ### Safety clauses that hold across every transition
 
-- A refused operation performs no dispatch and changes no counter, spec, preparation,
-  handoff or receipt. The only write a refusal may make is the invalidation of a retained
-  history-reconciliation proof inside `Service.locked`. The harness checks this with an
-  effects snapshot after every expected refusal.
+- A refused operation never changes authority: no dispatch, no request intent, no counter,
+  no spec, preparation, handoff, receipt, settlement or acceptance change. Whether a refusal
+  also leaves an append-only diagnostic trace differs by operation; the table below is what
+  the harness observed, where `refuses()` snapshots every durable effect (every file in the
+  room directory by digest except `state.json`, the saved request states, pointer fields and
+  field inventories, counters and POST count) before and after each refused call and requires
+  an empty difference unless an explicit allowance names the exact append.
+
+| Refused operation (observed in `test_ao_lifecycle_contract.REFUSAL_EFFECTS`) | Durable effect of the refusal |
+| --- | --- |
+| `ao_room_prepare` (removed prepared worktree; fresh worktree on a prepared room) | none |
+| `ao_room_bind` (removed prepared workspace) | none |
+| `ao_room_send` (role never bound; routing evidence lost; owned request active or uncertain; not the named outcome successor; identical id with another payload; unowned completed turn; unverified recovered context; candidate changed after verification; no passed checkpoint; snapshot `history_truncated`; spec record changed) | none |
+| `ao_room_handoff` (no current agreement; spec record changed) | none |
+| `ao_room_verify` (no captured engineering result) | none |
+| `ao_room_accept` (no captured engineering result; receipt bytes modified; prefix or foreign verdict identity; spec record changed) | none — `observe()` on identical reviewer evidence returns the existing record without minting |
+| `ao_room_outcome_audit` (owned request still uncertain; unowned completed turn) | none |
+| `ao_room_outcome_resume` (extra completed turn after the audit) | none |
+| `ao_room_outcome_resume` (the failed turn's own evidence changed after the audit) | append-only: `observe()` mints one new `outcomes/<request>/<sha>.json` and moves `semantic_outcome_sha256` before the digest check refuses with `Outcome evidence changed or does not establish an eligible diagnosed failure`; the request stays `uncertain`, no settlement is written |
+
+  A stronger "no write at all on refusal" target is therefore **unmet** for that last case
+  and is left as observed: the appended record is evidence of what was seen, the original
+  failed receipt is unchanged, and no authority moved. Separately, any refused operation
+  inside `Service.locked` may invalidate a retained history-reconciliation proof; that write
+  lands in `state.json`, which the snapshot excludes for exactly that reason.
 - Uncertain delivery is held, never resent: an identical `ao_room_send` reads the saved
   record; a different payload under the same id refuses; nothing resends under a new id
   while a request is active or uncertain.

@@ -57,39 +57,67 @@ OPEN_GAPS = (
      "demonstrated_by": "ChangedCandidateTests.test_changed_completed_at_after_capture_is_admitted_and_mints_a_new_semantic_record"},
 )
 
+# Observed durable effects of each refused operation in this module, transcribable into the coverage
+# map. 'none' means the refusal produced no durable effect (the auto-snapshot in refuses() requires an
+# empty diff); the one non-empty entry is pinned with refuses(..., allow=...).
+REFUSAL_EFFECTS = {
+    'ao_room_prepare: removed prepared worktree': 'none',
+    'ao_room_prepare: fresh worktree on a prepared room': 'none',
+    'ao_room_bind: removed prepared workspace': 'none',
+    'ao_room_send: role never bound': 'none',
+    'ao_room_handoff: no current agreement': 'none',
+    'ao_room_send: routing evidence lost (.claude removed)': 'none',
+    'ao_room_verify: no captured engineering result': 'none',
+    'ao_room_send: acceptance_review without passed checkpoint': 'none',
+    'ao_room_accept: no captured engineering result': 'none',
+    'ao_room_send: correction while an owned request is active/uncertain': 'none',
+    'ao_room_send: correction that is not the named outcome successor': 'none',
+    'ao_room_outcome_audit: owned request still active/uncertain': 'none',
+    'ao_room_outcome_resume: extra completed turn after the audit': 'none',
+    'ao_room_outcome_resume: failed-turn evidence drift after the audit': (
+        "append-only: observe() mints one new outcomes/implementation/<sha>.json for the changed "
+        "evidence and moves semantic_outcome_sha256 before resume's digest check refuses"),
+    'ao_room_send: identical request_id with a different payload': 'none',
+    'ao_room_send: unowned completed (automation-origin) turn': 'none',
+    'ao_room_outcome_audit: unowned completed turn': 'none',
+    'ao_room_send: unverified recovered context': 'none',
+    'ao_room_send: candidate changed after verification': 'none',
+    'ao_room_accept: receipt bytes modified': 'none',
+    'ao_room_accept: reviewer verdict with prefix/foreign identities': 'none',
+    'ao_room_send/accept/handoff: spec record changed after agreement': 'none',
+    'ao_room_send: snapshot history_truncated': 'none',
+}
+
 
 class LifecycleFixture(Fixture):
     """Shared lifecycle harness: durable-effect snapshots, exact refusals and the MCP boundary."""
     TEMPLATE_SETUP = True
 
+    POINTER_FIELDS = ('semantic_outcome_sha256', 'outcome_resume_sha256',
+                      'engineering_record_sha256', 'completion_candidate_sha256', 'receipt_sha256')
+
     def effects(self):
         """Immutable durable evidence plus dispatch/counter surface.
 
-        Covers POST count, every saved request state, acceptances, verifications, the checkpoint/spec/
-        preparation/handoff digests, the purpose counters, and the bytes of every immutable artifact a
-        refused operation must never touch: preparation.json, the spec record, and each request's
-        receipt, engineering record and completion-candidate file. state.json itself is excluded
-        because a refused operation may legitimately rewrite it through reconciliation invalidation.
+        artifacts binds the bytes of every regular file in the room directory except state.json (a
+        refused operation may legitimately rewrite it through reconciliation invalidation), so
+        outcomes/**, receipts/, engineering/, completion-candidates/, specs/, handoffs/, verification/,
+        preparation.json and audit files are all covered by exact bytes; semantic_pointers exposes
+        pointer moves and request_fields exposes request fields a refusal must never write.
         """
         state = self.state()
         directory = self.directory()
-        artifacts = {}
-        preparation = directory / 'preparation.json'
-        if preparation.exists():
-            artifacts['preparation.json'] = hashlib.sha256(preparation.read_bytes()).hexdigest()
-        if state.get('spec'):
-            path = directory / state['spec']
-            artifacts[state['spec']] = hashlib.sha256(path.read_bytes()).hexdigest()
-        for request in state['requests'].values():
-            for key in ('receipt', 'engineering_record', 'completion_candidate'):
-                relative = request.get(key)
-                if isinstance(relative, str):
-                    artifacts[relative] = hashlib.sha256((directory / relative).read_bytes()).hexdigest()
+        artifacts = {path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                     for path in directory.rglob('*')
+                     if path.is_file() and path.name != 'state.json'}
         status = self.service.ao_room_status(self.room)
         counters = {key: status[key] for key in
                     ('spec_review_attempts', 'acceptance_review_attempts', 'spec_verdict_recovery_attempts')}
         return {'posts': len(self.fake.posts),
                 'request_states': {key: request['state'] for key, request in state['requests'].items()},
+                'semantic_pointers': {key: {name: request.get(name) for name in self.POINTER_FIELDS}
+                                      for key, request in state['requests'].items()},
+                'request_fields': {key: sorted(request) for key, request in state['requests'].items()},
                 'acceptances': len(state['acceptances']), 'verifications': len(state['verifications']),
                 'checkpoint_sha256': state.get('checkpoint_sha256'),
                 'spec_record_sha256': state.get('spec_record_sha256'),
@@ -100,10 +128,57 @@ class LifecycleFixture(Fixture):
     def assert_no_effects(self, before):
         self.assertEqual(self.effects(), before)
 
-    def refuses(self, pattern, fn, *args, **kwargs):
+    def _diff_effects(self, before, after):
+        diff = {}
+        for key in ('posts', 'acceptances', 'verifications', 'checkpoint_sha256',
+                    'spec_record_sha256', 'preparation_sha256', 'handoff_sha256', 'counters'):
+            if before[key] != after[key]:
+                diff[key] = {'before': before[key], 'after': after[key]}
+        if before['artifacts'] != after['artifacts']:
+            delta = {'added': sorted(set(after['artifacts']) - set(before['artifacts'])),
+                     'removed': sorted(set(before['artifacts']) - set(after['artifacts'])),
+                     'changed': sorted(key for key in set(before['artifacts']) & set(after['artifacts'])
+                                       if before['artifacts'][key] != after['artifacts'][key])}
+            if any(delta.values()):
+                diff['artifacts'] = delta
+        for key in ('request_states', 'semantic_pointers', 'request_fields'):
+            if before[key] != after[key]:
+                diff[key] = {rid: {'before': before[key].get(rid), 'after': after[key].get(rid)}
+                             for rid in set(before[key]) | set(after[key])
+                             if before[key].get(rid) != after[key].get(rid)}
+        return diff
+
+    def refuses(self, pattern, fn, *args, allow=None, **kwargs):
+        """Assert the refusal and snapshot durable effects around it.
+
+        allow=None requires an empty effect diff; allow=callable receives (diff, before, after) and
+        asserts the exact permitted append-only difference.
+        """
+        before = self.effects()
         with self.assertRaisesRegex((ao.RoomError, OSError), pattern) as caught:
             fn(*args, **kwargs)
+        after = self.effects()
+        diff = self._diff_effects(before, after)
+        if allow is None:
+            self.assertEqual(diff, {}, msg=repr(diff))
+        else:
+            allow(diff, before, after)
         return caught.exception
+
+    def allow_only_new_outcome_record(self, request_id):
+        """Permit exactly the observe-then-refuse append: one new outcome record plus its pointer move."""
+        def check(diff, before, after):
+            self.assertEqual(set(diff), {'artifacts', 'semantic_pointers'})
+            sha = after['semantic_pointers'][request_id]['semantic_outcome_sha256']
+            self.assertEqual(diff['artifacts'],
+                             {'added': ['outcomes/' + request_id + '/' + sha + '.json'],
+                              'removed': [], 'changed': []})
+            self.assertEqual(set(diff['semantic_pointers']), {request_id})
+            pointers = diff['semantic_pointers'][request_id]
+            changed = sorted(name for name, value in pointers['before'].items()
+                             if value != pointers['after'].get(name))
+            self.assertEqual(changed, ['semantic_outcome_sha256'])
+        return check
 
     def _mcp_call(self, name, arguments):
         service = project_room.Service(self.root / 'mcp-state')
@@ -243,23 +318,20 @@ class FailedStartupTests(PreparedRoomFixture):
         exc = self.refuses('No such file or directory',
                            self.service.ao_room_prepare, self.room, str(worktree))
         self.assertIsInstance(exc, FileNotFoundError)
-        self.assert_no_effects(before)
         second = self.root / 'engineer-worktree-2'
         subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '--detach', str(second), 'HEAD'],
                        check=True, capture_output=True)
         self.refuses('Prepared engineer workspace is immutable',
                      self.service.ao_room_prepare, self.room, str(second))
-        self.assert_no_effects(before)
         exc = self.refuses('No such file or directory',
                            self.service.ao_room_bind, self.room, 'engineer', 'engineer',
                            ao_workflow.FABLE_MODEL, 'max')
         self.assertIsInstance(exc, FileNotFoundError)
-        self.assert_no_effects(before)
         self.refuses('Bind the requested role first',
                      self.service.ao_room_send, self.room, 'engineer', 'x', 'r1', purpose='spec_review')
-        self.assert_no_effects(before)
         self.refuses('current exact spec requires completed Fable agreement',
                      self.service.ao_room_handoff, self.room, str(worktree))
+        # Cross-operation guarantee: the whole refusal sequence left the dead-end room untouched.
         self.assert_no_effects(before)
         status = self.service.ao_room_status(self.room)
         self.assertEqual(status['delegate']['attachment'], 'unverified')
@@ -288,11 +360,7 @@ class ProgressedRoomWorkspaceLossTests(AgreedRoomFixture):
     def test_progressed_room_with_removed_workspace_refuses_new_dispatch(self):
         self.implement()
         shutil.rmtree(self.repo / '.claude')  # the prepared routing evidence under the worktree
-        before = self.effects()
-        posts = len(self.fake.posts)
         self.refuses('Native routing evidence is unreadable or inconsistent', self.send, 'correction')
-        self.assertEqual(len(self.fake.posts), posts)
-        self.assert_no_effects(before)
         routing = self.service.ao_room_status(self.room)['delegate']['routing']
         self.assertEqual(routing['status'], 'unverified')
         self.assertIn('unreadable or inconsistent', routing['error'])
@@ -379,9 +447,7 @@ class InterruptedAndQuotaTests(AgreedRoomFixture):
         self.assertEqual(request['observed_turn']['state'], 'failed')
         self.assertIn('reconciliation', request)
         receipt_bytes = (self.directory() / request['receipt']).read_bytes()
-        before = self.effects()
         self.refuses('An owned request is active or uncertain', self.send, 'correction', 'blocked')
-        self.assert_no_effects(before)
         self.assertEqual(len(self.fake.posts), posts + 1)
         audit = self.service.ao_room_outcome_audit(self.room)
         self.assertEqual(audit['outcome']['kind'], 'quota_limit')
@@ -464,15 +530,16 @@ class InterruptedAndQuotaTests(AgreedRoomFixture):
         snapshot['turns'][-1]['errorMessage'] = 'changed after audit'
         snapshot.setdefault('sessionFailures', []).append(
             {'turnId': snapshot['turns'][-1]['id'], 'type': 'provider_error'})
+        # Observed baseline: the refusal happens after observe() has already minted the changed-evidence
+        # outcome record and moved the semantic_outcome pointer, so it is not write-free.
         self.refuses('Outcome evidence changed or does not establish an eligible diagnosed failure',
                      self.service.ao_room_outcome_resume, self.room, 'implementation',
                      audit['outcome_sha256'], 'resume-1', 'Diagnosis recorded after the audit',
-                     'Authorized one named continuation')
+                     'Authorized one named continuation',
+                     allow=self.allow_only_new_outcome_record('implementation'))
         request = self.state()['requests']['implementation']
         self.assertEqual(request['state'], 'uncertain')
         self.assertNotIn('outcome_resume', request)
-        # Observed baseline: the refusal happens after observe() has already minted the changed-evidence
-        # outcome record and moved the semantic_outcome pointer, so it is not write-free.
         self.assertNotEqual(request['semantic_outcome_sha256'], audit['outcome_sha256'])
         self.assertEqual(self.room_listing(),
                          sorted(listing + ['outcomes/implementation/'
@@ -586,9 +653,7 @@ class ExternalTurnTests(AgreedRoomFixture):
         self.implement()
         self.fake.snapshots['engineer']['turns'].append(
             {'id': 'unowned-1', 'state': 'recovered', 'providerTurnId': 'foreign-native-1'})
-        posts = len(self.fake.posts)
         self.refuses('unverified recovered context', self.send, 'correction')
-        self.assertEqual(len(self.fake.posts), posts)
 
 
 class ChangedCandidateTests(AgreedRoomFixture):
@@ -710,12 +775,8 @@ class LongHistoryTests(AgreedRoomFixture):
 
     def test_history_truncated_snapshot_refuses_dispatch_without_state_change(self):
         self.fake.snapshots['engineer']['history_truncated'] = True
-        before = self.effects()
-        posts = len(self.fake.posts)
         self.refuses('Conversation history exceeds the bounded accounting window',
                      self.send, 'implementation')
-        self.assertEqual(len(self.fake.posts), posts)
-        self.assert_no_effects(before)
 
 
 class GapRegistryTests(unittest.TestCase):
