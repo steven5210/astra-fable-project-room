@@ -2,6 +2,7 @@
 completed reviewer rows in both status views; fake backends only; no account, network, AO process or
 model call."""
 import json
+import unittest
 
 import ao_project_room as ao
 from test_ao_lifecycle_contract import AgreedRoomFixture
@@ -197,3 +198,40 @@ class ReviewDecisionStatusTests(AgreedRoomFixture):
         full = self.service.ao_room_status(self.room, view='full')
         self.assertEqual(self._row(full, 'acceptance_review')['review_decision'],
                          {'decision': 'approved', 'accepted': False})
+
+    def test_escaped_lone_surrogate_review_text_is_invalid_on_every_surface(self):
+        self.implement()
+        self.service.ao_room_verify(self.room, str(self.repo))
+        self.send('acceptance_review')
+        request = self.state()['requests']['acceptance_review']
+        text = json.dumps({**request['review'], 'decision': 'rejected', 'review': '\ud800'})
+        # json.dumps escapes the unpaired surrogate: the saved receipt holds the six ASCII
+        # characters of the \ud800 escape; json.loads restores the surrogate when status
+        # reads the verdict.
+        self.assertIn('\\ud800', text)
+        self.fake.finish('reviewer', text)
+        self.service.ao_room_sync(self.room)
+        expected = {'decision': 'invalid', 'reason': 'review_text_invalid', 'accepted': False}
+        for surface in self._decision_everywhere('acceptance_review'):
+            self.assertEqual(surface, expected)
+        # An approved verdict with the same surrogate reaches ao_room_accept's own nonempty
+        # call: it must refuse with a RoomError diagnosis, never escape UnicodeEncodeError.
+        self.send('acceptance_review', 'acceptance_review-2')
+        request = self.state()['requests']['acceptance_review-2']
+        text = json.dumps({**request['review'], 'decision': 'approved', 'review': '\ud800'})
+        self.assertIn('\\ud800', text)
+        self.fake.finish('reviewer', text)
+        self.service.ao_room_sync(self.room)
+        self.refuses('review must be valid UTF-8 text',
+                     self.service.ao_room_accept, self.room, 'acceptance_review-2')
+
+
+class NonemptyEncodingTests(unittest.TestCase):
+    """nonempty reports an unpaired surrogate as a RoomError diagnosis, not an escaped exception."""
+
+    def test_surrogate_is_room_error_and_other_messages_are_unchanged(self):
+        with self.assertRaisesRegex(ao.RoomError, 'must be valid UTF-8 text'):
+            ao.nonempty('\ud800', 'review')
+        self.assertEqual(ao.nonempty('ok', 'review'), 'ok')
+        with self.assertRaisesRegex(ao.RoomError, 'must be nonempty text, at most 8192 UTF-8 bytes'):
+            ao.nonempty('x' * 9000, 'review')

@@ -113,9 +113,12 @@ repeating the acceptance wording. Eligibility, ordering, counters and gates are 
 
 - The candidate-at-completion is the candidate at the controller's first observation after
   the native turn completed; a change made between native completion and that sync is bound
-  into the record, not detected (`ChangedCandidateTests`, captured silently). Verification
-  then fails against the changed bytes, so the bound candidate still cannot be accepted
-  without a passing gate run.
+  into the record, not detected (`ChangedCandidateTests`, captured silently), and nothing
+  downstream distinguishes it from the worker's own output: the gates run on the bound
+  candidate (the harness fixture's gate fails only because it checks the changed text; a gate
+  that passes on those bytes would verify them) and acceptance binds to the same candidate.
+  Closing that window would need evidence the controller does not have, such as the worker's
+  own candidate digest at completion; it is recorded here as a bound, not a protection.
 - A changed `completedAt` on an owned completed turn is admitted at the next observation and
   mints a new semantic-outcome record: **GAP-TT-1**, adopted from review finding B5 of the
   automation-reconciliation lane. It is unassigned. Binding it strictly needs evidence of how

@@ -54,7 +54,11 @@ def digest(value):
 
 
 def nonempty(value, label, maximum=8192):
-    if not isinstance(value, str) or not value.strip() or len(value.encode()) > maximum:
+    try:
+        invalid = not isinstance(value, str) or not value.strip() or len(value.encode()) > maximum
+    except UnicodeEncodeError:
+        raise RoomError(f"{label} must be valid UTF-8 text")
+    if invalid:
         raise RoomError(f"{label} must be nonempty text, at most {maximum} UTF-8 bytes")
     return value
 

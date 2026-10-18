@@ -484,6 +484,7 @@ def review_decision(directory, state, request):
         return {"decision": "invalid", "reason": "identities_mismatch", "accepted": accepted}
     from ao_project_room import nonempty
     try:
+        # An unpaired surrogate arrives here as RoomError ("must be valid UTF-8 text") from nonempty.
         nonempty(verdict.get("review"), "review", REVIEW_TEXT_MAX_BYTES)
     except RoomError:
         return {"decision": "invalid", "reason": "review_text_invalid", "accepted": accepted}

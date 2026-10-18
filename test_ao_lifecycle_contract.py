@@ -683,7 +683,9 @@ class ChangedCandidateTests(AgreedRoomFixture):
         self.assertTrue(request['completion_capture_attempted'])
         self.assertEqual(len(list((self.directory() / 'completion-candidates').iterdir())), 1)
         result = self.service.ao_room_verify(self.room, str(self.repo))
-        self.assertFalse(result['passed'])  # the recorded gate then fails against the changed bytes
+        # The fixture's own gate rejects the changed text; this is not a controller protection — a gate
+        # that passes on the changed bytes would verify the silently bound candidate.
+        self.assertFalse(result['passed'])
         self.refuses('Create a passed verification checkpoint first', self.send, 'acceptance_review')
 
     def test_candidate_changed_after_verification_is_refused_at_acceptance(self):
