@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 import unittest
@@ -151,6 +152,33 @@ class Fixture(unittest.TestCase):
         with self.assertRaises(RoomError):
             ap.enroll(self.controller, "bad name", str(other), {})
 
+    def test_default_login_dedup(self):
+        self.default_dir()  # saved default login uuid "default-account-uuid"
+        duplicate = self.profile_dir("profile-dup", uuid="default-account-uuid", email=None)
+        with self.assertRaises(RoomError) as caught:
+            ap.enroll(self.controller, "dup", str(duplicate), {})
+        self.assertIn("default", str(caught.exception))
+        different = self.profile_dir("profile-e", uuid="e-account-uuid", email=None)
+        record = ap.enroll(self.controller, "e", str(different), {})
+        self.assertIs(record["default_identity_compared"], True)
+        (self.home / ".claude.json").unlink()
+        another = self.profile_dir("profile-f", uuid="f-account-uuid", email=None)
+        record = ap.enroll(self.controller, "f", str(another), {})
+        self.assertIs(record["default_identity_compared"], False)
+
+    def test_default_pin_refuses_when_default_login_is_enrolled(self):
+        self.default_dir()
+        directory = self.profile_dir()
+        ap.enroll(self.controller, "b", str(directory), {})
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "b-account-uuid"}}))
+        with self.assertRaises(RoomError) as caught:
+            ap.pin(self.controller, "default", {})
+        self.assertIn("b", str(caught.exception))
+        self.assertIn("re-enroll", str(caught.exception))
+        self.default_dir()
+        self.assertEqual(ap.pin(self.controller, "default", {})["name"], "default")
+
     def test_pin(self):
         self.default_dir()
         directory = self.profile_dir()
@@ -208,7 +236,16 @@ class Fixture(unittest.TestCase):
                 text = str(caught.exception)
                 self.assertIn(key, text)
                 self.assertNotIn(SECRET, text)
-        ap.check_credential_env({key: "" for key in ap.CREDENTIAL_ENV}, "fixture environment")
+        clean = {key: "" for key in ap.CREDENTIAL_ENV}
+        del clean["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+        ap.check_credential_env(clean, "fixture environment")
+        with self.assertRaises(RoomError) as caught:
+            ap.check_credential_env({"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}, "fixture environment")
+        self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(caught.exception))
+        self.assertIn("present", str(caught.exception))
+        with self.assertRaises(RoomError):
+            ap.check_credential_env({"CLAUDE_SECURESTORAGE_CONFIG_DIR": "/somewhere"},
+                                    "fixture environment")
         with self.assertRaises(RoomError) as caught:
             ap.check_credential_env({ap.CUSTOM_HEADERS: "X: 1\n authorization : " + SECRET},
                                     "fixture environment")
@@ -245,6 +282,30 @@ class Fixture(unittest.TestCase):
         managed_env = {"CLAUDE_CODE_MANAGED_SETTINGS_PATH": str(managed_file)}
         self.assertEqual(ao_routing.managed_settings_path(managed_env), managed_file)
         self.assertRaises(RoomError, ap.check_credential_settings, pin, worktree, managed_env)
+        managed_file.write_text("{}")
+        ap.check_credential_settings(pin, worktree, managed_env)
+        # managed drop-in directory: helper, credential env, malformed JSON and non-json files
+        dropins = managed_file.parent / "managed-settings.d"
+        dropins.mkdir()
+        (dropins / "notes.txt").write_text("ignored")
+        (dropins / "50-helper.json").write_text(json.dumps({ap.HELPER_KEY: "/x"}))
+        with self.assertRaises(RoomError) as caught:
+            ap.check_credential_settings(pin, worktree, managed_env)
+        self.assertIn("managed drop-in", str(caught.exception))
+        (dropins / "50-helper.json").write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": SECRET}}))
+        with self.assertRaises(RoomError) as caught:
+            ap.check_credential_settings(pin, worktree, managed_env)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", str(caught.exception))
+        self.assertNotIn(SECRET, str(caught.exception))
+        (dropins / "50-helper.json").write_text("{")
+        self.assertRaises(RoomError, ap.check_credential_settings, pin, worktree, managed_env)
+        (dropins / "50-helper.json").unlink()
+        ap.check_credential_settings(pin, worktree, managed_env)
+        shutil.rmtree(dropins)
+        ap.check_credential_settings(pin, worktree, managed_env)
+        dropins.write_text("not a directory")
+        self.assertRaises(RoomError, ap.check_credential_settings, pin, worktree, managed_env)
+        dropins.unlink()
         # project source
         nested = worktree / ".claude"
         nested.mkdir()

@@ -152,6 +152,9 @@ def prepare(service, directory, state, worktree_path):
         saved = preparation(directory, state)
         if saved["worktree"] != str(worktree):
             raise RoomError("Prepared engineer workspace is immutable")
+        if state.get("account_profile"):
+            import ao_account_profiles
+            ao_account_profiles.recheck_prepared(service, state, saved)
         # A CLI acknowledgement may be lost. Only reconcile its exact observed
         # configuration; never repeat an uncertain setup command automatically.
         if state.get("preparation_status") != "configured":

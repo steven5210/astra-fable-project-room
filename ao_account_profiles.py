@@ -42,8 +42,8 @@ _MEANING = ("Fixed account profile for this room. identity_digest is the SHA-256
             "account UUID; the controller cannot attest which account served a request.")
 _TRUST_MEANING = ("Preparation never writes trust. Start Claude Code interactively in the worktree with "
                   "exactly this environment to record it; AO's non-interactive start sets session trust itself.")
-_SOURCES_CHECKED = ["AO project environment", "process environment", "user", "managed", "project", "local",
-                    CREDENTIALS_FILE]
+_SOURCES_CHECKED = ["AO project environment", "process environment", "user", "managed", "managed drop-ins",
+                    "project", "local", CREDENTIALS_FILE]
 
 
 def _now():
@@ -149,8 +149,16 @@ def _recorded_default(controller_config):
     return str(Path(base).expanduser().resolve())
 
 
-def enroll(home, name, config_dir, controller_config):
-    """Record one private config directory under a stable profile name; refuses before any write."""
+def _unpinned_identity_file(controller_config):
+    """The saved-login file an unpinned room and `default` actually use."""
+    override = (controller_config or {}).get("claude_config_dir_override")
+    if isinstance(override, str) and override:
+        return Path(override) / GLOBAL_CONFIG
+    return Path.home() / GLOBAL_CONFIG
+
+
+def enrollment(home, name, config_dir, controller_config):
+    """Validate one enrollment against the configuration about to apply; returns (document, record)."""
     name = profile_name(name)
     config_dir = validate_directory(config_dir)
     default_dir = str((Path.home() / ".claude").resolve())
@@ -159,6 +167,13 @@ def enroll(home, name, config_dir, controller_config):
                         "default profile; an explicit CLAUDE_CONFIG_DIR selects another credential item; "
                         "pin `default` instead")
     digest = identity_digest(Path(config_dir) / GLOBAL_CONFIG)
+    try:
+        default_digest = identity_digest(_unpinned_identity_file(controller_config))
+    except RoomError:
+        default_digest = None
+    if default_digest == digest:
+        raise RoomError("Profile " + name + " duplicates the controller's saved default login; one account in "
+                        "two credential items risks refresh-token rotation logging one out")
     document = load(home)
     existing = document["profiles"].get(name)
     if existing is not None and existing.get("config_dir_exact") != config_dir:
@@ -169,10 +184,22 @@ def enroll(home, name, config_dir, controller_config):
             raise RoomError("Profile " + name + " duplicates the saved login already enrolled as " + other +
                             "; one account in two profiles risks refresh-token rotation logging one out")
     record = {"name": name, "config_dir_exact": config_dir, "keychain_service": keychain_service(config_dir),
-              "identity_digest": digest, "enrolled_at": _now()}
+              "identity_digest": digest, "default_identity_compared": default_digest is not None,
+              "enrolled_at": _now()}
     document["profiles"][name] = record
+    return document, record
+
+
+def commit(home, document):
+    """Atomically write one validated profiles document; callers sequence this after controller config."""
     from project_room import atomic_json
     atomic_json(_profiles_path(home), document)
+
+
+def enroll(home, name, config_dir, controller_config):
+    """Validate and commit one enrollment under a stable profile name."""
+    document, record = enrollment(home, name, config_dir, controller_config)
+    commit(home, document)
     return record
 
 
@@ -185,8 +212,15 @@ def pin(home, name, controller_config):
             raise RoomError("Profile default selects the saved default login, but the controller records an explicit "
                             "Claude configuration directory; pin an enrolled profile instead")
         global_config = str(Path.home() / GLOBAL_CONFIG)
+        digest = identity_digest(global_config)
+        for other, record in load(home)["profiles"].items():
+            if record.get("identity_digest") == digest:
+                raise RoomError("The saved default login is also enrolled as profile " + other + "; one account "
+                                "in two credential items risks refresh-token rotation logging one out; log the "
+                                "default profile back into its own account or re-enroll " + other +
+                                " from a different account")
         return {"version": 1, "name": DEFAULT, "config_dir_exact": None, "claude_config_dir": default_dir,
-                "global_config_path": global_config, "identity_digest": identity_digest(global_config),
+                "global_config_path": global_config, "identity_digest": digest,
                 "keychain_service": KEYCHAIN_BASE, "enrolled_at": None, "pinned_at": _now(), "meaning": _MEANING}
     name = profile_name(name)
     record = load(home)["profiles"].get(name)
@@ -225,6 +259,9 @@ def check_credential_env(env, label):
     """Refuse a credential source in one environment mapping; values are never echoed."""
     if not isinstance(env, Mapping):
         raise RoomError(label + " must be a mapping of text keys")
+    if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in env:
+        raise RoomError(label + " sets CLAUDE_SECURESTORAGE_CONFIG_DIR (present, value withheld); "
+                        "it redirects the credential item")
     for key in CREDENTIAL_ENV:
         if env.get(key) not in (None, ""):
             raise RoomError(label + " sets " + key + "; a pinned account profile refuses conflicting credential "
@@ -238,8 +275,9 @@ def check_credential_settings(pin, worktree, environ):
     """Refuse apiKeyHelper or credential env keys in the settings the pinned launch would read."""
     import ao_routing
     config_dir = Path(pin["claude_config_dir"])
+    managed = ao_routing.managed_settings_path(environ)
     sources = (("user", config_dir / "settings.json"),
-               ("managed", ao_routing.managed_settings_path(environ)),
+               ("managed", managed),
                ("project", Path(worktree) / ".claude" / "settings.json"),
                ("local", Path(worktree) / ".claude" / "settings.local.json"))
     for label, path in sources:
@@ -250,6 +288,24 @@ def check_credential_settings(pin, worktree, environ):
             raise RoomError(label + " Claude settings define " + HELPER_KEY +
                             "; a pinned account profile refuses helper-provided credentials")
         check_credential_env(data.get("env") or {}, label + " Claude settings env")
+    if managed is not None:
+        dropins = Path(managed).parent / "managed-settings.d"
+        if dropins.exists():
+            if not dropins.is_dir():
+                raise RoomError("managed Claude settings drop-in directory is unreadable")
+            try:
+                names = sorted(entry.name for entry in dropins.iterdir() if entry.suffix == ".json")
+            except OSError as exc:
+                raise RoomError("managed Claude settings drop-in directory is unreadable") from exc
+            for entry_name in names:
+                data = ao_routing._settings_file(dropins / entry_name)
+                if data is None:
+                    continue
+                label = "managed drop-in " + entry_name
+                if HELPER_KEY in data:
+                    raise RoomError(label + " Claude settings define " + HELPER_KEY +
+                                    "; a pinned account profile refuses helper-provided credentials")
+                check_credential_env(data.get("env") or {}, label + " Claude settings env")
     credentials = config_dir / CREDENTIALS_FILE
     if credentials.exists() or credentials.is_symlink():
         raise RoomError("A plaintext credential file is present beside the pinned profile; pinned profiles "
@@ -319,6 +375,18 @@ def at_bind(service, state, prepared):
 
 def before_send(service, state, prepared):
     return _checked(service, state, prepared)
+
+
+def recheck_prepared(service, state, prepared):
+    """Every boundary check for a room whose saved preparation is being re-accepted, before it re-uses the receipt."""
+    import ao_routing
+    pin = state["account_profile"]
+    check_identity(pin)
+    project_env = ao_routing._project_env(service.client(state), state)
+    check_project_env(project_env, pin)
+    check_credential_env(project_env, "AO project environment")
+    check_credential_env(os.environ, "process environment")
+    check_credential_settings(pin, Path(prepared["worktree"]), os.environ)
 
 
 def observe_sync(service, state):

@@ -838,8 +838,13 @@ def context(service, directory, state):
         ao_account_profiles.check_context(room, pin)
     controller_path = service.root.parent / "config.json"
     controller = read(controller_path) if controller_path.exists() else {}
-    override = room.get("claude_config_dir_override") or controller.get("claude_config_dir_override")
-    recorded = room.get("claude_config_dir") or controller.get("claude_config_dir")
+    if pin:
+        # A pinned room's saved choice wins by key presence, including a null override.
+        override = room.get("claude_config_dir_override")
+        recorded = room.get("claude_config_dir")
+    else:
+        override = room.get("claude_config_dir_override") or controller.get("claude_config_dir_override")
+        recorded = room.get("claude_config_dir") or controller.get("claude_config_dir")
     candidates = {str(Path(value).expanduser().resolve()) for value in (override, recorded) if isinstance(value, str) and value}
     if len(candidates) > 1:
         if isinstance(override, str) and not Path(override).expanduser().is_absolute():

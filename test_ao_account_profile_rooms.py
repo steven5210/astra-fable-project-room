@@ -41,11 +41,11 @@ class AccountFixture(Fixture):
         self.profile_b.mkdir(mode=0o700)
         (self.profile_b / ".claude.json").write_text(json.dumps(
             {"oauthAccount": {"accountUuid": B_UUID, "emailAddress": "profile-owner@example.invalid"}}))
-        with patch.dict(os.environ):
+        with patch.dict(os.environ, {"HOME": str(self.user_home)}):
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
             result = project_room.Service(str(self.home)).setup(
                 claude_bin=str(self.fixture_claude), delegate_provider="none",
-                claude_profile="b", config_dir=str(self.profile_b))
+                claude_profile="b", profile_dir=str(self.profile_b))
         self.assertEqual(result["enrolled_profile"], "b")
         self.assertEqual(result["claude_profiles"], ["b"])
 
@@ -169,8 +169,8 @@ class BoundaryTests(AccountFixture):
         self.assertIs(evidence["project_env_checked"], True)
         self.assertIs(evidence["process_env_checked"], True)
         self.assertEqual(evidence["credential_sources_checked"],
-                         ["AO project environment", "process environment", "user", "managed", "project",
-                          "local", ".credentials.json"])
+                         ["AO project environment", "process environment", "user", "managed",
+                          "managed drop-ins", "project", "local", ".credentials.json"])
         trust = evidence["trust"]
         self.assertIs(trust["trust_recorded"], False)
         self.assertEqual(trust["explicit_setup"]["env"], {"CLAUDE_CONFIG_DIR": str(self.profile_b)})
@@ -252,6 +252,88 @@ class BoundaryTests(AccountFixture):
         self.assertEqual(listed["spec_review"]["account_profile"],
                          {"name": "b", "identity_digest": B_DIGEST})
 
+    def test_repeat_prepare_rechecks_profile_boundaries(self):
+        self.env(self.exact())
+        self.prepare()
+        path = self.directory() / "preparation.json"
+        original = path.read_bytes()
+        self.env({"CLAUDE_CONFIG_DIR": "/drifted"})
+        self.assertRaises(RoomError, self.prepare)
+        self.assertEqual(path.read_bytes(), original)
+        self.env(self.exact())
+        self.prepare()
+        self.assertEqual(path.read_bytes(), original)
+        (self.profile_b / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "other-account-uuid"}}))
+        self.assertRaises(RoomError, self.prepare)
+
+    def test_securestorage_dir_presence_refused_at_every_boundary(self):
+        self.env({**self.exact(), "CLAUDE_SECURESTORAGE_CONFIG_DIR": ""})
+        with self.assertRaises(RoomError) as caught:
+            self.prepare()
+        self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(caught.exception))
+        self.env(self.exact())
+        self.prepare()
+        self.bind()
+        self.env({**self.exact(), "CLAUDE_SECURESTORAGE_CONFIG_DIR": ""})
+        posts = len(self.fake.posts)
+        with self.assertRaises(RoomError) as caught:
+            self.service.ao_room_send(self.room, "engineer", "Perform the exact authorized purpose.",
+                                      "spec_review", purpose="spec_review")
+        self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(caught.exception))
+        self.assertEqual(self.state()["requests"], {})
+        self.assertEqual(len(self.fake.posts), posts)
+        self.env(self.exact())
+        (self.profile_b / "settings.json").write_text(json.dumps(
+            {"env": {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}}))
+        with self.assertRaises(RoomError) as caught:
+            self.service.ao_room_send(self.room, "engineer", "Perform the exact authorized purpose.",
+                                      "spec_review", purpose="spec_review")
+        self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(caught.exception))
+        (self.profile_b / "settings.json").unlink()
+        self.assertEqual(self.state()["requests"], {})
+
+    def test_managed_dropin_refusals(self):
+        managed = self.root / "managed-settings.json"
+        managed.write_text("{}")
+        dropins = self.root / "managed-settings.d"
+        dropins.mkdir()
+        (dropins / "50-helper.json").write_text(json.dumps({"apiKeyHelper": "/fixture/helper"}))
+        self.env(self.exact())
+        with patch.dict(os.environ, {"CLAUDE_CODE_MANAGED_SETTINGS_PATH": str(managed)}):
+            with self.assertRaises(RoomError) as caught:
+                self.prepare()
+            self.assertIn("managed drop-in", str(caught.exception))
+            (dropins / "50-helper.json").unlink()
+            self.prepare()
+            self.bind()
+            (dropins / "60-env.json").write_text(json.dumps(
+                {"env": {"ANTHROPIC_AUTH_TOKEN": "do-not-print-this-secret"}}))
+            posts = len(self.fake.posts)
+            with self.assertRaises(RoomError) as caught:
+                self.service.ao_room_send(self.room, "engineer", "Perform the exact authorized purpose.",
+                                          "spec_review", purpose="spec_review")
+            self.assertIn("ANTHROPIC_AUTH_TOKEN", str(caught.exception))
+            self.assertNotIn("do-not-print-this-secret", str(caught.exception))
+            self.assertEqual(self.state()["requests"], {})
+            self.assertEqual(len(self.fake.posts), posts)
+            self.assertRaises(RoomError, self.prepare)
+
+    def test_default_pin_ignores_controller_override(self):
+        self.room = self.open_pinned("default", feature="default-ctx")
+        self.service.ao_room_spec_put(self.room, 1, "Implement the exact test contract.", self.gates,
+                                      "Astra approves this scope")
+        config_path = self.home / "config.json"
+        value = ao.read(config_path)
+        value["claude_config_dir_override"] = str(self.profile_b)
+        value["claude_config_dir"] = str(self.profile_b)
+        ao.atomic(config_path, value)
+        import ao_routing
+        self.assertEqual(ao_routing.context(self.service, self.directory(), self.state())["claude_config_dir"],
+                         str((self.user_home / ".claude").resolve()))
+        self.env()
+        self.prepare()
+
     def test_sync_observes_drift_without_refusing(self):
         self.env(self.exact())
         self.bind()
@@ -314,6 +396,23 @@ class SurfacesTests(AccountFixture):
         result = json.loads(output.getvalue())
         self.assertEqual(result["enrolled_profile"], "c")
         self.assertEqual(result["claude_profiles"], ["b", "c"])
+
+    def test_refused_setup_leaves_no_enrollment(self):
+        fresh = self.root / "fresh-home"
+        fresh.mkdir(mode=0o700)
+        bad = self.root / "not-executable"
+        bad.write_text("not an executable")
+        bad.chmod(0o644)
+        with patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            with self.assertRaises(RoomError):
+                project_room.Service(str(fresh)).setup(
+                    claude_bin=str(bad), delegate_provider="none",
+                    claude_profile="b", profile_dir=str(self.profile_b))
+        self.assertFalse((fresh / ap.PROFILES_FILE).exists())
+        self.assertEqual(ap.load(fresh)["profiles"], {})
+        record = ap.enroll(fresh, "later", str(self.profile_b), {})
+        self.assertEqual(record["name"], "later")
 
     def test_usage_audit_work_unit_carries_profile(self):
         unit = ao_usage_audit._work_unit({"role": "engineer", "purpose": "spec_review", "state": "sent",

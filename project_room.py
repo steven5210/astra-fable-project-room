@@ -283,7 +283,7 @@ class Service:
         return value
 
     def setup(self, claude_bin=None, qwen_config=None, deepseek_config=None, delegate_provider=None,
-              claude_profile=None, config_dir=None):
+              claude_profile=None, profile_dir=None):
         """Persist the private controller configuration for future rooms.
 
         Provider selection is compatible with the documented flows: a `delegate_provider` recorded in config.json is
@@ -301,13 +301,8 @@ class Service:
                 raise room.RoomError("The existing configuration is not valid JSON; move " + str(target) + " aside before running setup") from exc
             if not isinstance(prior, dict):
                 raise room.RoomError("The existing configuration is not a JSON object; move " + str(target) + " aside before running setup")
-            enrolled = None
-            if claude_profile is not None:
-                if config_dir is None:
-                    raise room.RoomError("--claude-profile requires --config-dir")
-                import ao_account_profiles
-                # Enroll before anything is written so a refusal leaves no partial configuration.
-                enrolled = ao_account_profiles.enroll(self.home, claude_profile, config_dir, prior)
+            if claude_profile is not None and profile_dir is None:
+                raise room.RoomError("--claude-profile requires --config-dir")
             executable = str(Path(claude_bin).expanduser().resolve()) if claude_bin else prior.get("claude_bin") or discover_claude()
             if not Path(executable).is_file() or not os.access(executable, os.X_OK):
                 raise room.RoomError("claude_bin must name an executable file")
@@ -356,6 +351,14 @@ class Service:
                 # later worker or retained MCP would resolve somewhere else.
                 override = resolved
             config_dir = str(Path(recorded or override or Path.home() / ".claude").expanduser().resolve())
+            enrolled = None
+            document = None
+            if claude_profile is not None:
+                import ao_account_profiles
+                # Validate against the configuration setup is about to write; commit after every other write.
+                document, enrolled = ao_account_profiles.enrollment(
+                    self.home, claude_profile, profile_dir,
+                    {"claude_config_dir": config_dir, "claude_config_dir_override": override})
             if claude_bin or not prior.get("claude_bin"):
                 # Retain a verified copy under the private home so installer pruning of the
                 # managed directory cannot break rooms pinned to it; an already-retained
@@ -377,6 +380,8 @@ class Service:
                 config["delegate_provider"] = selected
             atomic_json(target, config)
             import ao_account_profiles
+            if document is not None:
+                ao_account_profiles.commit(self.home, document)
             result = {"configured": True, "config_path": str(target), "model": MODEL, "delegate_provider": provider,
                       "delegate_provider_selected": selected is not None, "qwen_configured": bool(qwen), "deepseek_configured": bool(deepseek),
                       "existing_rooms_unchanged": True,
@@ -2074,7 +2079,7 @@ def main(argv=None):
         service = Service(args.home)
         if args.command == "setup":
             result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider,
-                                   claude_profile=args.claude_profile, config_dir=args.config_dir)
+                                   claude_profile=args.claude_profile, profile_dir=args.config_dir)
         elif args.command == "doctor":
             result = service.room_doctor()
         elif args.command == "call":
