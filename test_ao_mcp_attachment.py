@@ -142,7 +142,8 @@ class AttachmentTests(unittest.TestCase):
 
     def receive(self, proc):
         result = bytearray()
-        deadline = time.monotonic() + 5
+        # A safety cap for a loaded CI runner, not a timing assertion.
+        deadline = time.monotonic() + 30
         while not result.endswith(b"\n"):
             remaining = deadline - time.monotonic()
             self.assertGreater(remaining, 0, "fake transport response deadline")
@@ -154,7 +155,8 @@ class AttachmentTests(unittest.TestCase):
         return bytes(result)
 
     def wait_for(self, predicate):
-        deadline = time.monotonic() + 4
+        # A safety cap for a loaded CI runner, not a timing assertion.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             result = predicate()
             if result:

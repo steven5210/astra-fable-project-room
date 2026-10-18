@@ -26,7 +26,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The offline suite runs as five module-level shards balanced by the pinned
     # per-module weights in tests/shard_weights.json; each shard job runs its
-    # modules through a bounded worker pool (3 on macOS, 4 on Linux). Timing
+    # modules through a bounded worker pool (2 on macOS, 3 on Linux -- one core
+    # of headroom for the runner, subprocess bursts and the OS). Timing
     # records and the diagnostic summary job are never required checks.
     # 45 minutes is a CI budget, not a Fable, model or gate deadline.
     timeout-minutes: 45
@@ -45,7 +46,7 @@ jobs:
           GIT_CONFIG_NOSYSTEM: "1"
           PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           PROJECT_ROOM_TIMING_RUN_ID: ${{ github.run_id }}
-        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 --workers 3 -v --record "$RUNNER_TEMP/timing"
+        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 --workers 2 -v --record "$RUNNER_TEMP/timing"
       - name: Run Linux tests in an isolated process namespace
         if: runner.os == 'Linux'
         env:
@@ -72,7 +73,7 @@ jobs:
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
             --env PROJECT_ROOM_TIMING_REVISION --env PROJECT_ROOM_TIMING_RUN_ID \
-            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 --workers 4 -v --record /timing
+            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 --workers 3 -v --record /timing
       - name: Upload per-test timing record
         uses: actions/upload-artifact@v4
         if: always()

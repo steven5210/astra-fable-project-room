@@ -122,11 +122,24 @@ macOS runner-minutes per run.
 ## In-job workers
 
 Each shard job runs its modules through a bounded pool of worker processes
-(`--workers K`, one module per process, longest estimated module first;
-macOS runners have three cores, Linux four). Modules never share a process,
-every test keeps its own temporary directories, and the shard's record is the
-merge of the per-module records. `--workers 1` restores the previous single
-process for the whole shard.
+(`--workers K`, one module per process, longest estimated module first).
+The chosen counts are 2 on macOS and 3 on Linux -- one core of headroom on
+the three- and four-core hosted runners for the runner itself, subprocess
+bursts and the OS. Modules never share a process, every test keeps its own
+temporary directories, and the shard's record is the merge of the per-module
+records. `--workers 1` restores the previous single process for the whole
+shard.
+
+Exclusive modules: on Linux, the modules that launch the legacy controller's
+verification job (`test_verification`, `test_verification_matrix`, the
+`EXCLUSIVE_MODULES` set in `tests/run_test_shards.py`) run alone in the pool.
+The job's gate observation and cleanup scan every same-user process through
+/proc, and a transient process of another worker -- between exit and reap,
+or mid-exec -- reads as `inspection_incomplete` to the fail-closed scan.
+macOS is unaffected (`ps -E` covers only the process's own children). A new
+module that drives that path must be added to the set; the symptom of
+forgetting is a deterministic `inspection_incomplete` refusal in that module
+under the pool, never a silent pass.
 
 ## Rollback
 
@@ -154,3 +167,6 @@ Every piece is independent:
 - Records are produced by the code under test; the summary treats them as
   untrusted data (bounded, type-checked, never executed) and the unittest
   jobs decide pass or fail on their own.
+- Tests with short real-time waits are the contention risk a larger pool
+  trades against: a wait sized for an idle runner can miss under a full
+  pool (the reason `--workers` stays one below the core count).
