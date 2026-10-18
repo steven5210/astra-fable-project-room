@@ -65,10 +65,12 @@ and `test_run_test_shards.py` pins that the union of the shards equals the
 discovered inventory exactly, at the test-id level, with no id discovered
 twice.
 
-A discovered module without a weight is a hard failure, both in the runner
-(`--shard`, `--jobs`, `--list` exit 2) and in the suite
-(`test_run_test_shards.test_every_discovered_module_has_a_pinned_weight`),
-with the exact command to fix it:
+A discovered module without a weight is a hard failure only in the pin
+test (`test_run_test_shards.test_every_discovered_module_has_a_pinned_weight`)
+and in `--check-weights` (exit 2); the runner itself (`--shard`, `--jobs`,
+`--list`) warns on stderr and schedules the module at the median pinned
+weight, so an unpinned module does not turn every shard job red and the
+other shards still run and record. The fix command is printed either way:
 
 ```
 python3 tests/run_test_shards.py --measure test_new_module
@@ -77,7 +79,9 @@ python3 tests/run_test_shards.py --measure test_new_module
 `--measure` runs the module once locally through the timed runner and pins
 its wall seconds with `samples: 0`, which marks it as a local estimate until
 a CI refresh replaces it. `--check-weights` reports coverage and the local
-estimates.
+estimates. A PR that adds a test module pins its weight in the same PR; when
+`main` gains a module, an open PR fails the pin test until it merges `main`
+and runs `--measure` (or a refresh).
 
 ### Refreshing from CI
 

@@ -110,20 +110,30 @@ def _missing_text(error):
     return "\n".join(lines)
 
 
+def weight_estimate(weights):
+    """The stand-in weight for a discovered module that has no pinned
+    weight: the median of the pinned weights, 1.0 s when there are none."""
+    return (float(statistics.median(float(w) for w in weights.values()))
+            if weights else 1.0)
+
+
 def assign(modules, shards, weights):
+    """LPT grouping over `weights`; a discovered module without a pinned
+    weight is scheduled at `weight_estimate` and listed in the returned
+    `missing` so the caller can warn while the run still proceeds."""
     missing = sorted(set(modules) - set(weights))
-    orphaned = sorted(set(weights) - set(modules))
-    if missing:
-        raise MissingWeights(missing, orphaned)
+    estimate = weight_estimate(weights)
+    effective = {module: float(weights.get(module, estimate))
+                 for module in modules}
     groups = [[] for _ in range(shards)]
     loads = [0.0] * shards
-    for module in sorted(modules, key=lambda m: (-float(weights[m]), m)):
+    for module in sorted(modules, key=lambda m: (-effective[m], m)):
         target = min(range(shards), key=lambda i: (loads[i], i))
         groups[target].append(module)
-        loads[target] += float(weights[module])
+        loads[target] += effective[module]
     for group in groups:
         group.sort()
-    return groups, loads
+    return groups, loads, missing
 
 
 def stale_estimates(weights, measured):
@@ -596,14 +606,22 @@ def main(argv=None):
     if shards < 1:
         print(f"error: shard count must be >= 1 (got {shards})", file=sys.stderr)
         return 2
-    try:
-        groups, loads = assign(modules, shards, weights)
-    except MissingWeights as exc:
-        print(_missing_text(exc), file=sys.stderr)
-        return 2
+    groups, loads, missing = assign(modules, shards, weights)
     assert sorted(m for group in groups for m in group) == modules, \
         "shard assignment must cover every module exactly once"
     orphaned = sorted(set(weights) - set(modules))
+    if missing:
+        # The hard failure is the pin test and --check-weights; the runner
+        # warns and estimates so an unpinned module (e.g. one just merged to
+        # main) does not turn every shard job red with no test output.
+        estimate = weight_estimate(weights)
+        for module in missing:
+            weights[module] = estimate
+        print(f"warning: discovered test modules without a pinned weight "
+              f"(estimated at the median {estimate:g} s): "
+              f"{', '.join(missing)}", file=sys.stderr)
+        print("run: python3 tests/run_test_shards.py --measure "
+              + " ".join(missing), file=sys.stderr)
     if orphaned:
         print(f"warning: weighted entries that are not discovered test "
               f"modules (stale; --refresh-weights drops them): "

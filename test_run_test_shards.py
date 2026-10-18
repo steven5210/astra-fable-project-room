@@ -74,10 +74,11 @@ class _WorkerProc:
 class RunTestShardsTests(unittest.TestCase):
     def test_real_modules_partition_exactly_once_and_deterministically(self):
         modules = run_test_shards.test_modules()
-        groups, loads = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        groups, loads, missing = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        self.assertEqual(missing, [])
         self.assertEqual(sorted(module for group in groups for module in group), modules)
         self.assertTrue(all(groups))
-        again, again_loads = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        again, again_loads, _m = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
         self.assertEqual((groups, loads), (again, again_loads))
 
     def _weights_doc(self, weights, samples=None):
@@ -97,18 +98,22 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_skewed_weights_isolate_the_heavy_module(self):
         weights = {"test_a": 1000, "test_b": 1, "test_c": 1, "test_d": 1}
-        groups, loads = run_test_shards.assign(
+        groups, loads, _missing = run_test_shards.assign(
             ["test_a", "test_b", "test_c", "test_d"], 2, weights)
         self.assertEqual(groups, [["test_a"], ["test_b", "test_c", "test_d"]])
 
-    def test_an_unweighted_module_fails_assignment_with_the_measure_command(self):
+    def test_an_unweighted_module_is_scheduled_at_the_median(self):
         weights = {"test_a": 10, "test_b": 20}
-        with self.assertRaises(run_test_shards.MissingWeights) as ctx:
-            run_test_shards.assign(["test_a", "test_b", "test_zz"], 2, weights)
-        self.assertEqual(ctx.exception.missing, ["test_zz"])
-        self.assertEqual(ctx.exception.orphaned, [])
+        groups, loads, missing = run_test_shards.assign(
+            ["test_a", "test_b", "test_zz"], 2, weights)
+        self.assertEqual(missing, ["test_zz"])
+        # median(10, 20) = 15 -> LPT: b(20) alone, then zz(15) and a(10).
+        self.assertEqual(groups, [["test_b"], ["test_a", "test_zz"]])
+        self.assertEqual(loads, [20, 25])
 
-    def test_shard_mode_reports_the_measure_command_for_missing_weights(self):
+    def test_shard_mode_warns_and_runs_with_missing_weights(self):
+        # The runner warns and estimates at the median; the hard failure is
+        # the pin test and --check-weights.
         weights = run_test_shards.load_weights()
         dropped = sorted(weights)[0]
         del weights[dropped]
@@ -117,10 +122,34 @@ class RunTestShardsTests(unittest.TestCase):
             path.write_text(json.dumps(self._weights_doc(weights)))
             err = io.StringIO()
             with mock.patch.object(run_test_shards, "WEIGHTS_FILE", path), \
-                    contextlib.redirect_stderr(err):
+                    contextlib.redirect_stderr(err), \
+                    mock.patch("subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=0)
                 code = run_test_shards.main(["--shard", "0", "--shards", "5"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 0)
+        self.assertIn("warning: discovered test modules without a pinned "
+                      "weight (estimated at the median", err.getvalue())
+        self.assertIn(dropped, err.getvalue())
         self.assertIn(f"--measure {dropped}", err.getvalue())
+        run.assert_called_once()
+
+    def test_list_mode_warns_and_continues_with_missing_weights(self):
+        weights = run_test_shards.load_weights()
+        dropped = sorted(weights)[0]
+        del weights[dropped]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shard_weights.json"
+            path.write_text(json.dumps(self._weights_doc(weights)))
+            err, out = io.StringIO(), io.StringIO()
+            with mock.patch.object(run_test_shards, "WEIGHTS_FILE", path), \
+                    contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(out):
+                code = run_test_shards.main(["--list", "--shards", "5"])
+        self.assertEqual(code, 0)
+        self.assertIn("warning: discovered test modules without a pinned "
+                      "weight", err.getvalue())
+        self.assertIn(f"--measure {dropped}", err.getvalue())
+        self.assertIn("shard 0/5", out.getvalue())
 
     def test_every_discovered_module_has_a_pinned_weight(self):
         weights = run_test_shards.load_weights()
@@ -408,7 +437,7 @@ class RunTestShardsTests(unittest.TestCase):
         self.assertTrue(all(name.startswith('test_ao_review_extension.')
                             for name in executable_ids))
         modules = run_test_shards.test_modules()
-        groups, _ = run_test_shards.assign(
+        groups, _loads, _missing = run_test_shards.assign(
             modules, 5, run_test_shards.load_weights())
         loader = unittest.TestLoader()
         union = []
@@ -418,7 +447,7 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_shard_mode_invokes_unittest_with_the_assigned_modules(self):
         modules = run_test_shards.test_modules()
-        groups, _ = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        groups, _loads, _missing = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
         runner = mock.Mock(return_value=mock.Mock(returncode=0))
         with mock.patch.object(run_test_shards.subprocess, "run", runner):
             code = run_test_shards.main(["--shard", "1", "--shards", "5"])
@@ -430,7 +459,7 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_shard_mode_with_record_invokes_the_timed_runner(self):
         modules = run_test_shards.test_modules()
-        groups, _ = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
+        groups, _loads, _missing = run_test_shards.assign(modules, 5, run_test_shards.load_weights())
         runner = mock.Mock(return_value=mock.Mock(returncode=0))
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(run_test_shards.subprocess, "run", runner):
@@ -629,7 +658,7 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_workers_one_keeps_the_single_process_shard_command(self):
         modules = run_test_shards.test_modules()
-        groups, _ = run_test_shards.assign(
+        groups, _loads, _missing = run_test_shards.assign(
             modules, 5, run_test_shards.load_weights())
         for argv in (["--shard", "1", "--shards", "5"],
                      ["--shard", "1", "--shards", "5", "--workers", "1"]):
