@@ -404,6 +404,28 @@ class TimedUnittestTests(unittest.TestCase):
         self.assertEqual(merged["shard"], {"index": 4, "count": 5})
         self.assertNotIn("tests_truncated", merged)
 
+    def test_merge_records_stamps_process_seconds_for_single_module_workers(self):
+        records = [self._worker_record("a", 1), self._worker_record("b", 2)]
+        merged = timed_unittest.merge_records(
+            records, wall_seconds=1.0, modules_requested=["a", "b"],
+            workers=2, worker_runs=[
+                {"module": "a", "exit_code": 0, "seconds": 7.5,
+                 "record": True},
+                {"module": "b", "exit_code": 0, "seconds": 9.25,
+                 "record": True}])
+        self.assertEqual(merged["modules"]["a"]["process_seconds"], 7.5)
+        self.assertEqual(merged["modules"]["b"]["process_seconds"], 9.25)
+        # A worker record covering other modules besides its own stamps
+        # nothing -- the process seconds cannot be attributed to one module.
+        shared = self._worker_record("a", 1)
+        shared["modules"]["b"] = {"tests": 2, "wall_seconds": 0.5}
+        merged = timed_unittest.merge_records(
+            [shared], wall_seconds=1.0, modules_requested=["a"],
+            workers=2, worker_runs=[
+                {"module": "a", "exit_code": 0, "seconds": 7.5,
+                 "record": True}])
+        self.assertNotIn("process_seconds", merged["modules"]["a"])
+
     def test_merge_records_marks_truncation_and_survives_zero_records(self):
         rows = [{"id": f"m.C.t{i}", "module": "m"} for i in range(3)]
         one = self._worker_record("m", 3, rows=rows)

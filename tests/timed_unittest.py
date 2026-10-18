@@ -20,6 +20,7 @@ record is written atomically even when the run is interrupted (complete: false).
 import argparse
 import contextlib
 import json
+import math
 import os
 import platform
 import sys
@@ -318,6 +319,16 @@ _PROVENANCE_KEYS = ("python", "python_minor", "implementation", "os", "platform"
                     "machine", "revision", "run_id", "started_at", "shard")
 
 
+def _num(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 def _merge_provenance(first):
     """Provenance for a merged record: copied from the first worker record, or
     filled exactly as build_record does when no worker produced one."""
@@ -352,9 +363,14 @@ def merge_records(records, **provenance):
         len(present) == len(records)
         and all(record.get("summary", {}).get("was_successful") is True
                 for record in present))
+    worker_runs = provenance["worker_runs"]
     modules, tests, truncated = {}, [], False
-    for record in present:
-        modules.update(record.get("modules") or {})
+    for i, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        worker_run = worker_runs[i] if i < len(worker_runs) else None
+        record_modules = record.get("modules") or {}
+        modules.update(record_modules)
         if record.get("tests_truncated"):
             truncated = True
         for row in record.get("tests") or []:
@@ -362,6 +378,17 @@ def merge_records(records, **provenance):
                 tests.append(row)
             else:
                 truncated = True
+        # One module per worker process: the runner's own child wall seconds
+        # (imports and class fixtures included) are the module's process
+        # seconds. Stamped only when the worker measured exactly that module.
+        run_module = (worker_run.get("module")
+                      if isinstance(worker_run, dict) else None)
+        run_seconds = _num(worker_run.get("seconds")
+                           if isinstance(worker_run, dict) else None)
+        if (isinstance(run_module, str) and run_seconds is not None
+                and set(record_modules) == {run_module}
+                and isinstance(modules[run_module], dict)):
+            modules[run_module]["process_seconds"] = run_seconds
     record = {"format": FORMAT,
               "complete": (len(present) == len(records)
                            and all(worker.get("complete") is True

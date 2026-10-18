@@ -35,6 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RAN_RE = re.compile(r"^Ran (\d+) tests? in ([\d.]+)s$")
 RESULT_RE = re.compile(r"^(OK|FAILED)(?: \(.*\))?$")
+TOTAL_RE = re.compile(r"^total: (\d+) tests$")
 WEIGHTS_FILE = ROOT / "tests" / "shard_weights.json"
 WEIGHTS_FORMAT = "project_room_shard_weights_v2"
 COMBINED_FORMAT = "project_room_timing_combined_v1"
@@ -199,6 +200,7 @@ def measure(modules_to_measure):
         return 2
     data = load_weights_file()
     data.setdefault("samples", {})
+    measured = {}
     for module in modules_to_measure:
         with tempfile.TemporaryDirectory() as tmp:
             record_path = Path(tmp) / "record.json"
@@ -218,9 +220,13 @@ def measure(modules_to_measure):
                       f"(exit {proc.returncode}); weights file unchanged",
                       file=sys.stderr)
                 return 1
+        measured[module] = wall
+    for module, wall in measured.items():
         data["weights"][module] = round(wall, 2)
         data["samples"][module] = 0
-        write_weights_file(data)
+    # Write once only after every requested module measured cleanly.
+    write_weights_file(data)
+    for module, wall in measured.items():
         print(f"{module}: {wall} s (local estimate, samples 0)")
     return 0
 
@@ -252,14 +258,20 @@ def _combined_job_qualifies(job):
 
 
 def _combined_measurements(data):
-    """Yield (module, wall_seconds) from complete macos/3.11 jobs."""
+    """Yield (module, seconds) from complete macos/3.11 jobs -- the module's
+    process_seconds when the worker pool stamped it, else wall_seconds."""
     for job in data["jobs"]:
         if not _combined_job_qualifies(job):
             continue
         for module, stats in job["record"]["modules"].items():
             if not isinstance(module, str) or not isinstance(stats, dict):
                 continue
-            wall = _num(stats.get("wall_seconds"))
+            # The worker pool stamps the module's whole-process wall as
+            # process_seconds (imports, first setUpClass and teardown
+            # included); a single-process record has only wall_seconds.
+            wall = _num(stats.get("process_seconds"))
+            if wall is None:
+                wall = _num(stats.get("wall_seconds"))
             if wall is not None:
                 yield module, wall
 
@@ -378,6 +390,19 @@ def log_summary(log_path):
         if ran_line != "-" and result_line != "-":
             break
     return ran_line, result_line, count
+
+
+def pool_log_summary(log_path, exit_code):
+    """Summarize a worker-pool shard log: its last `Ran` line belongs to the
+    last module only, so the shard count comes from the child's final
+    `total: N tests` line and the result from the child's exit code."""
+    ran_line, count = "-", 0
+    for line in reversed(log_path.read_text(errors="replace").splitlines()):
+        total = TOTAL_RE.match(line)
+        if total:
+            ran_line, count = line, int(total.group(1))
+            break
+    return ran_line, "OK" if exit_code == 0 else "FAILED", count
 
 
 def run_shard_workers(index, shards, group, weights, args):
@@ -535,7 +560,10 @@ def run_all(args, groups):
     for i, group, log_path, handle, proc in running:
         code = proc.wait()
         handle.close()
-        ran_line, result_line, count = log_summary(log_path)
+        if args.workers >= 2:
+            ran_line, result_line, count = pool_log_summary(log_path, code)
+        else:
+            ran_line, result_line, count = log_summary(log_path)
         total += count
         if code != 0 or ran_line == "-":
             bad += 1

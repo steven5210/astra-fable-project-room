@@ -105,6 +105,7 @@ jobs:
           path: ${{ runner.temp }}/timing-artifacts
           merge-multiple: false
       - name: Fetch job timings
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" > "$RUNNER_TEMP/jobs.json"
@@ -114,6 +115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 tests/ci_timing_baseline.py --repo "${{ github.repository }}" --workflow tests.yml --out "$RUNNER_TEMP/baselines" --skip-run-id "${{ github.run_id }}"
       - name: Build the timing summary
+        if: always()
         env:
           PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 tests/ci_timing_summary.py --records "$RUNNER_TEMP/timing-artifacts" --jobs "$RUNNER_TEMP/jobs.json" --combined "$RUNNER_TEMP/timing-combined.json" --markdown "$GITHUB_STEP_SUMMARY" --baselines "$RUNNER_TEMP/baselines" --weights tests/shard_weights.json

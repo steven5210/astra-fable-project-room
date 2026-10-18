@@ -23,6 +23,9 @@ shard, format `project_room_test_timing_v1`:
   classes' `setUpClass` / `tearDownClass` and in module-level fixtures. The
   first class's `setUpClass` runs before the first test starts and is outside
   the wall, the same blind spot the verbose log timestamps have;
+  under the worker pool the merged record also carries `process_seconds` per
+  module -- the whole worker process wall, which is what the weights use, so
+  the first-class-`setUpClass` blind spot applies only to `wall_seconds`;
 - provenance: Python version, OS, machine, the source revision
   (`PROJECT_ROOM_TIMING_REVISION`, the PR head or the pushed commit), the run
   id and the shard index.

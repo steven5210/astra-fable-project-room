@@ -162,7 +162,7 @@ class CiTimingSummaryTests(unittest.TestCase):
                       markdown)
         self.assertIn("linux/3.12: exec max 4.0m, median 4.0m, max/median 1.00",
                       markdown)
-        self.assertIn("runner-minutes:", markdown)
+        self.assertIn("runner-minutes (unittest + lint):", markdown)
 
         self.assertIn("#### macos/3.11", markdown)
         self.assertIn("| test_heavy | 120s | 90s | 67% | 30s |", markdown)
@@ -407,8 +407,9 @@ class BaselineComparisonTests(unittest.TestCase):
         self.assertIn("macos/3.11: exec max 8.0m, median 4.5m,"
                       " max/median 1.78, sum 9.0m; baseline max 5.2m,"
                       " median 5.2m (n=5 runs, range 4.8m-6.7m)", markdown)
-        self.assertIn("runner-minutes: 20 vs baseline median 8"
-                      " (n=5 runs, range 8-8)", markdown)
+        self.assertIn("runner-minutes (unittest + lint): 20"
+                      " vs baseline median 8 (n=5 runs, range 8-8)",
+                      markdown)
         self.assertIn("linux/3.12: exec max 1.3m", markdown)
         self.assertIn("baseline: none", markdown)  # no linux/3.12 baseline
 
@@ -447,6 +448,54 @@ class BaselineComparisonTests(unittest.TestCase):
         self.assertIn("no usable baselines", markdown)
         self.assertIn("baseline: none", markdown)
         self.assertEqual(combined["baseline"]["runs"], [])
+
+    def test_sustained_requires_the_two_newest_runs_to_be_high(self):
+        # test_x is slow now (250 vs median 100, n=5) but the two newest
+        # baseline runs are fast -- the warning stands without "sustained".
+        self._write_record("a", "shard-0-of-5.json", record(
+            "macos", "3.11", 0, modules={"test_x": {"wall_seconds": 250}}))
+        self._write_jobs([])
+        for run_id, wall in [(109, 100), (108, 100), (107, 100),
+                             (106, 100), (105, 250)]:
+            self._write_baseline(run_id, [baseline_job({"test_x": wall})])
+        markdown, _ = self._run()
+        self.assertIn("`test_x` 250s vs baseline median 100s (n=5 runs",
+                      markdown)
+        self.assertNotIn("sustained", markdown)
+
+    def test_runner_minutes_excludes_the_timing_summary_job(self):
+        self._write_record("a", "shard-0-of-5.json",
+                           record("macos", "3.11", 0))
+        self._write_jobs([
+            job("unittest (macos-latest, 3.11, 0)", "2026-10-17T00:00:00Z",
+                "2026-10-17T00:01:00Z", "2026-10-17T00:11:00Z",
+                [step("Run tests", "2026-10-17T00:01:00Z",
+                      "2026-10-17T00:11:00Z")]),
+            # In-progress summary job: its unfinished total must not count.
+            job("timing-summary", "2026-10-17T00:10:00Z",
+                "2026-10-17T00:11:00Z", None, []),
+        ])
+        # A completed baseline summary job (900 s) must not inflate the
+        # baseline runner-minutes either.
+        self._write_baseline(101, [
+            baseline_job({}, total_seconds=500),
+            {"name": "timing-summary", "os": None, "python": None,
+             "conclusion": "success", "exec_seconds": 100,
+             "total_seconds": 900}])
+        markdown, _ = self._run()
+        # 600 s current, 500 s baseline -- the summary job is out on both.
+        self.assertIn("runner-minutes (unittest + lint): 10"
+                      " vs baseline median 8", markdown)
+
+    def test_slowest_table_shows_process_seconds_when_present(self):
+        self._write_record("a", "shard-0-of-5.json", record(
+            "macos", "3.11", 0, modules={
+                "test_pooled": {"wall_seconds": 90, "test_seconds": 80,
+                                "process_seconds": 120}}))
+        self._write_jobs([{"jobs": []}])
+        markdown, _ = self._run(baselines=False)
+        self.assertIn("| module | wall | process | test |", markdown)
+        self.assertIn("| test_pooled | 90s | 120s | 80s |", markdown)
 
     def test_unreadable_weights_degrades_to_note(self):
         self._write_record("a", "shard-0-of-5.json",

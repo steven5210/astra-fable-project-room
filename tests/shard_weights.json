@@ -9,7 +9,7 @@
    "run 39056172645 (main 6351285, 2026-10-17, macos-latest/3.11)",
    "run 39010015879 (PR #217 18ac675, 2026-10-17, macos-latest/3.11)"
   ],
-  "unit": "seconds of module wall time in one CI shard job (median over the listed runs)"
+  "unit": "seconds of module process wall in one CI shard job when measured by the worker pool, else module wall (median over the listed runs)"
  },
  "samples": {
   "test_ao_acceptance_extension": 2,

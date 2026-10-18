@@ -218,6 +218,30 @@ class RunTestShardsTests(unittest.TestCase):
         self.assertIn("kept previous values", text)
         self.assertIn("dropped stale entries", text)
 
+    def test_refresh_weights_prefers_process_seconds(self):
+        # The pool's whole-process wall (imports + first setUpClass included)
+        # is what the weight should pin when the record carries it.
+        weights = run_test_shards.load_weights()
+        target = "test_docs_links"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            file1 = tmp / "c1.json"
+            file1.write_text(json.dumps(self._combined("111", "abcdef1", [
+                self._job("macos", "3.11", {target: {"wall_seconds": 10,
+                                                     "process_seconds": 40}}),
+                self._job("macos", "3.11", {target: {"wall_seconds": 12}})])))
+            wpath = tmp / "w.json"
+            wpath.write_text(json.dumps(self._weights_doc(weights)))
+            with mock.patch.object(run_test_shards, "WEIGHTS_FILE", wpath), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = run_test_shards.main(
+                    ["--refresh-weights", str(file1)])
+            data = json.loads(wpath.read_text())
+        self.assertEqual(code, 0)
+        # median(40 process, 12 wall) -- each run contributes its best
+        # measurement, not process-or-wall mixed within one run.
+        self.assertEqual(data["weights"][target], 26.0)
+
     def test_refresh_weights_fails_when_a_module_has_neither_weight_nor_sample(self):
         weights = run_test_shards.load_weights()
         dropped = sorted(weights)[0]
@@ -286,6 +310,66 @@ class RunTestShardsTests(unittest.TestCase):
                 code = run_test_shards.main(["--measure", "test_docs_links"])
             self.assertEqual(code, 1)
             self.assertEqual(wpath.read_text(), before)
+
+    def test_measure_writes_once_after_every_module_succeeds(self):
+        weights = run_test_shards.load_weights()
+        targets = ["test_docs_links", "test_run_test_shards"]
+        calls = {"n": 0}
+
+        def fake_run(argv, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the second module fails
+                return mock.Mock(returncode=1)
+            record = Path(argv[argv.index("--record") + 1])
+            record.write_text(json.dumps(
+                {"complete": True,
+                 "modules": {targets[0]: {"wall_seconds": 10}}}))
+            return mock.Mock(returncode=0)
+
+        writes = []
+
+        def counting_write(data):
+            writes.append(dict(data["weights"]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wpath = Path(tmp) / "w.json"
+            before = json.dumps(self._weights_doc(weights), indent=1,
+                                sort_keys=True)
+            wpath.write_text(before)
+            err = io.StringIO()
+            with mock.patch.object(run_test_shards, "WEIGHTS_FILE", wpath), \
+                    mock.patch.object(run_test_shards.subprocess, "run",
+                                      side_effect=fake_run), \
+                    mock.patch.object(run_test_shards, "write_weights_file",
+                                      side_effect=counting_write), \
+                    contextlib.redirect_stderr(err):
+                code = run_test_shards.main(["--measure", *targets])
+            self.assertEqual(code, 1)
+            self.assertEqual(wpath.read_text(), before)  # nothing written
+            self.assertEqual(writes, [])
+            self.assertIn("weights file unchanged", err.getvalue())
+
+            def fake_ok(argv, **kwargs):
+                module = argv[-1]
+                record = Path(argv[argv.index("--record") + 1])
+                record.write_text(json.dumps(
+                    {"complete": True,
+                     "modules": {module: {"wall_seconds": 5}}}))
+                return mock.Mock(returncode=0)
+
+            out = io.StringIO()
+            with mock.patch.object(run_test_shards, "WEIGHTS_FILE", wpath), \
+                    mock.patch.object(run_test_shards.subprocess, "run",
+                                      side_effect=fake_ok), \
+                    mock.patch.object(run_test_shards, "write_weights_file",
+                                      side_effect=counting_write), \
+                    contextlib.redirect_stdout(out):
+                code = run_test_shards.main(["--measure", *targets])
+            self.assertEqual(code, 0)
+            self.assertEqual(len(writes), 1)
+            self.assertEqual({target: writes[0][target] for target in targets},
+                             {"test_docs_links": 5.0,
+                              "test_run_test_shards": 5.0})
 
     def test_stale_estimates_needs_both_factor_and_absolute_margin(self):
         weights = {"a": 100.0, "b": 100.0, "c": 100.0, "d": 10.0, "e": 1000.0}
@@ -558,7 +642,10 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_jobs_mode_with_workers_runs_each_shard_as_a_pool(self):
         def fake_popen(argv, **kwargs):
-            kwargs["stdout"].write("Ran 1 tests in 0.001s\nOK\n")
+            # A pool child's log ends with the module table and `total: N`.
+            kwargs["stdout"].write("=== wm: exit 0, 0.1s ===\n"
+                                   "Ran 1 tests in 0.001s\nOK\n"
+                                   "total: 1 tests\n")
             return mock.Mock(wait=lambda: 0)
 
         with mock.patch.object(run_test_shards.subprocess, "Popen",
@@ -573,6 +660,31 @@ class RunTestShardsTests(unittest.TestCase):
                                         str(ROOT / "tests" / "run_test_shards.py"),
                                         "--shard", str(index)])
             self.assertEqual(argv[argv.index("--workers") + 1], "3")
+
+    def test_jobs_mode_summarizes_pool_children_by_their_total_line(self):
+        # A pool child's log ends with a per-module table and `total: N` --
+        # its last `Ran` line is only the last module's.
+        def fake_popen(argv, **kwargs):
+            kwargs["stdout"].write(
+                "=== test_a: exit 0, 1.0s ===\n"
+                "Ran 12 tests in 1.0s\nOK\n"
+                "=== test_b: exit 0, 1.0s ===\n"
+                "Ran 8 tests in 1.0s\nOK\n"
+                "total: 20 tests\n")
+            return mock.Mock(wait=lambda: 0)
+
+        out = io.StringIO()
+        with mock.patch.object(run_test_shards.subprocess, "Popen",
+                               side_effect=fake_popen), \
+                contextlib.redirect_stdout(out):
+            code = run_test_shards.main(["--jobs", "5", "--workers", "2"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        # Every shard row reports the pool total (20), not the last module's
+        # Ran line (8), and the suite total sums all five shards.
+        self.assertEqual(text.count("total: 20 tests"), 5)
+        self.assertNotIn("Ran 8 tests", text)
+        self.assertIn("total: 100 tests", text)
 
     def test_workers_requires_a_shard_mode(self):
         with self.assertRaises(SystemExit) as ctx:

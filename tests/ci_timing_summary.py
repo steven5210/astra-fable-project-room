@@ -80,8 +80,9 @@ def _clean_module_stats(stats):
     if not isinstance(stats, dict):
         return None
     clean = {}
-    for field in ("tests", "wall_seconds", "test_seconds", "setup_seconds",
-                  "body_seconds", "teardown_seconds", "fixture_gap_seconds"):
+    for field in ("tests", "wall_seconds", "process_seconds", "test_seconds",
+                  "setup_seconds", "body_seconds", "teardown_seconds",
+                  "fixture_gap_seconds"):
         clean[field] = _num(stats.get(field))
     outcomes = stats.get("outcomes")
     if isinstance(outcomes, dict):
@@ -278,7 +279,9 @@ def section_imbalance(jobs_metrics, baselines=None):
             continue
         groups.setdefault((metrics["os"], metrics["python"]), []).append(metrics)
     lines = ["", "### Shard imbalance", ""]
-    runner_minutes = sum(m["total"] for m in jobs_metrics if m["total"] is not None)
+    runner_minutes = sum(m["total"] for m in jobs_metrics
+                         if m["total"] is not None
+                         and m["name"] != "timing-summary")
     queues = [m["queue"] for m in jobs_metrics if m["queue"] is not None]
     for key in sorted(groups):
         execs = sorted(m["exec"] for m in groups[key])
@@ -297,7 +300,7 @@ def section_imbalance(jobs_metrics, baselines=None):
         else:
             line += "; baseline: none"
         lines.append(line)
-    line = f"- runner-minutes: {runner_minutes / 60:.0f}"
+    line = f"- runner-minutes (unittest + lint): {runner_minutes / 60:.0f}"
     if baselines and baselines["runner_minutes"]:
         runs = baselines["runner_minutes"]
         line += (f" vs baseline median {statistics.median(runs):.0f}"
@@ -325,8 +328,12 @@ def section_slowest(records, top=15):
     for key in sorted(groups):
         lines.append(f"#### {key[0]}/{key[1]}")
         lines.append("")
-        lines.append("| module | wall | test | setup share | fixture gap |")
-        lines.append("| --- | --- | --- | --- | --- |")
+        has_process = any(stats.get("process_seconds") is not None
+                          for stats in groups[key].values())
+        process_col = (" | process" if has_process else "")
+        lines.append(f"| module | wall{process_col} | test | setup share"
+                     " | fixture gap |")
+        lines.append("| --- " * (6 if has_process else 5) + "|")
         ranked = sorted(groups[key].items(),
                         key=lambda item: item[1]["wall_seconds"], reverse=True)
         for module, stats in ranked[:top]:
@@ -334,10 +341,12 @@ def section_slowest(records, top=15):
             setup = stats.get("setup_seconds")
             share = ("n/a" if setup is None or not test_seconds
                      else f"{100 * setup / test_seconds:.0f}%")
-            lines.append("| {} | {} | {} | {} | {} |".format(
-                _cell(module), _seconds(stats["wall_seconds"]),
-                _seconds(test_seconds), share,
-                _seconds(stats.get("fixture_gap_seconds"))))
+            cells = [_cell(module), _seconds(stats["wall_seconds"])]
+            if has_process:
+                cells.append(_seconds(stats.get("process_seconds")))
+            cells += [_seconds(test_seconds), share,
+                      _seconds(stats.get("fixture_gap_seconds"))]
+            lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -395,7 +404,7 @@ def baseline_stats(entries):
             module_runs.setdefault(module, []).append(statistics.median(walls))
         groups, total, counted = {}, 0.0, False
         for job in entry["data"].get("jobs", []):
-            if not isinstance(job, dict):
+            if not isinstance(job, dict) or job.get("name") == "timing-summary":
                 continue
             os_name, python = job.get("os"), job.get("python")
             exec_seconds = _num(job.get("exec_seconds"))
@@ -425,7 +434,11 @@ def _current_module_walls(records, os_name=None, python=None):
                 and (record["os"], record["python"]) != (os_name, python)):
             continue
         for module, stats in record["modules"].items():
-            wall = stats.get("wall_seconds")
+            # Process seconds first so both sides of the baseline comparison
+            # measure the same thing when the record came from a worker pool.
+            wall = stats.get("process_seconds")
+            if wall is None:
+                wall = stats.get("wall_seconds")
             if wall is not None:
                 walls[module] = max(wall, walls.get(module, 0.0))
     return walls
@@ -479,10 +492,10 @@ def _build_warnings(records, jobs_metrics, baselines, weights_data):
                     f"inconclusive (n={base['n']}): slower than baseline"
                     f" {detail}")
                 continue
-            sustained = (base["n"] >= 5 and len(base["runs"]) >= 2
-                         and all(wall > 1.5 * base["median"]
-                                 and wall - base["median"] > 60
-                                 for wall in base["runs"][:2]))
+            sustained = (base["n"] >= 5 and len(base["runs"]) >= 2 and all(
+                historical > 1.5 * base["median"]
+                and historical - base["median"] > 60
+                for historical in base["runs"][:2]))
             warnings.append("module slower than baseline: " + detail
                             + (" -- sustained" if sustained else ""))
     if weights_data is not None:
