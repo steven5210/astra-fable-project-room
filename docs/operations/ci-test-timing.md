@@ -136,7 +136,10 @@ verification job (`test_verification`, `test_verification_matrix`, the
 The job's gate observation and cleanup scan every same-user process through
 /proc, and a transient process of another worker -- between exit and reap,
 or mid-exec -- reads as `inspection_incomplete` to the fail-closed scan.
-macOS is unaffected (`ps -E` covers only the process's own children). A new
+macOS is unaffected: the scan there parses `/bin/ps -E`, which cannot
+distinguish an unreadable environment from an empty one, so it is never
+`inspection_incomplete` (a documented platform limit in `verification.py`) --
+the exclusivity is Linux-only for that reason. A new
 module that drives that path must be added to the set; the symptom of
 forgetting is a deterministic `inspection_incomplete` refusal in that module
 under the pool, never a silent pass.

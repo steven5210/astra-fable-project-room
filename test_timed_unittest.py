@@ -130,7 +130,9 @@ counter = {"runs": 0}
 
 class DupCase(unittest.TestCase):
     def setUp(self):
-        time.sleep(0.05)
+        # The first run sleeps 0.5 s, the second 0.05: a row that accumulated
+        # phase time instead of measuring its own run would read ~0.55.
+        time.sleep(0.5 if counter["runs"] == 0 else 0.05)
 
     def test_dup(self):
         counter["runs"] += 1
@@ -296,9 +298,11 @@ class TimedUnittestTests(unittest.TestCase):
                 if row["id"] == "timed_synth_dup_a.DupCase.test_dup"]
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["outcome"] for row in rows], ["fail", "ok"])
-        for row in rows:
-            self.assertGreaterEqual(row["setup_seconds"], 0.04)
-            self.assertLessEqual(row["setup_seconds"], 0.09)
+        first, second = rows
+        self.assertGreaterEqual(first["setup_seconds"], 0.45)
+        # 0.25 s of noise budget on a 0.05 s sleep; the cumulative-rows bug
+        # would read >= 0.55 here.
+        self.assertLess(second["setup_seconds"], 0.3)
 
     def test_an_import_failure_is_attributed_to_the_requested_module(self):
         # loadTestsFromNames turns an ImportError into a _FailedTest entry.

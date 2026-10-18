@@ -42,7 +42,11 @@ MAX_COMBINED_BYTES = 8 * 1024 * 1024
 # Modules that launch the legacy controller's verification job: its gate
 # observation and cleanup scan every same-user process through /proc on
 # Linux and treat an unreadable transient process as inspection_incomplete,
-# so a worker pool must schedule them alone (see run_shard_workers).
+# so a worker pool must schedule them alone (see run_shard_workers). The
+# exclusivity is Linux-only: on macOS the scan parses /bin/ps -E, which
+# cannot distinguish an unreadable environment from an empty one, so it is
+# never inspection_incomplete (a documented platform limit in
+# verification.py).
 EXCLUSIVE_MODULES = frozenset({"test_verification", "test_verification_matrix"})
 REFRESH_PLATFORM = ("macos", "3.11")
 
@@ -388,9 +392,10 @@ def run_shard_workers(index, shards, group, weights, args):
     # alone in the pool: its gate observation and cleanup scan every same-user
     # process through /proc on Linux, so a transient process of another worker
     # (between exit and reap, or mid-exec) reads as inspection_incomplete and
-    # the fail-closed tests observe refusals. On macOS the scan only covers
-    # the process's own children (ps -E) and cannot be incomplete, so the
-    # exclusivity applies on Linux only.
+    # the fail-closed tests observe refusals. On macOS the scan parses
+    # /bin/ps -E, which cannot distinguish an unreadable environment from an
+    # empty one, so it is never inspection_incomplete (a documented platform
+    # limit in verification.py) and the exclusivity applies on Linux only.
     exclusive = (set(group) & EXCLUSIVE_MODULES
                  if platform.system() == "Linux" else set())
     queue = (sorted(exclusive, key=lambda m: (-float(weights[m]), m))
