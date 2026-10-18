@@ -220,7 +220,8 @@ class RunTestShardsTests(unittest.TestCase):
 
     def test_refresh_weights_prefers_process_seconds(self):
         # The pool's whole-process wall (imports + first setUpClass included)
-        # is what the weight should pin when the record carries it.
+        # is what the weight should pin when the record carries it; wall and
+        # process samples are never mixed within one module.
         weights = run_test_shards.load_weights()
         target = "test_docs_links"
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,9 +239,9 @@ class RunTestShardsTests(unittest.TestCase):
                     ["--refresh-weights", str(file1)])
             data = json.loads(wpath.read_text())
         self.assertEqual(code, 0)
-        # median(40 process, 12 wall) -- each run contributes its best
-        # measurement, not process-or-wall mixed within one run.
-        self.assertEqual(data["weights"][target], 26.0)
+        # One run has a process sample -> only process samples count.
+        self.assertEqual(data["weights"][target], 40.0)
+        self.assertEqual(data["samples"][target], 1)
 
     def test_refresh_weights_fails_when_a_module_has_neither_weight_nor_sample(self):
         weights = run_test_shards.load_weights()

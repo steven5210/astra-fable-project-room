@@ -258,8 +258,8 @@ def _combined_job_qualifies(job):
 
 
 def _combined_measurements(data):
-    """Yield (module, seconds) from complete macos/3.11 jobs -- the module's
-    process_seconds when the worker pool stamped it, else wall_seconds."""
+    """Yield (module, seconds, kind) from complete macos/3.11 jobs -- kind is
+    "process" when the worker pool stamped process_seconds, else "wall"."""
     for job in data["jobs"]:
         if not _combined_job_qualifies(job):
             continue
@@ -269,11 +269,13 @@ def _combined_measurements(data):
             # The worker pool stamps the module's whole-process wall as
             # process_seconds (imports, first setUpClass and teardown
             # included); a single-process record has only wall_seconds.
-            wall = _num(stats.get("process_seconds"))
-            if wall is None:
-                wall = _num(stats.get("wall_seconds"))
+            process = _num(stats.get("process_seconds"))
+            if process is not None:
+                yield module, process, "process"
+                continue
+            wall = _num(stats.get("wall_seconds"))
             if wall is not None:
-                yield module, wall
+                yield module, wall, "wall"
 
 
 def refresh_weights(paths):
@@ -288,8 +290,9 @@ def refresh_weights(paths):
             continue
         jobs_seen = sum(1 for job in combined["jobs"]
                         if _combined_job_qualifies(job))
-        for module, wall in _combined_measurements(combined):
-            measured.setdefault(module, []).append(wall)
+        for module, seconds, kind in _combined_measurements(combined):
+            measured.setdefault(module, {}).setdefault(kind, []).append(
+                seconds)
         run_id = combined.get("run_id")
         revision = combined.get("revision")
         sources.append(
@@ -300,10 +303,13 @@ def refresh_weights(paths):
     modules = test_modules()
     new_weights, new_samples, kept = {}, {}, []
     for module in modules:
-        walls = measured.get(module)
-        if walls:
-            new_weights[module] = round(statistics.median(walls), 2)
-            new_samples[module] = len(walls)
+        kinds = measured.get(module)
+        if kinds:
+            # Process and wall seconds measure different spans; never mix
+            # them. Any process sample makes the median process-only.
+            chosen = kinds.get("process") or kinds["wall"]
+            new_weights[module] = round(statistics.median(chosen), 2)
+            new_samples[module] = len(chosen)
         elif module in weights:
             new_weights[module] = weights[module]
             new_samples[module] = samples.get(module, 0)

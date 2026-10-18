@@ -313,16 +313,26 @@ def section_imbalance(jobs_metrics, baselines=None):
     return "\n".join(lines)
 
 
+def _module_cost(stats):
+    """A module's ranking cost: its whole-process wall when the worker pool
+    stamped it, else its module wall. Returns (seconds, "process"|"wall")."""
+    process = stats.get("process_seconds")
+    if process is not None:
+        return process, "process"
+    return stats.get("wall_seconds") or 0, "wall"
+
+
 def section_slowest(records, top=15):
     groups = {}
     for record in records:
         key = (record["os"], record["python"])
         modules = groups.setdefault(key, {})
         for module, stats in record["modules"].items():
-            wall = stats.get("wall_seconds")
-            if wall is None:
+            if stats.get("wall_seconds") is None \
+                    and stats.get("process_seconds") is None:
                 continue
-            if module not in modules or wall > modules[module]["wall_seconds"]:
+            if module not in modules or (_module_cost(stats)
+                                         > _module_cost(modules[module])):
                 modules[module] = stats
     lines = ["", "### Slowest modules", ""]
     for key in sorted(groups):
@@ -330,20 +340,27 @@ def section_slowest(records, top=15):
         lines.append("")
         has_process = any(stats.get("process_seconds") is not None
                           for stats in groups[key].values())
-        process_col = (" | process" if has_process else "")
-        lines.append(f"| module | wall{process_col} | test | setup share"
-                     " | fixture gap |")
-        lines.append("| --- " * (6 if has_process else 5) + "|")
+        cost_head = "cost (process|wall)" if has_process else "cost (wall)"
+        if has_process:
+            lines.append(f"| module | {cost_head} | wall | process | test"
+                         " | setup share | fixture gap |")
+        else:
+            lines.append(f"| module | {cost_head} | test | setup share"
+                         " | fixture gap |")
+        lines.append("| --- " * (7 if has_process else 5) + "|")
         ranked = sorted(groups[key].items(),
-                        key=lambda item: item[1]["wall_seconds"], reverse=True)
+                        key=lambda item: _module_cost(item[1])[0],
+                        reverse=True)
         for module, stats in ranked[:top]:
+            cost, _kind = _module_cost(stats)
             test_seconds = stats.get("test_seconds")
             setup = stats.get("setup_seconds")
             share = ("n/a" if setup is None or not test_seconds
                      else f"{100 * setup / test_seconds:.0f}%")
-            cells = [_cell(module), _seconds(stats["wall_seconds"])]
+            cells = [_cell(module), _seconds(cost)]
             if has_process:
-                cells.append(_seconds(stats.get("process_seconds")))
+                cells += [_seconds(stats.get("wall_seconds")),
+                          _seconds(stats.get("process_seconds"))]
             cells += [_seconds(test_seconds), share,
                       _seconds(stats.get("fixture_gap_seconds"))]
             lines.append("| " + " | ".join(cells) + " |")
@@ -391,17 +408,24 @@ def load_baselines(root):
 def baseline_stats(entries):
     """Per-module and per-(os, python) baselines over the collected runs.
 
-    A module's baseline is the median of its per-run macOS/3.11 wall seconds;
-    runs are kept newest-first so the newest two can be checked for sustained
-    drift. execs: (os, py) -> per-run max and median shard exec seconds.
+    A module's baseline is the median of its per-run macOS/3.11 seconds,
+    kept per measurement kind (process vs wall) so drift is only compared
+    against the same kind; runs are kept newest-first so the newest two can
+    be checked for sustained drift. execs: (os, py) -> per-run max and
+    median shard exec seconds.
     """
     module_runs, execs, runner_minutes = {}, {}, []
     for entry in entries:
         per_module = {}
-        for module, wall in shardtools._combined_measurements(entry["data"]):
-            per_module.setdefault(module, []).append(wall)
-        for module, walls in per_module.items():
-            module_runs.setdefault(module, []).append(statistics.median(walls))
+        for module, seconds, kind in shardtools._combined_measurements(
+                entry["data"]):
+            per_module.setdefault(module, {}).setdefault(
+                kind, []).append(seconds)
+        for module, kinds in per_module.items():
+            series = module_runs.setdefault(
+                module, {"process": [], "wall": []})
+            for kind, values in kinds.items():
+                series[kind].append(statistics.median(values))
         groups, total, counted = {}, 0.0, False
         for job in entry["data"].get("jobs", []):
             if not isinstance(job, dict) or job.get("name") == "timing-summary":
@@ -421,26 +445,32 @@ def baseline_stats(entries):
             group["median"].append(statistics.median(values))
         if counted:
             runner_minutes.append(total / 60)
-    modules = {module: {"median": statistics.median(walls), "n": len(walls),
-                        "min": min(walls), "max": max(walls), "runs": walls}
-               for module, walls in module_runs.items()}
+    modules = {}
+    for module, series in module_runs.items():
+        modules[module] = {
+            kind: {"median": statistics.median(values), "n": len(values),
+                   "min": min(values), "max": max(values), "runs": values}
+            for kind, values in series.items() if values}
     return {"modules": modules, "execs": execs, "runner_minutes": runner_minutes}
 
 
 def _current_module_walls(records, os_name=None, python=None):
+    """module -> (seconds, kind): the module's process wall when the worker
+    pool stamped it, else its module wall -- the largest value across
+    records."""
     walls = {}
     for record in records:
         if (os_name is not None
                 and (record["os"], record["python"]) != (os_name, python)):
             continue
         for module, stats in record["modules"].items():
-            # Process seconds first so both sides of the baseline comparison
-            # measure the same thing when the record came from a worker pool.
-            wall = stats.get("process_seconds")
-            if wall is None:
-                wall = stats.get("wall_seconds")
-            if wall is not None:
-                walls[module] = max(wall, walls.get(module, 0.0))
+            process = stats.get("process_seconds")
+            if process is not None:
+                value, kind = process, "process"
+            else:
+                value, kind = stats.get("wall_seconds"), "wall"
+            if value is not None and value > walls.get(module, (0,))[0]:
+                walls[module] = (value, kind)
     return walls
 
 
@@ -476,32 +506,48 @@ def _build_warnings(records, jobs_metrics, baselines, weights_data):
                 f" -- refresh: {REFRESH_CMD}")
     current_mac = _current_module_walls(records, "macos", "3.11")
     if baselines is not None:
+        missing_kind = {}
         for module in sorted(current_mac):
+            wall, kind = current_mac[module]
             base = baselines["modules"].get(module)
             if base is None:
                 continue
-            wall = current_mac[module]
-            slower = wall > 1.5 * base["median"] and wall - base["median"] > 60
+            # Process and wall seconds measure different spans; only a
+            # baseline of the same kind can be compared against.
+            series = base.get(kind)
+            if not series:
+                missing_kind[kind] = missing_kind.get(kind, 0) + 1
+                continue
+            median = series["median"]
+            slower = wall > 1.5 * median and wall - median > 60
             if not slower:
                 continue
-            detail = (f"`{_cell(module)}` {wall:.0f}s vs baseline median"
-                      f" {base['median']:.0f}s (n={base['n']} runs,"
-                      f" range {base['min']:.0f}s-{base['max']:.0f}s)")
-            if base["n"] < 3:
+            detail = (f"`{_cell(module)}` {wall:.0f}s {kind} vs baseline"
+                      f" median {median:.0f}s {kind} (n={series['n']} runs,"
+                      f" range {series['min']:.0f}s-{series['max']:.0f}s)")
+            if series["n"] < 3:
                 inconclusive.append(
-                    f"inconclusive (n={base['n']}): slower than baseline"
-                    f" {detail}")
+                    f"inconclusive (n={series['n']} {kind}): slower than"
+                    f" baseline {detail}")
                 continue
-            sustained = (base["n"] >= 5 and len(base["runs"]) >= 2 and all(
-                historical > 1.5 * base["median"]
-                and historical - base["median"] > 60
-                for historical in base["runs"][:2]))
+            sustained = (series["n"] >= 5 and all(
+                historical > 1.5 * median and historical - median > 60
+                for historical in series["runs"][:2]))
             warnings.append("module slower than baseline: " + detail
                             + (" -- sustained" if sustained else ""))
+        for kind in sorted(missing_kind):
+            count = missing_kind[kind]
+            inconclusive.append(
+                f"inconclusive: no {kind} baseline runs for {count}"
+                f" module{'s' if count != 1 else ''} (measurement kind"
+                " changed; comparisons resume once baselines of that kind"
+                " exist)")
     if weights_data is not None:
         weights = weights_data.get("weights", {})
         samples = weights_data.get("samples", {})
-        stale = shardtools.stale_estimates(weights, current_mac)
+        stale = shardtools.stale_estimates(
+            weights, {module: value
+                      for module, (value, _kind) in current_mac.items()})
         if stale:
             warnings.append("stale weight estimates: "
                             + ", ".join(f"`{_cell(module)}`" for module in stale)

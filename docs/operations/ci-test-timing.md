@@ -52,9 +52,14 @@ summary page. It needs only `actions: read` on the default token.
 ## Shard weights
 
 `tests/shard_weights.json` (format `project_room_shard_weights_v2`) pins one
-weight per discovered test module: the median macOS/3.11 module wall seconds
-over the runs listed in `_meta.sources`, with `samples` = the number of jobs
-that measured it. `tests/run_test_shards.py` partitions modules by longest
+weight per discovered test module: the median macOS/3.11 module *process*
+seconds under the worker pool (one process per module, so imports, class
+fixtures and teardown are included), falling back to module wall seconds
+for single-process records -- over the runs listed in `_meta.sources`, with
+`samples` = the number of jobs that measured it. In the timing summary,
+compare a weight with the `cost (process|wall)` column of the Slowest
+modules table, which uses the same process-first metric.
+`tests/run_test_shards.py` partitions modules by longest
 processing time first over these weights; the assignment is deterministic
 and `test_run_test_shards.py` pins that the union of the shards equals the
 discovered inventory exactly, at the test-id level, with no id discovered
@@ -84,7 +89,9 @@ python3 tests/run_test_shards.py --refresh-weights timing-combined.json [more...
 ```
 
 Only complete macOS/3.11 job records are used; the weight is the median
-across all of them, so pass several runs to average out runner variability
+across all of them -- of the module's process samples when any input run
+measured them, else its wall samples, never mixed -- so pass several runs
+to average out runner variability
 (the same module varied by 30–56 % between two macOS runs twelve hours
 apart). A module absent from every input keeps its previous value and is
 listed as kept; entries for modules that no longer exist are dropped. Review
@@ -103,16 +110,20 @@ fail the run.
 - **Shard imbalance**: per OS/Python, `max / median` execution time above
   1.5 with the slowest shard more than three minutes over the median. Fix:
   refresh the weights.
-- **Stale estimates**: a module whose measured macOS wall differs from its
+- **Stale estimates**: a module whose measured macOS cost (process seconds
+  under the pool, else module wall) differs from its
   weight by more than a factor of two and more than 30 seconds
   (`run_test_shards.stale_estimates`). Fix: refresh the weights.
 - **Local estimates**: modules still at `samples: 0`. Fix: refresh after the
   next `main` run that contains them.
 - **Slower than baseline**: a module above the rolling `main` median by more
-  than a factor of 1.5 and more than 60 seconds. The baseline is the median
+  than a factor of 1.5 and more than 60 seconds, compared only against
+  baseline runs of the same measurement kind (process vs wall). The
+  baseline is the median
   over the last ten successful `main` runs that have a complete macOS/3.11
   record; the sample size is printed next to every comparison, and a
-  comparison with fewer than three samples is reported as inconclusive. A
+  comparison with fewer than three same-kind samples is reported as
+  inconclusive. A
   single slow run is runner noise as often as a regression; the warning
   says `sustained` only when the previous two `main` runs were also above
   the threshold.

@@ -248,7 +248,8 @@ def baseline_job(module_walls, exec_seconds=300, total_seconds=500,
             "conclusion": "success",
             "exec_seconds": exec_seconds, "total_seconds": total_seconds,
             "record": {"complete": True,
-                       "modules": {module: {"wall_seconds": wall}
+                       "modules": {module: (wall if isinstance(wall, dict)
+                                            else {"wall_seconds": wall})
                                    for module, wall in module_walls.items()}}}
 
 
@@ -367,11 +368,11 @@ class BaselineComparisonTests(unittest.TestCase):
 
         self.assertIn("### Warnings", markdown)
         # (a) test_a: 2.5x baseline, n=5, newest two runs also high.
-        self.assertIn("`test_a` 250s vs baseline median 100s"
+        self.assertIn("`test_a` 250s wall vs baseline median 100s wall"
                       " (n=5 runs, range 100s-250s) -- sustained", markdown)
         # (b) test_b: exceeds the magnitude but n=2 -> inconclusive only.
-        self.assertIn("inconclusive (n=2): slower than baseline `test_b`",
-                      markdown)
+        self.assertIn("inconclusive (n=2 wall): slower than baseline"
+                      " `test_b`", markdown)
         self.assertNotIn("warning title=Test timing::module slower than "
                          "baseline: test_b", stdout)
         # (c) test_c: 1.3x -> neither warning nor inconclusive.
@@ -459,8 +460,8 @@ class BaselineComparisonTests(unittest.TestCase):
                              (106, 100), (105, 250)]:
             self._write_baseline(run_id, [baseline_job({"test_x": wall})])
         markdown, _ = self._run()
-        self.assertIn("`test_x` 250s vs baseline median 100s (n=5 runs",
-                      markdown)
+        self.assertIn("`test_x` 250s wall vs baseline median 100s wall"
+                      " (n=5 runs", markdown)
         self.assertNotIn("sustained", markdown)
 
     def test_runner_minutes_excludes_the_timing_summary_job(self):
@@ -494,8 +495,46 @@ class BaselineComparisonTests(unittest.TestCase):
                                 "process_seconds": 120}}))
         self._write_jobs([{"jobs": []}])
         markdown, _ = self._run(baselines=False)
-        self.assertIn("| module | wall | process | test |", markdown)
-        self.assertIn("| test_pooled | 90s | 120s | 80s |", markdown)
+        self.assertIn("| module | cost (process|wall) | wall | process"
+                      " | test |", markdown)
+        self.assertIn("| test_pooled | 120s | 90s | 120s | 80s |", markdown)
+
+    def test_slowest_table_ranks_by_process_seconds_when_present(self):
+        # Cost is process_seconds when the pool stamped it: a module with
+        # 1 s of module wall but 300 s of process wall outranks a 200 s
+        # wall-only module.
+        self._write_record("a", "shard-0-of-5.json", record(
+            "macos", "3.11", 0, modules={
+                "test_big_wall": {"wall_seconds": 200, "test_seconds": 190},
+                "test_small_wall": {"wall_seconds": 1, "test_seconds": 1,
+                                    "process_seconds": 300}}))
+        self._write_jobs([{"jobs": []}])
+        markdown, _ = self._run(baselines=False)
+        self.assertLess(markdown.index("test_small_wall"),
+                        markdown.index("test_big_wall"))
+
+    def test_drift_compares_only_the_same_measurement_kind(self):
+        # A pooled current run measures process seconds; wall-only
+        # baselines are a different span, so the module is inconclusive,
+        # never warned.
+        self._write_record("a", "shard-0-of-5.json", record(
+            "macos", "3.11", 0, modules={
+                "test_p": {"wall_seconds": 50, "process_seconds": 250}}))
+        self._write_jobs([])
+        for run_id in range(101, 106):
+            self._write_baseline(run_id, [baseline_job({"test_p": 100})])
+        markdown, _ = self._run()
+        self.assertIn("inconclusive: no process baseline runs for 1 module"
+                      " (measurement kind changed", markdown)
+        self.assertNotIn("module slower than baseline", markdown)
+
+        # The same current value against process baselines warns as before.
+        for run_id in range(101, 106):
+            self._write_baseline(run_id, [baseline_job(
+                {"test_p": {"wall_seconds": 80, "process_seconds": 100}})])
+        markdown, _ = self._run()
+        self.assertIn("module slower than baseline: `test_p` 250s process"
+                      " vs baseline median 100s process (n=5 runs", markdown)
 
     def test_unreadable_weights_degrades_to_note(self):
         self._write_record("a", "shard-0-of-5.json",
