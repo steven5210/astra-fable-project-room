@@ -125,7 +125,7 @@ Completed prose-only verdict with no usable JSON →
 [one-use spec-verdict format recovery](../../../docs/guides/spec-verdict-format-recovery.md).
 This requires specific human authorization, a native format-only response and
 Astra's comparison of both complete texts; it never renews ordinary review limits.
-A completed fourth review that retained a negative or noncanonical-negative verdict
+A completed extension review that retained a negative or noncanonical-negative verdict
 on a corrected charter can instead continue through
 [one authorized exact-spec re-review](../../../docs/guides/spec-rereview.md) —
 the room's one-ever named re-review after human approval, never a renewal or refund.
@@ -209,7 +209,7 @@ acceptance, and remaining blockers.
   Diagnose them without resending.
 - Quota stop, semantic hold, or an instruction staged while paused →
   [efficient continuation](../../../docs/guides/efficient-continuation.md).
-- Consumed charter extension whose fourth review completed negative or noncanonical-negative,
+- Consumed charter extension whose additional review completed negative or noncanonical-negative,
   with a corrected registered revision and human approval →
   [one authorized exact-spec re-review](../../../docs/guides/spec-rereview.md).
 - Standing policy `follow_newest_qualified_family_member` → set or revoke it with

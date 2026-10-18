@@ -145,7 +145,7 @@ them into the audited native history; the audit evidence then records each one
 under `settled_failures` (its request id, turn and provider-turn ids,
 settlement kind, its outcome-resume path, and the exact receipt,
 outcome-resume and outcome digests that settled it), and send admission
-refuses the fourth review if any of that evidence is missing, modified or
+refuses the additional review if any of that evidence is missing, modified or
 re-pointed. Each settled request must also carry the bound engineer identity
 in force when it was sent (the engineer role and every stored binding field,
 including harness, AO session, conversation and branch, with the model and
@@ -172,7 +172,7 @@ remain strict and unaffected; active, interrupted, cancelled, unowned failed
 and unverified recovered native turns still refuse the audit or admission. An
 audit taken before this change on a room whose settled failures were already
 admitted through a provider transition must be repeated, because its evidence
-now lists them. For the same reason, a fourth-review grant committed before
+now lists them. For the same reason, an extension grant committed before
 this change on such a room, used or not, records no granted settlements and now
 refuses ordinary validation, so room status, sync, handoff, send and the other
 room operations that run it refuse; because the extension is granted only once,
@@ -198,7 +198,7 @@ about this lane shortens or bypasses that remaining lifecycle.
 
 ## What stays unchanged
 
-When this lane's fourth review completes with a retained negative or
+When this lane's additional review completes with a retained negative or
 noncanonical-negative verdict and the operator registers the exact corrected
 next revision with human approval for one more exact-spec review, the room's
 separate one-ever re-review continuation applies; see

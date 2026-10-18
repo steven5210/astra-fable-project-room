@@ -308,7 +308,7 @@ Codex task discovers updated MCP tools after plugin installation.
    [pre-acceptance exact-spec review extension](../../../docs/guides/pre-acceptance-review-extension.md)
    for a room with zero acceptances whose latest completed engineering turn
    proposed a scope change; the two lanes share the one grant. When that
-   granted fourth review completed with a retained negative or
+   granted additional review completed with a retained negative or
    noncanonical-negative verdict and the operator registered the corrected
    next revision, the room's one-ever explicitly authorized exact-spec
    re-review can admit one named intent — see

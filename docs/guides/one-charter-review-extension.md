@@ -68,7 +68,7 @@ availability.
 While the committed grant is unused, registering a different charter refuses
 before writing a spec or state. Reading the identical current revision remains
 idempotent. Registration after consumption retains its existing semantics and
-cannot grant a fifth review.
+cannot grant another review.
 
 A crash after the consumption record is written but before its request reaches
 saved room state is a separate, fail-closed hold. Status and new mutations refuse
@@ -117,6 +117,6 @@ Identical reads of already committed provider and configured routing results
 remain available. Reviewer recovery still requires an unused reviewer; a grant's
 retained independent acceptance already makes that recovery lane ineligible.
 
-The operation preserves historical evidence and cannot automatically grant a
-fifth review. Implementation, independent acceptance, integration and publication
+The operation preserves historical evidence and cannot automatically grant
+another review. Implementation, independent acceptance, integration and publication
 continue under their existing authorization and exact-spec requirements.

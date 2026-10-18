@@ -306,7 +306,7 @@ def _consumption(directory, state, reference):
     request_id = ao.identifier(original['request_id'])
     current = state['requests'].get(request_id)
     if current is None:
-        raise RoomError('Fourth-review consumption is durable but its request projection is missing; diagnose without resending')
+        raise RoomError('Extension-review consumption is durable but its request projection is missing; diagnose without resending')
     relative = str(path.relative_to(directory))
     if (original.get('state') != 'uncertain' or original.get('purpose') != 'spec_review'
             or current.get('review_extension_consumption') != relative
@@ -1088,7 +1088,7 @@ def validate(service, state, allow_pending=False):
     reference = state.get('spec_review_extension')
     if reference is None:
         if _consumptions(directory):
-            raise RoomError('Fourth-review consumption evidence has no committed grant; diagnose without resending')
+            raise RoomError('Extension-review consumption evidence has no committed grant; diagnose without resending')
         if not allow_pending:
             guard_pending_receipts(directory, state)
         return None
