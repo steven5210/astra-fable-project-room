@@ -38,6 +38,7 @@ Project Room's documents are grouped into guides, references and operations runb
 - [Compaction-failure recovery](operations/compaction-failure-recovery.md) — the supported lane for one exact native autocompact-thrashing failure.
 - [Retained AO provider and routing adoption](operations/provider-transition.md) — the audited one-time DeepInfra-to-official provider and routing adoption for existing AO rooms.
 - [Qualification drafts](operations/qualification-draft.md) — the report-plus-draft workflow that turns a newer qualified family member into a validated, explicitly adopted qualification revision.
+- [CI test timing](operations/ci-test-timing.md) — per-test timing records, pinned shard weights, rolling main-baseline drift warnings and the bounded worker pool.
 
 ## Guard-referenced
 

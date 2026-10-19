@@ -1,10 +1,16 @@
 """Order-controlled checks of the TEMPLATE_SETUP machinery: a templated class builds its room
 workflow once into a class-owned snapshot, then every test restores pristine disk bytes at the same
 paths and fresh in-memory state from the snapshot."""
+import json
+from pathlib import Path
 import subprocess
 import unittest
 
+import ao_native_identity
 from test_ao_acceptance_extension import AcceptanceContinuationFixture
+from test_ao_preacceptance_settled_history import SettledHistoryFixture
+
+REAL_READ_OWNER = ao_native_identity.read_owner
 
 
 def head(repo):
@@ -77,6 +83,56 @@ class FixtureTemplateTests(unittest.TestCase):
         self.assertNotEqual(len(three['state']['fake']['snapshots']['reviewer']['turns']),
                             len(two['state']['fake']['snapshots']['reviewer']['turns']))
         self.assertNotEqual(three['state']['attrs']['room'], two['state']['attrs']['room'])
+
+    def test_class_cleanups_remove_a_dynamically_created_template_dir(self):
+        # OracleParityTests-style use: a variant class built at call time owns its
+        # template dir through addClassCleanup, which fixture.doCleanups alone
+        # never runs.
+        variant = type('DynamicTemplate', (AcceptanceContinuationFixture,), {})
+        fixture = variant('runTest')
+        fixture.setUp()
+        path = Path(fixture.temp.name)
+        self.assertTrue(path.is_dir())
+        fixture.doCleanups()
+        self.assertTrue(path.is_dir())
+        variant.doClassCleanups()
+        self.assertFalse(path.exists())
+
+    def test_settled_history_template_restores_room_fake_state_and_the_real_owner_reader(self):
+        class Probe(SettledHistoryFixture):
+            def test_a_mutates(self):
+                type(self).template_expected = self.expected_settled_failures()
+                type(self).template_state = (self.directory() / 'state.json').read_bytes()
+                type(self).template_posts = len(self.fake.posts)
+                type(self).template_settled = [dict(entry) for entry in self.settled]
+                type(self).first_service = self.service
+                self.settled.append({'request_id': 'probe', 'turn_id': 'probe',
+                                     'successor_request_id': 'probe'})
+                (self.directory() / 'stray-file').write_text('stray\n')
+                state = self.state()
+                state['probe-mutation'] = True
+                (self.directory() / 'state.json').write_bytes(json.dumps(state).encode())
+                self.fake.posts.append({'path': '/probe', 'payload': {}})
+
+            def test_b_restored(self):
+                self.assertFalse((self.directory() / 'stray-file').exists())
+                self.assertEqual((self.directory() / 'state.json').read_bytes(),
+                                 type(self).template_state)
+                self.assertEqual(len(self.fake.posts), type(self).template_posts)
+                self.assertEqual(self.settled, type(self).template_settled)
+                self.assertEqual(len(self.settled), self.SETTLED_FAILURES)
+                self.assertEqual(len(self.completed), self.COMPLETED_TURNS)
+                self.assertEqual(self.expected_settled_failures(),
+                                 type(self).template_expected)
+                self.assertIsNot(self.service, type(self).first_service)
+                self.assertIs(ao_native_identity.read_owner, REAL_READ_OWNER)
+
+        suite = unittest.TestSuite([Probe('test_a_mutates'), Probe('test_b_restored')])
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, 2)
+        self.assertFalse(result.errors, [entry[1] for entry in result.errors])
+        self.assertFalse(result.failures, [entry[1] for entry in result.failures])
 
 
 if __name__ == '__main__':
