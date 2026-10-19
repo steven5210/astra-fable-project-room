@@ -24,13 +24,12 @@ jobs:
           - os: macos-latest
             python: "3.12"
     runs-on: ${{ matrix.os }}
-    # The offline suite (about 2,200 tests) runs as five module-level shards balanced by
-    # measured duration (tests/shard_weights.json). Measured on the #142 main run:
-    # unbalanced four-way shards took 12-20 minutes on macOS and 5-12 on Linux; balanced
-    # five-way shards are estimated at about 11 minutes on macOS and 6 on Linux. macOS
-    # runs Python 3.11 only because the account runs about five macOS jobs at a time and
-    # 3.11 is the production interpreter. This is a CI budget, not a Fable, model or gate
-    # deadline.
+    # The offline suite runs as five module-level shards balanced by the pinned
+    # per-module weights in tests/shard_weights.json; each shard job runs its
+    # modules through a bounded worker pool (2 on macOS, 3 on Linux -- one core
+    # of headroom for the runner, subprocess bursts and the OS). Timing
+    # records and the diagnostic summary job are never required checks.
+    # 45 minutes is a CI budget, not a Fable, model or gate deadline.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -45,11 +44,15 @@ jobs:
         env:
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_CONFIG_NOSYSTEM: "1"
-        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 -v
+          PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+          PROJECT_ROOM_TIMING_RUN_ID: ${{ github.run_id }}
+        run: python tests/run_test_shards.py --shard ${{ matrix.shard }} --shards 5 --workers 2 -v --record "$RUNNER_TEMP/timing"
       - name: Run Linux tests in an isolated process namespace
         if: runner.os == 'Linux'
         env:
           PROJECT_ROOM_TEST_IMAGE: python:${{ matrix.python }}-bookworm
+          PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+          PROJECT_ROOM_TIMING_RUN_ID: ${{ github.run_id }}
         run: |
           # Hosted runner services can deny same-user /proc reads. Keep that
           # production refusal intact and inspect only this test container's processes.
@@ -59,14 +62,71 @@ jobs:
           docker pull "$PROJECT_ROOM_TEST_IMAGE"
           project_room_candidate="$(mktemp -d "${RUNNER_TEMP}/project-room-tests.XXXXXX")"
           git archive HEAD | tar -x -C "$project_room_candidate"
+          timing_dir="${RUNNER_TEMP}/timing"
+          mkdir -p "$timing_dir"
           docker run --rm --init --pull never --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges \
             --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=1g,mode=1777 \
             --mount "type=bind,source=$project_room_candidate,target=/candidate,readonly" \
+            --mount "type=bind,source=$timing_dir,target=/timing" \
             --workdir /candidate --env PYTHONDONTWRITEBYTECODE=1 \
             --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_CONFIG_NOSYSTEM=1 \
-            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 -v
+            --env PROJECT_ROOM_TIMING_REVISION --env PROJECT_ROOM_TIMING_RUN_ID \
+            "$PROJECT_ROOM_TEST_IMAGE" python -B tests/run_test_shards.py --shard "${{ matrix.shard }}" --shards 5 --workers 3 -v --record /timing
+      - name: Upload per-test timing record
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timing-${{ matrix.os }}-py${{ matrix.python }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/timing/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  timing-summary:
+    needs: unittest
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    # Diagnostic only: it must never be a required check and never hide the
+    # unittest results, which remain the gates.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download timing records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: timing-*
+          path: ${{ runner.temp }}/timing-artifacts
+          merge-multiple: false
+      - name: Fetch job timings
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" > "$RUNNER_TEMP/jobs.json"
+      - name: Fetch recent main baselines
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tests/ci_timing_baseline.py --repo "${{ github.repository }}" --workflow tests.yml --out "$RUNNER_TEMP/baselines" --skip-run-id "${{ github.run_id }}"
+      - name: Build the timing summary
+        if: always()
+        env:
+          PROJECT_ROOM_TIMING_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tests/ci_timing_summary.py --records "$RUNNER_TEMP/timing-artifacts" --jobs "$RUNNER_TEMP/jobs.json" --combined "$RUNNER_TEMP/timing-combined.json" --markdown "$GITHUB_STEP_SUMMARY" --baselines "$RUNNER_TEMP/baselines" --weights tests/shard_weights.json
+      - name: Upload combined timing summary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timing-summary
+          path: ${{ runner.temp }}/timing-combined.json
+          if-no-files-found: warn
+          retention-days: 90
 
   lint:
     runs-on: ubuntu-latest

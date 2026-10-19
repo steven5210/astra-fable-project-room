@@ -846,6 +846,9 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     binding = state.get("bindings", {}).get("engineer", {})
     prepared = ao_delegates.validate_preparation(directory, state, binding.get("session_id"), check_routing=delegating)
     workspace(service, directory, state, check_routing=delegating)
+    if role == "engineer" and state.get("account_profile"):
+        import ao_account_profiles
+        ao_account_profiles.before_send(service, state, prepared)
     ao_delegates.assert_settled(service.root.parent, state, directory)
     assembly = _assembly(gather, "\n" if role == "engineer" else "")
     if role == "reviewer":

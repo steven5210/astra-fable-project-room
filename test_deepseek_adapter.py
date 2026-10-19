@@ -5,6 +5,7 @@ import http.client
 import http.server
 import json
 import os
+import socketserver
 from pathlib import Path
 import subprocess
 import sys
@@ -98,6 +99,13 @@ class FakeDeepSeek:
 
         class Server(http.server.ThreadingHTTPServer):
             daemon_threads = True
+
+            def server_bind(self):
+                # HTTPServer.server_bind resolves the bind host through socket.getfqdn, whose first
+                # call per process costs ~36 s on the macOS CI runner. The loopback name is fixed.
+                socketserver.TCPServer.server_bind(self)
+                self.server_name = "127.0.0.1"
+                self.server_port = self.server_address[1]
 
             def handle_error(self, request, client_address):
                 pass  # a killed or cancelled client is expected in these tests
@@ -229,6 +237,19 @@ def fake_connection(port):
         def request(self, method, url, body=None, headers=None, **kwargs):
             return super().request(method, url, body=body, headers={**(headers or {}), "X-Fixture-Target": self.fixture_target}, **kwargs)
     return Fake
+
+
+class FakeDeepSeekServerTests(unittest.TestCase):
+    """The fake loopback server never resolves the bind host's name."""
+
+    def test_server_bind_never_calls_getfqdn(self):
+        with mock.patch("socket.getfqdn", side_effect=AssertionError("reverse DNS in tests")):
+            fake = FakeDeepSeek()
+        try:
+            self.assertEqual(fake.server.server_name, "127.0.0.1")
+            self.assertEqual(fake.server.server_port, fake.port)
+        finally:
+            fake.close()
 
 
 class AdapterFixture(unittest.TestCase):

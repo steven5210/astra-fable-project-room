@@ -30,12 +30,9 @@ class ReviewExtensionFixture(Fixture):
 
     NATIVE = 'synthetic-native-owner'
 
-    def setUp(self):
-        super().setUp()
-        self.configure_runtime()
-        self.room = self.open()
-        self.spec()
-        original_request = self.fake.request
+    def _install_raw_request(self):
+        """Bind the closed-over request closure to the CURRENT fake; a deepcopy cannot carry it."""
+        original_request = type(self.fake).request.__get__(self.fake, type(self.fake))
 
         def raw_request(method, path, payload=None):
             if method == 'GET' and '/conversation?' in path:
@@ -43,6 +40,13 @@ class ReviewExtensionFixture(Fixture):
             return original_request(method, path, payload)
 
         self.fake.request = raw_request
+
+    def setUp(self):
+        super().setUp()
+        self.configure_runtime()
+        self.room = self.open()
+        self.spec()
+        self._install_raw_request()
         for session in self.fake.sessions.values():
             session['isTerminated'] = False
         for snapshot in self.fake.snapshots.values():
@@ -1160,13 +1164,21 @@ class ExtensionEvolutionTests(ReviewExtensionFixture):
                 self.service.ao_room_spec_review_extend(**self.grant_inputs(second))
 
 
-class ExtensionExecutableEvolutionTests(ReviewExtensionFixture):
+class ExecutableRuntimeMixin:
+    """The synthetic-engineer-executable runtime shared by executable-repair fixtures.
+
+    Kept off ``unittest.TestCase`` on purpose: importing a TestCase class into another test module
+    makes unittest collect its tests a second time under that module's name.
+    """
+
     def configure_runtime(self):
         self.original_executable = self.root / 'original-claude'
         self.original_executable.write_text('#!/bin/sh\nprintf "2.1.282 (Claude Code)\\n"\n')
         self.original_executable.chmod(0o700)
         ao.atomic(self.home / 'config.json', {'claude_bin': str(self.original_executable), 'claude_config_dir': str(self.claude_env)})
 
+
+class ExtensionExecutableEvolutionTests(ExecutableRuntimeMixin, ReviewExtensionFixture):
     def test_orphan_repair_blocks_fresh_audit_and_old_audit_grant_until_exact_reconciliation(self):
         import ao_executable_binding as executable
         self.fake.snapshots['engineer']['controller'] = 'stopped'

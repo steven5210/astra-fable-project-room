@@ -311,7 +311,7 @@ def _relation(request, parent, workers):
 
 
 def _work_unit(request):
-    return {key: request.get(key) for key in ("role", "purpose", "state", "provider_epoch")}
+    return {key: request.get(key) for key in ("role", "purpose", "state", "provider_epoch", "account_profile")}
 
 
 def _report(binding, gathered, parent, child_actors, child_coverage, api_delegates, reasons):
@@ -348,7 +348,8 @@ def _report(binding, gathered, parent, child_actors, child_coverage, api_delegat
 def _unavailable(reason, request_sha256=None, owner_sha256=None):
     return {"version": 1, "kind": "native_usage", "scope": "single_request", "coverage": "unavailable",
             "request_sha256": request_sha256, "owner_sha256": owner_sha256,
-            "work_unit": {"role": None, "purpose": None, "state": None, "provider_epoch": None},
+            "work_unit": {"role": None, "purpose": None, "state": None, "provider_epoch": None,
+                          "account_profile": None},
             "sources": [], "parent": None, "children": [], "child_coverage": "unavailable",
             "native_totals": {"coverage": "unavailable", "primary": None, "workers": None,
                               "workers_by_attested_model": None, "combined": None},
