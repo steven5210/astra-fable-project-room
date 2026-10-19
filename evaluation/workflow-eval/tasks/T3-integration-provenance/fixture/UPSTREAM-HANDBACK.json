@@ -1,0 +1,7 @@
+{
+  "accepted_by": "synthetic independent acceptance (fixture)",
+  "assignment_id": "eval-upstream-verdict",
+  "commit": "4c1f0b6e9d2a7f3b8e5c0a1d6f9b2c4e7a8d3f10",
+  "path": "upstream/verdict.py",
+  "sha256": "3124eb9cbd14bb8f6b7d81eafe9f2fcf19f1276ac903254fb8fd9c9c032cbbee"
+}

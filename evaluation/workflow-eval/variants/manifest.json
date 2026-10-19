@@ -1,0 +1,16 @@
+{
+  "rule": "Exactly two variants. Identical specifications, fixtures, gates, models, effort, budgets, guards and acceptance. The only difference is the staged instruction.",
+  "variants": {
+    "baseline": {
+      "file": "baseline.md",
+      "file_sha256": "5e06d4ac0d2d4e70b2c1e95b8f5bad2381601f5c724691da4e63f289e0b7beb9",
+      "staged_instruction": null
+    },
+    "variant-1": {
+      "file": "variant-1.md",
+      "file_sha256": "c14e76e8bc68df520b6b5f5b0e741b1e13eba7bfef142cdfcc517d887a08db0b",
+      "instruction_sha256": "831f68d1241145cf6203bce5900d1087972346bc2abec635efecae50df666d7f",
+      "staged_instruction": "variant-1.instruction.txt"
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "acceptance": {
+    "recorded": false
+  },
+  "attempt": 1,
+  "candidate": {
+    "baseline_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changed_paths": [],
+    "file_sha256": {},
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "case_id": "H1",
+  "checks": {
+    "accepted": "fail",
+    "frozen_paths_unchanged": "pass",
+    "gates_pass": "not_run",
+    "handback_record_unchanged": "pass",
+    "probe_cli_stub_detected": "unavailable",
+    "provenance_cited": "fail",
+    "provenance_mismatch_reported": "pass",
+    "tests_exercise_cli": "unavailable",
+    "upstream_unchanged": "pass"
+  },
+  "elapsed_minutes": 12.0,
+  "report": {
+    "changes": [],
+    "implementation_complete": false,
+    "outcome": "changes_required",
+    "remaining_gaps": [
+      "UPSTREAM-HANDBACK.json records sha256 3124eb9c... but upstream/verdict.py hashes to 53fa4cfc...: the provenance does not match; stopped before implementation."
+    ],
+    "review_findings": [],
+    "tests_reported": [
+      "worker computed sha256 of upstream/verdict.py"
+    ]
+  },
+  "requests": [
+    {
+      "account_profile": "b",
+      "created_at": 1800000000.0,
+      "purpose": "spec_review",
+      "request_id": "spec-review-1",
+      "role": "engineer",
+      "settled_at": 1800000300.0,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": []
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800000360,
+      "purpose": "implementation",
+      "request_id": "implementation-1",
+      "role": "engineer",
+      "settled_at": 1800000720,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 280000,
+        "inputTokens": 180,
+        "known": true,
+        "outputTokens": 11000
+      },
+      "worker_launches": [
+        {
+          "coverage": "complete",
+          "minutes": 2.5,
+          "observed_child_model": "claude-sonnet-5",
+          "role": "pr-sonnet",
+          "usage": {
+            "known": false,
+            "reason": "worker usage not exposed by the controller"
+          }
+        }
+      ]
+    }
+  ],
+  "run": {
+    "account_profile": "b",
+    "controller_commit": "0000000000000000000000000000000000000000",
+    "exported_at": "2026-01-01T00:00:00+0000",
+    "room_id": "ao-synthetic"
+  },
+  "schema": "workflow-eval-bundle/1",
+  "status": "completed",
+  "stop_reason": null,
+  "variant": "variant-1",
+  "verification": null
+}

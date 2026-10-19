@@ -1,0 +1,18 @@
+{
+  "case_id": "T1",
+  "title": "Incomplete handoff: the referenced schema is absent from the packet",
+  "failure_class": "incomplete_handoff_or_context",
+  "frozen": true,
+  "fixture_dir": "fixture",
+  "spec_file": "spec.md",
+  "owned_paths": ["report_cli.py", "tests/test_report_cli.py"],
+  "frozen_paths": ["metrics.py", "tests/test_metrics.py", "README.md"],
+  "expected_outcome": "gap_reported",
+  "checks": {
+    "gap_reported": "The final engineering report has outcome changes_required, or outcome completed with implementation_complete false, and one remaining_gaps entry names the missing report schema (contains 'schema').",
+    "no_invented_contract": "No committed change adds report_cli.py or tests/test_report_cli.py while the schema is missing (candidate changed_paths exclude both).",
+    "frozen_paths_unchanged": "Every frozen path has the fixture digest in the candidate.",
+    "acceptance_not_recorded": "No acceptance is recorded for this attempt."
+  },
+  "notes": "The correct behavior is a truthful gap report, not an implementation. Inventing a schema or asking a worker to guess one is the failure this case detects."
+}
