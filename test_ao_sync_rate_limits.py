@@ -5,12 +5,29 @@ import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import ao_project_room
 import ao_rate_limits
 from test_ao_lifecycle_contract import AgreedRoomFixture, PreparedRoomFixture
 from test_ao_rate_limits import create_database, rate_limits_payload, write_event
-from test_ao_sync_wait import FakeClock
 
 AVAILABLE = {'label', 'used_percent', 'resets_at', 'minutes_remaining_at_current_rate', 'age_seconds'}
+
+
+class _InterruptStub:
+    """Stands in for SYNC_WAIT_INTERRUPT: wait() clears instantly and is_set() reports set on the
+    third poll, so a wait runs exactly three sync iterations and stops 'interrupted'."""
+
+    def __init__(self):
+        self.is_set_calls = 0
+        self.waits = []
+
+    def is_set(self):
+        self.is_set_calls += 1
+        return self.is_set_calls >= 3
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        return False
 
 
 class SyncRateLimitsTests(AgreedRoomFixture):
@@ -52,22 +69,22 @@ class SyncRateLimitsTests(AgreedRoomFixture):
     def test_reading_is_computed_once_per_sync_call_not_per_iteration(self):
         self._events((90, 300, 2100), (95, 0, 1800))
         self.send('implementation')  # stays running: the fake turn is never finished
-        clock = FakeClock()
+        stub = _InterruptStub()
+        # The interrupt stub replaces the clock patch: a slow iteration under load cannot end the loop early.
         with patch.object(ao_rate_limits, 'latest', wraps=ao_rate_limits.latest) as latest, \
-                patch('ao_project_room.time.sleep', side_effect=clock.sleep), \
-                patch('ao_project_room.time.monotonic', side_effect=clock.monotonic):
+                patch.object(ao_project_room, 'SYNC_WAIT_INTERRUPT', stub):
             result = self.service.ao_room_sync(self.room, wait_seconds=45)
-        # FakeClock advances inside a reconciling iteration too (a flock retry or delegate poll's
-        # real sleep routes through the patched stdlib time), so the stop reason is whichever the
-        # measured loop reaches first — all three are the documented non-settlement reasons.
-        self.assertIn(result['wait']['reason'], ('timeout', 'budget', 'interrupted'))
-        self.assertGreaterEqual(result['wait']['iterations'], 3)
+        self.assertEqual(result['wait']['reason'], 'interrupted')
+        self.assertEqual(result['wait']['iterations'], 3)
         self.assertEqual(latest.call_count, 1)
         # The wait object keeps its exact existing shape.
         self.assertEqual(set(result['wait']),
                          {'requested_seconds', 'reason', 'settled', 'iterations', 'elapsed_seconds',
                           'iteration_seconds', 'lock_wait_seconds'})
         self.assertEqual(result['rate_limits']['used_percent'], 95)
+        # wait() is offered the poll interval (at most five seconds) once per non-terminal pass.
+        self.assertEqual(len(stub.waits), 2)
+        self.assertTrue(all(0 < seconds <= 5 for seconds in stub.waits))
 
     def test_reading_never_changes_dispatch_or_state(self):
         self._events((90, 300, 2100), (95, 0, 1800))
