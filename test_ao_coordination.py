@@ -10,6 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+import ao_coordination
 import ao_native_outcome
 import ao_project_room as ao
 import ao_workflow
@@ -444,6 +445,13 @@ class PathValidationTests(CoordinationFixture):
                     self.service.ao_room_assignment_open('ao-x', 'V1', 'ao-y', paths, 'i', 'a')
         with self.assertRaises(RoomError):
             self.service.ao_room_assignment_open('ao-x', 'V1', 'ao-y', ['x'] * 201, 'i', 'a')
+        for paths in (['.github/workflows/ci.yml'], ['.gitignore']):
+            with self.subTest(paths=paths):
+                self.assertEqual(ao_coordination._owned_paths(paths), paths)
+        for paths in (['.git/x'], ['a/.git/x'], ['a\x00b']):
+            with self.subTest(paths=paths):
+                with self.assertRaises(RoomError):
+                    ao_coordination._owned_paths(paths)
 
     def test_rename_and_delete_scope(self):
         # Deleting an owned file records D; renaming inside owned paths passes.
@@ -761,7 +769,7 @@ class GateTests(CoordinationFixture):
         self.assertFalse(result['passed'])
         with self.assertRaises(RoomError):
             self.accept_b()
-        with self.assertRaisesRegex(RoomError, 'tampered_checkpoint'):
+        with self.assertRaisesRegex(RoomError, 'missing_checkpoint'):
             self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
 
     def test_scope_drift_refuses_at_accept_and_handback(self):

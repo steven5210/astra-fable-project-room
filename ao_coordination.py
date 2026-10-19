@@ -207,7 +207,8 @@ def _relative_path(value, label):
         size = len(value.encode())
     except UnicodeEncodeError:
         raise RoomError(label + " entries must be valid UTF-8") from None
-    if size > OWNED_PATH_BYTES or "\\" in value or value.startswith("/") or value.startswith("."):
+    if (size > OWNED_PATH_BYTES or "\\" in value or "\0" in value
+            or value.startswith("/") or value.startswith("./")):
         raise RoomError(label + " entries must be normalized relative repository paths")
     if any(part in ("", ".", "..", ".git") for part in value.split("/")):
         raise RoomError(label + " entries must be normalized relative repository paths")
@@ -385,7 +386,8 @@ def handback_record(service, room_id, assignment_id, acceptance_request_id):
         try:
             checkpoint = service.checkpoint(room_dir, state)
         except RoomError as exc:
-            _refuse(directory, lifecycle, operation, "tampered_checkpoint", str(exc)[:200])
+            reason = "tampered_checkpoint" if state.get("checkpoint") else "missing_checkpoint"
+            _refuse(directory, lifecycle, operation, reason, str(exc)[:200])
         expected = {"spec_sha256": spec["sha256"], "candidate_sha256": checkpoint["candidate_sha256"],
                     "evidence_sha256": state["checkpoint_sha256"]}
         acceptance = None
