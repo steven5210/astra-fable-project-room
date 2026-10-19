@@ -1,8 +1,9 @@
 # One additional AO charter review
 
 This narrow operation records an actual new user approval for **one** additional
-Fable charter review after a normal AO room has consumed exactly three
-`spec_review` intents. It is available only once in that room's lifetime. It does
+Fable charter review after a normal AO room's debate budget is exhausted by
+three completed `spec_review` turns that did not accept, while the room's
+dispatched review intents remain below the hard ceiling of five. It is available only once in that room's lifetime. It does
 not renew source-review or independent acceptance allowances, release provider
 holds, reset counters, replace a room/session, or dispatch a model.
 
@@ -43,7 +44,7 @@ clears the current checkpoint pointer.
    `spec_review` when the existing provider and semantic holds permit it. Only the
    exact audited charter, native session and unchanged accepted candidate qualify.
    Before state projection or any AO POST, the controller saves one immutable,
-   content-addressed consumption record containing the exact fourth request
+   content-addressed consumption record containing the exact additional request
    identity and its grant. That durable intent consumes the allowance immediately,
    including when acknowledgement is lost or its native result fails. Deleting or
    relabeling the projected request cannot restore the allowance. The grant digest
@@ -67,7 +68,7 @@ availability.
 While the committed grant is unused, registering a different charter refuses
 before writing a spec or state. Reading the identical current revision remains
 idempotent. Registration after consumption retains its existing semantics and
-cannot grant a fifth review.
+cannot grant another review.
 
 A crash after the consumption record is written but before its request reaches
 saved room state is a separate, fail-closed hold. Status and new mutations refuse
@@ -89,7 +90,7 @@ The grant permits these existing maintenance operations while retaining its
 original evidence and allowance:
 
 - Authorized operating instructions may append through `ao_room_instruction_stage`
-  before or after the fourth review. Original amendment pointers remain an exact
+  before or after the additional review. Original amendment pointers remain an exact
   prefix; all referenced bytes, hashes and delivered-instruction evidence are
   revalidated. Staging an instruction neither resumes work nor creates a review.
 - An explicit `ao_room_outcome_audit` may establish the first native source or
@@ -116,6 +117,6 @@ Identical reads of already committed provider and configured routing results
 remain available. Reviewer recovery still requires an unused reviewer; a grant's
 retained independent acceptance already makes that recovery lane ineligible.
 
-The operation preserves historical evidence and cannot automatically grant a
-fifth review. Implementation, independent acceptance, integration and publication
+The operation preserves historical evidence and cannot automatically grant
+another review. Implementation, independent acceptance, integration and publication
 continue under their existing authorization and exact-spec requirements.

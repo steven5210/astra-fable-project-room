@@ -1,6 +1,6 @@
 # Pre-acceptance exact-spec review extension
 
-This is the second lane of the same one-time, once-per-room fourth charter-review
+This is the second lane of the same one-time, once-per-room additional charter-review
 allowance described in [one additional AO charter review](one-charter-review-extension.md).
 That guide's receipt mechanics, durability, status reporting and maintenance
 operations during an unused grant all apply unchanged; this guide covers only
@@ -8,7 +8,7 @@ what differs when the grant is sought **before any independent acceptance**,
 against an unaccepted, unverified candidate whose latest completed engineering
 turn proposed a scope change rather than a finished implementation.
 
-Both lanes share the same room-wide counter and the same single fourth-review
+Both lanes share the same room-wide counter and the same single additional-review
 intent. Granting one lane consumes the room's only additional review exactly as
 granting the other would; neither renews, renumbers or coexists with the other
 inside one room.
@@ -30,17 +30,22 @@ Use this lane instead when:
 A normal `scope_change` report ordinarily just blocks further implementation
 and correction turns until a revised spec is registered and freshly agreed.
 This lane lets the user instead authorize **one** additional charter review of
-that proposed revision directly, without discarding the three already-consumed
-spec-review attempts or requiring a full independent acceptance cycle first.
+that proposed revision directly, without discarding the three non-accepting
+reviews that exhausted the debate budget or requiring a full independent acceptance cycle first.
 
 ## Preconditions
 
-- Exactly three retained `spec_review` intents, none of them this room's
-  already-exhausted fourth.
+- Three completed `spec_review` turns that did not accept (the exhausted
+  debate budget), with fewer than five dispatched review intents in total.
 - Zero retained acceptances (`state["acceptances"] == []`).
-- The retained agreed handoff's spec record matches the last of those three
-  reviews; registering the next charter (below) does not disturb that
-  retained handoff pointer.
+- The retained agreed handoff keeps the review that agreed its spec record in
+  its saved `agreement`. Under debate counting that accepting review always
+  precedes the non-accepting reviews that exhausted the budget — a handoff
+  always needs an accepting review, so this lane is reachable only when later
+  reviews (of the handoff revision or of revised charters) exhausted it — so
+  the anchor is the handoff's agreed review, not the chronologically latest
+  review. Registering the next charter (below) does not disturb that retained
+  handoff pointer.
 - The named scope-change request is the room's single latest completed
   `implementation`/`correction` request — not an earlier one superseded by a
   later send, and not still pending. Its engineering report (full form or the
@@ -83,7 +88,7 @@ spec-review attempts or requiring a full independent acceptance cycle first.
    spec/handoff") is preserved verbatim as the proposal's
    `rejected_report_diagnostic` evidence, exactly as a malformed delegate
    attribution already is, and still supports the proposal; the audit never
-   re-validates, repairs or normalizes that diagnostic. The fourth review
+   re-validates, repairs or normalizes that diagnostic. The additional review
    reviews the registered charter, not the engineer's report, and the ordinary
    correction path already refuses any further correction after a
    `scope_change` outcome, so without this lane an incomplete `scope_change`
@@ -102,7 +107,7 @@ spec-review attempts or requiring a full independent acceptance cycle first.
    candidate live, exactly as the original lane re-validates the retained
    accepted candidate; a worktree or evidence change since the grant refuses
    the send with the same live check the audit itself performs. The send
-   consumes the room's one fourth-review intent immediately and durably, the
+   consumes the room's one additional review intent immediately and durably, the
    same as the original lane.
 
 `ao_room_status.spec_review_extension` reports `lane: "pre_acceptance"` and the
@@ -121,7 +126,7 @@ the ordinary routing validation that delegating sends already use
 (`.claude/settings.local.json` and the pinned `.claude/agents/` definitions)
 and the private routing guard bytes must still match their pins. The audit,
 both grant inspections, pending-receipt reconciliation, the identical replay
-of a committed grant and the fourth send — before its consumption record,
+of a committed grant and the additional send — before its consumption record,
 request intent or POST — refuse with that validation's own message, for
 example "Private routing guard changed" or "Pinned routing file changed:
 .claude/agents/pr-sonnet.md", and save no audit, grant receipt, grant
@@ -140,7 +145,7 @@ them into the audited native history; the audit evidence then records each one
 under `settled_failures` (its request id, turn and provider-turn ids,
 settlement kind, its outcome-resume path, and the exact receipt,
 outcome-resume and outcome digests that settled it), and send admission
-refuses the fourth review if any of that evidence is missing, modified or
+refuses the additional review if any of that evidence is missing, modified or
 re-pointed. Each settled request must also carry the bound engineer identity
 in force when it was sent (the engineer role and every stored binding field,
 including harness, AO session, conversation and branch, with the model and
@@ -167,7 +172,7 @@ remain strict and unaffected; active, interrupted, cancelled, unowned failed
 and unverified recovered native turns still refuse the audit or admission. An
 audit taken before this change on a room whose settled failures were already
 admitted through a provider transition must be repeated, because its evidence
-now lists them. For the same reason, a fourth-review grant committed before
+now lists them. For the same reason, an extension grant committed before
 this change on such a room, used or not, records no granted settlements and now
 refuses ordinary validation, so room status, sync, handoff, send and the other
 room operations that run it refuse; because the extension is granted only once,
@@ -182,9 +187,9 @@ and the normalized terminal digest. A later-format proof never validates
 under the earlier rule, an earlier-format proof refuses as the current head,
 and no retained record is ever rewritten to pass.
 
-## After the fourth review
+## After the additional review
 
-Reaching agreement on the fourth review does not itself finish anything: the
+Reaching agreement on the additional review does not itself finish anything: the
 room still needs a genuine implementation turn against the newly agreed
 charter (a fresh handoff and a new `implementation`-purpose send under its own
 request identity, distinct from the scope-change proposal's own request),
@@ -193,7 +198,7 @@ about this lane shortens or bypasses that remaining lifecycle.
 
 ## What stays unchanged
 
-When this lane's fourth review completes with a retained negative or
+When this lane's additional review completes with a retained negative or
 noncanonical-negative verdict and the operator registers the exact corrected
 next revision with human approval for one more exact-spec review, the room's
 separate one-ever re-review continuation applies; see

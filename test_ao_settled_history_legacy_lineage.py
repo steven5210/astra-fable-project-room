@@ -223,6 +223,7 @@ class LegacyLineageFixture(PreAcceptanceFixture):
         self.service.ao_room_sync(self.room)
         self.final_request_id = _RESUME
         self.assertEqual(self.state()['requests'][self.final_request_id]['state'], 'completed')
+        self.exhaust_debate()
         self.register()
         self.assert_lineage_shape()
 
@@ -596,6 +597,15 @@ class LegacyHeadFixture(LegacyLineageFixture):
             with patch('ao_quality_review.inspect', return_value=minimal):
                 return super().send(purpose, key)
         return super().send(purpose, key)
+
+    def exhaust_debate(self):
+        # The same deliberately bypassed send-time lane as in send(): the deliberately
+        # legacy-shaped head is this fixture's point, and ao_quality_review's own narrower
+        # current-head check (a different lane covered elsewhere) would refuse the debate sends.
+        minimal = {'source': None, 'pending': [], 'equivalence': None,
+                   'equivalent_amendment_sha256': []}
+        with patch('ao_quality_review.inspect', return_value=minimal):
+            super().exhaust_debate()
 
 
 class LegacyHeadTests(LegacyHeadFixture):

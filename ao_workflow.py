@@ -81,10 +81,14 @@ def latest(state, purposes):
     return max(items, key=lambda r: r["created_order"]) if items else None
 
 
-def spec_review_report(service, directory, state, request):
-    spec = service.spec(directory, state)
-    if not request or request["spec_record_sha256"] != state["spec_record_sha256"]:
-        raise RoomError("The current exact spec requires completed Fable agreement")
+def strict_verdict(directory, state, request, spec):
+    """The strict verdict contract for one completed spec_review request against one immutable spec record.
+
+    The agreement path passes the room's current spec record; the debate-budget classifier passes
+    each request's own bound record. Both paths share every check here and cannot diverge: usable
+    outcome, owning epoch, request identity against the bound engineer session, canonical decision,
+    exact revision and SHA of the given record, nonempty interpretation and a string findings list.
+    """
     from ao_outcomes import usable
     usable(directory, request)
     verdict = final_json(directory, request)
@@ -101,12 +105,24 @@ def spec_review_report(service, directory, state, request):
     return verdict
 
 
+def accepting_verdict(verdict):
+    """The accepting decision on an already shape-validated verdict: accept with no BLOCKER findings."""
+    return verdict["decision"] == "accept" and not any(f.startswith("BLOCKER:") for f in verdict["findings"])
+
+
+def spec_review_report(service, directory, state, request):
+    spec = service.spec(directory, state)
+    if not request or request["spec_record_sha256"] != state["spec_record_sha256"]:
+        raise RoomError("The current exact spec requires completed Fable agreement")
+    return strict_verdict(directory, state, request, spec)
+
+
 def agreement(service, directory, state):
     request = latest(state, {"spec_review"})
     import ao_spec_verdict_recovery
     recovered = ao_spec_verdict_recovery.agreement(service, directory, state, request)
     verdict = recovered["verdict"] if recovered else spec_review_report(service, directory, state, request)
-    if verdict['decision'] != 'accept' or any(f.startswith('BLOCKER:') for f in verdict['findings']):
+    if not accepting_verdict(verdict):
         raise RoomError("Fable rejected, incompletely reviewed, or did not accept the exact current spec")
     spec = service.spec(directory, state)
     return {"agreed": True, "spec_revision": spec["revision"], "spec_sha256": spec["sha256"],

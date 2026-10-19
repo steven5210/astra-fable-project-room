@@ -1,12 +1,15 @@
 """One explicitly authorized exact-spec re-review after a consumed charter extension, with no renewal.
 
 This is a separate, once-per-room continuation -- not an extension of the ordinary review limit
-and not a refund of the consumed fourth charter review. It applies only when the room's one
-charter-review extension was granted and consumed, that fourth review completed with a retained
+and not a refund of the consumed additional charter review. It applies only when the room's one
+charter-review extension was granted and consumed, that additional review completed with a retained
 negative or noncanonical verdict, the operator registered the exact corrected next revision, and
-the actual human answer authorized one more exact-spec review. One named intent is consumed
-durably before POST; failed or uncertain delivery exhausts it. There is no banking, no chaining
-and no counter; any further substantive review needs a new product decision.
+the actual human answer authorized one more exact-spec review. The re-review is the intent after
+the extension's frozen granted position, and it is never admitted above the five-dispatch ceiling:
+when the extension review was itself the fifth dispatch, spec review in the room ends and the
+corrected charter is a new product decision. One named intent is consumed durably before POST;
+failed or uncertain delivery exhausts it. There is no banking, no chaining and no counter; any
+further substantive review needs a new product decision.
 """
 
 import copy
@@ -20,6 +23,7 @@ import time
 import ao_delegates
 import ao_project_room as ao
 import ao_review_extension as extension
+import ao_spec_review_budget
 import ao_workflow
 from ao_reviewer_recovery import _store_once
 from implementation import candidate_snapshot
@@ -30,7 +34,10 @@ KEY = 'spec_rereview'
 LANE = 'spec_rereview'
 CLAIM = 'spec_rereview_sha256'
 MEANING = ('One authorized exact-spec re-review intent only, of the exact corrected charter; the consumed '
-           'fourth review, its verdict and every other allowance stay unchanged')
+           'additional review, its verdict and every other allowance stay unchanged')
+CEILING_REFUSAL = ('The consumed extension review was the fifth spec-review dispatch; a re-review would '
+                   'exceed the five-dispatch ceiling. Preserve evidence and return the corrected charter '
+                   'to the user as a new product decision')
 MAX_RECORD_BYTES = 96_000_000
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # Mechanical source-result kinds map to exactly the operator-declared classifications.
@@ -181,17 +188,21 @@ def _inspect(service, directory, state, target, reconcile=False):
     if not committed:
         raise RoomError('Re-review requires the consumed one-time charter review extension')
     ext_record, ext_evidence = committed
+    granted_max = ext_record['maximum_spec_review_attempts']
     ext_reference = state['spec_review_extension']
     consumed = extension._consumption(directory, state, ext_reference)
-    if consumed is None or len(extension._reviews(state)) != extension.LIMIT + 1:
-        raise RoomError('Re-review requires the charter extension consumed by exactly one completed fourth review')
+    if consumed is None or len(extension._reviews(state)) != granted_max:
+        raise RoomError('Re-review requires the charter extension consumed by exactly one completed '
+                        'additional review')
+    if granted_max + 1 > ao_spec_review_budget.DISPATCH_CEILING:
+        raise RoomError(CEILING_REFUSAL)
     import ao_outcomes
     source = state['requests'].get(target['source_request_id'])
     if (source is None or source is not ao_workflow.latest(state, {'spec_review'})
             or source is not ao_outcomes.latest_for_role(state, 'engineer')
             or consumed['request_id'] != source['request_id']
             or source.get('state') != 'completed' or source.get('role') != 'engineer'):
-        raise RoomError('Re-review requires the consumed fourth review as its source, still the latest '
+        raise RoomError('Re-review requires the consumed additional review as its source, still the latest '
                         'retained engineer result')
     ao_workflow.completed_receipt(directory, source)
     from ao_model_boundaries import _authenticated_request
@@ -417,17 +428,24 @@ def validate(service, state, allow_pending=False):
             raise RoomError('Committed re-review grant was modified')
         saved = _audit(directory, record['inputs']['audit_sha256'])
         evidence = saved['evidence']
+        # The lane's position is the committed extension's frozen granted maximum, authenticated
+        # here by the same validate the audit path already ran: it is never the retired LIMIT
+        # constant, so an extension granted at a later position still resolves correctly.
+        ext_committed = extension.validate(service, state)
+        if not ext_committed:
+            raise RoomError('Re-review requires the consumed one-time charter review extension')
+        granted_max = ext_committed[0]['maximum_spec_review_attempts']
         if (record['evidence_sha256'] != ao.digest(evidence)
                 or record['before_state_sha256'] != evidence['state_sha256']
-                or len(extension._reviews(evidence['state'])) != extension.LIMIT + 1):
+                or len(extension._reviews(evidence['state'])) != granted_max):
             raise RoomError('Re-review audit chain changed')
         _retained(service, directory, state, evidence)
         consumed = _consumption(directory, state, reference)
         reviews = extension._reviews(state)
-        if not extension.LIMIT + 1 <= len(reviews) <= extension.LIMIT + 2:
+        if not granted_max <= len(reviews) <= granted_max + 1:
             raise RoomError('Re-review attempts were removed or exceeded the single authorized intent')
         claims = _claims(state)
-        if len(reviews) == extension.LIMIT + 2:
+        if len(reviews) == granted_max + 1:
             last = reviews[-1]
             import ao_engineering_model
             frozen = ao_engineering_model.binding_for_request(directory, state,
@@ -527,7 +545,10 @@ def admission(service, directory, state, message):
     if not committed:
         raise RoomError('An unused exact one-time re-review grant is required before its authorized intent')
     _, evidence = committed
-    if len(extension._reviews(state)) >= extension.LIMIT + 2:
+    granted_max = len(extension._reviews(evidence['state']))
+    if granted_max + 1 > ao_spec_review_budget.DISPATCH_CEILING:
+        raise RoomError(CEILING_REFUSAL)
+    if len(extension._reviews(state)) >= granted_max + 1:
         raise RoomError(EXHAUSTED)
     spec = service.spec(directory, state)
     target = evidence['target']
@@ -582,7 +603,8 @@ def consume(service, directory, state, request, message):
     The orphaned record remains a diagnosed hold even if native history is empty.
     """
     committed = validate(service, state)
-    if not committed or len(extension._reviews(state)) != extension.LIMIT + 1:
+    if (not committed
+            or len(extension._reviews(state)) != len(extension._reviews(committed[1]['state']))):
         raise RoomError('An unused exact one-time re-review grant is required before consuming its authorized intent')
     _, evidence = committed
     reference = state[KEY]

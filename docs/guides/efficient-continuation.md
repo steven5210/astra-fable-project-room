@@ -359,7 +359,7 @@ alone is insufficient when diagnosing premature completion.
 The operation changes only the three ignored routing files and their
 content-addressed guard, recording original and replacement bytes before writes.
 It retains the original preparation, executable binding, provider epochs, quota
-holds, requests and review counts. An existing fourth-review grant must already be consumed
+holds, requests and review counts. An existing review-extension grant must already be consumed
 by the completed accepted review of the current exact spec; an unused or rejected
 grant cannot be refreshed. A crash leaves ordinary routing blocked until the
 identical request reconciles unchanged evidence. While its intent is pending,

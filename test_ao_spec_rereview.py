@@ -20,22 +20,31 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import ao_project_room as ao
+import ao_spec_review_budget as budget
 import ao_spec_rereview as rereview
 import ao_workflow
 import project_room
 import project_room_mcp
 import project_room_runtime as runtime
 from test_ao_preacceptance_review_extension import PreAcceptanceFixture
-from test_ao_review_extension import ExecutableRuntimeMixin
+from test_ao_review_extension import ExecutableRuntimeMixin, ReviewExtensionFixture
 
-EXHAUSTED = 'fourth Fable review intent is exhausted'
+EXHAUSTED = 'additional Fable review intent is exhausted'
 REREVIEW_EXHAUSTED = 'one re-review intent is exhausted'
 
 
 class ReReviewFixture(PreAcceptanceFixture):
     """The consumed charter extension's fourth review completed with the noncanonical negative
     verdict; the operator then registered the corrected revision-3 charter whose first gate
-    declares a synthetic artifact path plus its bytes hash, exactly as an audited gate does."""
+    declares a synthetic artifact path plus its bytes hash, exactly as an audited gate does.
+
+    The counting shape is the retained one (as in Han's room): two accepting reviews, one
+    non-accepting review and the extension consumed as the fourth dispatch, so the re-review is
+    the fifth. The extension grant is minted under the retired completed-review eligibility --
+    the strict debate budget admits this shape's audit only with three non-accepting reviews,
+    while a retained grant minted under the old rule must still validate. The audit and extend
+    calls bind real evidence; only the eligibility counter is simulated, and every later
+    validation runs the real counters."""
 
     MESSAGE = 'Review the exact corrected specification revision 3.'
     REREVIEW_ID = 'spec-rereview'
@@ -49,12 +58,37 @@ class ReReviewFixture(PreAcceptanceFixture):
         self.spec3 = self.register_corrected()
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
         self.send('spec_review', 'fourth')
         self.fake.finish('engineer', json.dumps(self.source_verdict()))
         self.service.ao_room_sync(self.room)
+
+    def register(self):
+        if self.target_spec is None:
+            self.target_spec = self.service.ao_room_spec_put(self.room, 2,
+                'Review the newly authorized validation charter after the proposed scope change.',
+                self.gates, 'Astra approves this exact next charter under the actual scope decision')
+        return self.target_spec
+
+    def audit(self, **changes):
+        changes.setdefault('spec_revision', 2)
+        return super().audit(**changes)
+
+    def legacy_grant(self):
+        """Mint the one extension under the retained completed-review eligibility.
+
+        Three completed reviews stand where the strict debate budget sees only one
+        non-accepting review, exactly the position of a retained room whose grant predates
+        debate counting. The patched counter covers only the audit and grant calls; the bound
+        evidence, the consumption journal and every subsequent validation are real.
+        """
+        with patch.object(budget, 'debate_attempts', lambda directory, state: budget.DEBATE_LIMIT):
+            self.inputs = self.grant_inputs()
+            return self.service.ao_room_preacceptance_review_extend(**self.inputs)
 
     def source_verdict(self):
         """The retained noncanonical result: one JSON object, no canonical ``decision``."""
@@ -513,9 +547,11 @@ class ReReviewUnconsumedFixture(ReReviewFixture):
     """The extension is granted but the fourth intent was deliberately never sent."""
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
 
     def register_corrected(self):
         self.write_script()
@@ -524,7 +560,7 @@ class ReReviewUnconsumedFixture(ReReviewFixture):
 
 class ReReviewUnconsumedTests(ReReviewUnconsumedFixture):
     def test_extension_not_consumed_refuses_the_audit(self):
-        self.assert_refuses_without_mutation('consumed by exactly one completed fourth review',
+        self.assert_refuses_without_mutation('consumed by exactly one completed additional review',
             lambda: self.rereview_audit(source_request_id='implementation',
                                         source_receipt_sha256='0' * 64,
                                         source_final_text_sha256='0' * 64))
@@ -534,9 +570,11 @@ class ReReviewProseSourceFixture(ReReviewFixture):
     """The fourth review finished as plain prose, never one JSON object."""
 
     def through_fourth(self):
+        self.agree(decision='changes_required', key='charter-2')
+        self.agree(key='charter-3')
         self.propose_scope_change()
         self.spec2 = self.register()
-        self.extension_grant = self.grant()
+        self.extension_grant = self.legacy_grant()
         self.send('spec_review', 'fourth')
         self.fake.finish('engineer', 'The charter is refused in plain words.')
         self.service.ao_room_sync(self.room)
@@ -1333,6 +1371,97 @@ class ReReviewRoutingRefreshTests(ReReviewRoutingFixture):
         self.attempt_refresh()
         self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
         self.service.ao_room_handoff(self.room, str(self.repo))
+
+
+class ExtensionAtCeilingRereviewTests(ReviewExtensionFixture):
+    """The extension granted at four dispatches: one accepting charter review and three
+    non-accepting reviews exhaust the debate budget at dispatch 4, so the extension's own
+    consumed review is the fifth dispatch. The re-review audit then refuses above the
+    dispatch ceiling -- its single intent could never send -- instead of minting a lane."""
+
+    REREVIEW_ID = 'spec-rereview'
+    MESSAGE = 'Review the exact corrected specification revision 4.'
+
+    def setUp(self):
+        super().setUp()  # charter-1 accept, charter-2..4 changes_required
+        summary = budget.summary(self.directory(), self.state())
+        self.assertEqual((summary['debate_attempts'], summary['dispatches']), (3, 4))
+        self.spec3 = self.register()
+        self.audited = self.audit()
+        self.extension_grant = self.grant()
+        self.agree(decision='changes_required', revision=3, key='fifth')
+        self.spec4 = self.register_corrected()
+
+    def write_script(self):
+        self.script = self.repo / 'scope_gate.py'
+        self.script.write_text("from pathlib import Path\nassert Path('feature.txt').is_file()\n")
+        self.script_sha256 = ao.digest(self.script.read_bytes())
+        return self.script
+
+    def corrected_gates(self):
+        return [[sys.executable, '-B', str(self.script), self.script_sha256]] + [list(g) for g in self.gates]
+
+    def register_corrected(self):
+        self.write_script()
+        return self.service.ao_room_spec_put(self.room, 4,
+            'Review the corrected validation charter after the refused extension review.',
+            self.corrected_gates(),
+            'Astra approves this exact corrected charter under the actual product decision')
+
+    def audit_inputs(self, **changes):
+        source = self.state()['requests']['fifth']
+        raw = ao_workflow.raw_final_text(self.directory(), source)
+        inputs = {'room_id': self.room, 'spec_revision': 4, 'spec_sha256': self.spec4['sha256'],
+                  'source_request_id': 'fifth',
+                  'source_receipt_sha256': source['receipt_sha256'],
+                  'source_final_text_sha256': ao.digest(raw.encode()),
+                  'source_classification': 'changes_required',
+                  'request_id': self.REREVIEW_ID,
+                  'message_sha256': ao.digest(self.MESSAGE.encode()),
+                  'gate_artifacts': [str(self.script)],
+                  'native_session_id': self.NATIVE, 'native_owner_database': str(self.database)}
+        inputs.update(changes)
+        return inputs
+
+    def room_files(self):
+        return {str(p.relative_to(self.directory())): p.read_bytes()
+                for p in self.directory().rglob('*') if p.is_file()}
+
+    def test_rereview_audit_refuses_above_the_dispatch_ceiling(self):
+        # The consumed extension review was itself a non-accepting completed dispatch.
+        summary = budget.summary(self.directory(), self.state())
+        self.assertEqual((summary['debate_attempts'], summary['dispatches']), (4, 5))
+        posts = len(self.fake.posts)
+        before = self.room_files()
+        with self.assertRaisesRegex(ao.RoomError, 'five-dispatch ceiling'):
+            self.service.ao_room_spec_rereview_audit(**self.audit_inputs())
+        self.assertEqual(len(self.fake.posts), posts)
+        self.assertEqual(self.room_files(), before)
+        with self.assertRaisesRegex(ao.RoomError, 'Five Fable spec-review dispatches reached the room ceiling'):
+            self.send('spec_review', 'sixth')
+        self.assertEqual(len(self.fake.posts), posts)
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status['spec_review_budget']['dispatches'], 5)
+        self.assertFalse(status['spec_review_budget']['ordinary_review_capacity'])
+        import ao_review_extension
+        self.assertIsNotNone(ao_review_extension.validate(self.service, self.state()))
+
+
+class ExtensionRecordTamperTests(ReReviewFixture):
+    """The lane resolves its position through the committed extension's own validator, so a
+    tampered granted maximum surfaces as the extension's refusal, never silently renumbered."""
+
+    def test_modified_extension_maximum_refuses_through_the_extension_validator(self):
+        self.granted()
+        self.send_rereview()
+        self.finish_rereview()
+        reference = self.state()['spec_review_extension']
+        path = self.directory() / reference['receipt']
+        record = ao.read(path)
+        record['maximum_spec_review_attempts'] += 1
+        ao.atomic(path, record)
+        with self.assertRaisesRegex(ao.RoomError, 'Committed review-extension grant was modified'):
+            rereview.validate(self.service, self.state())
 
 
 if __name__ == '__main__':

@@ -11,10 +11,16 @@ new product decision.
 
 All of these must already be true:
 
-- The room's one charter-review extension was granted **and consumed** by a
-  fourth `spec_review` intent (either lane of the extension; see
+- The room's one charter-review extension was granted **and consumed** by one
+  additional `spec_review` intent at its granted position (either lane of the
+  extension; see
   [pre-acceptance exact-spec review extension](pre-acceptance-review-extension.md)).
-- That fourth review **completed** and its retained final result is a negative
+- The extension's granted position leaves room for the re-review: it is the
+  intent after the extension review and is never admitted above the
+  five-dispatch ceiling. When the extension review was itself the fifth
+  dispatch, spec review in the room ends there; the corrected charter is a
+  new product decision, not a re-review.
+- That additional review **completed** and its retained final result is a negative
   or noncanonical-negative verdict: a canonical `changes_required` decision, a
   canonical `accept` carrying a `BLOCKER:` finding, or exactly one JSON object
   in a noncanonical schema that cannot be read as the required verdict (for
@@ -26,9 +32,9 @@ All of these must already be true:
   `ao_room_spec_put` — exactly one revision above the reviewed one.
 - The actual human answer explicitly authorized one more exact-spec review.
 
-A completed fourth review whose verdict is a clean canonical `accept` makes
+A completed extension review whose verdict is a clean canonical `accept` makes
 the lane inapplicable (the room would already agree on registering the same
-spec). A prose-only or multi-object fourth result belongs to the format lanes
+spec). A prose-only or multi-object result belongs to the format lanes
 instead — see
 [one-use spec-verdict format recovery](spec-verdict-format-recovery.md) — and
 is refused here.
@@ -39,7 +45,7 @@ is refused here.
    immutable). If the correction changed a gate script, declare each artifact
    the re-review must pin in `gate_artifacts`.
 2. Call `ao_room_spec_rereview_audit` with `room_id`, `spec_revision`,
-   `spec_sha256`, `source_request_id` (the consumed fourth review's own
+   `spec_sha256`, `source_request_id` (the consumed extension review's own
    `request_id`), `source_receipt_sha256`, `source_final_text_sha256` (the
    SHA256 of its retained raw final text), `source_classification`,
    `request_id` (the one named intent), `message_sha256` (the SHA256 of the
@@ -78,7 +84,7 @@ Example (synthetic; ids and hashes are placeholders):
 project-room call ao_room_spec_rereview_audit --args '{
   "room_id": "ao-room", "spec_revision": 3,
   "spec_sha256": "<sha of the registered revision-3 spec>",
-  "source_request_id": "fourth", "source_receipt_sha256": "<sha>",
+  "source_request_id": "extension-review", "source_receipt_sha256": "<sha>",
   "source_final_text_sha256": "<sha of the retained raw final text>",
   "source_classification": "noncanonical_negative",
   "request_id": "spec-rereview",
@@ -90,7 +96,7 @@ project-room call ao_room_spec_rereview_grant --args '{
   "room_id": "ao-room", "audit_sha256": "<from the audit>",
   "authorization": "User answered yes to one re-review of the corrected charter.",
   "authorization_reference": "The retained operator answer and where it was recorded.",
-  "diagnosis": "The consumed fourth review returned a retained negative verdict on the prior charter."}'
+  "diagnosis": "The consumed extension review returned a retained negative verdict on the prior charter."}'
 project-room call ao_room_send --args '{
   "room_id": "ao-room", "role": "engineer", "purpose": "spec_review",
   "request_id": "spec-rereview",
@@ -127,9 +133,9 @@ project-room call ao_room_send --args '{
   the audited evidence stale, before the intent is consumed or after it is
   agreed.
 - A routing refresh is not supported in this lane. The existing
-  fourth-review refresh guard requires the room agreement to be the consumed
-  fourth review's own; after a re-review grant there is no agreement, and
-  after an accepted re-review the agreement belongs to that fifth review, so
+  refresh guard requires the room agreement to be the consumed
+  extension review's own; after a re-review grant there is no agreement, and
+  after an accepted re-review the agreement belongs to the re-review, so
   the guard refuses the refresh before any `routing-refresh/` journal write
   and the room is never stranded. Validation also pins the audited
   `routing_refresh` pointer itself, so a tampered pointer refuses.

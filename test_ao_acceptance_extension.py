@@ -684,18 +684,23 @@ class AcceptanceRecordContinuationTests(AcceptanceContinuationFixture):
 
 
 class CharterAndAcceptanceContinuationTests(AcceptanceContinuationFixture):
-    spec_review_count = 3
+    # One accepting charter review; the three non-accepting reviews of revision 2 below
+    # exhaust the debate budget while staying under the five-dispatch ceiling.
+    spec_review_count = 1
     last_review_decision = 'approved'
 
     def test_consumed_fourth_charter_and_acceptance_grants_preserve_both_histories(self):
         accepted = self.service.ao_room_accept(self.room, 'prior-3')
-        spec = self.spec(2)
-        audit = self.service.ao_room_spec_review_extension_audit(self.room, 2, spec['sha256'],
+        self.spec(2)
+        for number in (2, 3, 4):
+            self.agree(decision='changes_required', revision=2, key='debate-' + str(number))
+        spec = self.spec(3)
+        audit = self.service.ao_room_spec_review_extension_audit(self.room, 3, spec['sha256'],
                     accepted['candidate_sha256'], self.NATIVE, str(self.database))
         self.service.ao_room_spec_review_extend(self.room, audit['audit_sha256'],
                     'Actual synthetic user approval of one further charter review.',
                     'The approved next charter needs its one additional review.', 'grant-fourth-charter')
-        self.agree(revision=2, key='fourth-charter')
+        self.agree(revision=3, key='fourth-charter')
         self.service.ao_room_handoff(self.room, str(self.repo))
         self.send('implementation', 'second-charter-implementation')
         self.fake.finish('engineer', json.dumps(self.report()))

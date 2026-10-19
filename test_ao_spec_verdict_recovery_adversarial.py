@@ -81,8 +81,9 @@ class VerdictRecoveryAdversarialTests(Fixture):
         self.assertEqual(sum(r.get('purpose') == 'spec_review' for r in state['requests'].values()), 3)
         self.assertEqual(sum(r.get('role') == 'reviewer' for r in state['requests'].values()), 0)
         self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
-        with self.assertRaises(ao.RoomError):
-            self.send('spec_review', 'not-a-free-fourth-review')
+        self.agree(key='fourth-review'); self.agree(key='fifth-review')
+        with self.assertRaisesRegex(ao.RoomError, 'reached the room ceiling'):
+            self.send('spec_review', 'not-a-free-sixth-review')
         self.implement()
         self.assertTrue(self.service.ao_room_status(self.room)['agreement']['agreed'])
         self.send('correction', 'normal-later-correction')
