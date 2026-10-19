@@ -15,12 +15,10 @@ invents a second shape for the create-once journal.
 """
 
 import copy
-import json
 import os
 from pathlib import Path
 import re
 import sqlite3
-import stat
 import time
 import xml.etree.ElementTree as ET
 
@@ -40,7 +38,8 @@ AGENT_TOOLS = frozenset(('Agent', 'Task'))
 NOTIFICATION_FIELDS = ('task-id', 'tool-use-id', 'output-file', 'status', 'summary', 'note')
 TERMINAL_NOTIFICATION_STATUS = frozenset(('completed', 'failed', 'cancelled', 'stopped', 'error'))
 NO_PATCH = {'acknowledged': False, 'error': None, 'response_sha256': None}
-MAX_TRANSCRIPT_BYTES = 64_000_000
+MAX_TRANSCRIPT_BYTES = ao_native_outcome.MAX_TRANSCRIPT_BYTES  # re-export retained for callers/tests; production reads the shared constant directly
+MALFORMED_CHILD_EVIDENCE = 'The retained native transcript contains a malformed row; child evidence is unknown'
 AUDIT_MEANING = ('Current transition evidence only. The audit wrote nothing; a transition reobserves this exact '
                  'evidence under the room lock and writes one create-once intent. A configured-model change then '
                  'sends exactly one guarded AO conversation settings PATCH before it can commit, while a '
@@ -351,8 +350,14 @@ def _require_qualification_unchanged(stored, fresh):
                         'disappeared; a fresh audit is required')
 
 
-def _read_transcript(path_value, native_session_id):
-    """Read the complete plain native transcript with the ownership rules the outcome lane already uses."""
+def _read_transcript(path_value, native_session_id, prefix_bytes=None):
+    """Read the complete plain native transcript with the ownership rules the outcome lane already uses.
+
+    Returns the shared reader's dict (``sha256``, ``size``, ``records``, ``events``, ``offsets``,
+    ``ends``, ``prefix_sha256``); see ``ao_native_outcome.read_complete_transcript``. Every row must be
+    a JSON object: this lane has no use for a bare scalar/list row, so that shape refusal is enforced
+    here rather than deferred to whichever caller happens to inspect ``events`` next.
+    """
     if not isinstance(path_value, str) or not path_value:
         raise RoomError('Supply the exact retained native transcript path')
     path = Path(path_value)
@@ -360,21 +365,14 @@ def _read_transcript(path_value, native_session_id):
             or any(part.is_symlink() for part in (path, *path.parents))):
         raise RoomError('Use the exact owned native transcript without symlinks; its file name must be the retained '
                         'provider session identity plus .jsonl')
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise RoomError('The retained native transcript is unavailable') from exc
-    with os.fdopen(descriptor, 'rb') as stream:
-        before = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022
-                or before.st_size > MAX_TRANSCRIPT_BYTES):
-            raise RoomError('Native transcript ownership, type or size is unsafe')
-        raw = stream.read(MAX_TRANSCRIPT_BYTES + 1)
-        after = os.fstat(stream.fileno())
-    if (len(raw) != before.st_size or (before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_ino, after.st_size, after.st_mtime_ns)):
-        raise RoomError('Native transcript changed while it was being observed')
-    return raw
+    reading = ao_native_outcome.read_complete_transcript(
+        path, unsafe_message='Native transcript ownership, type or size is unsafe',
+        changed_message='Native transcript changed while it was being observed',
+        malformed_message=MALFORMED_CHILD_EVIDENCE,
+        unavailable_message='The retained native transcript is unavailable', prefix_bytes=prefix_bytes)
+    if any(not isinstance(row, dict) for row in reading['events']):
+        raise RoomError(MALFORMED_CHILD_EVIDENCE)
+    return reading
 
 
 def _notification_fields(text):
@@ -605,24 +603,39 @@ def child_evidence(raw, native_session_id, workspace, guard_sha256s=None):
     without a correlated owned result, a foreground launch without a completed projection or failed-launch result,
     a background launch without its exact terminal SDK notification, a notification naming no recorded parent
     launch, and any ambiguous, torn or conflicting duplicate all refuse instead of being assumed successful.
+
+    ``raw`` accepts either the retained bytes of a complete transcript or an already-parsed list of
+    rows (the shape every production caller passes, from the shared reader's own ``'events'``, so its
+    behaviour is unchanged by the two bounds below). A bytes/bytearray ``raw`` longer than
+    ``ao_native_outcome.MAX_TRANSCRIPT_BYTES`` refuses with the same unsafe message the file-reading
+    lane uses, before anything is parsed; an admitted one is fed to ``iter_transcript_records`` in
+    ``ao_native_outcome.TRANSCRIPT_READ_CHUNK`` slices rather than as one single chunk, so one record's
+    pending-buffer bound stays meaningful instead of the whole bytes object counting as one chunk. A
+    list ``raw`` longer than ``ao_native_outcome.MAX_TRANSCRIPT_RECORDS`` refuses with the shared
+    record-count budget message.
     """
     guard_sha256s = _guard_digests(guard_sha256s)  # normalised once: a one-shot iterable must serve every result
-    if not isinstance(raw, bytes):
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > ao_native_outcome.MAX_TRANSCRIPT_BYTES:
+            raise RoomError('Native transcript ownership, type or size is unsafe')
+        chunk_bytes = ao_native_outcome.TRANSCRIPT_READ_CHUNK
+        slices = (bytes(raw[start:start + chunk_bytes]) for start in range(0, len(raw), chunk_bytes))
+        rows = (row for _, _, row in
+                ao_native_outcome.iter_transcript_records(slices, malformed_message=MALFORMED_CHILD_EVIDENCE))
+    elif isinstance(raw, list):
+        if len(raw) > ao_native_outcome.MAX_TRANSCRIPT_RECORDS:
+            raise RoomError(ao_native_outcome.TRANSCRIPT_RECORD_COUNT_REFUSAL)
+        rows = raw
+    else:
         raise RoomError('The retained native transcript is unreadable')
     if not isinstance(native_session_id, str) or not native_session_id:
         raise RoomError('The retained native session identity is unavailable; child evidence is unknown')
     if not isinstance(workspace, str) or not workspace:
         raise RoomError('The retained native workspace is unavailable; child evidence is unknown')
     launches, tools, results, notifications, seen_rows = {}, {}, {}, {}, {}
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError as exc:
-            raise RoomError('The retained native transcript contains a malformed row; child evidence is unknown') from exc
+    for row in rows:
         if not isinstance(row, dict):
-            raise RoomError('The retained native transcript contains a malformed row; child evidence is unknown')
+            raise RoomError(MALFORMED_CHILD_EVIDENCE)
         identity = row.get('uuid')
         if isinstance(identity, str) and identity:
             stamp = ao.digest(row)
@@ -1045,11 +1058,11 @@ def _observe(service, directory, state, binding, expected, owner_database, trans
         raise RoomError('The retained native owner evidence workspace differs from the prepared engineer worktree')
     if owner['ao_conversation_id'] != binding['conversation_id'] or owner['active_branch_id'] != binding['branch_id']:
         raise RoomError('The retained native owner evidence conversation or branch differs from the bound engineer')
-    raw = _read_transcript(transcript_path, owner['provider_conversation_id'])
-    children = child_evidence(raw, owner['provider_conversation_id'], worktree,
+    reading = _read_transcript(transcript_path, owner['provider_conversation_id'])
+    children = child_evidence(reading['events'], owner['provider_conversation_id'], worktree,
                               guard_sha256s=guard_sha256s)
     return ({'settings': copy.deepcopy(snapshot.get('settings') or {}), 'controller': snapshot.get('controller'),
-             'history_sha256': history['history_sha256'], 'transcript_sha256': ao.digest(raw),
+             'history_sha256': history['history_sha256'], 'transcript_sha256': reading['sha256'],
              'native_owner': copy.deepcopy(owner)},
             {'snapshot': snapshot, 'history': history, 'children': children, 'owner': owner})
 
