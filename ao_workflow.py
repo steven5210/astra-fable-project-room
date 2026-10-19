@@ -18,6 +18,8 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
                       "remaining_gaps", "backlog", "routing_log", "spec_revision", "spec_sha256", "baseline_commit"}
 DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
                         "operator work with operator_requests ([] or valid entries); omission cannot clear it")
+CAPTURE_REQUIRED = "Acceptance requires a captured completed engineering result"
+REVIEW_TEXT_MAX_BYTES = 30000
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
@@ -400,7 +402,7 @@ def engineering_ready(service, directory, state):
     ao_delegates.assert_settled(service.root.parent, state, directory)
     request = latest(state, {"implementation", "correction"})
     if not request or not request.get("engineering_record"):
-        raise RoomError("Acceptance requires a captured completed engineering result")
+        raise RoomError(CAPTURE_REQUIRED)
     if state.get("provider_transition") and request.get("provider_epoch") != 2:
         raise RoomError("Acceptance requires a completed engineering result from the current provider epoch; historical results stay historical")
     from ao_outcomes import usable, observe
@@ -427,6 +429,66 @@ def engineering_ready(service, directory, state):
     if state.get("provider_transition") and record.get("provider_epoch") != request.get("provider_epoch"):
         raise RoomError("Captured engineering result belongs to another provider epoch")
     return request
+
+
+def engineering_capture(state):
+    """Read-only projection of the latest implementation/correction request's capture result.
+
+    Derived only from saved request fields: reads no file, runs no gate, observes nothing and
+    grants nothing. status is one of none, pending, held, capture_failed, captured, unobserved."""
+    request = latest(state, {"implementation", "correction"})
+    if request is None:
+        return {"status": "none"}
+    semantic = request.get("semantic_status") if isinstance(request.get("semantic_status"), dict) else {}
+    result = {"request_id": request["request_id"], "purpose": request.get("purpose"),
+              "request_state": request["state"],
+              "current": {"handoff": request.get("handoff_sha256") == state.get("handoff_sha256"),
+                          "spec_record": request.get("spec_record_sha256") == state.get("spec_record_sha256")}}
+    if request.get("engineering_record"):
+        result.update(status="captured", engineering_record_sha256=request.get("engineering_record_sha256"),
+                      result_candidate_sha256=request.get("result_candidate_sha256"))
+    elif request["state"] in ("submitted", "running"):
+        result["status"] = "pending"
+    elif request["state"] != "completed" or semantic.get("hold") or request.get("semantic_observation_error"):
+        result.update(status="held", semantic_kind=semantic.get("kind"))
+        if request.get("semantic_observation_error"):
+            result["semantic_observation_error"] = str(request["semantic_observation_error"])[:500]
+    elif request.get("engineering_error"):
+        result.update(status="capture_failed", engineering_error=str(request["engineering_error"])[:500])
+    else:
+        result["status"] = "unobserved"
+    return result
+
+
+def review_decision(directory, state, request):
+    """Read-only: the preserved reviewer verdict's decision for one completed reviewer request.
+
+    Reads the saved receipt through completed_receipt/final_json (digest-validated), compares the
+    verdict's identities with the request's bound review identities, requires the reviewer prompt's
+    mandatory review text, and reports whether a saved acceptance names the request. It never
+    approves, rejects or accepts anything; ao_room_accept itself only ever reads an approved
+    verdict's review text."""
+    if request.get("role") != "reviewer" or request.get("state") != "completed":
+        return None
+    accepted = any(isinstance(a, dict) and a.get("request_id") == request.get("request_id")
+                   for a in state.get("acceptances") or [])
+    from ao_response_normalization import ResponseFormatError
+    try:
+        verdict = final_json(directory, request)
+    except (RoomError, ResponseFormatError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {"decision": "unavailable", "reason": str(exc)[:200], "accepted": accepted}
+    expected = request.get("review")
+    if not isinstance(verdict, dict) or verdict.get("decision") not in ("approved", "rejected"):
+        return {"decision": "invalid", "reason": "decision_missing", "accepted": accepted}
+    if not isinstance(expected, dict) or not expected or any(verdict.get(k) != v for k, v in expected.items()):
+        return {"decision": "invalid", "reason": "identities_mismatch", "accepted": accepted}
+    from ao_project_room import nonempty
+    try:
+        # An unpaired surrogate arrives here as RoomError ("must be valid UTF-8 text") from nonempty.
+        nonempty(verdict.get("review"), "review", REVIEW_TEXT_MAX_BYTES)
+    except RoomError:
+        return {"decision": "invalid", "reason": "review_text_invalid", "accepted": accepted}
+    return {"decision": verdict["decision"], "accepted": accepted}
 
 
 def part_texts(prepared, policy):

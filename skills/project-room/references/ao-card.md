@@ -42,7 +42,8 @@ Rules for every phase:
   went, call the read-only `ao_room_timing`; its gap kinds name saved evidence,
   never causes. Report the
   rate-limit window label, its used percent or `not reported`, and its reset
-  time; treat the reading as advisory, never as headroom.
+  time — the `ao_room_sync` result carries it, so no extra status call is
+  needed; treat the reading as advisory, never as headroom.
 - `ao_room_progress.deliverables` (additive, read-only) folds the same task list
   into requirement labels, lineage and closure. Read `closure` for measured
   counts and deltas (never a percentage), `blockers`/`blockers_total` for named
@@ -135,7 +136,8 @@ the spec, policy, gates or summaries. Sync to terminal. The final report needs
 `outcome`, `implementation_complete`, `changes`, `tests_reported`,
 `review_findings`, `remaining_gaps`, `backlog`, `routing_log` and the exact
 spec, baseline and SHA fields. Read full receipts, not previews. In status,
-inspect `review_followups`, `enhancement_proposals` and `operator_requests`;
+inspect `review_followups`, `enhancement_proposals`, `operator_requests` and
+`engineering_capture` (the latest engineering request's read-only capture status);
 `findings` projects the engineer's provenance tokens read-only — read
 `required_open` and `preexisting_required_open` as required work (a preexisting
 defect that blocks the approved behavior is required, not cleanup), and the
@@ -175,6 +177,8 @@ Do not erase it or relaunch.
 `ao_room_send` role `reviewer`, purpose `acceptance_review`, with a focused
 request; sync to terminal. Read Fable's routing report against the actual ledger
 facts. On `rejected`, investigate, correct, reverify and send a new review.
+`review_decision` on each reviewer status row shows the saved verdict and whether
+it was accepted.
 `ao_room_accept` with that review's `request_id`. There are 3
 acceptance-review requests per room.
 **Stop:** allowance exhausted → [acceptance-review continuation](../../../docs/guides/acceptance-review-continuation.md),

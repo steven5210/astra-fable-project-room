@@ -54,7 +54,11 @@ def digest(value):
 
 
 def nonempty(value, label, maximum=8192):
-    if not isinstance(value, str) or not value.strip() or len(value.encode()) > maximum:
+    try:
+        invalid = not isinstance(value, str) or not value.strip() or len(value.encode()) > maximum
+    except UnicodeEncodeError:
+        raise RoomError(f"{label} must be valid UTF-8 text")
+    if invalid:
         raise RoomError(f"{label} must be nonempty text, at most {maximum} UTF-8 bytes")
     return value
 
@@ -1207,7 +1211,9 @@ class Service:
         if invalid:
             raise RoomError("wait_seconds must be finite and between 0 and 45")
         if wait_seconds == 0:
-            return self._sync_once(room_id)[0]
+            summary = self._sync_once(room_id)[0]
+            self._sync_rate_limits(summary, room_id)
+            return summary
         config_warning = None
         try:
             maximum = sync_wait_max_seconds(self.root)
@@ -1275,6 +1281,7 @@ class Service:
         if config_warning is not None:
             wait["config_warning"] = config_warning
         summary["wait"] = wait
+        self._sync_rate_limits(summary, room_id)
         return summary
 
     def _capture_recovery(self, directory, state, request):
@@ -1433,7 +1440,15 @@ class Service:
             if directory.is_relative_to(candidate):
                 raise RoomError("Room state must be outside the candidate")
             if ao_workflow.normal(state):
-                ao_workflow.engineering_ready(self, directory, state)
+                try:
+                    ao_workflow.engineering_ready(self, directory, state)
+                except RoomError as exc:
+                    capture = ao_workflow.engineering_capture(state)
+                    if str(exc) == ao_workflow.CAPTURE_REQUIRED and capture.get("status") == "capture_failed":
+                        raise RoomError("Verification requires a captured completed engineering result; request "
+                                        + capture["request_id"] + " recorded engineering_error: "
+                                        + capture["engineering_error"]) from exc
+                    raise
                 if str(candidate) != ao_workflow.handoff_record(directory, state)["worktree"]:
                     raise RoomError("Verify only the bound engineer candidate")
             before = candidate_snapshot(candidate)
@@ -1553,7 +1568,7 @@ class Service:
                 raise RoomError("Reviewer final response must be one JSON verdict") from exc
             if not isinstance(verdict, dict) or verdict.get("decision") != "approved" or any(verdict.get(k) != v for k, v in expected.items()):
                 raise RoomError("Reviewer rejected or did not approve the exact identities; inspect its saved receipt")
-            nonempty(verdict.get("review"), "review", 30000)
+            nonempty(verdict.get("review"), "review", ao_workflow.REVIEW_TEXT_MAX_BYTES)
             acceptance = {**expected, "request_id": request_id, "reviewer_session": request["session_id"],
                           "reviewer_model": request["model"], "workflow": state["workflow"], "review": verdict["review"],
                           "receipt_sha256": request["receipt_sha256"]}
@@ -1564,7 +1579,7 @@ class Service:
                 self.save(directory, state)
             return acceptance | {"accepted": True, "publication": "not performed"}
 
-    def request_summary(self, request):
+    def request_summary(self, request, directory=None, state=None):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
                   "reconciliation", "receipt", "receipt_sha256", "reroute_evidence", "usage", "purpose", "provider_epoch",
                   "result_candidate_sha256", "engineering_error", "normalization_capture_error",
@@ -1582,6 +1597,9 @@ class Service:
             result["model_identity"] = "contradicted"
             result["model_reroute"] = {k: str(v)[:500] for k, v in request["model_reroute"].items()
                                       if k in ("fromModel", "toModel", "providerTurnId", "reason", "at")}
+        if (directory is not None and state is not None and request.get("role") == "reviewer"
+                and request.get("state") == "completed"):
+            result["review_decision"] = ao_workflow.review_decision(directory, state, request)
         return result
 
     def summary(self, directory, state):
@@ -1630,13 +1648,14 @@ class Service:
                          spec_verdict_recovery_attempts=sum(r.get("purpose") == "spec_verdict_repair" for r in ordered),
                          spec_verdict_recovery=ao_spec_verdict_recovery.summary(directory, state),
                          engineer_context=ao_workflow.context_summary(state, directory),
+                         engineering_capture=ao_workflow.engineering_capture(state),
                          review_followups=ao_review_followups.summary(self, directory, state))
         return {**extra, "room_id": state["room_id"], "room_path": str(directory), "workflow": state["workflow"],
                 "project_path": state["project_path"], "feature": state["feature"], "ao_url": state["ao_url"],
                 "spec": state.get("spec"), "bindings": state["bindings"],
                 "latest_prompt": ao_prompt_metrics.latest_prompt(directory, state),
                 "reviewer_recovery": recovery_summary(self, state),
-                "requests": [self.request_summary(r) for r in visible],
+                "requests": [self.request_summary(r, directory, state) for r in visible],
                 "requests_truncated": len(state["requests"]) > 20, "checkpoint": state.get("checkpoint"),
                 "latest_verification": state["verifications"][-1] if state["verifications"] else None,
                 "latest_acceptance": state["acceptances"][-1] if state["acceptances"] else None,
@@ -1646,7 +1665,7 @@ class Service:
                           "includes_delegates": False, "is_context_occupancy": False,
                           "limitation": "AO-reported native counters, not subscription quota or billing. Delegate ledgers remain separate."}}
 
-    def _compact_status(self, result, state):
+    def _compact_status(self, result, state, directory):
         """The ``view="compact"`` projection: the same object minus the request and delegate bulk."""
         ordered = sorted(state["requests"].values(), key=ao_prompt_metrics.presentation_order)
         latest = {}
@@ -1656,7 +1675,7 @@ class Service:
         counts = {}
         for request in ordered:
             counts[request["state"]] = counts.get(request["state"], 0) + 1
-        result["requests"] = [self.request_summary(request) for request in selected]
+        result["requests"] = [self.request_summary(request, directory, state) for request in selected]
         result["request_counts"] = counts
         result["requests_truncated"] = len(ordered) > len(selected)
         delegate = result.get("delegate")
@@ -1672,22 +1691,43 @@ class Service:
                 delegate["routing"] = {key: routing[key] for key in
                                        ("status", "guard_sha256", "execution_policy", "agents")
                                        if key in routing}
+        result["rate_limits"] = self._rate_limits(state)
+        result["view"] = "compact"
+        return result
+
+    def _rate_limits(self, state):
+        """The provider's live rate-limit reading in the compact-status shape; advisory only.
+
+        Reads the registered native outcome source database for the latest engineer request's
+        session through ao_rate_limits.latest (already fail-soft). Never refuses, authorizes or
+        alters dispatch, holds or counters; an unavailable source reports its reason, never a guess.
+        """
         import ao_rate_limits
+        ordered = sorted(state["requests"].values(), key=ao_prompt_metrics.presentation_order)
+        latest = {}
+        for request in ordered:
+            latest[request["role"]] = request
         engineer = latest.get("engineer") or {}
         reading = ao_rate_limits.latest((state.get("native_outcome_source") or {}).get("database"),
                                         engineer.get("session_id"))
         if reading["available"]:
             window = reading["window"]
-            result["rate_limits"] = {"label": window["label"],
-                                     "used_percent": window["used_percent"] if window["reported"] else "not reported",
-                                     "resets_at": window["resets_at"],
-                                     "minutes_remaining_at_current_rate":
-                                         reading["burn"]["minutes_remaining_at_current_rate"],
-                                     "age_seconds": reading["age_seconds"]}
-        else:
-            result["rate_limits"] = {"unavailable_reason": reading["unavailable_reason"]}
-        result["view"] = "compact"
-        return result
+            return {"label": window["label"],
+                    "used_percent": window["used_percent"] if window["reported"] else "not reported",
+                    "resets_at": window["resets_at"],
+                    "minutes_remaining_at_current_rate":
+                        reading["burn"]["minutes_remaining_at_current_rate"],
+                    "age_seconds": reading["age_seconds"]}
+        return {"unavailable_reason": reading["unavailable_reason"]}
+
+    def _sync_rate_limits(self, summary, room_id):
+        """Attach the advisory rate-limit reading to one finished ao_room_sync result, once per call."""
+        try:
+            state = read(self.root / "rooms" / identifier(room_id) / "state.json")
+        except (OSError, ValueError):
+            summary["rate_limits"] = {"unavailable_reason": "room_state_unreadable"}
+            return
+        summary["rate_limits"] = self._rate_limits(state)
 
     def ao_room_status(self, room_id, view="full"):
         # State is atomically replaced, so status can remain available while a
@@ -1699,7 +1739,7 @@ class Service:
             raise RoomError("Unknown AO room; legacy rooms use the existing room_* tools")
         state = read(directory / "state.json")
         result = self.summary(directory, state)
-        return self._compact_status(result, state) if view == "compact" else result
+        return self._compact_status(result, state, directory) if view == "compact" else result
 
     def ao_room_progress(self, room_id, request_id=None, max_text_chars=400):
         # Read-only like status: one bounded observation, never a state write.

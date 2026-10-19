@@ -193,6 +193,9 @@ starting a reconciliation whose last measured iteration would overrun the
 requested wait, while the first iteration, lock acquisition or a slower later
 iteration can still exceed it. `settled` is true only when every owned request
 is terminal; an `uncertain` request still needs sync/recovery, never replay.
+The sync result also carries `rate_limits` in the compact-status shape, read
+once per call from the registered engineer's AO database — advisory only, never
+headroom and never authority.
 Saved status remains readable while a verification gate holds the mutation lock.
 Use `ao_room_list` to find saved AO rooms; it returns at most 50 metadata records
 with explicit truncation. Check legacy `room_list` before treating an ambiguous
@@ -715,7 +718,13 @@ still exist; an observation timeout does not prove primary completion or cancel 
 
 Run `ao_room_verify` on the intended candidate worktree. It must belong to the
 room's Git repository. Normal rooms require the unchanged captured Fable candidate
-in its bound worktree and a complete engineering report. This runs the spec's argv gates (no implicit shell) with a
+in its bound worktree and a complete engineering report. Status projects the latest
+implementation/correction request's capture result read-only as `engineering_capture`:
+`none` (no such request), `pending` (still active), `held` (semantic hold or
+observation error), `capture_failed` (an `engineering_error` was recorded, which the
+verification refusal names), `captured` or `unobserved`; its `current` flags only
+compare the request's saved handoff and spec-record digests against the room's
+present values, and the projection grants nothing. This runs the spec's argv gates (no implicit shell) with a
 pinned per-gate timeout, default 120 seconds, maximum 7200. Supply a larger budget
 when the known suite requires it. Gate programs are trusted authorized project
 commands, not a sandbox; do not put model calls or publication commands in them.
@@ -749,7 +758,12 @@ must inspect independently, stay read-only, and finish with one JSON object:
 ```
 
 Use `rejected` with actionable findings when appropriate. Sync its terminal native
-response, investigate findings, repair and reverify if needed. `ao_room_accept`
+response, investigate findings, repair and reverify if needed. Reviewer rows in
+status carry `review_decision`: `approved`, `rejected`, `invalid` (with reason
+`identities_mismatch`, `decision_missing` or `review_text_invalid`) or
+`unavailable` (with the refusal reason), plus `accepted` — derived read-only from the digest-validated saved
+verdict and the bound identities, so a completed reviewer turn by itself is
+neither. `ao_room_accept`
 accepts only an actual completed independent reviewer response with matching
 identities, intact logs and unchanged candidate bytes. The ordinary allowance is
 three acceptance-review requests per room across revisions. Further necessary

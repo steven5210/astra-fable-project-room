@@ -19,28 +19,41 @@ def stamp(moment):
     return moment.strftime("%Y-%m-%d %H:%M:%S.%f +0000 UTC")
 
 
+def create_database(path):
+    """An empty synthetic AO provider-event database at path."""
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE conversation_provider_events "
+                           "(session_id TEXT, method TEXT, received_at TEXT, payload_json TEXT)")
+
+
+def rate_limits_payload(percent, secondary=-1, resets=3600, secondary_resets=86400, label="five hour"):
+    """One account.rateLimits payload in the provider's own shape."""
+    return {"rateLimits": {"PrimaryUsedPercent": percent, "SecondaryUsedPercent": secondary,
+                           "PrimaryResetsInSeconds": resets, "SecondaryResetsInSeconds": secondary_resets,
+                           "PlanLabel": label, "CodexCapacity": None}}
+
+
+def write_event(database, session, method, moment, payload):
+    """Insert one provider-event row exactly as the AO bridge stores it."""
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO conversation_provider_events VALUES (?,?,?,?)",
+                           (session, method, stamp(moment), json.dumps(payload)))
+
+
 class RateLimitViewTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.database = Path(self.temporary.name).resolve() / "ao.db"
         self.now = datetime.datetime(2026, 10, 8, 0, 0, tzinfo=datetime.timezone.utc)
-        with sqlite3.connect(self.database) as connection:
-            connection.execute("CREATE TABLE conversation_provider_events "
-                               "(session_id TEXT, method TEXT, received_at TEXT, payload_json TEXT)")
+        create_database(self.database)
 
     def event(self, percent, seconds_ago, *, session="session-1", label="five hour", resets=3600,
               secondary=-1, secondary_resets=86400, method="account.rateLimits", payload=None):
         if payload is None:
-            payload = {"rateLimits": {"PrimaryUsedPercent": percent,
-                                      "SecondaryUsedPercent": secondary,
-                                      "PrimaryResetsInSeconds": resets,
-                                      "SecondaryResetsInSeconds": secondary_resets,
-                                      "PlanLabel": label, "CodexCapacity": None}}
+            payload = rate_limits_payload(percent, secondary, resets, secondary_resets, label)
         moment = self.now - datetime.timedelta(seconds=seconds_ago)
-        with sqlite3.connect(self.database) as connection:
-            connection.execute("INSERT INTO conversation_provider_events VALUES (?,?,?,?)",
-                               (session, method, stamp(moment), json.dumps(payload)))
+        write_event(self.database, session, method, moment, payload)
 
     def latest(self, **kwargs):
         return ao_rate_limits.latest(str(self.database), "session-1", now=self.now, **kwargs)
