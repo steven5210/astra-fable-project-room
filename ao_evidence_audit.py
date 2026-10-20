@@ -282,8 +282,16 @@ def _preparation_record(root, relative, expected, delegate_sha256, room_id):
                          and prepared.get("delegate_sha256") == delegate_sha256
                          and prepared.get("provider") in ("deepseek", "none", "qwen"))
     routing = prepared.get("routing")
-    _preparation_failure(isinstance(routing, dict) and type(routing.get("version")) is int
-                         and routing["version"] in (1, 2))
+    version = routing.get("version") if isinstance(routing, dict) else None
+    _preparation_failure(type(version) is int and version in (1, 2, 3))
+    if version == 3:
+        import ao_routing
+        if routing.get("execution_policy") != ao_routing.EXECUTION_POLICY:
+            raise AuditRefusal("preparation_unbound")
+        try:
+            ao_routing.recorded_agents(routing)
+        except RoomError:
+            raise AuditRefusal("preparation_unbound") from None
     for value in (routing.get("claude_config_dir"), prepared.get("worktree")):
         size = audit_io.bounded_bytes(value)
         _preparation_failure(size is not None and 0 < size <= audit_io.MAX_PATH_BYTES

@@ -134,6 +134,9 @@ monitor, use the network, or write the AO or delegate database. The DeepSeek led
 when applicable, is opened with SQLite `mode=ro`; symlinked and non-regular ledger
 paths are refused as unsafe.
 
+Version-3 preparations are audited with their qualification binding: the recorded
+execution policy and the source-qualified worker map must match the record.
+
 The version-1 closed report separates parent `primary` counters, proven native child
 `workers`, and `api_delegates`. Native assistant responses are grouped by bounded
 message ID: repeated snapshots count once, output uses the maximum snapshot, and
