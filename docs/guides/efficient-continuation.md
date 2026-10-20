@@ -214,6 +214,28 @@ because its `ao_workflow.PARTS` vocabulary does not contain the name —
 recovery is a forward fix on a controller that keeps the name, never a
 rewrite or removal of the delivered record.
 
+The one-time `evidence_closure_v1` amendment is carried through
+`ao_workflow.PARTS` exactly the same way — once per AO engineer session, fail
+closed: a new session receives it in its first packet, a retained session
+receives it once on its next ordinary engineer send (`spec_review`,
+`implementation`, or `correction`), and it stays under `undelivered_parts`
+until a `completed` or `settled_failure` engineer turn's verified receipt shows
+it was actually carried. A read-only status read, `setup`, `ao_room_prepare`, or
+a paused room never dispatches it by itself. It refines the lifecycle execution
+and closure, quality-first review, and finding provenance defaults above with an
+evidence-based handoff-assessment and finding-closure discipline, and documents
+the read-only, offline `ao_report_validate` draft-report syntax/shape check; it
+supersedes none of the frozen text or digests already recorded for those parts,
+and is delivered text only: it grants nothing. See the [Fable policy reference's
+matching section](../../skills/project-room/references/fable-policy.md#evidence-closure-one-time-part-evidence_closure_v1)
+for the exact delivered text. Rollback window: before the first engineer send
+after install, resyncing the previous plugin is safe; after a completed or
+settled engineer turn has carried this part, the previous controller's
+delivered-context check refuses that session's history because its
+`ao_workflow.PARTS` vocabulary does not contain the name — recovery is a forward
+fix on a controller that keeps the name, never a rewrite or removal of the
+delivered record.
+
 ## Finding-provenance delivery (AO rooms)
 
 The one-time `finding_provenance_v1` amendment is carried through

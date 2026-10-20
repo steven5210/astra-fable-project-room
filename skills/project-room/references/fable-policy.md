@@ -135,3 +135,27 @@ The retained AO engineer receives this text once, as the one-time workflow part 
 > Finding provenance (reporting default; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): in review_findings, remaining_gaps and backlog, tag each entry with whitespace-free tokens origin=introduced|preexisting|integration, scope=required|optional, disposition=fixed|open|deferred|decision_needed, and when known invariant=<name>, evidence=<reference> and owner=<unit or area>. A preexisting or integration issue that prevents the approved behavior from working is scope=required and stays a remaining gap; unrelated cleanup is scope=optional and stays separate. An ordinary in-scope fix needs no product decision: reserve disposition=decision_needed for an actual scope or contract choice. An untagged entry is read as unknown, never as resolved or optional. These tokens change no report field and grant nothing; the controller only reads them.
 
 The controller projects these tokens read-only into saved `ao_room_status.review_followups.engineering.findings`: per-field and overall counts, `by_origin`/`by_scope`/`by_disposition` histograms, the `required_open`, `preexisting_required_open`, `unknown_scope_open` and `decision_needed` counters, and bounded redacted items. A category never changes scope, resolves a finding, blocks anything or grants implementation or publication authority; an untagged entry is unknown, never resolved or optional, and a tagged `remaining_gaps` entry blocks acceptance exactly like an untagged one. The amendment is delivered text only: it changes no model, budget, guard, review allowance or existing room snapshot.
+
+## Evidence closure (one-time part `evidence_closure_v1`)
+
+The retained AO engineer receives this text once, as the one-time workflow part `evidence_closure_v1` (delivered through `ao_workflow.PARTS` exactly like `lifecycle_closure_v1` above — a new session receives it in its first packet, a retained session receives it once, carried on its next engineer send):
+
+> Evidence closure v1 (engineering default; refines the lifecycle execution and closure, quality-first review and finding provenance defaults, whose frozen text stays in force; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): before a lifecycle-sensitive unit is reported closed, give an evidence-based handoff assessment of its invariants — name the invariant, every production writer and entry point the unit actually touched, and the positive and adversarial proof exercised on the real production path — and state, per claim, which evidence kind backs it: applied change, worker-reported check, formal candidate verification or independent acceptance. Evidence that predates a later edit is stale for that edit, never carried forward silently. A required finding, gap or proof requirement stays open without a concrete basis: it closes only by citing the specific evidence that discharges it — a named test, a gate's actual output, or an inspected artifact with its digest — and a belief, a received result, an exited worker's silence or an unrelated passing check is never that basis; an item without it stays listed in remaining_gaps or review_findings with its reason, never marked resolved. Plan delegated work as connected units, not isolated outputs: each unit carries its parent requirement, the interfaces and verified anchors it depends on, the files it owns and the integration step that connects its result to the rest of the work; after integration, rerun the affected focused checks on the connected result before the handback, and no unit is reported done on its own evidence while its connection to the others is unverified. The read-only ao_report_validate operation (CLI or MCP) checks only the syntax and shape of one draft engineering report, lists every check it does not perform, writes nothing and calls no provider; a worker or the engineer may run it before a handback, but a successful result never shows authentication, delegate verification, readiness or acceptance, and the final engineering report keeps its existing format.
+
+In summary, the amendment asks for five things: (1) an evidence-based handoff
+assessment of every invariant a closed unit touched, naming writers, entry
+points and the positive/adversarial proof, with the evidence kind stated per
+claim; (2) a required finding, gap or proof requirement stays open without a
+concrete, citable basis — belief, a received result, an exited worker or an
+unrelated passing check is never that basis; (3) delegated work is planned as
+connected units carrying parent requirement, verified interfaces/anchors and
+owned files, with an integration step and a post-integration recheck before the
+unit is reported done; (4) the read-only, offline `ao_report_validate` operation
+validates only a draft report's syntax and shape, names what it does not check,
+and never itself shows authentication, delegate verification, readiness or
+acceptance; and (5) none of this adds a report field, changes a model, guard,
+budget or authority, or supersedes the frozen text of `lifecycle_closure_v1`,
+`quality_first_review_v1` or `finding_provenance_v1`, each of which stays in
+force unchanged. The amendment is delivered text only: it changes no model,
+budget, guard, review allowance or existing room snapshot, and grants no scope
+or execution permission by itself.

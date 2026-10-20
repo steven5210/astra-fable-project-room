@@ -75,6 +75,97 @@ it is a global default that takes effect in a room only after the updated plugin
 has been installed or resynced (see [Install and authenticate](../../README.md#install-and-authenticate));
 existing room snapshots and historical records already saved are not rewritten.
 
+## Draft report validation and evidence closure (AO rooms)
+
+The read-only `ao_report_validate` tool checks only the syntax and shape of one
+draft engineering report — the full report form or the compact
+`project_room_engineering_v2` form — against the same shared schema authoritative
+final capture uses. It takes one argument, `report_text` (a bounded string, never
+a path: at most 1,000,000 UTF-8 bytes, nesting depth at most 64), needs no
+room, provider or authentication, and is available from both the CLI and the
+bundled MCP server, where it is listed read-only. The exact local CLI form:
+
+```sh
+python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", ...}"}'
+```
+
+and, to avoid shell escaping for a large draft, the `--args-file` variant with a
+JSON file containing `{"report_text": "..."}`:
+
+```sh
+python3 project_room.py call ao_report_validate --args-file /absolute/path/to/args.json
+```
+
+(`--home`, when given, is a global option that precedes the subcommand —
+`python3 project_room.py --home /absolute/controller-home call ao_report_validate ...`
+— because the `call` subcommand does not re-accept it after `call` itself.)
+
+The result object reports `operation`, `validity_scope` (always
+`syntax_and_shape_only`), `syntax_shape_valid` (bool), `report_form` (`full`,
+`project_room_engineering_v2`, `unsupported`, or `null`), `diagnostics` (a list of
+`{field, message}` entries that block validity), `advisories` (a list of
+`{field, message}` entries that never change validity — a malformed
+`enhancement_proposals` entry is always advisory), `unperformed_checks` (always
+the same named list: `handoff_authentication`, `spec_identity_equality`,
+`compact_contract_delivery`, `controller_metadata_attachment`,
+`delegate_attribution_verification`, `engineering_readiness`,
+`findings_projection`, `capture_receipts`), and `limits`
+(`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
+failures — a non-string, empty, oversized or invalid-UTF-8 `report_text`, or
+nesting past the admitted depth — are refusals (a JSON error, CLI exit 2), never
+diagnostics; a malformed syntax or root shape is instead a diagnostic on field
+`$`. The full form keeps whatever unknown fields it is given, including a
+model-supplied `controller_metadata`; the compact form refuses a model-supplied
+`controller_metadata` exactly as the existing compact-contract projection does.
+
+The operation itself writes nothing, creates no home or config, and calls no
+provider from its own entry — a fact about this operation, not a claim that the
+whole CLI or MCP process starts up without ever touching the filesystem (ordinary
+controller-home provisioning at process startup is pre-existing and unchanged).
+A passing result is never evidence of handoff authentication, delegate
+attribution, engineering readiness or independent acceptance, and it changes
+nothing else: the final engineering report keeps its existing format regardless
+of whether this tool ran. A worker may run it on a draft before writing a
+handback, as a preflight syntax/shape check. An operator may run it on a
+malformed engineer handback to get field-level diagnostics before starting the
+correction loop; it is never a substitute for capture, verification or
+independent acceptance, and the operator still inspects the actual evidence
+needed for those steps.
+
+The companion evidence-closure default asks Fable to ground every closure claim
+in named evidence: before reporting a lifecycle-sensitive unit closed, name the
+invariant and every production writer and entry point it touched, give the
+positive and adversarial proof actually exercised on the real production path,
+and state per claim which evidence kind backs it (applied change, worker-reported
+check, formal candidate verification, or independent acceptance) — evidence that
+predates a later edit is stale for that edit. A required finding, gap or proof
+requirement stays open until a specific piece of evidence (a named test, a gate's
+actual output, an inspected artifact with its digest) is cited to discharge it; a
+belief, a received result, an exited worker, or an unrelated passing check is
+never that basis. Delegated work is planned as connected units — parent
+requirement, verified interfaces and anchors, owned files, and the integration
+step that connects the result — and the connected result gets the affected
+focused checks again after integration, before the unit is reported done.
+
+AO engineer sessions receive this guidance once, as the one-time
+`evidence_closure_v1` workflow part: a new session receives it in its first
+packet, and a retained session receives it once, carried on its next ordinary
+engineer send (`spec_review`, `implementation`, or `correction`). A read-only
+status read, `setup`, `ao_room_prepare`, or a paused room never dispatches it by
+itself; only an actual engineer send does. It refines the already-merged
+lifecycle execution and closure, quality-first review, and finding provenance
+defaults above — their frozen text and digests stay exactly as recorded, and
+this part supersedes none of them. See [lifecycle-closure
+delivery](efficient-continuation.md#lifecycle-closure-delivery-ao-rooms) for the
+exact delivery timing it shares, and the [Fable policy reference's matching
+section](../../skills/project-room/references/fable-policy.md#evidence-closure-one-time-part-evidence_closure_v1)
+for the exact delivered text. This default is scoped to AO rooms; legacy
+`room_*` rooms are unaffected by it. Like the other reusable instructions in this
+guide, it is a global default that takes effect in a room only after the updated
+plugin has been installed or resynced (see [Install and
+authenticate](../../README.md#install-and-authenticate)); existing room
+snapshots and already-delivered workflow-part records are not rewritten.
+
 ## Enhancement issue handoff
 
 Under the user's existing filing authorization, Astra opens or links a GitHub issue for each worthwhile enhancement in the feature project's repository. Check both open and closed issues and the current implementation first; reuse an existing issue and record completed or superseded proposals rather than opening stale duplicates. A local backlog entry alone is not a filed issue.

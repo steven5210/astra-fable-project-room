@@ -5,6 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+import ao_evidence_closure
 import ao_execution_evidence
 import ao_finding_provenance
 import ao_progress
@@ -57,9 +58,14 @@ class DigestAndFrozenBytesTests(unittest.TestCase):
                              "unexpected import line in ao_finding_provenance.py: " + repr(line))
 
     def test_parts_tuple_keeps_history_and_appends_the_new_part_last(self):
-        self.assertEqual(ao_workflow.PARTS[:-1], OLDER_PARTS)
-        self.assertEqual(ao_workflow.PARTS[-1], ao_finding_provenance.PART)
-        self.assertEqual(len(ao_workflow.PARTS), 18)
+        # evidence_closure_v1 was appended after this unit, so finding_provenance_v1 is no longer
+        # PARTS[-1]; its own fixed position (index 17, immediately after every older part) stays
+        # pinned here regardless, and evidence_closure_v1's own ordering is independently pinned in
+        # test_lifecycle_closure.py and test_ao_evidence_closure.py.
+        self.assertEqual(ao_workflow.PARTS[:17], tuple(p for p in OLDER_PARTS if p != ao_evidence_closure.PART))
+        self.assertEqual(ao_workflow.PARTS[17], ao_finding_provenance.PART)
+        self.assertEqual(ao_workflow.PARTS[18], ao_evidence_closure.PART)
+        self.assertEqual(len(ao_workflow.PARTS), 19)
 
     def test_existing_frozen_part_digests_are_unchanged(self):
         cases = (
@@ -99,7 +105,10 @@ class NewSessionDeliveryTests(fixtures.Fixture):
         request = self.state()['requests']['spec_review']
         carried = request['carried']
         self.assertEqual(carried['parts'].count(ao_finding_provenance.PART), 1)
-        self.assertEqual(carried['parts'][-1], ao_finding_provenance.PART)
+        # evidence_closure_v1 was appended after this unit, so it is now last; finding_provenance_v1
+        # is second to last.
+        self.assertEqual(carried['parts'][-2], ao_finding_provenance.PART)
+        self.assertEqual(carried['parts'][-1], ao_evidence_closure.PART)
         self.assertEqual(carried['part_sha256'][ao_finding_provenance.PART],
                          ao_finding_provenance.INSTRUCTION_SHA256)
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
@@ -237,8 +246,9 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
 
 
 class CombinedPartsDeliveryTests(fixtures.Fixture):
-    """A session retained from before either of the last two parts existed receives
-    execution_evidence_v1 and finding_provenance_v1 once, together, in PARTS order."""
+    """A session retained from before any of the last three parts existed receives
+    execution_evidence_v1, finding_provenance_v1 and evidence_closure_v1 once, together, in PARTS
+    order (evidence_closure_v1 was appended after this unit; see test_ao_evidence_closure.py)."""
 
     def setUp(self):
         super().setUp()
@@ -266,18 +276,21 @@ class CombinedPartsDeliveryTests(fixtures.Fixture):
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertNotIn(ao_execution_evidence.PART, held['parts'])
         self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
 
         self.send('correction', 'corr-1')
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
         self.assertEqual(request['carried']['parts'],
-                         [ao_execution_evidence.PART, ao_finding_provenance.PART])
+                         [ao_execution_evidence.PART, ao_finding_provenance.PART, ao_evidence_closure.PART])
         self.assertEqual(request['carried']['part_sha256'],
                          {ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256,
-                          ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+                          ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256,
+                          ao_evidence_closure.PART: ao_evidence_closure.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_evidence_closure.INSTRUCTION), 1)
         # Every pre-existing receipt's bytes are unchanged by the new send.
         for key, saved in before.items():
             self.assertEqual((self.directory() / self.state()['requests'][key]['receipt']).read_bytes(),
@@ -293,6 +306,8 @@ class CombinedPartsDeliveryTests(fixtures.Fixture):
                          self.state()['requests']['corr-2']['text'])
         self.assertNotIn(ao_finding_provenance.INSTRUCTION,
                          self.state()['requests']['corr-2']['text'])
+        self.assertNotIn(ao_evidence_closure.INSTRUCTION,
+                         self.state()['requests']['corr-2']['text'])
 
     def test_an_uncertain_turn_leaves_both_new_parts_undelivered(self):
         before = self.receipt_digests()
@@ -302,13 +317,15 @@ class CombinedPartsDeliveryTests(fixtures.Fixture):
         self.assertEqual(result['state'], 'uncertain')
         request = self.state()['requests']['corr-uncertain']
         self.assertEqual(request['carried']['parts'],
-                         [ao_execution_evidence.PART, ao_finding_provenance.PART])
+                         [ao_execution_evidence.PART, ao_finding_provenance.PART, ao_evidence_closure.PART])
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertNotIn(ao_execution_evidence.PART, held['parts'])
         self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
         summary = ao_workflow.context_summary(self.state(), self.directory())
         self.assertIn(ao_execution_evidence.PART, summary['undelivered_parts'])
         self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
+        self.assertIn(ao_evidence_closure.PART, summary['undelivered_parts'])
         for key, saved in before.items():
             self.assertEqual((self.directory() / self.state()['requests'][key]['receipt']).read_bytes(),
                              saved)

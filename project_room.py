@@ -1894,15 +1894,11 @@ class Service:
                         pass
 
     def call(self, name, arguments):
-        if name not in TOOL_SCHEMAS:
-            raise room.RoomError(f"Unknown tool {name}")
-        if not isinstance(arguments, dict):
-            raise room.RoomError("arguments must be an object")
-        schema = TOOL_SCHEMAS[name][1]
-        missing = set(schema.get("required", [])) - set(arguments)
-        extra = set(arguments) - set(schema["properties"])
-        if missing or extra:
-            raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
+        tool_arguments(name, arguments)
+        if name == "ao_report_validate":
+            # Read-only and offline: dispatch before any branch that touches self.home.
+            import ao_report_validation
+            return ao_report_validation.validate_draft(**arguments)
         if name.startswith("ao_room_") or name == "ao_release_check":
             import ao_project_room
             return getattr(ao_project_room.Service(self.home), name)(**arguments)
@@ -1982,6 +1978,23 @@ TOOL_SCHEMAS = {
 
 import ao_project_room
 TOOL_SCHEMAS.update(ao_project_room.TOOL_SCHEMAS)
+
+
+def tool_arguments(name, arguments):
+    """Validate one tool call's arguments against TOOL_SCHEMAS.
+
+    Shared by Service.call and main's pre-Service ao_report_validate dispatch so both reject
+    malformed input identically, with the same messages, regardless of whether a home is ever touched.
+    """
+    if name not in TOOL_SCHEMAS:
+        raise room.RoomError(f"Unknown tool {name}")
+    if not isinstance(arguments, dict):
+        raise room.RoomError("arguments must be an object")
+    schema = TOOL_SCHEMAS[name][1]
+    missing = set(schema.get("required", [])) - set(arguments)
+    extra = set(arguments) - set(schema["properties"])
+    if missing or extra:
+        raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
 
 
 def main(argv=None):
@@ -2076,6 +2089,15 @@ def main(argv=None):
                 return 2
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0 if result["coverage"] == "complete" else 1
+        if args.command == "call" and args.tool == "ao_report_validate":
+            # Dispatch before Service construction: this read-only, offline draft validator must not
+            # provision a home, matching the audit commands above.
+            import ao_report_validation
+            arguments = json.loads(Path(args.args_file).read_text() if args.args_file else args.args)
+            tool_arguments(args.tool, arguments)
+            result = ao_report_validation.validate_draft(**arguments)
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
         service = Service(args.home)
         if args.command == "setup":
             result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider,
