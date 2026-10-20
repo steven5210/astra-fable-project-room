@@ -290,7 +290,7 @@ def _preparation_record(root, relative, expected, delegate_sha256, room_id):
             raise AuditRefusal("preparation_unbound")
         try:
             ao_routing.recorded_agents(routing)
-        except RoomError:
+        except (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError):
             raise AuditRefusal("preparation_unbound") from None
     for value in (routing.get("claude_config_dir"), prepared.get("worktree")):
         size = audit_io.bounded_bytes(value)
