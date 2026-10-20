@@ -149,6 +149,11 @@ inspect `review_followups`, `enhancement_proposals`, `operator_requests` and
 defect that blocks the approved behavior is required, not cleanup), and the
 projection grants nothing. Pending operator requests block acceptance: do only
 the authorized execution, return the evidence, then get Fable's next judgment.
+For a malformed handback, the operator (or a qualified worker) can run the
+read-only, offline `ao_report_validate` tool for field-level syntax/shape
+diagnostics before starting the correction loop below, and Fable reads the
+result; the engineer's own guard is unchanged and admits no shell, CLI or MCP
+execution. It never replaces capture, verification or independent acceptance.
 **Stop:** `scope_change` → a revised, agreed spec first: register the exact next
 charter revision and reach Fable's renewed exact-spec agreement on it before any
 new handoff or implementation. With the room's debate budget already exhausted
