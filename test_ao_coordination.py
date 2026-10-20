@@ -733,6 +733,42 @@ class ImportConflictTests(CoordinationFixture):
                                                       'git cherry-pick -x ' + record['commit'])
         self.assertEqual(imported['kind'], 'faithful')
 
+    def test_multi_commit_handback_suggests_and_imports_the_range(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def two_commits():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            self.commit_wt(self.assign_wt, 'first assignment commit')
+            (self.assign_wt / 'owned' / 'second.txt').write_text('second\n')
+            self.commit_wt(self.assign_wt, 'second assignment commit')
+
+        self.implement_b(two_commits, commit=False)
+        self.review_b()
+        self.accept_b()
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(sorted(entry['path'] for entry in record['changed_paths']),
+                         ['owned/part.txt', 'owned/second.txt'])
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.assertEqual(preflight['preview'], 'clean')
+        self.assertEqual(preflight['suggested_operation'][-1],
+                         record['baseline_commit'] + '..' + record['commit'])
+        # Importing only the last commit misses the first one: not faithful, needs a resolution.
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        with self.assertRaisesRegex(RoomError, 'integration_modifications_unresolved'):
+            self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                               'git cherry-pick -x ' + record['commit'])
+        self.git(self.repo, 'reset', '--hard', preflight['owner_head_before'])
+        # The suggested range import reproduces every handback path byte for byte.
+        self.git(self.repo, 'cherry-pick', '-x', record['baseline_commit'] + '..' + record['commit'])
+        imported = self.service.ao_room_import_record(
+            self.room, 'A1', preflight['preflight_sha256'],
+            'git cherry-pick -x ' + record['baseline_commit'] + '..' + record['commit'])
+        self.assertEqual(imported['kind'], 'faithful')
+        self.assertEqual(imported['missing_paths'], [])
+
 
 class OrdinaryRoomTests(CoordinationFixture):
     def test_ordinary_room_is_unchanged(self):

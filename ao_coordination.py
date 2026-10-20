@@ -593,8 +593,11 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
         preview = "unavailable"
         conflicts = []
         if head == baseline or _is_ancestor(worktree, baseline, head):
-            merged = _git_run(worktree, "merge-tree", "--write-tree",
-                              "--merge-base=" + handback["commit"] + "^", head, handback["commit"])
+            # Three-way preview against the actual common ancestor of the owner head and the
+            # handback commit: for both descendants of the lineage baseline that ancestor is the
+            # baseline, so the preview covers the whole baseline..commit range the handback
+            # recorded. The two-argument form needs git 2.38; older git records "unavailable".
+            merged = _git_run(worktree, "merge-tree", "--write-tree", head, handback["commit"])
             if merged.returncode == 0:
                 preview = "clean"
             elif merged.returncode == 1:
@@ -612,7 +615,7 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
                   "owner_touched_assigned_paths": sorted(set(touched)),
                   "blockers": sorted(set(blockers)),
                   "suggested_operation": ["git", "-C", str(worktree), "cherry-pick", "-x",
-                                          handback["commit"]],
+                                          baseline + ".." + handback["commit"]],
                   "ready": not blockers and preview == "clean",
                   "recorded_at": time.time()}
         prior = _dedupe(directory / "import-preflights", record)
