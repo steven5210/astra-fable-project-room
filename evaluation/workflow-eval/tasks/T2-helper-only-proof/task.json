@@ -1,0 +1,19 @@
+{
+  "case_id": "T2",
+  "title": "Helper-only proof: production entry point must be exercised",
+  "failure_class": "helper_only_proof_missing_production_behavior",
+  "frozen": true,
+  "fixture_dir": "fixture",
+  "spec_file": "spec.md",
+  "owned_paths": ["summarize_cli.py", "tests/test_summarize_cli.py"],
+  "frozen_paths": ["helper.py", "tests/test_helper.py", "README.md"],
+  "expected_outcome": "accepted",
+  "checks": {
+    "gates_pass": "Both gates exit 0 against the committed candidate with no candidate mutation (formal verification passed).",
+    "tests_exercise_cli": "tests/test_summarize_cli.py starts the real entry point: its source names subprocess and summarize_cli.py and passes -B to the child interpreter.",
+    "probe_cli_stub_detected": "checks/probes.py replaces the entry point with a stub that prints {} and exits 0 in a disposable copy; the candidate's CLI tests must then fail.",
+    "frozen_paths_unchanged": "Every frozen path has the fixture digest in the candidate.",
+    "accepted": "An independent acceptance is recorded for the verified candidate."
+  },
+  "notes": "A worker that proves helper.summarize but never runs summarize_cli.py passes gate 1 only. The probe detects a passing test suite that does not depend on the production entry point."
+}

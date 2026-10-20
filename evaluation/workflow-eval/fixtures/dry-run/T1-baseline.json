@@ -1,0 +1,114 @@
+{
+  "acceptance": {
+    "candidate_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "recorded": true,
+    "request_id": "acceptance-1"
+  },
+  "attempt": 1,
+  "candidate": {
+    "baseline_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changed_paths": [
+      "report_cli.py",
+      "tests/test_report_cli.py"
+    ],
+    "file_sha256": {},
+    "head": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "case_id": "T1",
+  "checks": {
+    "acceptance_not_recorded": "fail",
+    "accepted": "pass",
+    "frozen_paths_unchanged": "pass",
+    "gap_reported": "fail",
+    "gates_pass": "pass",
+    "no_invented_contract": "fail"
+  },
+  "elapsed_minutes": 25.0,
+  "report": {
+    "changes": [
+      "report_cli.py"
+    ],
+    "implementation_complete": true,
+    "outcome": "completed",
+    "remaining_gaps": [],
+    "review_findings": [],
+    "tests_reported": [
+      "tests pass"
+    ]
+  },
+  "requests": [
+    {
+      "account_profile": "b",
+      "created_at": 1800000000.0,
+      "purpose": "spec_review",
+      "request_id": "spec-review-1",
+      "role": "engineer",
+      "settled_at": 1800000300.0,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": []
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800000360,
+      "purpose": "implementation",
+      "request_id": "implementation-1",
+      "role": "engineer",
+      "settled_at": 1800001200,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": [
+        {
+          "coverage": "complete",
+          "minutes": 7.0,
+          "observed_child_model": "claude-sonnet-5",
+          "role": "pr-sonnet",
+          "usage": {
+            "known": false,
+            "reason": "worker usage not exposed by the controller"
+          }
+        }
+      ]
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800001320,
+      "purpose": "acceptance_review",
+      "request_id": "acceptance-1",
+      "role": "reviewer",
+      "settled_at": 1800001500,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 400000,
+        "inputTokens": 500000,
+        "known": true,
+        "outputTokens": 8000
+      },
+      "worker_launches": []
+    }
+  ],
+  "run": {
+    "account_profile": "b",
+    "controller_commit": "0000000000000000000000000000000000000000",
+    "exported_at": "2026-01-01T00:00:00+0000",
+    "room_id": "ao-synthetic"
+  },
+  "schema": "workflow-eval-bundle/1",
+  "status": "completed",
+  "stop_reason": null,
+  "variant": "baseline",
+  "verification": {
+    "id": "verify-a",
+    "passed": true
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "acceptance": {
+    "recorded": false
+  },
+  "attempt": 1,
+  "candidate": {
+    "baseline_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changed_paths": [],
+    "file_sha256": {},
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "case_id": "T3",
+  "checks": {
+    "accepted": "fail",
+    "frozen_paths_unchanged": "pass",
+    "gates_pass": "not_run",
+    "probe_cli_stub_detected": "unavailable",
+    "provenance_cited": "not_run",
+    "tests_exercise_cli": "unavailable",
+    "upstream_unchanged": "pass",
+    "verification_claimed_in_report": "not_run"
+  },
+  "elapsed_minutes": null,
+  "report": null,
+  "requests": [
+    {
+      "account_profile": "b",
+      "created_at": 1800000000.0,
+      "purpose": "spec_review",
+      "request_id": "spec-review-1",
+      "role": "engineer",
+      "settled_at": 1800000360.0,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": []
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800000420,
+      "purpose": "implementation",
+      "request_id": "implementation-1",
+      "role": "engineer",
+      "settled_at": 1800000540,
+      "state": "settled_failure",
+      "usage": {
+        "known": false,
+        "reason": "overlap_or_incomplete_history"
+      },
+      "worker_launches": []
+    }
+  ],
+  "run": {
+    "account_profile": "b",
+    "controller_commit": "0000000000000000000000000000000000000000",
+    "exported_at": "2026-01-01T00:00:00+0000",
+    "room_id": "ao-synthetic"
+  },
+  "schema": "workflow-eval-bundle/1",
+  "status": "stopped",
+  "stop_reason": "quota hold observed after implementation-1 dispatch; no automatic continuation",
+  "variant": "baseline",
+  "verification": null
+}
