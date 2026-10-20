@@ -183,11 +183,15 @@ class SharedSchemaIdentityTests(unittest.TestCase):
     def test_unperformed_checks_names_and_count_are_pinned(self):
         # Independent literal, not merely the module comparing its own tuple to itself: catches an
         # accidental rename, reorder, duplicate or omission of a named check. The first eight are the
-        # original authentication/delivery/readiness/persistence checks; the final five accurately
+        # original authentication/delivery/readiness/persistence checks; the next five accurately
         # name what ao_workflow.capture_engineering additionally performs (completion-candidate
         # binding, native outcome usability, the report-correction chain walk, require_disposition,
         # and the candidate-unchanged-after-completion equality check) that this offline operation
-        # never performs either. This list is a reminder, never an exhaustive contract: capture,
+        # never performs either. The final three name deferred authoritative checks that sit beyond
+        # capture itself -- semantic correctness assessment, the pinned formal gates (ao_room_verify)
+        # and Astra's independent acceptance (ao_room_accept) -- and are always present, even for a
+        # completed/true draft with no remaining gaps, so a clean draft is never mistaken for an
+        # accepted or capturable one. This list is a reminder, never an exhaustive contract: capture,
         # readiness and acceptance may perform further checks this tuple does not name.
         names = [item["check"] for item in ao_report_validation.UNPERFORMED_CHECKS]
         self.assertEqual(names, [
@@ -195,9 +199,18 @@ class SharedSchemaIdentityTests(unittest.TestCase):
             "controller_metadata_attachment", "delegate_attribution_verification", "engineering_readiness",
             "findings_projection", "capture_receipts", "candidate_binding", "native_outcome_evidence",
             "correction_chain", "issue_dispositions", "candidate_unchanged",
+            "semantic_correctness_assessment", "formal_candidate_verification", "independent_acceptance",
         ])
-        self.assertEqual(len(names), 13)
-        self.assertEqual(len(set(names)), 13)  # every name distinct
+        self.assertEqual(len(names), 16)
+        self.assertEqual(len(set(names)), 16)  # every name distinct
+
+        # A completed/true compact draft with empty remaining_gaps (the compact-valid fixture) still
+        # returns all 16 deferred checks, including the three new ones: a clean, gap-free draft never
+        # implies semantic correctness, formal candidate verification or independent acceptance.
+        fixture = _FIXTURES_BY_NAME["compact-valid.json"]
+        draft = ao_report_validation.validate_draft(fixture["text"])
+        self.assertTrue(draft["syntax_shape_valid"], draft)
+        self.assertEqual([item["check"] for item in draft["unperformed_checks"]], names)
 
 
 class FixtureParityTests(unittest.TestCase):

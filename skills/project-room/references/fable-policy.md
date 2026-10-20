@@ -140,22 +140,37 @@ The controller projects these tokens read-only into saved `ao_room_status.review
 
 The retained AO engineer receives this text once, as the one-time workflow part `evidence_closure_v1` (delivered through `ao_workflow.PARTS` exactly like `lifecycle_closure_v1` above — a new session receives it in its first packet, a retained session receives it once, carried on its next engineer send):
 
-> Evidence closure v1 (engineering default; refines the lifecycle execution and closure, quality-first review and finding provenance defaults, whose frozen text stays in force; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): before a lifecycle-sensitive unit is reported closed, give an evidence-based handoff assessment of its invariants — name the invariant, every production writer and entry point the unit actually touched, and the positive and adversarial proof exercised on the real production path — and state, per claim, which evidence kind backs it: applied change, worker-reported check, formal candidate verification or independent acceptance. Evidence that predates a later edit is stale for that edit, never carried forward silently. A required finding, gap or proof requirement stays open without a concrete basis: it closes only by citing the specific evidence that discharges it — a named test, a gate's actual output, or an inspected artifact with its digest — and a belief, a received result, an exited worker's silence or an unrelated passing check is never that basis; an item without it stays listed in remaining_gaps or review_findings with its reason, never marked resolved. Plan delegated work as connected units, not isolated outputs: each unit carries its parent requirement, the interfaces and verified anchors it depends on, the files it owns and the integration step that connects its result to the rest of the work; after integration, rerun the affected focused checks on the connected result before the handback, and no unit is reported done on its own evidence while its connection to the others is unverified. The read-only ao_report_validate operation (CLI or MCP) checks only the syntax and shape of one draft engineering report, names the authoritative checks it does not perform, writes nothing and calls no provider; a worker or the engineer may run it before a handback, but a successful result never shows authentication, delegate verification, readiness or acceptance, and the final engineering report keeps its existing format.
+> Evidence closure v1 (engineering default; refines the lifecycle execution and closure, quality-first review and finding provenance defaults, whose frozen text stays in force; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): before a lifecycle-sensitive unit is reported closed, give an evidence-based handoff assessment that names, per invariant, its authoritative truth source (the final production path and saved state that decide it) and every reader, writer and interface the unit affects; an intact positive control exercised through the public entry point; an independently varied invalid case shown to reach the intended check rather than an earlier or unrelated one; the actual effect of each refusal on files, saved state, allowances, consumption and dispatch wherever those could change; and the assumptions the proof rests on and how they compose. State per claim which evidence kind backs it: applied change, worker-reported check, formal candidate verification or independent acceptance. Evidence that predates a later edit is stale for that edit and is reused only where the edit demonstrably leaves it unaffected, with that reason stated. A required finding, gap or proof requirement closes only by citing the specific evidence that discharges it (a named test, a gate's actual output or an inspected artifact with its digest); calling it pre-existing, private-store, backlog or out of scope leaves it open unless a concrete contract or evidence reason is given, and without such a basis it stays listed in remaining_gaps or review_findings with its reason, while a justified non-blocking limitation may be recorded as such. Resolve known required correctness and contract questions before expensive formal verification is requested. Consolidate known related defects into complete connected units, each with one accountable owner, explicit interfaces and file ownership, its parent requirement and verified anchors, a challenging proof and the integration step that connects its result to the rest; after integration, rerun the affected focused checks on the connected result before the handback, and report no unit done on its own evidence while its connection to the others is unverified. This adds no report schema or checklist, and no backlog item blocks by itself. The read-only ao_report_validate operation (CLI or MCP) checks only the syntax and shape of one draft engineering report, names deferred authoritative checks it never performs, writes nothing and calls no provider; a qualified worker or the operator invokes it before a handback and the engineer reads its result, because the engineer's own guard admits no shell, CLI or MCP execution; a successful result never shows semantic correctness, authentication, delegate verification, readiness, formal candidate verification or independent acceptance, and the final engineering report keeps its existing format.
 
-In summary, the amendment asks for five things: (1) an evidence-based handoff
-assessment of every invariant a closed unit touched, naming writers, entry
-points and the positive/adversarial proof, with the evidence kind stated per
-claim; (2) a required finding, gap or proof requirement stays open without a
-concrete, citable basis — belief, a received result, an exited worker or an
-unrelated passing check is never that basis; (3) delegated work is planned as
-connected units carrying parent requirement, verified interfaces/anchors and
-owned files, with an integration step and a post-integration recheck before the
-unit is reported done; (4) the read-only, offline `ao_report_validate` operation
-validates only a draft report's syntax and shape, names what it does not check,
-and never itself shows authentication, delegate verification, readiness or
-acceptance; and (5) none of this adds a report field, changes a model, guard,
-budget or authority, or supersedes the frozen text of `lifecycle_closure_v1`,
-`quality_first_review_v1` or `finding_provenance_v1`, each of which stays in
-force unchanged. The amendment is delivered text only: it changes no model,
-budget, guard, review allowance or existing room snapshot, and grants no scope
-or execution permission by itself.
+In summary, the amendment asks for eleven things, refining rather than
+superseding the frozen `lifecycle_closure_v1`, `quality_first_review_v1` and
+`finding_provenance_v1` text: (1) an evidence-based handoff assessment naming,
+per invariant, its authoritative truth source (the final production path and
+saved state that decide it) and every reader, writer and interface the unit
+affects; (2) an intact positive control exercised through the public entry
+point; (3) an independently varied invalid case shown to reach the intended
+check rather than an earlier or unrelated one; (4) the actual effect of each
+refusal on files, saved state, allowances, consumption and dispatch wherever
+those could change; (5) the assumptions the proof rests on and how they
+compose; (6) evidence that predates a later edit is stale for that edit and is
+reused only where the edit demonstrably leaves it unaffected, with that reason
+stated; (7) a required finding, gap or proof requirement closes only by citing
+the specific evidence that discharges it — calling it pre-existing,
+private-store, backlog or out of scope leaves it open without a concrete
+contract or evidence reason, though a justified non-blocking limitation may be
+recorded as such; (8) known required correctness and contract questions are
+resolved before expensive formal verification is requested; (9) known related
+defects are consolidated into complete connected units, each with one
+accountable owner, explicit interfaces and file ownership, its parent
+requirement and verified anchors, a challenging proof and the integration step
+that connects its result to the rest, with the affected focused checks rerun on
+the connected result after integration; (10) none of this adds a report schema
+or checklist, and no backlog item blocks by itself; and (11) the read-only,
+offline `ao_report_validate` operation names deferred authoritative checks it
+never performs — a qualified worker or the operator invokes it before a
+handback and the engineer reads the result, never the engineer invoking it
+directly, and a successful result never shows semantic correctness,
+authentication, delegate verification, readiness, formal candidate verification
+or independent acceptance. The amendment is delivered text only: it changes no
+model, budget, guard, review allowance or existing room snapshot, and grants no
+scope or execution permission by itself.

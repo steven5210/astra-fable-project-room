@@ -150,9 +150,9 @@ def handle(message, service):
                             if legacy_visible or name.startswith("ao_")]}
     elif method == "tools/call":
         name = params.get("name")
-        if (not _legacy_tools_visible(service) and isinstance(name, str)
-                and name in project_room.TOOL_SCHEMAS
-                and not name.startswith("ao_")):
+        # Consult the legacy-tools gate only for a legacy tool name: it reads the saved config and may open the room registry, which an ao_* call (including the read-only draft validation) must never trigger.
+        if (isinstance(name, str) and name in project_room.TOOL_SCHEMAS
+                and not name.startswith("ao_") and not _legacy_tools_visible(service)):
             error = {"error": LEGACY_TOOLS_HIDDEN_ERROR}
             result = {"content": [{"type": "text", "text": json.dumps(error, ensure_ascii=False)}], "isError": True}
         else:

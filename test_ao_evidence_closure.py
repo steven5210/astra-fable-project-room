@@ -49,7 +49,7 @@ FINDING_PROVENANCE_SHA256 = "d67ce9529889ce53b817988c386774148eb92909dcec76d6ea6
 # Independent literal pin for this module's own text, exactly like the sibling pins above: comparing
 # it against both the live INSTRUCTION_SHA256 constant and a freshly computed digest of the live
 # INSTRUCTION catches drift in the text, the pin, or both, rather than only a self-consistency check.
-EVIDENCE_CLOSURE_SHA256 = "3ef5a1ea29407100275ace4c98705070f5322caad4033264cc1ba5c886ec3ea1"
+EVIDENCE_CLOSURE_SHA256 = "f7b58c915e3d566332f0e612fb7bea521455ae044342838360929cf85d1fa0a1"
 
 
 class FrozenModulePatternTests(unittest.TestCase):

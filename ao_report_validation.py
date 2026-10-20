@@ -3,9 +3,14 @@
 ao_workflow.engineering_report (authoritative capture) and the offline ``ao_report_validate`` AO tool
 both judge report *shape* through ``shape_diagnostics`` below, so a draft that passes here cannot
 later fail capture for a shape reason it was not told about. Capture additionally enforces
-authenticated identity equality, delegate attribution, provider delivery and persistence; those are
-never performed here and are named verbatim in ``UNPERFORMED_CHECKS`` so a caller never mistakes a
-valid draft for an accepted or capturable one.
+authenticated identity equality, delegate attribution, provider delivery and persistence, and the
+workflow around capture additionally depends on the candidate's semantic correctness, the pinned
+formal gates and Astra's independent acceptance; none of that is performed here. ``UNPERFORMED_CHECKS``
+names these deferred authoritative checks verbatim -- always including semantic correctness
+assessment, formal candidate verification and independent acceptance, even for a completed/true
+draft with no remaining gaps -- so a caller never mistakes a valid draft for an accepted or
+capturable one. The tuple is a reminder of named checks, never an exhaustive contract: capture,
+readiness and acceptance may perform further checks it does not name.
 
 This module performs no IO, writes nothing, creates no directory, calls no provider or network
 endpoint, and never requires a room, provider configuration or authentication. It never echoes the
@@ -38,11 +43,13 @@ _IDENTITY_FIELDS = ('spec_revision', 'spec_sha256', 'baseline_commit')
 _LIST_FIELDS = ('changes', 'tests_reported', 'review_findings', 'remaining_gaps', 'backlog', 'routing_log')
 _OUTCOMES = ('completed', 'changes_required', 'scope_change')
 
-# Named, authoritative capture/readiness/acceptance checks that this offline, parser-only draft
-# operation never performs. Order is fixed and this tuple is always returned in full, whether or not
-# the submitted draft is valid, so a caller never infers acceptance from a clean draft result. This
-# is a reminder of the checks named here, never an exhaustive contract that capture, readiness and
-# acceptance perform only these and nothing else.
+# Named, deferred authoritative checks that this offline, parser-only draft operation never
+# performs. Order is fixed and this tuple is always returned in full, whether or not the submitted
+# draft is valid -- including a completed/true draft with no remaining gaps -- so a caller never
+# infers acceptance from a clean draft result. The list always includes semantic correctness
+# assessment, formal candidate verification and independent acceptance. This is a reminder of the
+# checks named here, never an exhaustive contract that capture, readiness and acceptance perform
+# only these and nothing else.
 UNPERFORMED_CHECKS = (
     {"check": "handoff_authentication", "description": "request handoff_sha256 equals the bound handoff"},
     {"check": "spec_identity_equality", "description": "spec_revision/spec_sha256/baseline_commit equal the handoff record"},
@@ -57,6 +64,9 @@ UNPERFORMED_CHECKS = (
     {"check": "correction_chain", "description": "report-only correction evidence is walked, authenticated and checked for cycles"},
     {"check": "issue_dispositions", "description": "malformed operator work in a walked correction chain requires an explicit operator_requests disposition"},
     {"check": "candidate_unchanged", "description": "the candidate is re-snapshotted and compared equal to the bound completion candidate before capture succeeds"},
+    {"check": "semantic_correctness_assessment", "description": "whether the reported changes, tests, findings and gaps are true, sufficient and bound to the actual candidate; a parser never judges this"},
+    {"check": "formal_candidate_verification", "description": "the pinned formal gates run by the operator on the exact candidate (ao_room_verify), never by this call"},
+    {"check": "independent_acceptance", "description": "Astra's independent acceptance of the exact spec, candidate and gate evidence (ao_room_accept), never implied by a valid draft"},
 )
 
 

@@ -106,14 +106,17 @@ The result object reports `operation`, `validity_scope` (always
 `{field, message}` entries that block validity), `advisories` (a list of
 `{field, message}` entries that never change validity — a malformed
 `enhancement_proposals` entry is always advisory), `unperformed_checks` (always
-the same named list, naming the authoritative capture, readiness and acceptance
-checks this call never performs — a reminder of named checks, never an
-exhaustive contract: `handoff_authentication`, `spec_identity_equality`,
+the same named list, naming deferred authoritative checks this call never
+performs, always including semantic correctness assessment, formal candidate
+verification and independent acceptance, even for a completed/true draft with
+no remaining gaps — a reminder of named checks, never an exhaustive contract:
+`handoff_authentication`, `spec_identity_equality`,
 `compact_contract_delivery`, `controller_metadata_attachment`,
 `delegate_attribution_verification`, `engineering_readiness`,
 `findings_projection`, `capture_receipts`, `candidate_binding`,
 `native_outcome_evidence`, `correction_chain`, `issue_dispositions`,
-`candidate_unchanged`), and `limits`
+`candidate_unchanged`, `semantic_correctness_assessment`,
+`formal_candidate_verification`, `independent_acceptance`), and `limits`
 (`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
 failures — a non-string, empty, oversized or invalid-UTF-8 `report_text`, or
 nesting past the admitted depth — are refusals (a JSON error, CLI exit 2), never
@@ -122,46 +125,66 @@ diagnostics; a malformed syntax or root shape is instead a diagnostic on field
 model-supplied `controller_metadata`; the compact form refuses a model-supplied
 `controller_metadata` exactly as the existing compact-contract projection does.
 
-The operation itself writes nothing, creates no home or config, and calls no
-provider from its own entry — a fact about this operation, not a claim that the
-whole CLI or MCP process starts up without ever touching the filesystem (ordinary
-controller-home provisioning at process startup is pre-existing and unchanged).
-Two further pre-existing facts sit at that same boundary, outside this
-operation's own zero-effects guarantee: the shared `tools/list`/`tools/call`
-legacy-tools gate (`project_room.Service.legacy_tools_visible`) can, for an
-already-provisioned home whose saved config selects the `ao` backend without
-`legacy_tools`, open the local SQLite room registry as a read before dispatch
-reaches any tool, including this one — an edge case a never-provisioned home
-cannot exercise, since a missing config file always takes that gate's simpler
-"visible" fallback instead; and running these commands through the `python3`
+The operation itself writes nothing, creates no home, config or registry, and
+calls no provider from any public entry: the CLI preflight runs before
+controller construction; `Service.call` dispatches it before any room or home
+access; and the MCP `tools/call` dispatch consults the shared legacy-tools gate
+(`project_room.Service.legacy_tools_visible`) only for a legacy `room_*` tool
+name, so a draft validation never opens or creates the local SQLite room
+registry, including on a configured home whose saved config selects the `ao`
+backend and whose registry file is missing. That is a fact about this
+operation, not a claim that the whole CLI or MCP process never touches the
+filesystem: ordinary controller-home provisioning at MCP process startup is
+pre-existing and unchanged; the `initialize` and `tools/list` methods still
+consult the same gate as before (pre-existing listing behavior outside this
+operation); and running any `project_room.py` command through the `python3`
 interpreter can let it write its own `__pycache__` bytecode for imported
-modules, exactly like any other Python invocation — an interpreter cache
-artifact (already git-ignored, and avoided entirely with
-`PYTHONDONTWRITEBYTECODE=1`), never a room-state or controller-home write.
+modules (already git-ignored, avoided with `PYTHONDONTWRITEBYTECODE=1`), never
+a room-state or controller-home write.
 A passing result is never evidence of handoff authentication, delegate
 attribution, engineering readiness or independent acceptance, and it changes
 nothing else: the final engineering report keeps its existing format regardless
-of whether this tool ran. A worker may run it on a draft before writing a
-handback, as a preflight syntax/shape check. An operator may run it on a
-malformed engineer handback to get field-level diagnostics before starting the
-correction loop; it is never a substitute for capture, verification or
-independent acceptance, and the operator still inspects the actual evidence
-needed for those steps.
+of whether this tool ran. A qualified worker or the operator invokes it on a
+draft before a handback, as a preflight syntax/shape check, and the engineer
+reads the result; the engineer's own guard is unchanged and admits no shell,
+CLI or MCP execution. An operator may run it on a malformed engineer handback
+to get field-level diagnostics before starting the correction loop; it is
+never a substitute for capture, verification or independent acceptance, and
+the operator still inspects the actual evidence needed for those steps.
 
-The companion evidence-closure default asks Fable to ground every closure claim
-in named evidence: before reporting a lifecycle-sensitive unit closed, name the
-invariant and every production writer and entry point it touched, give the
-positive and adversarial proof actually exercised on the real production path,
-and state per claim which evidence kind backs it (applied change, worker-reported
-check, formal candidate verification, or independent acceptance) — evidence that
-predates a later edit is stale for that edit. A required finding, gap or proof
-requirement stays open until a specific piece of evidence (a named test, a gate's
-actual output, an inspected artifact with its digest) is cited to discharge it; a
-belief, a received result, an exited worker, or an unrelated passing check is
-never that basis. Delegated work is planned as connected units — parent
-requirement, verified interfaces and anchors, owned files, and the integration
-step that connects the result — and the connected result gets the affected
-focused checks again after integration, before the unit is reported done.
+The companion evidence-closure default asks Fable to ground every closure
+claim in named evidence: before reporting a lifecycle-sensitive unit closed,
+give an evidence-based handoff assessment that names, per invariant, its
+authoritative truth source (the final production path and saved state that
+decide it) and every reader, writer and interface the unit affects; an intact
+positive control exercised through the public entry point; an independently
+varied invalid case shown to reach the intended check rather than an earlier
+or unrelated one; the actual effect of each refusal on files, saved state,
+allowances, consumption and dispatch wherever those could change; and the
+assumptions the proof rests on and how they compose. State per claim which
+evidence kind backs it: applied change, worker-reported check, formal
+candidate verification, or independent acceptance. Evidence that predates a
+later edit is stale for that edit and is reused only where the edit
+demonstrably leaves it unaffected, with that reason stated. A required
+finding, gap or proof requirement closes only by citing the specific evidence
+that discharges it (a named test, a gate's actual output, or an inspected
+artifact with its digest); calling it pre-existing, private-store, backlog or
+out of scope leaves it open unless a concrete contract or evidence reason is
+given, and without such a basis it stays listed in remaining_gaps or
+review_findings with its reason, while a justified non-blocking limitation
+may be recorded as such. Resolve known required correctness and contract
+questions before expensive formal verification is requested. Known related
+defects are consolidated into complete connected units — each with one
+accountable owner, explicit interfaces and file ownership, its parent
+requirement and verified anchors, a challenging proof, and the integration
+step that connects its result to the rest — and after integration the
+connected result gets the affected focused checks again before the unit is
+reported done; no unit is reported done on its own evidence while its
+connection to the others is unverified. This adds no report schema or
+checklist, and no backlog item blocks by itself; the read-only, offline
+`ao_report_validate` operation names deferred authoritative checks it never
+performs, a qualified worker or the operator invokes it before a handback, and
+the engineer reads the result.
 
 AO engineer sessions receive this guidance once, as the one-time
 `evidence_closure_v1` workflow part: a new session receives it in its first
