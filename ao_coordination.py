@@ -152,7 +152,10 @@ def _is_ancestor(path, base, commit):
 
 
 def _status_clean(path):
-    return not _git_run(path, "status", "--porcelain", "-z", "--untracked-files=all").stdout.strip()
+    result = _git_run(path, "status", "--porcelain", "-z", "--untracked-files=all")
+    if result.returncode:
+        raise RoomError("Git status failed: " + result.stderr.decode(errors="replace")[:500])
+    return not result.stdout.strip()
 
 
 def _decode(raw):
@@ -277,13 +280,21 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
             superseded = (superseded_dir, old_lifecycle)
         prior_coord = assign.get("coordination")
         if prior_coord:
-            # An idempotent retry finds the pointer this call wrote, and supersession
-            # keeps the superseded id beside the new one; anything else means the room
-            # already participates in coordination.
-            known = {assignment_id, supersedes}
-            if (prior_coord.get("role") != "assignment"
-                    or not set(prior_coord.get("assignment_ids") or []) <= known):
+            if prior_coord.get("role") != "assignment":
                 raise RoomError("The assignment room already participates in coordination")
+            # Terminal assignments stay in the pointer for audit without blocking
+            # admission; an engaged id admits only an idempotent retry of this call
+            # or its named supersession. An unresolvable pointer entry blocks.
+            for prior_id in prior_coord.get("assignment_ids") or []:
+                if prior_id == assignment_id or prior_id == supersedes:
+                    continue
+                try:
+                    prior_lifecycle = _lifecycle(_assignment_dir(service.root, prior_id))
+                except RoomError:
+                    raise RoomError(
+                        "The assignment room already participates in coordination") from None
+                if prior_lifecycle.get("state") in ENGAGED:
+                    raise RoomError("The assignment room already participates in coordination")
         try:
             assign_spec = service.spec(assign_dir, assign)
         except RoomError:
@@ -417,7 +428,11 @@ def handback_record(service, room_id, assignment_id, acceptance_request_id):
         if commit != checkpoint["candidate"]["head"]:
             _refuse(directory, lifecycle, operation, "tampered_checkpoint",
                     "the candidate HEAD moved after verification")
-        if not _status_clean(worktree):
+        try:
+            clean = _status_clean(worktree)
+        except RoomError as exc:
+            _refuse(directory, lifecycle, operation, "worktree_unverified", str(exc)[:200])
+        if not clean:
             _refuse(directory, lifecycle, operation, "worktree_dirty",
                     "the assignment worktree must be fully committed")
         baseline = lineage["owner"]["baseline_commit"]
@@ -566,8 +581,11 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
         _revalidate_handback(service, directory, lineage, lifecycle, handback, worktree)
         blockers, touched = [], []
         head = _git(worktree, "rev-parse", "HEAD")
-        if not _status_clean(worktree):
-            blockers.append("owner_worktree_dirty")
+        try:
+            if not _status_clean(worktree):
+                blockers.append("owner_worktree_dirty")
+        except RoomError as exc:
+            _refuse(directory, lifecycle, operation, "worktree_unverified", str(exc)[:200])
         try:
             owner_spec = service.spec(owner_dir, owner)
             if owner_spec["sha256"] != lineage["owner"]["spec_sha256"]:
@@ -597,6 +615,8 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
             # handback commit: for both descendants of the lineage baseline that ancestor is the
             # baseline, so the preview covers the whole baseline..commit range the handback
             # recorded. The two-argument form needs git 2.38; older git records "unavailable".
+            # suggested_operation merges the handback commit itself: the same three-way
+            # operation the preview models, carried into the owner history as provenance.
             merged = _git_run(worktree, "merge-tree", "--write-tree", head, handback["commit"])
             if merged.returncode == 0:
                 preview = "clean"
@@ -614,8 +634,8 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
                   "preview": preview, "conflicts": conflicts,
                   "owner_touched_assigned_paths": sorted(set(touched)),
                   "blockers": sorted(set(blockers)),
-                  "suggested_operation": ["git", "-C", str(worktree), "cherry-pick", "-x",
-                                          baseline + ".." + handback["commit"]],
+                  "suggested_operation": ["git", "-C", str(worktree), "merge", "--no-ff",
+                                          "--no-edit", handback["commit"]],
                   "ready": not blockers and preview == "clean",
                   "recorded_at": time.time()}
         prior = _dedupe(directory / "import-preflights", record)
@@ -719,7 +739,11 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
         missing = sorted(handback_paths - destination_paths)
         extra = sorted(destination_paths - handback_paths)
         modified = sorted(path for path in handback_paths & destination_paths if not identical[path])
-        faithful = not missing and not extra and not modified
+        if missing:
+            _refuse(directory, lifecycle, tool, "handback_not_incorporated",
+                    "the destination lacks handback path(s) " + ", ".join(missing)
+                    + "; a deliberate drop is a scope change and needs a new assignment")
+        faithful = not extra and not modified
         kind = "faithful" if faithful else "resolved_with_modifications"
         if not faithful and resolution is None:
             _refuse(directory, lifecycle, tool, "integration_modifications_unresolved",

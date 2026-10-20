@@ -411,6 +411,31 @@ class AdmissionTests(CoordinationFixture):
                 self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization',
                 supersedes='A1')
 
+    def test_terminal_assignments_admit_new_ones(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                           'git merge --no-ff --no-edit ' + record['commit'])
+        # The imported assignment stays in the pointer for audit without blocking A2.
+        opened = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization')
+        self.assertTrue(opened['opened'])
+        status = self.service.ao_room_status(self.assign_room)['coordination']
+        states = {entry['assignment_id']: entry['state'] for entry in status['assignments']}
+        self.assertEqual(states, {'A1': 'imported', 'A2': 'active'})
+        # The engaged A2 still blocks a plain A3; supersession admits it and keeps history.
+        with self.assertRaisesRegex(RoomError, 'participates'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization')
+        self.service.ao_room_assignment_open(
+            self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization',
+            supersedes='A2')
+        status = self.service.ao_room_status(self.assign_room)['coordination']
+        states = {entry['assignment_id']: entry['state'] for entry in status['assignments']}
+        self.assertEqual(states, {'A1': 'imported', 'A2': 'superseded', 'A3': 'active'})
+        self.assertEqual(self.state_b()['coordination']['assignment_ids'], ['A1', 'A2', 'A3'])
+
     def test_wrong_repository_and_role_refusals(self):
         self.open_rooms()
         other = self.root / 'other-repo'
@@ -708,6 +733,20 @@ class ImportConflictTests(CoordinationFixture):
         self.assertEqual(imported['resolution'],
                          'Merged owner and assignment bytes in owned/part.txt by hand.')
 
+    def test_unrelated_commit_is_not_an_import(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        # An owner commit that carries none of the handback paths is not an import;
+        # a resolution text cannot repair the missing handback.
+        (self.repo / 'unrelated.txt').write_text('owner only\n')
+        self.commit_wt(self.repo, 'unrelated owner commit')
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git commit unrelated',
+                resolution='Recorded an unrelated owner commit.')
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+
     def test_owner_head_advance_reports_stale_preflight(self):
         record = self.handed_back()
         clean = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
@@ -753,21 +792,25 @@ class ImportConflictTests(CoordinationFixture):
         preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
         self.assertTrue(preflight['ready'])
         self.assertEqual(preflight['preview'], 'clean')
-        self.assertEqual(preflight['suggested_operation'][-1],
-                         record['baseline_commit'] + '..' + record['commit'])
-        # Importing only the last commit misses the first one: not faithful, needs a resolution.
+        self.assertIn('merge', preflight['suggested_operation'])
+        self.assertEqual(preflight['suggested_operation'][-1], record['commit'])
+        # Importing only the last commit leaves a handback path missing: the handback is
+        # not incorporated and no resolution text can repair that.
         self.git(self.repo, 'cherry-pick', '-x', record['commit'])
-        with self.assertRaisesRegex(RoomError, 'integration_modifications_unresolved'):
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
             self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
-                                               'git cherry-pick -x ' + record['commit'])
+                                               'git cherry-pick -x ' + record['commit'],
+                                               resolution='Imported only the tip.')
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
         self.git(self.repo, 'reset', '--hard', preflight['owner_head_before'])
-        # The suggested range import reproduces every handback path byte for byte.
-        self.git(self.repo, 'cherry-pick', '-x', record['baseline_commit'] + '..' + record['commit'])
+        # The suggested merge reproduces every handback path byte for byte.
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
         imported = self.service.ao_room_import_record(
             self.room, 'A1', preflight['preflight_sha256'],
-            'git cherry-pick -x ' + record['baseline_commit'] + '..' + record['commit'])
+            'git merge --no-ff --no-edit ' + record['commit'])
         self.assertEqual(imported['kind'], 'faithful')
         self.assertEqual(imported['missing_paths'], [])
+        self.assertEqual(self.lifecycle()['state'], 'imported')
 
 
 class OrdinaryRoomTests(CoordinationFixture):
@@ -807,6 +850,19 @@ class GateTests(CoordinationFixture):
             self.accept_b()
         with self.assertRaisesRegex(RoomError, 'missing_checkpoint'):
             self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_unverifiable_worktree_refuses(self):
+        self.assignment_accepted()
+        real = ao_coordination._git_run
+
+        def broken(path, *args):
+            if args and args[0] == 'status':
+                return subprocess.CompletedProcess(['git'], 1, b'', b'fatal: not a git repository')
+            return real(path, *args)
+
+        with patch.object(ao_coordination, '_git_run', side_effect=broken):
+            with self.assertRaisesRegex(RoomError, 'worktree_unverified'):
+                self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
 
     def test_scope_drift_refuses_at_accept_and_handback(self):
         self.open_rooms()
