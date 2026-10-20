@@ -25,6 +25,11 @@ from test_ao_normal import Fixture
 
 REPO_ROOT = Path(__file__).resolve().parent
 
+# The reviewer's exact synthetic private-path/credential sentinel (B1): a value that must never be
+# echoed back by any admission refusal, whether submitted as an argument name, an argument value, a
+# bare (nonobject) arguments payload, or nested inside a collection under an unexpected key.
+SENTINEL = "/synthetic/private/credential-DO-NOT-ECHO"
+
 # Sanitized synthetic draft-report fixtures, authored from the public compact contract and the observed
 # defect classes above; not live receipts, project data, IDs or room context, and not test results in
 # themselves. Each "text" is byte-for-byte what a native session could return; its recorded "sha256" is
@@ -344,6 +349,139 @@ class AdmissionTests(unittest.TestCase):
         text = '{"a":' + '[' * 2000 + '1' + ']' * 2000 + '}'
         with self.assertRaisesRegex(RoomError, "Draft report exceeds the admitted nesting depth"):
             ao_report_validation.validate_draft(text)
+
+
+# The complete, fixed success-result key order (unchanged by B1/B2); the refusal-payload key order
+# is exactly ["error"] followed by these same eight keys.
+_SUCCESS_RESULT_KEYS = ["operation", "validity_scope", "syntax_shape_valid", "report_form",
+                        "diagnostics", "advisories", "unperformed_checks", "limits"]
+_REFUSAL_PAYLOAD_KEYS = ["error"] + _SUCCESS_RESULT_KEYS
+_FIXED_LIMITS = {"max_text_bytes": ao_report_validation.MAX_TEXT_BYTES, "max_depth": ao_report_validation.MAX_DEPTH,
+                 "max_diagnostics": ao_report_validation.MAX_DIAGNOSTICS, "truncated": False}
+VALID_TEXT = _FIXTURES_BY_NAME["compact-valid.json"]["text"]
+
+
+class AdmissionRefusalTests(unittest.TestCase):
+    """B1/B2: every admission-refusal branch reachable through validate_call (the shared entry point
+    behind Service.call, the CLI preflight and MCP tools/call) raises a fixed, bounded, non-echoing
+    DraftAdmissionError -- never the reviewer's sentinel, whatever its role (argument name, argument
+    value, bare nonobject payload, or nested inside a collection) -- whose .payload still carries all
+    16 unperformed_checks and the fixed limits, exactly like a validated draft, plus "error". The
+    malformed-JSON and success cases are included as the contrasting, non-refusal control."""
+
+    def _refused(self, arguments):
+        with self.assertRaises(ao_report_validation.DraftAdmissionError) as caught:
+            ao_report_validation.validate_call(arguments)
+        exc = caught.exception
+        self.assertIsInstance(exc, RoomError)
+        self.assertIn(str(exc), ao_report_validation.ADMISSION_MESSAGES)
+        self.assertEqual(exc.payload["error"], str(exc))
+        self.assertEqual(list(exc.payload), _REFUSAL_PAYLOAD_KEYS)
+        self.assertEqual(exc.payload["unperformed_checks"],
+                          [dict(item) for item in ao_report_validation.UNPERFORMED_CHECKS])
+        self.assertEqual(len(exc.payload["unperformed_checks"]), 16)
+        self.assertEqual(exc.payload["limits"], _FIXED_LIMITS)
+        serialized = json.dumps(exc.payload)
+        self.assertNotIn(SENTINEL, str(exc))
+        self.assertNotIn(SENTINEL, serialized)
+        return exc
+
+    def test_nonobject_arguments_are_refused_with_an_identical_fixed_payload(self):
+        cases = ([SENTINEL], SENTINEL, None, 0, True)
+        lengths = set()
+        for value in cases:
+            with self.subTest(value=repr(value)[:50]):
+                exc = self._refused(value)
+                self.assertEqual(str(exc), "arguments must be an object")
+                lengths.add(len(json.dumps(exc.payload)))
+        self.assertEqual(len(lengths), 1)  # identical payload size regardless of what was submitted
+
+    def test_wrong_argument_keys_are_refused_with_an_identical_fixed_payload(self):
+        cases = (
+            {},
+            {"report_text": VALID_TEXT, SENTINEL: 0},
+            {"report_text": VALID_TEXT, "k" * 80_000: 0},
+            {"report_text": VALID_TEXT, "k" * 20_000: 0},
+            {"report_text": VALID_TEXT, **{f"extra{i}": i for i in range(1000)}},
+            {"report_text": VALID_TEXT, "nested": {SENTINEL: [SENTINEL, {"a": SENTINEL}]}},
+            {"report_text": VALID_TEXT, "extra_key": SENTINEL},
+        )
+        lengths = set()
+        for arguments in cases:
+            with self.subTest(key_count=len(arguments)):
+                exc = self._refused(arguments)
+                self.assertEqual(str(exc), "Invalid arguments; ao_report_validate admits exactly one "
+                                            "argument, report_text")
+                lengths.add(len(json.dumps(exc.payload)))
+        self.assertEqual(len(lengths), 1)  # identical payload size regardless of the extra key(s)
+
+    def test_report_text_wrong_type_is_refused_with_an_identical_fixed_payload(self):
+        cases = (
+            {"a": SENTINEL, SENTINEL: SENTINEL},
+            [SENTINEL],
+            12345,
+            None,
+            True,
+            SENTINEL.encode(),
+        )
+        lengths = set()
+        for value in cases:
+            with self.subTest(value=repr(value)[:50]):
+                exc = self._refused({"report_text": value})
+                self.assertEqual(str(exc), ao_report_validation.ADMISSION_MESSAGES[2])
+                lengths.add(len(json.dumps(exc.payload)))
+        self.assertEqual(len(lengths), 1)
+
+    def test_blank_report_text_is_refused(self):
+        for value in ("", "  \n"):
+            with self.subTest(value=repr(value)):
+                exc = self._refused({"report_text": value})
+                self.assertEqual(str(exc), ao_report_validation.ADMISSION_MESSAGES[2])
+
+    def test_lone_surrogate_report_text_is_refused_without_echoing_it(self):
+        for value in ("\ud800", SENTINEL + "\udfff"):
+            with self.subTest(value=repr(value)[:50]):
+                exc = self._refused({"report_text": value})
+                self.assertEqual(str(exc), "report_text must be valid UTF-8 text")
+
+    def test_oversized_report_text_is_refused(self):
+        oversized_ascii = "a" * (ao_report_validation.MAX_TEXT_BYTES + 1)
+        # Undersize in characters, oversize in UTF-8 bytes: "£" (U+00A3) is 2 bytes in UTF-8.
+        oversized_multibyte = "£" * 600_000
+        self.assertLess(len(oversized_multibyte), ao_report_validation.MAX_TEXT_BYTES)
+        self.assertGreater(len(oversized_multibyte.encode("utf-8")), ao_report_validation.MAX_TEXT_BYTES)
+        for value in (oversized_ascii, oversized_multibyte):
+            with self.subTest(size=len(value)):
+                exc = self._refused({"report_text": value})
+                self.assertEqual(str(exc), ao_report_validation.ADMISSION_MESSAGES[2])
+
+    def test_depth_just_over_the_limit_is_refused(self):
+        exc = self._refused({"report_text": AdmissionTests._nested(ao_report_validation.MAX_DEPTH + 1)})
+        self.assertEqual(str(exc), "Draft report exceeds the admitted nesting depth")
+
+    def test_depth_far_beyond_the_recursion_limit_is_refused(self):
+        text = '{"a":' * 2000 + '0' + '}' * 2000
+        exc = self._refused({"report_text": text})
+        self.assertEqual(str(exc), "Draft report exceeds the admitted nesting depth")
+
+    def test_malformed_json_report_text_still_returns_a_result_with_all_unperformed_checks(self):
+        # Contrast case: malformed JSON is a validated-but-invalid draft, never a refusal -- the
+        # "$" diagnostic path stays a normal RETURN, with all 16 unperformed_checks still present.
+        result = ao_report_validation.validate_call({"report_text": "not json at all {{{"})
+        self.assertFalse(result["syntax_shape_valid"])
+        self.assertEqual(len(result["unperformed_checks"]), 16)
+        self.assertEqual(list(result), _SUCCESS_RESULT_KEYS)
+
+    def test_success_result_key_list_is_unchanged(self):
+        result = ao_report_validation.validate_call({"report_text": VALID_TEXT})
+        self.assertTrue(result["syntax_shape_valid"], result)
+        self.assertEqual(list(result), _SUCCESS_RESULT_KEYS)
+        # A following valid request still works after a refusal on the same process: admission
+        # refusal leaves no mutated module state (ADMISSION_MESSAGES/UNPERFORMED_CHECKS are read-only
+        # tuples; nothing here is cached per-call).
+        self._refused({})
+        result_again = ao_report_validation.validate_call({"report_text": VALID_TEXT})
+        self.assertEqual(result_again, result)
 
 
 class MalformedJsonDiagnosticsTests(unittest.TestCase):
@@ -675,6 +813,10 @@ class ZeroEffectsTests(unittest.TestCase):
             self.assertFalse(home.exists())
 
     def test_cli_invalid_arguments_report_the_shared_error_convention_and_still_create_no_home(self):
+        # B1/B2: ao_report_validate no longer shares tool_arguments's interpolated
+        # "missing=[...], unexpected=[...]" text with every other tool; its own admission is a fixed,
+        # bounded refusal object (the complete payload, not merely {"error": ...}) that still carries
+        # all 16 unperformed_checks and the fixed limits on stderr.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "cli-error-home"  # deliberately never created; isolated temp dir, not the repo
             self.assertFalse(home.exists())
@@ -684,8 +826,8 @@ class ZeroEffectsTests(unittest.TestCase):
                 capture_output=True, text=True, cwd=str(REPO_ROOT))
             self.assertEqual(completed.returncode, 2)
             self.assertEqual(completed.stdout, "")
-            self.assertEqual(json.loads(completed.stderr),
-                              {"error": "Invalid arguments; missing=['report_text'], unexpected=[]"})
+            message = "Invalid arguments; ao_report_validate admits exactly one argument, report_text"
+            self.assertEqual(json.loads(completed.stderr), ao_report_validation.refusal_payload(message))
             self.assertFalse(home.exists())
 
     def test_cli_recursion_depth_refusal_reports_exit_2_and_still_creates_no_home(self):
@@ -705,7 +847,7 @@ class ZeroEffectsTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2, completed.stdout)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(json.loads(completed.stderr),
-                              {"error": "Draft report exceeds the admitted nesting depth"})
+                              ao_report_validation.refusal_payload("Draft report exceeds the admitted nesting depth"))
             self.assertFalse(home.exists())
 
     def test_no_network_process_database_or_filesystem_access(self):
@@ -760,6 +902,23 @@ class ZeroEffectsTests(unittest.TestCase):
             self.assertFalse(unparsable["syntax_shape_valid"])
             with self.assertRaises(RoomError):
                 ao_report_validation.validate_draft("")
+
+            # B1/B2: validate_call's own admission branches (argument shape, report_text
+            # shape/size/encoding/depth) must likewise never open, mkdir, connect or spawn anything.
+            for arguments in (
+                [SENTINEL],                                                   # nonobject arguments
+                {},                                                           # wrong argument keys (missing)
+                {"report_text": SENTINEL, "unexpected": SENTINEL},            # wrong argument keys (extra)
+                {"report_text": None},                                        # report_text wrong type
+                {"report_text": ""},                                          # blank report_text
+                {"report_text": "\ud800"},                                    # lone surrogate
+                {"report_text": "a" * (ao_report_validation.MAX_TEXT_BYTES + 1)},          # oversized
+                {"report_text": AdmissionTests._nested(ao_report_validation.MAX_DEPTH + 1)},  # depth 65
+                {"report_text": '{"a":' * 2000 + '0' + '}' * 2000},           # depth far beyond recursion limit
+            ):
+                with self.subTest(arguments=repr(arguments)[:60]):
+                    with self.assertRaises(ao_report_validation.DraftAdmissionError):
+                        ao_report_validation.validate_call(arguments)
         finally:
             http.client.HTTPSConnection.__init__ = originals[(http.client, "HTTPSConnection__init__")]
             http.client.HTTPConnection.__init__ = originals[(http.client, "HTTPConnection__init__")]

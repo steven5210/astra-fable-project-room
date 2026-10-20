@@ -1894,11 +1894,14 @@ class Service:
                         pass
 
     def call(self, name, arguments):
-        tool_arguments(name, arguments)
         if name == "ao_report_validate":
-            # Read-only and offline: dispatch before any branch that touches self.home.
+            # Read-only and offline: dispatched before tool_arguments and before any branch that
+            # touches self.home. This endpoint admits its own arguments (bounded, non-echoing --
+            # ao_report_validation.admit_arguments) and never reaches the shared tool_arguments
+            # check below, which keeps its historical interpolated message for every other tool.
             import ao_report_validation
-            return ao_report_validation.validate_draft(**arguments)
+            return ao_report_validation.validate_call(arguments)
+        tool_arguments(name, arguments)
         if name.startswith("ao_room_") or name == "ao_release_check":
             import ao_project_room
             return getattr(ao_project_room.Service(self.home), name)(**arguments)
@@ -1983,8 +1986,12 @@ TOOL_SCHEMAS.update(ao_project_room.TOOL_SCHEMAS)
 def tool_arguments(name, arguments):
     """Validate one tool call's arguments against TOOL_SCHEMAS.
 
-    Shared by Service.call and main's pre-Service ao_report_validate dispatch so both reject
-    malformed input identically, with the same messages, regardless of whether a home is ever touched.
+    ao_report_validate is no longer checked here: that endpoint admits its own arguments in
+    ao_report_validation.admit_arguments (a bounded, non-echoing refusal that never interpolates a
+    supplied name or value), dispatched in Service.call and in main's CLI preflight before this
+    function, and in MCP tools/call, before either ever reaches this shared check. This historical
+    check, including its exact interpolated message text (``Invalid arguments; missing=[...],
+    unexpected=[...]``), is unchanged for every other tool.
     """
     if name not in TOOL_SCHEMAS:
         raise room.RoomError(f"Unknown tool {name}")
@@ -2091,11 +2098,23 @@ def main(argv=None):
             return 0 if result["coverage"] == "complete" else 1
         if args.command == "call" and args.tool == "ao_report_validate":
             # Dispatch before Service construction: this read-only, offline draft validator must not
-            # provision a home, matching the audit commands above.
+            # provision a home, matching the audit commands above. This endpoint admits its own
+            # arguments (ao_report_validation.admit_arguments), not the shared tool_arguments check:
+            # an unreadable --args-file (missing, unreadable, undecodable) still raises its own
+            # historical error below, caught by the outer except exactly like any other command;
+            # only malformed JSON *text* in --args/--args-file becomes the same fixed, bounded
+            # admission refusal as a bad report_text.
             import ao_report_validation
-            arguments = json.loads(Path(args.args_file).read_text() if args.args_file else args.args)
-            tool_arguments(args.tool, arguments)
-            result = ao_report_validation.validate_draft(**arguments)
+            args_text = Path(args.args_file).read_text() if args.args_file else args.args
+            try:
+                try:
+                    arguments = json.loads(args_text)
+                except (ValueError, RecursionError) as exc:
+                    raise ao_report_validation.DraftAdmissionError("arguments must be an object") from exc
+                result = ao_report_validation.validate_call(arguments)
+            except ao_report_validation.DraftAdmissionError as exc:
+                print(json.dumps(exc.payload), file=sys.stderr)
+                return 2
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0
         service = Service(args.home)

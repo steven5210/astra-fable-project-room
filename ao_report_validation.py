@@ -15,10 +15,23 @@ readiness and acceptance may perform further checks it does not name.
 This module performs no IO, writes nothing, creates no directory, calls no provider or network
 endpoint, and never requires a room, provider configuration or authentication. It never echoes the
 submitted report's bytes, values or any filesystem path back to the caller.
+
+Argument admission -- whether ``arguments`` is an object carrying exactly one key, ``report_text``,
+and whether that ``report_text`` is a nonempty, valid-UTF-8, size- and depth-bounded string -- is this
+endpoint's own bounded, non-echoing refusal, raised as ``DraftAdmissionError`` before any shape check
+ever runs. ``str(exc)`` is always one of the fixed ``ADMISSION_MESSAGES`` literals, never a supplied
+name, value, type name, length, count or path; ``exc.payload`` is the complete, fixed-size refusal
+object every public surface (the raised exception's own ``.payload``, the CLI's stderr JSON, and the
+MCP ``isError`` result's text and structuredContent) presents, carrying the same ``unperformed_checks``
+and ``limits`` a validated draft carries, plus ``"error"``. A refused admission is distinct from a
+validated-but-invalid draft: the latter is a normal return with ``syntax_shape_valid`` false and
+concrete diagnostics; the former never returns, and its payload's ``diagnostics``/``advisories`` stay
+empty because no shape check ever ran.
 """
 
 from ao_quality_review import MAX_DEPTH
 import ao_report_contract
+from room import RoomError
 
 # Draft-only. Comfortably under project_room_mcp.MAX_LINE (3,000,000 bytes) for ordinary text, but
 # this is not a guarantee that an admitted report_text's JSON-escaped bytes always stay under that
@@ -68,6 +81,49 @@ UNPERFORMED_CHECKS = (
     {"check": "formal_candidate_verification", "description": "the pinned formal gates run by the operator on the exact candidate (ao_room_verify), never by this call"},
     {"check": "independent_acceptance", "description": "Astra's independent acceptance of the exact spec, candidate and gate evidence (ao_room_accept), never implied by a valid draft"},
 )
+
+# The complete, fixed set of admission-refusal messages this operation can ever raise, in no
+# particular priority order. Every one is a literal (the nonempty-text message is built from
+# MAX_TEXT_BYTES so it cannot drift from the actual bound); never a supplied name, value, type name,
+# length, count or path. str(DraftAdmissionError(...)) is always a member of this tuple.
+ADMISSION_MESSAGES = (
+    "arguments must be an object",
+    "Invalid arguments; ao_report_validate admits exactly one argument, report_text",
+    f"report_text must be nonempty text, at most {MAX_TEXT_BYTES} UTF-8 bytes",
+    "report_text must be valid UTF-8 text",
+    "Draft report exceeds the admitted nesting depth",
+)
+
+
+def refusal_payload(message):
+    """The complete, fixed-size refusal object every public surface presents for one admission
+    refusal: DraftAdmissionError.payload, the CLI's stderr JSON, and the MCP isError result's text and
+    structuredContent. ``message`` must be one of ADMISSION_MESSAGES. Carries the same
+    unperformed_checks and limits a validated draft result carries, plus "error"; diagnostics and
+    advisories stay empty because no shape check ever ran. Fixed size regardless of the refused
+    input: no submitted bytes, lengths or counts are embedded anywhere in this object."""
+    return {
+        "error": message,
+        "operation": "ao_report_validate",
+        "validity_scope": "syntax_and_shape_only",
+        "syntax_shape_valid": False,
+        "report_form": None,
+        "diagnostics": [],
+        "advisories": [],
+        "unperformed_checks": [dict(item) for item in UNPERFORMED_CHECKS],
+        "limits": {"max_text_bytes": MAX_TEXT_BYTES, "max_depth": MAX_DEPTH, "max_diagnostics": MAX_DIAGNOSTICS,
+                   "truncated": False},
+    }
+
+
+class DraftAdmissionError(RoomError):
+    """Fixed, bounded, non-echoing refusal of one ao_report_validate call at admission, before any
+    shape check. str(exc) is one of the fixed admission messages; ``payload`` is the complete refusal
+    object every public surface presents."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.payload = refusal_payload(message)
 
 
 def shape_diagnostics(report, identity_required):
@@ -143,23 +199,53 @@ def _bounded(entries):
     return bounded, truncated
 
 
+def admit_arguments(arguments):
+    """Admit exactly one ao_report_validate argument, report_text, before any shape check ever runs.
+
+    This is the endpoint's own bounded, non-echoing argument admission, used in place of the shared
+    tool_arguments check for this one tool. Touches only the submitted keys, never a submitted value:
+    a nonobject ``arguments``, or one that does not carry exactly the single key "report_text", is
+    refused by one of the two fixed ADMISSION_MESSAGES literals, never by interpolating what was
+    actually submitted.
+    """
+    if not isinstance(arguments, dict):
+        raise DraftAdmissionError("arguments must be an object")
+    if set(arguments) != {"report_text"}:
+        raise DraftAdmissionError("Invalid arguments; ao_report_validate admits exactly one argument, report_text")
+    return arguments["report_text"]
+
+
+def validate_call(arguments):
+    """Public entry point shared by Service.call, the CLI preflight and MCP tools/call: admit the
+    raw ``arguments`` object, then validate the admitted report_text. Raises DraftAdmissionError for
+    any refused admission (argument shape or report_text shape/size/encoding/depth); never for a
+    malformed *report*, which always comes back as a normal result with diagnostics."""
+    return validate_draft(admit_arguments(arguments))
+
+
 def validate_draft(report_text):
     """Read-only, offline syntax/shape validation of one draft engineering report text.
 
     Never raises for a malformed *report*: malformed JSON, an unsupported report_format, model-written
     controller_metadata, malformed operator_requests/enhancement_proposals and pure shape defects all
     become diagnostics/advisories in the returned object. Only a malformed *admission* (wrong type,
-    empty, not UTF-8, oversized, or nested deeper than MAX_DEPTH) raises RoomError, at admission,
-    before any shape check. Nesting deeper than MAX_DEPTH is refused as the same admission failure
-    whether it is detected by the post-parse depth walk or, for a document nested past the
-    interpreter's own recursion limit, by the parser's RecursionError.
+    empty, not UTF-8, oversized, or nested deeper than MAX_DEPTH) raises DraftAdmissionError, a
+    RoomError subclass, at admission, before any shape check. str(exc) is always one of the fixed
+    ADMISSION_MESSAGES literals -- never a supplied value, type name, length or path -- and
+    exc.payload is the complete, fixed-size refusal object every public surface presents, carrying the
+    same unperformed_checks and limits a validated draft carries, plus "error". Nesting deeper than
+    MAX_DEPTH is refused as the same admission failure whether it is detected by the post-parse depth
+    walk or, for a document nested past the interpreter's own recursion limit, by the parser's
+    RecursionError.
     """
     import ao_project_room
     import ao_response_normalization
     import ao_review_followups
-    from room import RoomError
 
-    ao_project_room.nonempty(report_text, "report_text", MAX_TEXT_BYTES)
+    try:
+        ao_project_room.nonempty(report_text, "report_text", MAX_TEXT_BYTES)
+    except RoomError as exc:
+        raise DraftAdmissionError(str(exc)) from exc
     try:
         report = ao_response_normalization.strict_object(report_text)
         parsed = True
@@ -171,12 +257,12 @@ def validate_draft(report_text):
         # admission failure below, exactly like the post-parse MAX_DEPTH check, never surfaced as
         # a "$" diagnostic.
         if isinstance(exc.__cause__, RecursionError):
-            raise RoomError("Draft report exceeds the admitted nesting depth") from exc
+            raise DraftAdmissionError("Draft report exceeds the admitted nesting depth") from exc
         report = None
         parsed = False
 
     if parsed and _exceeds_max_depth(report):
-        raise RoomError("Draft report exceeds the admitted nesting depth")
+        raise DraftAdmissionError("Draft report exceeds the admitted nesting depth")
 
     diagnostics = []
     advisories = []

@@ -118,17 +118,27 @@ no remaining gaps — a reminder of named checks, never an exhaustive contract:
 `candidate_unchanged`, `semantic_correctness_assessment`,
 `formal_candidate_verification`, `independent_acceptance`), and `limits`
 (`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
-failures — a non-string, empty, oversized or invalid-UTF-8 `report_text`, or
-nesting past the admitted depth — are refusals (a JSON error, CLI exit 2), never
-diagnostics; a malformed syntax or root shape is instead a diagnostic on field
-`$`. The full form keeps whatever unknown fields it is given, including a
+failures — arguments other than exactly `report_text`, or a `report_text` that
+is a non-string, empty, oversized or invalid-UTF-8, or nesting past the
+admitted depth — are refusals, never diagnostics, and every refusal carries a
+fixed, bounded payload with that same field set (`syntax_shape_valid: false`,
+`report_form: null`, empty `diagnostics`/`advisories`, the full
+`unperformed_checks` list and `limits`) plus `error`, never echoing the
+caller's supplied argument names, values or paths: the API raises
+`DraftAdmissionError` with that object on its `.payload` attribute, the CLI
+exits 2 with that object on stderr, and MCP returns an `isError` result whose
+`content` text and `structuredContent` are that same object. A malformed
+syntax or root shape is instead a diagnostic on field `$`, in a normal
+(non-refusal) result. The full form keeps whatever unknown fields it is given, including a
 model-supplied `controller_metadata`; the compact form refuses a model-supplied
 `controller_metadata` exactly as the existing compact-contract projection does.
 
 The operation itself writes nothing, creates no home, config or registry, and
 calls no provider from any public entry: the CLI preflight runs before
-controller construction; `Service.call` dispatches it before any room or home
-access; and the MCP `tools/call` dispatch consults the shared legacy-tools gate
+controller construction; `Service.call` dispatches it, through its own bounded
+argument admission, before the shared `tool_arguments` check every other tool
+goes through and before any room or home access; and the MCP `tools/call`
+dispatch consults the shared legacy-tools gate
 (`project_room.Service.legacy_tools_visible`) only for a legacy `room_*` tool
 name, so a draft validation never opens or creates the local SQLite room
 registry, including on a configured home whose saved config selects the `ao`
@@ -141,6 +151,19 @@ operation); and running any `project_room.py` command through the `python3`
 interpreter can let it write its own `__pycache__` bytecode for imported
 modules (already git-ignored, avoided with `PYTHONDONTWRITEBYTECODE=1`), never
 a room-state or controller-home write.
+
+The refusal boundary is exact: a request is inside the operation once an
+`arguments` value — any JSON value, including a non-object — reaches the
+endpoint through `Service.call`, through MCP `tools/call` naming this tool, or
+through the CLI preflight given any `--args`/`--args-file` text, including
+malformed JSON text; every refusal from that point on is the same fixed
+payload described above. A refusal raised before that point is pre-existing,
+unchanged, and carries no payload, because nothing reached the endpoint: the
+MCP transport's `-32600 Request exceeds maximum size` for an oversized line,
+its `-32700 Invalid JSON`, its invalid request/id/params and unknown-method
+errors, the generic `Unknown tool` dispatch error for a name that is not this
+endpoint, and the CLI's historical generic error for an unreadable
+`--args-file`.
 A passing result is never evidence of handoff authentication, delegate
 attribution, engineering readiness or independent acceptance, and it changes
 nothing else: the final engineering report keeps its existing format regardless

@@ -23,6 +23,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
 import ao_project_room
+import ao_report_validation
 import project_room
 
 RELATIVE_PATH_ARGUMENTS = {
@@ -160,6 +161,13 @@ def handle(message, service):
                 value = service.call(name, input_arguments(name, params.get("arguments", {})))
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
                           "structuredContent": value, "isError": False}
+            except ao_report_validation.DraftAdmissionError as exc:
+                # Bounded, non-echoing admission refusal: the payload is fixed-size, carries the same
+                # unperformed_checks/limits a validated draft carries, and never contains a supplied
+                # name, value or path. Every other exception keeps the historical {"error": str(exc)}
+                # text form; this is the only tool with a structuredContent error result.
+                result = {"content": [{"type": "text", "text": json.dumps(exc.payload, ensure_ascii=False)}],
+                          "structuredContent": exc.payload, "isError": True}
             except Exception as exc:
                 result = {"content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}], "isError": True}
     else:

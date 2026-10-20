@@ -14,6 +14,7 @@ test_ao_normal.DelegateFixture for the one section (D4) that needs a DeepSeek-pr
 receipts, project data, IDs or room context; no network, provider or model call.
 """
 import hashlib
+import io
 import json
 from pathlib import Path
 import stat
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import ao_delegates
 import ao_project_room
@@ -119,10 +121,39 @@ class ConfiguredWithoutRegistryMcpEffectsTests(unittest.TestCase):
                     self.assertEqual(after, before, case)
                     self.assertNotIn("registry.sqlite3", after)
                     self.assertEqual(response["result"]["isError"], is_error, case)
+                    self.assertIsNone(service._legacy_tools_visible_cache, case)
                     if is_error:
-                        self.assertEqual(json.loads(response["result"]["content"][0]["text"]),
-                                          {"error": ADMISSION_MESSAGE})
+                        expected_payload = ao_report_validation.refusal_payload(ADMISSION_MESSAGE)
+                        self.assertEqual(json.loads(response["result"]["content"][0]["text"]), expected_payload)
+                        self.assertEqual(response["result"]["structuredContent"], expected_payload)
                     last_home, last_service = home, service
+
+            # B1/B2: the argument-shape refusal (wrong key set, never a report_text problem) gets the
+            # same zero-filesystem-effect and untouched-gate-cache proof, on its own fresh home within
+            # the same registry-absent section, plus the sentinel-absence check B1 exists for.
+            with self.subTest(case="sentinel_key_refusal"):
+                home = root / "sentinel_key_refusal"
+                (home / "ao").mkdir(parents=True)
+                (home / "ao" / "config.json").write_text(json.dumps({"default_backend": "ao"}))
+                service = _probe_double(home)
+                before = _snapshot(home)
+                response = project_room_mcp.handle(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "ao_report_validate",
+                                "arguments": {"report_text": VALID_TEXT, rv.SENTINEL: 0}}},
+                    service)
+                after = _snapshot(home)
+                self.assertEqual(after, before)
+                self.assertNotIn("registry.sqlite3", after)
+                self.assertTrue(response["result"]["isError"])
+                self.assertIsNone(service._legacy_tools_visible_cache)
+                text = response["result"]["content"][0]["text"]
+                self.assertNotIn(rv.SENTINEL, text)
+                expected_payload = ao_report_validation.refusal_payload(
+                    "Invalid arguments; ao_report_validate admits exactly one argument, report_text")
+                self.assertEqual(json.loads(text), expected_payload)
+                self.assertEqual(response["result"]["structuredContent"], expected_payload)
+                last_home, last_service = home, service
 
             self._assert_legacy_control(last_home, last_service)
 
@@ -243,6 +274,26 @@ class MissingHomeControlTests(unittest.TestCase):
             self.assertTrue(json.loads(completed.stdout)["syntax_shape_valid"])
             self.assertFalse(home.exists())
 
+    def test_cli_call_with_a_sentinel_key_refusal_and_a_never_created_home_creates_nothing(self):
+        """B1/B2: the argument-shape refusal (wrong key set) on a controller home that never
+        existed at all -- exit 2, empty stdout, the bounded refusal payload (never the sentinel)
+        on stderr, and the home still never created."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "never-created-cli-refusal-home"  # deliberately never created
+            self.assertFalse(home.exists())
+            arguments = {"report_text": VALID_TEXT, rv.SENTINEL: 0}
+            completed = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "project_room.py"), "--home", str(home),
+                 "call", "ao_report_validate", "--args", json.dumps(arguments)],
+                capture_output=True, text=True, cwd=str(REPO_ROOT))
+            self.assertEqual(completed.returncode, 2, completed.stdout)
+            self.assertEqual(completed.stdout, "")
+            expected_payload = ao_report_validation.refusal_payload(
+                "Invalid arguments; ao_report_validate admits exactly one argument, report_text")
+            self.assertEqual(json.loads(completed.stderr), expected_payload)
+            self.assertNotIn(rv.SENTINEL, completed.stderr)
+            self.assertFalse(home.exists())
+
     def test_mcp_handle_on_a_double_with_no_config_at_all_creates_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "no-config-home"  # deliberately never created; no ao/ directory at all
@@ -256,6 +307,167 @@ class MissingHomeControlTests(unittest.TestCase):
             self.assertTrue(response["result"]["structuredContent"]["syntax_shape_valid"])
             self.assertFalse(home.exists())
             self.assertFalse((home / "ao").exists())
+
+
+class CrossSurfaceRefusalZeroEffectsTests(AgreedRoomFixture):
+    """Section B2 (B1/B2 fix verification): every admission-refusal branch -- wrong argument keys
+    (including a 20,000- and an 80,000-byte unexpected key name), a non-object arguments value, a
+    wrong-type report_text, a lone surrogate, and an over-depth report_text -- run through all three
+    public entry points against the SAME rich provisioned controller home Section B uses. None of
+    these calls may mutate that home, and the reviewer's sentinel
+    (/synthetic/private/credential-DO-NOT-ECHO) must never appear in any surface's complete
+    serialized response. The 20,000- and 80,000-byte unexpected-key variants must produce a
+    byte-identical response on the mcp and cli surfaces, proving the refusal is bounded by the fixed
+    message alone, never by what was actually submitted."""
+
+    def test_refusal_inputs_have_zero_effect_and_never_echo_the_sentinel(self):
+        self.implement()
+        controller = project_room.Service(self.home)
+
+        def baseline():
+            return {
+                "home": _snapshot(self.home),
+                "repo": _snapshot(self.repo),
+                "posts": len(self.fake.posts),
+                "status": self.service.ao_room_status(self.room),
+            }
+
+        before = baseline()
+        wrong_keys_message = "Invalid arguments; ao_report_validate admits exactly one argument, report_text"
+        wrong_type_message = ao_report_validation.ADMISSION_MESSAGES[2]
+        utf8_message = "report_text must be valid UTF-8 text"
+        depth_message = "Draft report exceeds the admitted nesting depth"
+
+        cases = (
+            ("sentinel_key", {"report_text": VALID_TEXT, rv.SENTINEL: 0}, wrong_keys_message),
+            ("key_20k", {"report_text": VALID_TEXT, "k" * 20_000: 0}, wrong_keys_message),
+            ("key_80k", {"report_text": VALID_TEXT, "k" * 80_000: 0}, wrong_keys_message),
+            ("list_with_sentinel", [rv.SENTINEL], "arguments must be an object"),
+            ("wrong_type_with_sentinel", {"report_text": {rv.SENTINEL: rv.SENTINEL}}, wrong_type_message),
+            ("lone_surrogate", {"report_text": "\ud800"}, utf8_message),
+            ("depth_2000", {"report_text": '{"a":' * 2000 + "0" + "}" * 2000}, depth_message),
+        )
+
+        mcp_text_by_case = {}
+        cli_stderr_by_case = {}
+        for case, arguments, message in cases:
+            expected_payload = ao_report_validation.refusal_payload(message)
+
+            with self.subTest(case=case, entry="direct"):
+                with self.assertRaises(ao_report_validation.DraftAdmissionError) as caught:
+                    controller.call("ao_report_validate", arguments)
+                self.assertEqual(caught.exception.payload, expected_payload)
+                self.assertNotIn(rv.SENTINEL, str(caught.exception))
+                self.assertEqual(baseline(), before)
+
+            with self.subTest(case=case, entry="mcp"):
+                response = project_room_mcp.handle(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "ao_report_validate", "arguments": arguments}},
+                    controller)
+                self.assertTrue(response["result"]["isError"], case)
+                self.assertEqual(response["result"]["structuredContent"], expected_payload)
+                text = response["result"]["content"][0]["text"]
+                self.assertEqual(text, json.dumps(expected_payload, ensure_ascii=False))
+                self.assertNotIn(rv.SENTINEL, text)
+                mcp_text_by_case[case] = text
+                self.assertEqual(baseline(), before)
+
+            with self.subTest(case=case, entry="cli"):
+                completed = subprocess.run(
+                    [sys.executable, str(REPO_ROOT / "project_room.py"), "--home", str(self.home),
+                     "call", "ao_report_validate", "--args", json.dumps(arguments)],
+                    capture_output=True, text=True, cwd=str(REPO_ROOT))
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(json.loads(completed.stderr), expected_payload)
+                self.assertNotIn(rv.SENTINEL, completed.stderr)
+                cli_stderr_by_case[case] = completed.stderr
+                self.assertEqual(baseline(), before)
+
+        self.assertEqual(mcp_text_by_case["key_20k"], mcp_text_by_case["key_80k"])
+        self.assertEqual(cli_stderr_by_case["key_20k"], cli_stderr_by_case["key_80k"])
+        self.assertEqual(_snapshot(self.home)["registry.sqlite3"], before["home"]["registry.sqlite3"])
+
+    def test_ao_room_status_with_an_unexpected_key_keeps_its_historical_interpolated_message(self):
+        """Control: a different ao_* tool's historical tool_arguments admission is untouched by the
+        ao_report_validate-only reorder in Service.call -- the error stays a plain room.RoomError
+        (never DraftAdmissionError) and still interpolates the actual unexpected key name (pure
+        tool_arguments; no file changes, since the missing/unexpected check raises before
+        ao_project_room.Service(self.home) is even constructed)."""
+        self.implement()
+        controller = project_room.Service(self.home)
+        with self.assertRaises(RoomError) as caught:
+            controller.call("ao_room_status", {"room_id": self.room, rv.SENTINEL: 0})
+        self.assertIs(type(caught.exception), RoomError)
+        self.assertEqual(str(caught.exception), "Invalid arguments; missing=[], unexpected=['" + rv.SENTINEL + "']")
+
+
+class InProcessStreamLoopRefusalTests(AgreedRoomFixture):
+    """Section E: the real project_room_mcp.main() newline-delimited JSON-RPC loop (not the
+    unit-level handle() helper) reading six queued tools/call requests from a patched stdin and
+    writing replies to a patched stdout, against the SAME rich provisioned controller home, with
+    project_room.Service() patched to return that home's real Service so main() never constructs or
+    touches any other home."""
+
+    def test_six_queued_requests_are_answered_in_order_without_leaking_the_sentinel(self):
+        self.implement()
+        controller = project_room.Service(self.home)
+        before_home = _snapshot(self.home)
+        before_interrupt = ao_project_room.SYNC_WAIT_INTERRUPT
+
+        def request(identifier, arguments):
+            return json.dumps({"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+                                "params": {"name": "ao_report_validate", "arguments": arguments}}) + "\n"
+
+        wire = "".join((
+            request(1, {"report_text": VALID_TEXT}),
+            request(2, {"report_text": VALID_TEXT, rv.SENTINEL: 0}),
+            request(3, {"report_text": VALID_TEXT, "k" * 80_000: 0}),
+            request(4, [rv.SENTINEL]),
+            request(5, {"report_text": "\ud800"}),
+            request(6, {"report_text": VALID_TEXT}),
+        )).encode()
+
+        class BufferedInput:
+            def __init__(self, data):
+                self.buffer = io.BytesIO(data)
+
+        output = io.StringIO()
+        with patch.object(project_room, "Service", return_value=controller), \
+                patch.object(project_room_mcp.sys, "stdin", BufferedInput(wire)), \
+                patch.object(project_room_mcp.sys, "stdout", output):
+            project_room_mcp.main()
+
+        text = output.getvalue()
+        self.assertNotIn(rv.SENTINEL, text)
+        lines = [line for line in text.split("\n") if line]
+        self.assertEqual(len(lines), 6)
+        replies = [json.loads(line) for line in lines]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3, 4, 5, 6])
+        by_id = dict(zip((reply["id"] for reply in replies), lines))
+
+        for index in (0, 5):
+            self.assertFalse(replies[index]["result"]["isError"], index)
+            self.assertTrue(replies[index]["result"]["structuredContent"]["syntax_shape_valid"])
+
+        for index in (1, 2, 3, 4):
+            self.assertTrue(replies[index]["result"]["isError"], index)
+            structured = replies[index]["result"]["structuredContent"]
+            self.assertEqual(len(structured["unperformed_checks"]), 16)
+            self.assertEqual(structured["limits"],
+                              {"max_text_bytes": ao_report_validation.MAX_TEXT_BYTES,
+                               "max_depth": ao_report_validation.MAX_DEPTH,
+                               "max_diagnostics": ao_report_validation.MAX_DIAGNOSTICS,
+                               "truncated": False})
+
+        # reply 3 (id=3, the 80k-key case) is byte-identical to reply 2 (id=2, the sentinel-key
+        # case) once the single ascii id digit is normalized: both refusals carry the exact same
+        # fixed-size payload regardless of the unexpected key's actual name or length.
+        self.assertEqual(by_id[3].replace('"id": 3', '"id": 2', 1), by_id[2])
+
+        self.assertEqual(_snapshot(self.home), before_home)
+        self.assertIs(ao_project_room.SYNC_WAIT_INTERRUPT, before_interrupt)
 
 
 class CompactDraftIdentityContradictionTests(AgreedRoomFixture):
