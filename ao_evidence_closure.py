@@ -8,7 +8,7 @@ no pinned model, budget, guard or delegate setting.
 
 VERSION = 1
 PART = "evidence_closure_v1"
-INSTRUCTION_SHA256 = "534caa9fa0ff6e082d04c038774472eb543df4c132e6f644aabaaaea12aa4f2a"
+INSTRUCTION_SHA256 = "3ef5a1ea29407100275ace4c98705070f5322caad4033264cc1ba5c886ec3ea1"
 INSTRUCTION = (
     "Evidence closure v1 (engineering default; refines the lifecycle execution and closure, "
     "quality-first review and finding provenance defaults, whose frozen text stays in force; it "
@@ -30,8 +30,8 @@ INSTRUCTION = (
     "the affected focused checks on the connected result before the handback, and no unit is "
     "reported done on its own evidence while its connection to the others is unverified. The "
     "read-only ao_report_validate operation (CLI or MCP) checks only the syntax and shape of one "
-    "draft engineering report, lists every check it does not perform, writes nothing and calls no "
-    "provider; a worker or the engineer may run it before a handback, but a successful result never "
+    "draft engineering report, names the authoritative checks it does not perform, writes nothing and "
+    "calls no provider; a worker or the engineer may run it before a handback, but a successful result never "
     "shows authentication, delegate verification, readiness or acceptance, and the final engineering "
     "report keeps its existing format."
 )

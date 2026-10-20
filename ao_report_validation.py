@@ -15,21 +15,34 @@ submitted report's bytes, values or any filesystem path back to the caller.
 from ao_quality_review import MAX_DEPTH
 import ao_report_contract
 
-MAX_TEXT_BYTES = 1_000_000  # Draft-only; below project_room_mcp.MAX_LINE (3,000,000 bytes) with JSON-escaping headroom.
+# Draft-only. Comfortably under project_room_mcp.MAX_LINE (3,000,000 bytes) for ordinary text, but
+# this is not a guarantee that an admitted report_text's JSON-escaped bytes always stay under that
+# line limit: a pathological admitted text (for example, mostly control or non-ASCII characters that
+# each need a \uXXXX escape) can still expand past it once embedded in the MCP request line. That
+# case is refused by the MCP transport itself as an oversized request line, failing closed, not by
+# this bound.
+MAX_TEXT_BYTES = 1_000_000
 MAX_DIAGNOSTICS = 64
 MAX_MESSAGE_CHARS = 200
 
 # Must equal set(ao_workflow.ENGINEERING_FIELDS); asserted by test_ao_report_validation. Kept as an
-# independent literal (not imported) so this module never has to import ao_workflow.
+# independent literal, never read from ao_workflow, only so this one module-level constant needs no
+# import at module-load time -- not a claim that this module never loads ao_workflow at all: when
+# validate_draft actually runs, its own lazy `import ao_project_room` already transitively loads
+# ao_workflow (ao_project_room imports it at its own module level), well after this constant was
+# defined. The literal avoids a module-level dependency for this one tuple; the equality itself is
+# asserted by test, not enforced by import.
 FIELD_ORDER = ('outcome', 'implementation_complete', 'changes', 'tests_reported', 'review_findings',
                'remaining_gaps', 'backlog', 'routing_log', 'spec_revision', 'spec_sha256', 'baseline_commit')
 _IDENTITY_FIELDS = ('spec_revision', 'spec_sha256', 'baseline_commit')
 _LIST_FIELDS = ('changes', 'tests_reported', 'review_findings', 'remaining_gaps', 'backlog', 'routing_log')
 _OUTCOMES = ('completed', 'changes_required', 'scope_change')
 
-# Checks authoritative capture/readiness/acceptance perform that this offline, parser-only draft
+# Named, authoritative capture/readiness/acceptance checks that this offline, parser-only draft
 # operation never performs. Order is fixed and this tuple is always returned in full, whether or not
-# the submitted draft is valid, so a caller never infers acceptance from a clean draft result.
+# the submitted draft is valid, so a caller never infers acceptance from a clean draft result. This
+# is a reminder of the checks named here, never an exhaustive contract that capture, readiness and
+# acceptance perform only these and nothing else.
 UNPERFORMED_CHECKS = (
     {"check": "handoff_authentication", "description": "request handoff_sha256 equals the bound handoff"},
     {"check": "spec_identity_equality", "description": "spec_revision/spec_sha256/baseline_commit equal the handoff record"},
@@ -39,6 +52,11 @@ UNPERFORMED_CHECKS = (
     {"check": "engineering_readiness", "description": "completed outcome, implementation_complete, empty remaining_gaps, no pending operator work"},
     {"check": "findings_projection", "description": "review_findings lineage/provenance projection"},
     {"check": "capture_receipts", "description": "response-normalization and engineering capture records written only by authoritative capture"},
+    {"check": "candidate_binding", "description": "the candidate is bound to immutable completion-candidate evidence at first completed observation"},
+    {"check": "native_outcome_evidence", "description": "the request's native/worker outcome evidence is authenticated and checked for a semantic hold"},
+    {"check": "correction_chain", "description": "report-only correction evidence is walked, authenticated and checked for cycles"},
+    {"check": "issue_dispositions", "description": "malformed operator work in a walked correction chain requires an explicit operator_requests disposition"},
+    {"check": "candidate_unchanged", "description": "the candidate is re-snapshotted and compared equal to the bound completion candidate before capture succeeds"},
 )
 
 
@@ -121,7 +139,10 @@ def validate_draft(report_text):
     Never raises for a malformed *report*: malformed JSON, an unsupported report_format, model-written
     controller_metadata, malformed operator_requests/enhancement_proposals and pure shape defects all
     become diagnostics/advisories in the returned object. Only a malformed *admission* (wrong type,
-    empty, not UTF-8, oversized, or nested deeper than MAX_DEPTH) raises RoomError, before any parsing.
+    empty, not UTF-8, oversized, or nested deeper than MAX_DEPTH) raises RoomError, at admission,
+    before any shape check. Nesting deeper than MAX_DEPTH is refused as the same admission failure
+    whether it is detected by the post-parse depth walk or, for a document nested past the
+    interpreter's own recursion limit, by the parser's RecursionError.
     """
     import ao_project_room
     import ao_response_normalization
@@ -132,7 +153,15 @@ def validate_draft(report_text):
     try:
         report = ao_response_normalization.strict_object(report_text)
         parsed = True
-    except ao_response_normalization.ResponseFormatError:
+    except ao_response_normalization.ResponseFormatError as exc:
+        # A document nested deeper than the interpreter recursion limit (about 995 levels on
+        # Python 3.11) makes strict_object's decoder raise RecursionError before it can return a
+        # value; strict_object wraps that as this same ResponseFormatError, so it must be told
+        # apart from an ordinary malformed-JSON ResponseFormatError and refused as the depth
+        # admission failure below, exactly like the post-parse MAX_DEPTH check, never surfaced as
+        # a "$" diagnostic.
+        if isinstance(exc.__cause__, RecursionError):
+            raise RoomError("Draft report exceeds the admitted nesting depth") from exc
         report = None
         parsed = False
 

@@ -24,6 +24,7 @@ import ao_residual_escalation
 import ao_workflow
 import lifecycle_closure
 import project_room_runtime
+from room import RoomError
 import test_ao_continuation
 import test_ao_normal as fixtures
 
@@ -45,6 +46,11 @@ LIFECYCLE_CLOSURE_SHA256 = "d9db1bee4d3b65b301ab7f3508ca2d71a7b16de7f769626f7841
 EXECUTION_EVIDENCE_SHA256 = "4636e2c8ed80f6e748c538485d1c788d4ba6b9e5734efa3ca1e0aa4b53ff3574"
 FINDING_PROVENANCE_SHA256 = "d67ce9529889ce53b817988c386774148eb92909dcec76d6ea6faa78eb2ad8ec"
 
+# Independent literal pin for this module's own text, exactly like the sibling pins above: comparing
+# it against both the live INSTRUCTION_SHA256 constant and a freshly computed digest of the live
+# INSTRUCTION catches drift in the text, the pin, or both, rather than only a self-consistency check.
+EVIDENCE_CLOSURE_SHA256 = "3ef5a1ea29407100275ace4c98705070f5322caad4033264cc1ba5c886ec3ea1"
+
 
 class FrozenModulePatternTests(unittest.TestCase):
     """The same frozen-module shape as lifecycle_closure.py, ao_execution_evidence.py
@@ -57,8 +63,10 @@ class FrozenModulePatternTests(unittest.TestCase):
         self.assertEqual(ao_evidence_closure.PART, "evidence_closure_v1")
 
     def test_instruction_digest_matches_its_pin(self):
-        self.assertEqual(hashlib.sha256(ao_evidence_closure.INSTRUCTION.encode("utf-8")).hexdigest(),
-                         ao_evidence_closure.INSTRUCTION_SHA256)
+        computed = hashlib.sha256(ao_evidence_closure.INSTRUCTION.encode("utf-8")).hexdigest()
+        self.assertEqual(computed, ao_evidence_closure.INSTRUCTION_SHA256)
+        # Independent literal, not merely the module comparing its own text to its own pin.
+        self.assertEqual(computed, EVIDENCE_CLOSURE_SHA256)
 
     def test_module_source_has_no_import_statements(self):
         # Same frozen-module guarantee the siblings carry: nothing computes or
@@ -325,6 +333,69 @@ class HistoricalSessionDeliveryTests(fixtures.Fixture):
         self.assertEqual(request['carried']['part_sha256'][ao_evidence_closure.PART],
                          ao_evidence_closure.INSTRUCTION_SHA256)
         self.assertNotIn(ao_progress.INSTRUCTION, request['text'])
+
+
+class OnceOnlyExclusionProofTests(fixtures.Fixture):
+    """Two further once-only delivery proofs, beyond RetainedSessionDeliveryTests above: the part is
+    named undelivered before any send ever reaches the engineer session, and an attempted send that a
+    semantic hold refuses never advances delivery credit or posts, exactly like any other refused
+    ao_room_send."""
+
+    def test_part_is_named_undelivered_before_the_first_send_with_zero_posts(self):
+        # After bind, before any engineer send exists at all: no completed turn has carried
+        # anything yet, so every part -- including evidence_closure_v1 -- is still undelivered,
+        # and this read-only status call itself never posts.
+        self.room = self.open()
+        self.spec()
+        self.bind()
+        status = self.service.ao_room_status(self.room)
+        self.assertIn(ao_evidence_closure.PART, status['engineer_context']['undelivered_parts'])
+        self.assertEqual(len(self.fake.posts), 0)
+        # Confirmed from the same offline projection a live send would consult: delivered() finds no
+        # completed engineer turn yet, so the part is credited to no one.
+        held = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
+
+    def test_a_held_room_refuses_the_send_without_crediting_delivery_or_posting(self):
+        # Simulate a session whose first packet predates evidence_closure_v1 (exactly like
+        # RetainedSessionDeliveryTests.setUp), but let the one implementation turn finish with no
+        # final response at all: ao_outcomes classifies that as an unconditional semantic hold
+        # (kind "unknown"), entirely from the real completed-turn evidence, not a patched field.
+        with patch.object(ao_workflow, 'PARTS', OLDER_PARTS):
+            self.room = self.open()
+            self.spec()
+            self.bind()
+            self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send('implementation', 'impl-1')
+            self.fake.finish('engineer', '')
+            self.service.ao_room_sync(self.room)
+        request = self.state()['requests']['impl-1']
+        self.assertIn('no final response', request['engineering_error'])
+        self.assertEqual(ao_workflow.engineering_capture(self.state())['status'], 'held')
+        session_id = self.state()['bindings']['engineer']['session_id']
+        held_before = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertNotIn(ao_evidence_closure.PART, held_before['parts'])
+        summary_before = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertIn(ao_evidence_closure.PART, summary_before['undelivered_parts'])
+
+        state_before = json.dumps(self.state(), sort_keys=True)
+        posts_before = len(self.fake.posts)
+        # Back on the real, unpatched PARTS: a successful correction here would deliver
+        # evidence_closure_v1 for the first time, but the room is held, so ao_outcomes.gate must
+        # refuse before any packet is assembled or posted -- the same boundary
+        # test_ao_normal.py's test_missing_final_can_be_corrected_but_modified_receipt_cannot
+        # already demonstrates for the engineering_error/semantic-hold distinction itself.
+        with self.assertRaisesRegex(RoomError, 'Native semantic hold'):
+            self.send('correction', 'corr-1')
+        self.assertEqual(len(self.fake.posts), posts_before)
+        self.assertEqual(json.dumps(self.state(), sort_keys=True), state_before)
+        self.assertNotIn('corr-1', self.state()['requests'])
+
+        held_after = ao_workflow.delivered(self.state(), session_id, self.directory())
+        self.assertNotIn(ao_evidence_closure.PART, held_after['parts'])
+        summary_after = ao_workflow.context_summary(self.state(), self.directory())
+        self.assertIn(ao_evidence_closure.PART, summary_after['undelivered_parts'])
 
 
 if __name__ == "__main__":

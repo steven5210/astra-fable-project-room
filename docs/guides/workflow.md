@@ -86,7 +86,7 @@ room, provider or authentication, and is available from both the CLI and the
 bundled MCP server, where it is listed read-only. The exact local CLI form:
 
 ```sh
-python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", ...}"}'
+python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", \"implementation_complete\": true, \"changes\": [], \"tests_reported\": [], \"review_findings\": [], \"remaining_gaps\": [], \"backlog\": [], \"routing_log\": []}"}'
 ```
 
 and, to avoid shell escaping for a large draft, the `--args-file` variant with a
@@ -106,10 +106,14 @@ The result object reports `operation`, `validity_scope` (always
 `{field, message}` entries that block validity), `advisories` (a list of
 `{field, message}` entries that never change validity — a malformed
 `enhancement_proposals` entry is always advisory), `unperformed_checks` (always
-the same named list: `handoff_authentication`, `spec_identity_equality`,
+the same named list, naming the authoritative capture, readiness and acceptance
+checks this call never performs — a reminder of named checks, never an
+exhaustive contract: `handoff_authentication`, `spec_identity_equality`,
 `compact_contract_delivery`, `controller_metadata_attachment`,
 `delegate_attribution_verification`, `engineering_readiness`,
-`findings_projection`, `capture_receipts`), and `limits`
+`findings_projection`, `capture_receipts`, `candidate_binding`,
+`native_outcome_evidence`, `correction_chain`, `issue_dispositions`,
+`candidate_unchanged`), and `limits`
 (`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
 failures — a non-string, empty, oversized or invalid-UTF-8 `report_text`, or
 nesting past the admitted depth — are refusals (a JSON error, CLI exit 2), never
@@ -122,6 +126,18 @@ The operation itself writes nothing, creates no home or config, and calls no
 provider from its own entry — a fact about this operation, not a claim that the
 whole CLI or MCP process starts up without ever touching the filesystem (ordinary
 controller-home provisioning at process startup is pre-existing and unchanged).
+Two further pre-existing facts sit at that same boundary, outside this
+operation's own zero-effects guarantee: the shared `tools/list`/`tools/call`
+legacy-tools gate (`project_room.Service.legacy_tools_visible`) can, for an
+already-provisioned home whose saved config selects the `ao` backend without
+`legacy_tools`, open the local SQLite room registry as a read before dispatch
+reaches any tool, including this one — an edge case a never-provisioned home
+cannot exercise, since a missing config file always takes that gate's simpler
+"visible" fallback instead; and running these commands through the `python3`
+interpreter can let it write its own `__pycache__` bytecode for imported
+modules, exactly like any other Python invocation — an interpreter cache
+artifact (already git-ignored, and avoided entirely with
+`PYTHONDONTWRITEBYTECODE=1`), never a room-state or controller-home write.
 A passing result is never evidence of handoff authentication, delegate
 attribution, engineering readiness or independent acceptance, and it changes
 nothing else: the final engineering report keeps its existing format regardless

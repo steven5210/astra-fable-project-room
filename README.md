@@ -75,7 +75,7 @@ See [AO backend setup and normal workflow](docs/guides/ao-setup.md#cli-fallback)
 - **Draft report validation.** The read-only, offline `ao_report_validate` tool checks only the syntax and shape of one draft engineering report (full or compact `project_room_engineering_v2` form) against the same shared schema final capture uses; it needs no room, provider or authentication, writes nothing from its own entry, and calls no provider. From the CLI:
 
   ```sh
-  python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", ...}"}'
+  python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", \"implementation_complete\": true, \"changes\": [], \"tests_reported\": [], \"review_findings\": [], \"remaining_gaps\": [], \"backlog\": [], \"routing_log\": []}"}'
   ```
 
   and, for a large draft, `--args-file /absolute/path/to/args.json` with that file holding `{"report_text": "..."}`, instead of `--args`. It is also exposed through the bundled MCP server, listed read-only. A passing result never shows handoff authentication, delegate attribution, engineering readiness or acceptance. See [draft report validation and evidence closure](docs/guides/workflow.md#draft-report-validation-and-evidence-closure-ao-rooms).

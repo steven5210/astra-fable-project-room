@@ -19,10 +19,13 @@ from room import RoomError
 import test_ao_continuation
 import test_ao_normal as fixtures
 
-# The PARTS tuple as it stood immediately before this unit: every name except
-# finding_provenance_v1, taken from the live tuple so a change to the historical ordering or the
-# new element is caught, not just inferred from today's value.
-OLDER_PARTS = tuple(p for p in ao_workflow.PARTS if p != ao_finding_provenance.PART)
+# The PARTS tuple as it stood immediately before this unit: every name except finding_provenance_v1
+# and evidence_closure_v1 (appended immediately after it, later than this unit), taken from the live
+# tuple so a change to the historical ordering or either new element is caught, not just inferred
+# from today's value. Excluding only finding_provenance_v1 would describe an impossible history --
+# evidence_closure_v1 delivered while finding_provenance_v1, which PARTS orders before it, never was
+# -- since one engineer packet delivers every then-undelivered part at once, in PARTS order.
+OLDER_PARTS = tuple(p for p in ao_workflow.PARTS if p not in (ao_finding_provenance.PART, ao_evidence_closure.PART))
 # The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
 PRE_EXECUTION_PARTS = ao_workflow.PARTS[:16]
 # The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
@@ -62,7 +65,7 @@ class DigestAndFrozenBytesTests(unittest.TestCase):
         # PARTS[-1]; its own fixed position (index 17, immediately after every older part) stays
         # pinned here regardless, and evidence_closure_v1's own ordering is independently pinned in
         # test_lifecycle_closure.py and test_ao_evidence_closure.py.
-        self.assertEqual(ao_workflow.PARTS[:17], tuple(p for p in OLDER_PARTS if p != ao_evidence_closure.PART))
+        self.assertEqual(ao_workflow.PARTS[:17], OLDER_PARTS)
         self.assertEqual(ao_workflow.PARTS[17], ao_finding_provenance.PART)
         self.assertEqual(ao_workflow.PARTS[18], ao_evidence_closure.PART)
         self.assertEqual(len(ao_workflow.PARTS), 19)
@@ -118,12 +121,14 @@ class NewSessionDeliveryTests(fixtures.Fixture):
 
 
 class RetainedSessionDeliveryTests(fixtures.Fixture):
-    """A session retained from before this part existed gets it exactly once, then nothing."""
+    """A session retained from before finding_provenance_v1 (and evidence_closure_v1, appended
+    immediately after it) existed gets both exactly once together, then nothing."""
 
     def setUp(self):
         super().setUp()
-        # Simulate a session whose first packet predates only finding_provenance_v1: every older
-        # part was already delivered, so the next engineer send carries just the new part.
+        # Simulate a session whose first packet predates both finding_provenance_v1 and
+        # evidence_closure_v1: every older part was already delivered, so the next engineer send
+        # carries just the two new parts, together, in PARTS order.
         with patch.object(ao_workflow, 'PARTS', OLDER_PARTS):
             self.room = self.open()
             self.spec()
@@ -142,15 +147,18 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         held_before = ao_workflow.delivered(self.state(), self.state()['bindings']['engineer']['session_id'],
                                             self.directory())
         self.assertNotIn(ao_finding_provenance.PART, held_before['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held_before['parts'])
 
         self.send('correction', 'corr-1')
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
-        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART])
+        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART, ao_evidence_closure.PART])
         self.assertEqual(request['carried']['part_sha256'],
-                         {ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+                         {ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256,
+                          ao_evidence_closure.PART: ao_evidence_closure.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_evidence_closure.INSTRUCTION), 1)
         for other_text in (ao_residual_escalation.INSTRUCTION, ao_progress.INSTRUCTION_V2,
                            ao_progress.INSTRUCTION, ao_progress.INSTRUCTION_V3,
                            ao_read_admission.INSTRUCTION, ao_quality_review.INSTRUCTION,
@@ -160,6 +168,7 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         text2, carried2 = self.packet()
         self.assertEqual(carried2['parts'], [])
         self.assertNotIn(ao_finding_provenance.INSTRUCTION, text2)
+        self.assertNotIn(ao_evidence_closure.INSTRUCTION, text2)
 
     def test_uncertain_carried_request_is_undelivered_until_a_verified_completion(self):
         session_id = self.state()['bindings']['engineer']['session_id']
@@ -169,16 +178,20 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         request = self.state()['requests']['corr-uncertain']
         self.assertEqual(request['state'], 'uncertain')
         self.assertNotIn('receipt', request)
-        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART])
+        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART, ao_evidence_closure.PART])
         self.assertEqual(request['carried']['part_sha256'],
-                         {ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+                         {ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256,
+                          ao_evidence_closure.PART: ao_evidence_closure.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_evidence_closure.INSTRUCTION), 1)
 
         # Not a completed verified turn: the controller withholds credit for it.
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
         summary = ao_workflow.context_summary(self.state(), self.directory())
         self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
+        self.assertIn(ao_evidence_closure.PART, summary['undelivered_parts'])
 
         self.fake.lose_ack = False
         self.fake.finish('engineer', json.dumps(self.report()))
@@ -187,14 +200,17 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
 
         held2 = ao_workflow.delivered(self.state(), session_id, self.directory())
         self.assertIn(ao_finding_provenance.PART, held2['parts'])
+        self.assertIn(ao_evidence_closure.PART, held2['parts'])
         summary2 = ao_workflow.context_summary(self.state(), self.directory())
         self.assertNotIn(ao_finding_provenance.PART, summary2['undelivered_parts'])
+        self.assertNotIn(ao_evidence_closure.PART, summary2['undelivered_parts'])
         text, carried = self.packet()
         self.assertEqual(carried['parts'], [])
         self.assertNotIn(ao_finding_provenance.INSTRUCTION, text)
+        self.assertNotIn(ao_evidence_closure.INSTRUCTION, text)
 
     def test_a_downgraded_controller_refuses_the_carried_record_without_repair(self):
-        # Rollback boundary: once a completed engineer turn has carried the new part, the
+        # Rollback boundary: once a completed engineer turn has carried the new parts, the
         # previous PARTS vocabulary cannot read that session's delivered-context record, and
         # the refusal repairs nothing — the saved receipt bytes are untouched throughout.
         self.send('correction', 'corr-1')
@@ -202,11 +218,11 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
         self.assertEqual(request['state'], 'completed')
-        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART])
+        self.assertEqual(request['carried']['parts'], [ao_finding_provenance.PART, ao_evidence_closure.PART])
         receipt_bytes = (self.directory() / request['receipt']).read_bytes()
         # The current vocabulary reads the same record fine.
         record, names = ao_workflow.carried_by(request)
-        self.assertEqual(names, (ao_finding_provenance.PART,))
+        self.assertEqual(names, (ao_finding_provenance.PART, ao_evidence_closure.PART))
         with patch.object(ao_workflow, 'PARTS', OLDER_PARTS):
             with self.assertRaisesRegex(
                     RoomError, 'Delivered-context record is inconsistent; preserve the '
@@ -223,7 +239,8 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertEqual(text1, text2)
         self.assertEqual(carried1, carried2)
         self.assertEqual(text1.count(ao_finding_provenance.INSTRUCTION), 1)
-        self.assertEqual(carried1['parts'], [ao_finding_provenance.PART])
+        self.assertEqual(text1.count(ao_evidence_closure.INSTRUCTION), 1)
+        self.assertEqual(carried1['parts'], [ao_finding_provenance.PART, ao_evidence_closure.PART])
 
     def test_context_summary_and_delivered_report_undelivered_then_delivered_without_mutation(self):
         state = self.state()
@@ -234,7 +251,9 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         after = json.dumps(state, sort_keys=True)
         self.assertEqual(before, after)
         self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
+        self.assertIn(ao_evidence_closure.PART, summary['undelivered_parts'])
         self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
 
         self.send('correction', 'corr-1')
         self.fake.finish('engineer', json.dumps(self.report()))
@@ -243,6 +262,7 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         state2 = self.state()
         summary2 = ao_workflow.context_summary(state2, self.directory())
         self.assertNotIn(ao_finding_provenance.PART, summary2['undelivered_parts'])
+        self.assertNotIn(ao_evidence_closure.PART, summary2['undelivered_parts'])
 
 
 class CombinedPartsDeliveryTests(fixtures.Fixture):

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import ao_project_room
 import ao_report_contract
@@ -151,6 +152,11 @@ FIXTURES = (
     },
 )
 
+# Convenient lookup by name for lifecycle-driven parity tests that reuse a fixture's exact "text"
+# (and its already-digest-verified diagnostics/advisories/syntax_shape_valid) verbatim, instead of
+# retyping a second copy of the same sanitized bytes.
+_FIXTURES_BY_NAME = {fixture["name"]: fixture for fixture in FIXTURES}
+
 
 def full_report(**changes):
     """A fully valid full-form (no report_format) engineering report; override fields via changes."""
@@ -173,6 +179,25 @@ class SharedSchemaIdentityTests(unittest.TestCase):
         ao_report_validation.validate_draft(json.dumps(full_report()))
         ao_report_validation.validate_draft("not json")
         self.assertEqual([dict(item) for item in ao_report_validation.UNPERFORMED_CHECKS], before)
+
+    def test_unperformed_checks_names_and_count_are_pinned(self):
+        # Independent literal, not merely the module comparing its own tuple to itself: catches an
+        # accidental rename, reorder, duplicate or omission of a named check. The first eight are the
+        # original authentication/delivery/readiness/persistence checks; the final five accurately
+        # name what ao_workflow.capture_engineering additionally performs (completion-candidate
+        # binding, native outcome usability, the report-correction chain walk, require_disposition,
+        # and the candidate-unchanged-after-completion equality check) that this offline operation
+        # never performs either. This list is a reminder, never an exhaustive contract: capture,
+        # readiness and acceptance may perform further checks this tuple does not name.
+        names = [item["check"] for item in ao_report_validation.UNPERFORMED_CHECKS]
+        self.assertEqual(names, [
+            "handoff_authentication", "spec_identity_equality", "compact_contract_delivery",
+            "controller_metadata_attachment", "delegate_attribution_verification", "engineering_readiness",
+            "findings_projection", "capture_receipts", "candidate_binding", "native_outcome_evidence",
+            "correction_chain", "issue_dispositions", "candidate_unchanged",
+        ])
+        self.assertEqual(len(names), 13)
+        self.assertEqual(len(set(names)), 13)  # every name distinct
 
 
 class FixtureParityTests(unittest.TestCase):
@@ -291,6 +316,22 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(RoomError, "Draft report exceeds the admitted nesting depth"):
             ao_report_validation.validate_draft(self._nested(ao_report_validation.MAX_DEPTH + 1))
 
+    # R1: depths far beyond the interpreter's own recursion limit (about 995 levels on Python 3.11)
+    # make the decoder itself raise RecursionError, before strict_object can even return a value for
+    # the post-parse _exceeds_max_depth walk to inspect. Built by plain string repetition, never by
+    # json.dumps of an actually-nested Python container, because building *that* container (or
+    # serializing it back with json.dumps) would itself recurse past the same interpreter limit.
+
+    def test_depth_far_beyond_the_recursion_limit_raises_the_same_depth_refusal(self):
+        text = '{"a":' * 2000 + '1' + '}' * 2000
+        with self.assertRaisesRegex(RoomError, "Draft report exceeds the admitted nesting depth"):
+            ao_report_validation.validate_draft(text)
+
+    def test_deeply_nested_list_inside_an_object_beyond_the_recursion_limit_raises_the_same_refusal(self):
+        text = '{"a":' + '[' * 2000 + '1' + ']' * 2000 + '}'
+        with self.assertRaisesRegex(RoomError, "Draft report exceeds the admitted nesting depth"):
+            ao_report_validation.validate_draft(text)
+
 
 class MalformedJsonDiagnosticsTests(unittest.TestCase):
     """strict_object rejects ambiguous/invalid JSON; validate_draft turns that into one diagnostic, never a raise."""
@@ -355,7 +396,9 @@ class ProductionPathParityTests(AgreedRoomFixture):
     def test_wrong_spec_sha256_passes_shape_but_fails_capture_identity(self):
         bad = self.report(spec_sha256="0" * 64)
         text = json.dumps(bad)
+        posts_before = len(self.fake.posts)
         draft = ao_report_validation.validate_draft(text)
+        self.assertEqual(len(self.fake.posts), posts_before)  # the validator call itself never posts
         self.assertTrue(draft["syntax_shape_valid"], draft)  # shape alone is fine; identity is unperformed here
         self.send("implementation")
         self.fake.finish("engineer", text)
@@ -367,7 +410,9 @@ class ProductionPathParityTests(AgreedRoomFixture):
     def test_malformed_delegate_job_id_passes_shape_but_fails_delegate_attribution(self):
         bad = self.report(routing_log=[{"delegate_job_ids": ["synthetic-malformed-delegate-id"]}])
         text = json.dumps(bad)
+        posts_before = len(self.fake.posts)
         draft = ao_report_validation.validate_draft(text)
+        self.assertEqual(len(self.fake.posts), posts_before)  # the validator call itself never posts
         self.assertTrue(draft["syntax_shape_valid"], draft)  # a list of strings is shape-valid
         self.send("implementation")
         self.fake.finish("engineer", text)
@@ -377,23 +422,139 @@ class ProductionPathParityTests(AgreedRoomFixture):
                           "Engineering report names a malformed delegate job identifier")
 
 
-class DeliveryTimingParityTests(LifecycleFixture):
-    """A compact report's PART-delivery requirement is explicitly unperformed here (UNPERFORMED_CHECKS'
-    compact_contract_delivery); only the real ao_report_contract.project, called with authenticated room
-    state, can see that efficiency_contract_v1 was never delivered to this native session."""
+class LifecycleDraftParityTests(AgreedRoomFixture):
+    """Further validator/capture parity cases driven through the same public lifecycle as
+    ProductionPathParityTests above (handoff, ao_room_send, fake.finish with the draft text as the
+    engineer's own final response, ao_room_sync, then inspect the request's engineering_error or
+    captured engineering record), covering the remaining documented capture-side checks: shape
+    identity after compact projection, operator_requests and controller_metadata blocking, and the
+    advisory-never-blocks-capture guarantee for enhancement_proposals. Every validate_draft call here
+    is also checked to never post to the fake AO transport."""
 
-    def test_compact_report_before_any_delivery_passes_shape_but_fails_project(self):
-        self.room = self.open()
-        self.spec()
-        self.bind()  # no send() yet: PARTS have not self-delivered to the 'engineer' session
-        report = {"report_format": ao_report_contract.FORMAT, "outcome": "completed",
-                  "implementation_complete": True, "changes": [], "tests_reported": [], "review_findings": [],
-                  "remaining_gaps": [], "backlog": [], "routing_log": []}
-        draft = ao_report_validation.validate_draft(json.dumps(report))
+    def _validated_without_posting(self, text):
+        posts_before = len(self.fake.posts)
+        draft = ao_report_validation.validate_draft(text)
+        self.assertEqual(len(self.fake.posts), posts_before)  # the validator call itself never posts
+        return draft
+
+    def _captured(self, text):
+        self.send("implementation")
+        self.fake.finish("engineer", text)
+        self.service.ao_room_sync(self.room)
+        return self.state()["requests"]["implementation"]
+
+    def test_tests_object_fixture_diagnostic_parity_with_capture(self):
+        # (a) sanitized tests-object fixture: tests_reported is an object, not a list.
+        fixture = _FIXTURES_BY_NAME["tests-object.json"]
+        draft = self._validated_without_posting(fixture["text"])
+        self.assertEqual(draft["syntax_shape_valid"], fixture["syntax_shape_valid"])
+        self.assertEqual(draft["diagnostics"], fixture["diagnostics"])
+        request = self._captured(fixture["text"])
+        self.assertEqual(request.get("engineering_error"),
+                          "Engineering report is incomplete or refers to another spec/handoff")
+
+    def test_full_form_invalid_outcome_with_correct_identity_diagnostic_parity_with_capture(self):
+        # (b) a full-form shape-invalid draft (outcome "partial") carrying the handoff's correct
+        # identity, so the identity check itself never masks the shape defect in either path.
+        text = json.dumps(self.report(outcome="partial"))
+        draft = self._validated_without_posting(text)
+        self.assertFalse(draft["syntax_shape_valid"], draft)
+        self.assertEqual(draft["report_form"], "full")
+        self.assertEqual(draft["diagnostics"],
+                          [{"field": "outcome", "message": "must be completed, changes_required or scope_change"}])
+        request = self._captured(text)
+        self.assertEqual(request.get("engineering_error"),
+                          "Engineering report is incomplete or refers to another spec/handoff")
+
+    def test_valid_full_draft_with_real_identity_parity_with_capture(self):
+        # (c) a valid full draft using the handoff's real spec_revision/spec_sha256/baseline_commit.
+        text = json.dumps(self.report())
+        draft = self._validated_without_posting(text)
         self.assertTrue(draft["syntax_shape_valid"], draft)
-        self.assertEqual(draft["report_form"], "project_room_engineering_v2")
-        with self.assertRaisesRegex(RoomError, "Compact report contract was not delivered to this native session"):
-            ao_report_contract.project(self.directory(), self.state(), {"session_id": "engineer"}, report)
+        self.assertEqual(draft["report_form"], "full")
+        request = self._captured(text)
+        self.assertNotIn("engineering_error", request)
+        self.assertIn("engineering_record", request)
+
+    def test_compact_valid_fixture_parity_with_capture(self):
+        # (d) the compact-valid fixture verbatim: efficiency_contract_v1 was already delivered on the
+        # room's first (spec_review) engineer send, inside AgreedRoomFixture.build_template's agree().
+        fixture = _FIXTURES_BY_NAME["compact-valid.json"]
+        draft = self._validated_without_posting(fixture["text"])
+        self.assertEqual(draft["syntax_shape_valid"], fixture["syntax_shape_valid"])
+        self.assertTrue(draft["syntax_shape_valid"], draft)
+        request = self._captured(fixture["text"])
+        self.assertNotIn("engineering_error", request)
+        self.assertIn("engineering_record", request)
+
+    def test_enhancement_object_advisory_fixture_parity_with_capture(self):
+        # (e) the enhancement-object-advisory fixture verbatim: the validator reports exactly one
+        # advisory and stays valid; capture still produces a record because an advisory never blocks
+        # capture -- the required optional-proposal advisory proof.
+        fixture = _FIXTURES_BY_NAME["enhancement-object-advisory.json"]
+        draft = self._validated_without_posting(fixture["text"])
+        self.assertEqual(draft["syntax_shape_valid"], fixture["syntax_shape_valid"])
+        self.assertEqual(draft["advisories"], fixture["advisories"])
+        self.assertEqual(len(draft["advisories"]), 1)
+        request = self._captured(fixture["text"])
+        self.assertNotIn("engineering_error", request)
+        self.assertIn("engineering_record", request)
+
+    def test_operator_requests_string_list_fixture_blocking_parity_with_capture(self):
+        # (f) the operator-requests-string-list fixture: the validator's diagnostic and capture's
+        # engineering_error are both exactly the ao_review_followups.validate message.
+        fixture = _FIXTURES_BY_NAME["operator-requests-string-list.json"]
+        draft = self._validated_without_posting(fixture["text"])
+        self.assertEqual(draft["syntax_shape_valid"], fixture["syntax_shape_valid"])
+        self.assertEqual(draft["diagnostics"], fixture["diagnostics"])
+        request = self._captured(fixture["text"])
+        self.assertEqual(request.get("engineering_error"), fixture["diagnostics"][0]["message"])
+
+    def test_controller_metadata_injected_fixture_blocking_parity_with_capture(self):
+        # (g) the controller-metadata-injected fixture: the validator's diagnostic and capture's
+        # engineering_error are both exactly the refuse_model_metadata message.
+        fixture = _FIXTURES_BY_NAME["controller-metadata-injected.json"]
+        draft = self._validated_without_posting(fixture["text"])
+        self.assertEqual(draft["syntax_shape_valid"], fixture["syntax_shape_valid"])
+        self.assertEqual(draft["diagnostics"], fixture["diagnostics"])
+        request = self._captured(fixture["text"])
+        self.assertEqual(request.get("engineering_error"), fixture["diagnostics"][0]["message"])
+
+
+class UndeliveredCompactContractParityTests(LifecycleFixture):
+    """(h) Undelivered compact contract: the historical-session simulation pattern already used by
+    test_ao_evidence_closure.py's RetainedSessionDeliveryTests, excluding ao_report_contract.PART
+    (efficiency_contract_v1) from ao_workflow.PARTS for the room's entire bootstrap -- open, spec,
+    bind, agree, handoff, the first implementation send, its finish and its sync -- so the compact
+    contract part is never recorded in any completed request's carried parts for this native session.
+    The offline validator (run with no room at all) reports the same draft valid and always names
+    compact_contract_delivery among its unperformed_checks regardless; only the real
+    ao_report_contract.project, reached through authoritative capture with authenticated room state,
+    can see that the part was never actually delivered."""
+
+    def test_capture_fails_when_the_compact_contract_was_never_delivered(self):
+        reduced_parts = tuple(part for part in ao_workflow.PARTS if part != ao_report_contract.PART)
+        self.assertIn(ao_report_contract.PART, ao_workflow.PARTS)
+        self.assertNotIn(ao_report_contract.PART, reduced_parts)
+        compact_text = _FIXTURES_BY_NAME["compact-valid.json"]["text"]
+        with patch.object(ao_workflow, "PARTS", reduced_parts):
+            self.room = self.open()
+            self.spec()
+            self.bind()
+            self.agree()
+            self.service.ao_room_handoff(self.room, str(self.repo))
+            self.send("implementation")
+            self.fake.finish("engineer", compact_text)
+            self.service.ao_room_sync(self.room)
+        request = self.state()["requests"]["implementation"]
+        self.assertEqual(request.get("engineering_error"),
+                          "Compact report contract was not delivered to this native session")
+
+        posts_before = len(self.fake.posts)
+        draft = ao_report_validation.validate_draft(compact_text)
+        self.assertEqual(len(self.fake.posts), posts_before)  # the validator call itself never posts
+        self.assertTrue(draft["syntax_shape_valid"], draft)
+        self.assertIn("compact_contract_delivery", [item["check"] for item in draft["unperformed_checks"]])
 
 
 class ZeroEffectsTests(unittest.TestCase):
@@ -404,6 +565,17 @@ class ZeroEffectsTests(unittest.TestCase):
         self.assertFalse(hasattr(service, "home"))
         result = service.call("ao_report_validate", {"report_text": json.dumps(full_report())})
         self.assertTrue(result["syntax_shape_valid"])
+        self.assertFalse(hasattr(service, "home"))
+
+    def test_service_call_on_the_bare_double_raises_the_same_depth_refusal_for_a_recursion_depth(self):
+        # R1: the recursion-depth admission refusal propagates through Service.call exactly like any
+        # other RoomError this read-only tool can raise; the bare object.__new__ double proves it
+        # never needed self.home to do so.
+        service = object.__new__(project_room.Service)
+        self.assertFalse(hasattr(service, "home"))
+        text = '{"a":' * 2000 + '1' + '}' * 2000
+        with self.assertRaisesRegex(RoomError, "Draft report exceeds the admitted nesting depth"):
+            service.call("ao_report_validate", {"report_text": text})
         self.assertFalse(hasattr(service, "home"))
 
     def test_mcp_tools_list_and_tools_call_never_touch_an_unprovisioned_home(self):
@@ -503,11 +675,36 @@ class ZeroEffectsTests(unittest.TestCase):
                               {"error": "Invalid arguments; missing=['report_text'], unexpected=[]"})
             self.assertFalse(home.exists())
 
+    def test_cli_recursion_depth_refusal_reports_exit_2_and_still_creates_no_home(self):
+        # R1: the CLI preflight dispatches ao_report_validate before Service construction (see
+        # project_room.py main()), so a draft nested past the interpreter's own recursion limit must
+        # still report the documented JSON-error/exit-2 admission refusal, not an unhandled traceback,
+        # and must still never provision --home.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "cli-depth-home"  # deliberately never created; isolated temp dir, not the repo
+            self.assertFalse(home.exists())
+            text = '{"a":' * 2000 + '1' + '}' * 2000
+            args = json.dumps({"report_text": text})
+            completed = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "project_room.py"), "--home", str(home),
+                 "call", "ao_report_validate", "--args", args],
+                capture_output=True, text=True, cwd=str(REPO_ROOT))
+            self.assertEqual(completed.returncode, 2, completed.stdout)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(json.loads(completed.stderr),
+                              {"error": "Draft report exceeds the admitted nesting depth"})
+            self.assertFalse(home.exists())
+
     def test_no_network_process_database_or_filesystem_access(self):
-        """Tripwire every provider/process/db/file/dir primitive Service.__init__ or a delegate call would
-        use, then run validate_draft over clean, malformed and unparsable text; none may fire."""
+        """Tripwire every provider/process/db/file/dir/socket primitive Service.__init__ or a delegate
+        call would use, then run validate_draft over clean, malformed and unparsable text; none may
+        fire. io.open and os.open are the lower-level primitives builtins.open and the directory
+        helpers are themselves built on; socket.socket is the raw primitive under every provider or
+        network client, independent of http.client's own connection classes above."""
         import builtins
+        import io
         import os
+        import socket
 
         class Tripwire(Exception):
             pass
@@ -522,9 +719,12 @@ class ZeroEffectsTests(unittest.TestCase):
             (subprocess, "run"): subprocess.run,
             (sqlite3, "connect"): sqlite3.connect,
             (builtins, "open"): builtins.open,
+            (io, "open"): io.open,
+            (os, "open"): os.open,
             (os, "mkdir"): os.mkdir,
             (os, "makedirs"): os.makedirs,
             (Path, "mkdir"): Path.mkdir,
+            (socket, "socket"): socket.socket,
         }
         http.client.HTTPSConnection.__init__ = trip
         http.client.HTTPConnection.__init__ = trip
@@ -532,9 +732,12 @@ class ZeroEffectsTests(unittest.TestCase):
         subprocess.run = trip
         sqlite3.connect = trip
         builtins.open = trip
+        io.open = trip
+        os.open = trip
         os.mkdir = trip
         os.makedirs = trip
         Path.mkdir = trip
+        socket.socket = trip
         try:
             clean = ao_report_validation.validate_draft(json.dumps(full_report()))
             self.assertTrue(clean["syntax_shape_valid"])
@@ -551,9 +754,12 @@ class ZeroEffectsTests(unittest.TestCase):
             subprocess.run = originals[(subprocess, "run")]
             sqlite3.connect = originals[(sqlite3, "connect")]
             builtins.open = originals[(builtins, "open")]
+            io.open = originals[(io, "open")]
+            os.open = originals[(os, "open")]
             os.mkdir = originals[(os, "mkdir")]
             os.makedirs = originals[(os, "makedirs")]
             Path.mkdir = originals[(Path, "mkdir")]
+            socket.socket = originals[(socket, "socket")]
 
 
 class ToolSchemaTests(unittest.TestCase):
