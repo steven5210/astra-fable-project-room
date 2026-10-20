@@ -1,7 +1,8 @@
 # Variant 1: interface-and-provenance checklist (one staged instruction)
 
-Exactly one change against the baseline: before the first engineer send of an attempt, the operator stages the text below once
-with `ao_room_instruction_stage` (it is delivered once, with provenance, and dispatches no model). The specification, gates,
+Exactly one change against the baseline: after the spec agreement and before the implementation send of an attempt, the operator
+stages the text below once with `ao_room_instruction_stage` (it is delivered once, with provenance, with the next engineer
+request, and dispatches no model). The read-only spec review receives no variant text. The specification, gates,
 guards, models, effort, review budgets and acceptance are identical to the baseline.
 
 ## Staged instruction text (exact bytes between the markers)

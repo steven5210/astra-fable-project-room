@@ -8,7 +8,7 @@
     },
     "variant-1": {
       "file": "variant-1.md",
-      "file_sha256": "c14e76e8bc68df520b6b5f5b0e741b1e13eba7bfef142cdfcc517d887a08db0b",
+      "file_sha256": "fe9c11c6a55e8c4cfc684f1348aaaaf1ba53afe088a541e3e5d785dd4e6e39e7",
       "instruction_sha256": "831f68d1241145cf6203bce5900d1087972346bc2abec635efecae50df666d7f",
       "staged_instruction": "variant-1.instruction.txt"
     }

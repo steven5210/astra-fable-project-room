@@ -19,7 +19,8 @@
     "provenance_cited": "fail",
     "provenance_mismatch_reported": "pass",
     "tests_exercise_cli": "unavailable",
-    "upstream_unchanged": "pass"
+    "upstream_unchanged": "pass",
+    "verification_claimed_in_report": "pass"
   },
   "elapsed_minutes": 12.0,
   "report": {

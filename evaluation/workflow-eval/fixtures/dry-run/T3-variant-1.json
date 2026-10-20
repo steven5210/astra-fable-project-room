@@ -23,7 +23,8 @@
     "probe_cli_stub_detected": "pass",
     "provenance_cited": "pass",
     "tests_exercise_cli": "pass",
-    "upstream_unchanged": "pass"
+    "upstream_unchanged": "pass",
+    "verification_claimed_in_report": "pass"
   },
   "elapsed_minutes": 27.0,
   "report": {

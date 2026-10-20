@@ -39,8 +39,8 @@ The sealed plaintext for `H1` is kept outside the repository. Its SHA-256 is `ta
 ## Variants
 
 - [`variants/baseline.md`](variants/baseline.md): the installed controller at the recorded commit, no staged instruction.
-- [`variants/variant-1.md`](variants/variant-1.md): the same controller plus one instruction staged once before the first engineer
-  send with `ao_room_instruction_stage`. The exact bytes are `variants/variant-1.instruction.txt`; the digest is pinned in
+- [`variants/variant-1.md`](variants/variant-1.md): the same controller plus one instruction staged once, after the spec
+  agreement and before the implementation send, with `ao_room_instruction_stage`. The exact bytes are `variants/variant-1.instruction.txt`; the digest is pinned in
   [`variants/manifest.json`](variants/manifest.json).
 
 There are exactly two variants. Specifications, guards, authorization boundaries, review budgets and independent acceptance are
@@ -53,13 +53,18 @@ One attempt is one ordinary `fable_engineering` AO room on an isolated controlle
 1. Create a fresh synthetic repository from the case fixture at a baseline commit. Open the room with the exact qualified
    engineering model and the attempt's account profile. Prepare before launch, bind the engineer and the reviewer, and register
    the native outcome source.
-2. For `variant-1` only, stage the instruction once with `ao_room_instruction_stage` before the first send.
-3. Pin the frozen specification with the case gates. Send the spec review. Record attribution, served-model and routing evidence
-   as in the Part 2 trial.
+2. Pin the frozen specification with the case gates. Send the spec review. Record attribution, served-model and routing evidence
+   as in the Part 2 trial. The spec review is read-only and receives no variant text.
+3. For `variant-1` only, after the agreement and before the implementation send, stage the instruction once with
+   `ao_room_instruction_stage`. The controller delivers a staged instruction with the next engineer request, so staging it
+   here delivers the checklist to the implementation turn, which is the turn it addresses.
 4. Hand off and send the implementation. Allow at most one correction. Drain through supported sync.
 5. Verify, then send one acceptance review. A rejected acceptance is a recorded failure. There is no second review.
 6. Run `checks/probes.py --case <id> --candidate <worktree>` (disposable copy only), then
    `checks/export_bundle.py` with the probe output to produce the attempt bundle. Score all bundles with `checks/score.py`.
+   The exporter counts every observed worker launch with its outcome (qualified launches are a separate flag), proves
+   provenance against the candidate's file bytes rather than the report text, treats an untracked owned file as an invented
+   contract, marks missing facts `unavailable`, and leaves `elapsed_minutes` unknown while any request is unsettled.
 
 Attempts run sequentially, or at most two at a time on distinct account profiles. The order is fixed before execution and recorded.
 Interleaving does not change inputs. Observed overlap is reported as an interval, never as a speedup.
@@ -89,8 +94,11 @@ python3 evaluation/workflow-eval/dry_run.py --unseal <path to the sealed H1 plai
 ```
 
 The dry run verifies the frozen digests, the two variants, the commitment file and the caps; it runs the probes on two synthetic
-`T2` candidates (one that exercises the entry point and one helper-only candidate) and scores the synthetic bundles in
-[`fixtures/dry-run/`](fixtures/dry-run/), including a stopped attempt with unknown usage and the held-out example. It needs no model
+`T2` candidates (one that exercises the entry point and one helper-only candidate); it builds a synthetic controller room
+(state, receipts, handoff, verification, acceptance and an outcome record with one qualified and one contradicted worker launch)
+and exports and scores it through `export_bundle.py`, including an unsettled-review variant whose elapsed time stays unknown;
+and it scores the synthetic bundles in [`fixtures/dry-run/`](fixtures/dry-run/), including a stopped attempt with unknown usage
+and the held-out example. It needs no model
 credentials and makes no network call. Exit code 0 means every step passed.
 
 ## Limitations

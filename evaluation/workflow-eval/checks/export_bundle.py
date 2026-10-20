@@ -71,18 +71,28 @@ def usage_of(request):
 
 
 def worker_launches(room, request):
-    """Observed child launches from the supported outcome records (worker_observations); usage stays unknown."""
+    """Every observed child launch from the supported outcome records (worker_observations.launches).
+
+    Each launch keeps its own outcome (qualified, unresolved, unsupported, contradicted, ...). The qualified
+    executions are a separate subset (`qualified`), never the launch inventory, so an unqualified or
+    contradicted child still counts as effort and as unknown worker usage.
+    """
     launches = []
     directory = room / "outcomes" / request["request_id"]
     if directory.is_dir():
         for path in sorted(directory.glob("*.json")):
             observed = (read(path).get("worker_observations") or {})
-            for execution in observed.get("executions") or []:
-                interval = execution.get("interval") or {}
+            qualified = {(e.get("agent_id"), e.get("tool_use_id")) for e in observed.get("executions") or []}
+            inventory = observed.get("launches")
+            if inventory is None:  # an older record without the launch inventory: executions are all we have
+                inventory = observed.get("executions") or []
+            for launch in inventory:
+                interval = launch.get("interval") or {}
                 minutes = None
                 if isinstance(interval.get("launch"), (int, float)) and isinstance(interval.get("end"), (int, float)):
                     minutes = round((interval["end"] - interval["launch"]) / 60, 1)
-                launches.append({"role": execution.get("role"), "observed_child_model": execution.get("model"), "minutes": minutes,
+                launches.append({"role": launch.get("role"), "observed_child_model": launch.get("model"), "minutes": minutes,
+                                 "outcome": launch.get("outcome"), "qualified": (launch.get("agent_id"), launch.get("tool_use_id")) in qualified,
                                  "coverage": observed.get("coverage"), "usage": {"known": False, "reason": "worker usage not exposed by the controller"}})
     return launches
 
@@ -94,14 +104,18 @@ def candidate_facts(room, state, task):
     handoff = read(room / handoff_path)
     worktree = pathlib.Path(handoff["worktree"])
     if not worktree.is_dir():
-        return {"baseline_commit": handoff.get("baseline_commit"), "head": None, "changed_paths": None, "file_sha256": {}, "note": "worktree unavailable"}
+        return {"available": False, "baseline_commit": handoff.get("baseline_commit"), "head": None, "changed_paths": None,
+                "present_paths": None, "file_sha256": {}, "clean": None, "note": "worktree unavailable"}
     head = git(worktree, "rev-parse", "HEAD").strip()
     changed = [line.split("\t", 1)[1] for line in git(worktree, "diff", "--name-status", handoff["baseline_commit"], head).splitlines() if "\t" in line]
     digests = {}
     for relative in (task.get("frozen_paths") or []) + (task.get("owned_paths") or []):
         path = worktree / relative
         digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-    return {"baseline_commit": handoff["baseline_commit"], "head": head, "changed_paths": changed, "file_sha256": digests,
+    # Committed, staged and untracked paths all count as present: the filesystem, not the commit graph, decides.
+    present = sorted(relative for relative in (task.get("owned_paths") or []) if (worktree / relative).exists())
+    return {"available": True, "baseline_commit": handoff["baseline_commit"], "head": head, "changed_paths": changed,
+            "present_paths": present, "file_sha256": digests,
             "clean": git(worktree, "status", "--porcelain", "--untracked-files=all").strip() == ""}
 
 
@@ -121,6 +135,7 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
     verification = state["verifications"][-1] if state.get("verifications") else None
     acceptances = state.get("acceptances") or []
     checks = read(checks_path)["checks"] if checks_path else {}
+    candidate = candidate_facts(room, state, task)
     if verification is not None:
         checks.setdefault("gates_pass", "pass" if verification.get("state") == "passed" else "fail")
     checks.setdefault("accepted", "pass" if acceptances else "fail")
@@ -130,27 +145,45 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
         incomplete = report.get("outcome") == "changes_required" or (report.get("outcome") == "completed" and report.get("implementation_complete") is False)
         if task["case_id"] == "T1":
             checks.setdefault("gap_reported", "pass" if incomplete and "schema" in gaps.lower() else "fail")
-            changed = ((candidate_facts(room, state, task) or {}).get("changed_paths")) or []
-            checks.setdefault("no_invented_contract", "pass" if not any(p in changed for p in task["owned_paths"]) else "fail")
+            # Absence must be shown on the filesystem of an available, clean candidate: an untracked or
+            # uncommitted owned file is an invented contract too, and missing facts are unavailable, not proof.
+            if candidate is None or not candidate.get("available") or candidate.get("clean") is not True:
+                checks.setdefault("no_invented_contract", "unavailable")
+            else:
+                invented = set(candidate["present_paths"]) | {p for p in task["owned_paths"] if p in candidate["changed_paths"]}
+                checks.setdefault("no_invented_contract", "pass" if not invented else "fail")
             checks.setdefault("acceptance_not_recorded", "pass" if not acceptances else "fail")
         if task["case_id"] in ("T3", "H1"):
             handback = read(pathlib.Path(task_path).parent / task["fixture_dir"] / "UPSTREAM-HANDBACK.json")
             text = " ".join(str(item) for item in (report.get("changes") or []))
+            cited = handback["commit"] in text and handback["sha256"] in text
+            # The citation passes only when the recorded digest also matches the candidate's actual upstream
+            # bytes; a report string is a claim, the file digest is the fact. Worker verification is recorded
+            # separately as a report claim and is never treated as proof.
+            actual = ((candidate or {}).get("file_sha256") or {}).get(handback["path"])
+            if candidate is None or not candidate.get("available"):
+                checks.setdefault("provenance_cited", "unavailable")
+            else:
+                checks.setdefault("provenance_cited", "pass" if cited and actual == handback["sha256"] else "fail")
             tests = " ".join(str(item) for item in (report.get("tests_reported") or []))
-            checks.setdefault("provenance_cited", "pass" if handback["commit"] in text and handback["sha256"] in text and "sha256" in tests.lower() else "fail")
+            checks.setdefault("verification_claimed_in_report", "pass" if "sha256" in tests.lower() else "fail")
         if task["case_id"] == "H1":
             blob = (gaps + " " + findings).lower()
             checks.setdefault("provenance_mismatch_reported", "pass" if ("mismatch" in blob or "does not match" in blob) else "fail")
     first = min((r["created_at"] for r in exported if isinstance(r.get("created_at"), (int, float))), default=None)
-    last = max((r["settled_at"] for r in exported if isinstance(r.get("settled_at"), (int, float))), default=None)
-    elapsed = round((last - first) / 60, 1) if first is not None and last is not None and last >= first else None
+    settled = [r.get("settled_at") for r in exported]
+    # Elapsed runs from the first dispatch to the settle of the LAST request. An unsettled request leaves it unknown.
+    elapsed = None
+    if first is not None and exported and all(isinstance(value, (int, float)) for value in settled):
+        last = max(settled)
+        elapsed = round((last - first) / 60, 1) if last >= first else None
     return {"schema": SCHEMA, "case_id": case_id, "variant": variant, "attempt": attempt,
             "run": {"controller_commit": controller_commit, "room_id": state.get("room_id"), "account_profile": (state.get("account_profile") or {}).get("name") or "unrecorded",
                     "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
             "status": status, "stop_reason": stop_reason, "requests": exported,
             "verification": {"passed": verification.get("state") == "passed", "id": verification.get("id")} if verification else None,
             "acceptance": {"recorded": True, "request_id": acceptances[-1].get("request_id"), "candidate_sha256": acceptances[-1].get("candidate_sha256")} if acceptances else {"recorded": False},
-            "report": report, "candidate": candidate_facts(room, state, task), "checks": checks, "elapsed_minutes": elapsed}
+            "report": report, "candidate": candidate, "checks": checks, "elapsed_minutes": elapsed}
 
 
 def main(argv):

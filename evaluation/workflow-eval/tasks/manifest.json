@@ -9,14 +9,14 @@
       "fixture/upstream/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "fixture/upstream/verdict.py": "53fa4cfcf81b93c96dcc4ae221bcfa67acdb757a9a7bee08633ae6c4838da980",
       "spec.md": "b83e2a6bd9bf312d0b4fdc79943e28e4ba22ba425a11dddbe1081538765e36f8",
-      "task.json": "158e53ea9fa1e696f0e5e8f09b9e6aac8a75a27ef0b94b11032a69f4c5f220aa"
+      "task.json": "b11191d3b8d2eba74194ef1ccd81ea54efff5b99d55e979808d5aca7092890fc"
     },
     "T1-incomplete-handoff": {
       "fixture/README.md": "41f47770eeba6fe8598512e12bfee2fda0ddbf2c5764981cd47a9e291afd7b37",
       "fixture/metrics.py": "dfb3bcd6978da1c79f9007fe7b245375ccd369bbd2e1830af9e3be691d5eeac9",
       "fixture/tests/test_metrics.py": "959d5097984acca01e75898ff71da53b5201b83d5eb3e8c7f57142b07fa42824",
       "spec.md": "16a3dff2653f8bcda3a9615f979389e1296051298ceefbafcc29c836dbf7121c",
-      "task.json": "49dbd52dd4a4de9624b3ba8da4f6ab4b6532a0fcaed3e9c03e79ba76e9f0a55e"
+      "task.json": "3044a5358207d84d4a8d850b02670f293b89e14c6a7db46e1454e942ac6515f0"
     },
     "T2-helper-only-proof": {
       "fixture/README.md": "6995f3d612cfb8de37691b9b5e57eac50d39850f4c6cb0879f209e7762f97a58",
@@ -32,7 +32,7 @@
       "fixture/upstream/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "fixture/upstream/verdict.py": "3124eb9cbd14bb8f6b7d81eafe9f2fcf19f1276ac903254fb8fd9c9c032cbbee",
       "spec.md": "1c5c5ea679a9a3ed489f546d4ee06665d177ef803ae74a2fa9ead31adac06137",
-      "task.json": "58b223e16c348a3fb2014a64a448efce376c25cf590419357d225c9cc053266f"
+      "task.json": "d987bfccba19520d25c9c1c7ca275824bfd325d6ec48f4deb22f873faa839f6e"
     }
   }
 }

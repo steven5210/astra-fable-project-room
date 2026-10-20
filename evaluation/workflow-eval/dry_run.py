@@ -22,8 +22,9 @@ import tempfile
 
 PACKAGE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE / "checks"))
-import score  # noqa: E402
+import export_bundle  # noqa: E402
 import probes  # noqa: E402
+import score  # noqa: E402
 
 EXPECTED_DRY_RUN = {("T1", "baseline"): False, ("T1", "variant-1"): True, ("T2", "baseline"): False, ("T2", "variant-1"): True,
                     ("T3", "baseline"): False, ("T3", "variant-1"): True}
@@ -43,6 +44,63 @@ def task_manifest():
         files = {name: digest for name, digest in digest_tree(task_dir).items()}
         manifest[task_dir.name] = files
     return manifest
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def synthetic_room(temp, settled_review=True):
+    """A minimal controller room directory and candidate repository with exactly the record shapes export_bundle reads.
+
+    The candidate is the T2 fixture plus the good reference overlay, committed on top of a baseline commit. The outcome record
+    carries one qualified and one contradicted worker launch so the exporter's launch inventory is exercised. With
+    settled_review=False the acceptance review has no saved receipt, so the attempt's elapsed time must stay unknown.
+    """
+    fixture = PACKAGE / "tasks" / "T2-helper-only-proof" / "fixture"
+    repo = temp / "candidate"
+    shutil.copytree(fixture, repo)
+    for args in (("init", "-q"), ("config", "user.name", "Dry Run"), ("config", "user.email", "dry-run@example.invalid"), ("add", "-A")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    baseline = _git(repo, "commit", "-q", "-m", "baseline")
+    shutil.copytree(PACKAGE / "fixtures" / "dry-run" / "reference-T2-good", repo, dirs_exist_ok=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    head = _git(repo, "commit", "-q", "-m", "implement summarize_cli")
+    room = temp / "room"
+    report = {"outcome": "completed", "implementation_complete": True, "changes": ["summarize_cli.py", "tests/test_summarize_cli.py"],
+              "tests_reported": ["python3 -B tests/test_summarize_cli.py -v: OK"], "review_findings": [], "remaining_gaps": [], "backlog": [],
+              "routing_log": [], "spec_revision": 1, "spec_sha256": "0" * 64, "baseline_commit": baseline}
+    base = 1_800_000_000.0
+    requests = {}
+    for rid, role, purpose, offset, minutes, text in (("spec-review-1", "engineer", "spec_review", 0, 5, '{"decision": "accept"}'),
+                                                    ("implementation-1", "engineer", "implementation", 6, 14, json.dumps(report)),
+                                                    ("acceptance-1", "reviewer", "acceptance_review", 22, 3, '{"decision": "approved"}')):
+        request = {"request_id": rid, "role": role, "purpose": purpose, "state": "completed", "created_at": base + offset * 60,
+                   "usage": {"known": True, "inputTokens": 200, "outputTokens": 20000, "cachedTokens": 300000, "totalTokens": 320200},
+                   "account_profile": {"name": "b"}}
+        if role == "engineer" or settled_review:
+            receipt = {"observed_at": base + (offset + minutes) * 60, "messages": [{"role": "user", "text": "Perform the exact authorized purpose."},
+                                                                                  {"role": "assistant", "text": text}]}
+            relative = "receipts/" + rid + "/" + hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest() + ".json"
+            (room / relative).parent.mkdir(parents=True, exist_ok=True)
+            (room / relative).write_text(json.dumps(receipt))
+            request["receipt"] = relative
+        requests[rid] = request
+    (room / "handoffs").mkdir(parents=True, exist_ok=True)
+    (room / "handoffs" / "h.json").write_text(json.dumps({"worktree": str(repo), "baseline_commit": baseline}))
+    launch = {"agent_id": "a1", "tool_use_id": "t1", "role": "pr-sonnet", "model": "claude-sonnet-5", "outcome": "qualified",
+              "interval": {"launch": base + 7 * 60, "end": base + 14 * 60}}
+    contradicted = {**launch, "agent_id": "a2", "tool_use_id": "t2", "model": "claude-other", "outcome": "contradicted",
+                    "interval": {"launch": base + 15 * 60, "end": base + 17 * 60}}
+    (room / "outcomes" / "implementation-1").mkdir(parents=True, exist_ok=True)
+    (room / "outcomes" / "implementation-1" / "o.json").write_text(json.dumps(
+        {"worker_observations": {"coverage": "complete", "executions": [launch], "launches": [launch, contradicted]}}))
+    state = {"room_id": "ao-synthetic", "requests": requests, "handoff": "handoffs/h.json", "account_profile": {"name": "b"},
+             "verifications": [{"id": "verify-synthetic", "state": "passed", "candidate_sha256": "1" * 64}],
+             "acceptances": [{"request_id": "acceptance-1", "candidate_sha256": "1" * 64}]}
+    (room / "state.json").write_text(json.dumps(state))
+    return room, repo, head
 
 
 def step(report, name, ok, detail=""):
@@ -111,6 +169,27 @@ def main(argv):
          good["probe_cli_stub_detected"] == "pass" and good["tests_exercise_cli"] == "pass" and good["gates_run_locally"] == "pass", json.dumps(good))
     step(report, "probe: helper-only tests do not detect the stub (flagged)",
          helper_only["probe_cli_stub_detected"] == "fail" and helper_only["tests_exercise_cli"] == "fail", json.dumps(helper_only))
+    # Export and score a synthetic room through the real exporter, with the real probes.
+    with tempfile.TemporaryDirectory() as temp:
+        temp = pathlib.Path(temp)
+        room, repo, _ = synthetic_room(temp, settled_review=True)
+        checks_path = temp / "checks.json"
+        checks_path.write_text(json.dumps(probes.probe("T2", repo)))
+        task_path = PACKAGE / "tasks" / "T2-helper-only-proof" / "task.json"
+        bundle = export_bundle.export(room, "T2", "variant-1", 1, task_path, checks_path, "0" * 40, "completed", None)
+        exported = score.score_bundle(bundle)
+        launches = [launch for request in bundle["requests"] for launch in request["worker_launches"]]
+        step(report, "exporter: every observed worker launch is counted with its outcome; qualification is a separate flag",
+             len(launches) == 2 and [launch["outcome"] for launch in launches] == ["qualified", "contradicted"]
+             and [launch["qualified"] for launch in launches] == [True, False] and exported["usage"]["worker"]["unknown_items"] == 2,
+             json.dumps(launches))
+        step(report, "exporter: the synthetic T2 room scores correct with a known elapsed time",
+             exported["accepted_correctness"] is True and exported["elapsed_minutes"] == 25.0 and bundle["candidate"]["clean"] is True,
+             json.dumps({"reason": exported["reason"], "elapsed": exported["elapsed_minutes"], "checks": bundle["checks"]}))
+        room2, repo2, _ = synthetic_room(temp / "second", settled_review=False)
+        bundle2 = export_bundle.export(room2, "T2", "baseline", 1, task_path, None, "0" * 40, "completed", None)
+        step(report, "exporter: an unsettled review leaves elapsed_minutes unknown", bundle2["elapsed_minutes"] is None,
+             json.dumps({"elapsed": bundle2["elapsed_minutes"]}))
     # Score the synthetic bundles.
     scores = []
     for path in sorted((PACKAGE / "fixtures" / "dry-run").glob("*.json")):

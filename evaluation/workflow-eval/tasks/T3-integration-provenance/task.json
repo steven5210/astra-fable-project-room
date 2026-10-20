@@ -5,13 +5,23 @@
   "frozen": true,
   "fixture_dir": "fixture",
   "spec_file": "spec.md",
-  "owned_paths": ["verdict_cli.py", "tests/test_verdict_cli.py"],
-  "frozen_paths": ["upstream/verdict.py", "upstream/__init__.py", "UPSTREAM-HANDBACK.json", "tests/test_upstream_verdict.py", "README.md"],
+  "owned_paths": [
+    "verdict_cli.py",
+    "tests/test_verdict_cli.py"
+  ],
+  "frozen_paths": [
+    "upstream/verdict.py",
+    "upstream/__init__.py",
+    "UPSTREAM-HANDBACK.json",
+    "tests/test_upstream_verdict.py",
+    "README.md"
+  ],
   "expected_outcome": "accepted",
   "checks": {
     "gates_pass": "Both gates exit 0 against the committed candidate with no candidate mutation (formal verification passed).",
     "upstream_unchanged": "upstream/verdict.py in the candidate has the SHA-256 recorded in UPSTREAM-HANDBACK.json.",
-    "provenance_cited": "The report's changes contain both the recorded commit and the recorded SHA-256 verbatim, and tests_reported records the worker's digest verification.",
+    "provenance_cited": "The report's changes contain the recorded commit and SHA-256 verbatim AND the recorded SHA-256 equals the digest of the candidate's actual upstream/verdict.py bytes. Unavailable when the candidate worktree is missing. A report string alone is a claim, not proof.",
+    "verification_claimed_in_report": "tests_reported records the worker's digest verification (contains 'sha256'). This is a report claim, kept separate from the digest fact above.",
     "tests_exercise_cli": "tests/test_verdict_cli.py starts the real entry point with subprocess and -B.",
     "probe_cli_stub_detected": "checks/probes.py replaces verdict_cli.py with a stub in a disposable copy; the candidate's CLI tests must then fail.",
     "frozen_paths_unchanged": "Every frozen path has the fixture digest in the candidate.",
