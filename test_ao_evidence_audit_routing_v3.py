@@ -7,7 +7,9 @@ coverage in test_ao_evidence_audit and test_ao_usage_audit.
 """
 
 import copy
+from datetime import datetime, timezone
 import json
+from pathlib import Path
 import sqlite3
 import unittest
 import uuid
@@ -59,7 +61,33 @@ class RoutingV3AuditFixture(Fixture):
                         owner['branch_provider_conversation_id'], owner['branch_session_id'],
                         owner['strategy'], owner['replay_truncated']))
         self.database = path
+        self.write_transcript(provider_uuid, request)
         return path
+
+    def write_transcript(self, provider_uuid, request):
+        """The request's synthetic caller and response records under the scanned native id."""
+        config_root = Path(self.prepared_routing()['claude_config_dir'])
+        project_dir = config_root / 'projects' / str(self.repo).replace('/', '-')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds,
+                                                          timezone.utc),
+                                    datetime.now(timezone.utc)).isoformat()
+        records = [
+            {'type': 'user', 'uuid': self.request_id + '-caller', 'sessionId': provider_uuid,
+             'timestamp': stamp(0.001), 'cwd': str(self.repo), 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': self.request_id + '-reply', 'sessionId': provider_uuid,
+             'timestamp': stamp(0.002), 'cwd': str(self.repo),
+             'message': {'role': 'assistant', 'model': request['model'],
+                         'id': self.request_id + '-m0',
+                         'content': [{'type': 'text', 'text': 'Done'}],
+                         'stop_reason': 'end_turn',
+                         'usage': {'input_tokens': 1, 'output_tokens': 1,
+                                   'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0,
+                                   'server_tool_use': None, 'service_tier': None,
+                                   'cache_creation': None}}}]
+        (project_dir / (provider_uuid + '.jsonl')).write_text(
+            ''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
 
     def usage(self):
         return ao_usage_audit.audit(str(self.home), self.room, self.request_id, str(self.database))
@@ -92,6 +120,9 @@ class RealVersionThreeTests(RoutingV3AuditFixture, unittest.TestCase):
             binding['room_root'].close()
         report = self.usage()
         self.assertNotIn('preparation_unbound', report['reasons'])
+        self.assertNotEqual(report['coverage'], 'unavailable')
+        self.assertIsNotNone(report['parent'])
+        self.assertIsInstance(report['parent']['counters'], dict)
 
 
 class TamperedVersionThreeTests(RoutingV3AuditFixture, unittest.TestCase):
