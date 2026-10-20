@@ -852,3 +852,19 @@ Manual Claude compaction and a controlled native stop/resume are validated only
 as described under readiness above; automatic compaction thresholds and crash
 recovery still require their own live validation. Do not claim a smaller context
 window reading proves lower total usage or recovered subscription budget.
+
+## Owner and assignment rooms
+
+Two-room coordination lets one normal owner room admit one normal assignment room
+for a bounded set of owned paths in the same controller home and Git repository.
+Call `ao_room_assignment_open` on the owner room after its agreement and handoff.
+Work the assignment room through its ordinary spec, handoff, implementation,
+verification and acceptance flow, then call `ao_room_handback_record` on it.
+Preflight the import on the owner room with `ao_room_import_preflight`, let the
+operator perform the Git import by hand, then record it with
+`ao_room_import_record`. The controller validates recorded Git facts and refuses;
+it never merges, dispatches or writes to a worktree. A superseded or imported
+assignment releases ownership. Owner acceptance refuses a candidate that touches
+an engaged assignment's owned paths, and after an import it requires an
+engineering result recorded after that import. See
+[two-room coordination](../../../docs/guides/two-room-coordination.md).
