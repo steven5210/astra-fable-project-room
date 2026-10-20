@@ -28,7 +28,6 @@ import test_ao_normal as fixtures
 OLDER_PARTS = tuple(p for p in ao_workflow.PARTS if p not in (ao_finding_provenance.PART, ao_evidence_closure.PART))
 # The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
 PRE_EXECUTION_PARTS = ao_workflow.PARTS[:16]
-# The real 16-name prefix ending at progress_plan_v3, before either of the last two parts existed.
 
 # Independently copied pinned digests for the other existing frozen one-time workflow parts. Comparing
 # each against both the live module constant and this literal catches drift in either the text or its
