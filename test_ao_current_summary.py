@@ -421,6 +421,75 @@ class CurrentSummaryTests(CurrentSummaryFixture):
                          {'available': False, 'basis': None, 'reason': 'transcript unavailable'})
         self.assertEqual(self.record_only(degraded), self.record_only(full['current_summary']))
 
+    def test_a_pending_verification_with_a_later_turn_is_not_a_stale_approval(self):
+        self.plan_rows()
+        request = self.finish_engineering()
+        # A running verification blocks any further send, so the later turn is dispatched first.
+        self.send('correction', 'fix-1')
+        state = self.state()
+        state['verifications'].append({'id': 'verify-running', 'state': 'running',
+                                       'candidate_sha256': request['result_candidate_sha256']})
+        self.service.save(self.directory(), state)
+        full, compact, view = self.read_all()
+        cs = full['current_summary']
+        self.assertEqual(cs['ladder']['formal_verification'],
+                         {'status': 'pending',
+                          'candidate_sha256': request['result_candidate_sha256'],
+                          'relation': 'baseline_for_live_turn'})
+        self.assertEqual(cs['inconsistencies'], [])
+        # The later turn is live and its capture is not the baseline, so progress adds nothing.
+        self.assertEqual(view['current_summary']['inconsistencies'], [])
+
+    def test_a_failed_verification_with_a_later_turn_is_not_a_stale_approval(self):
+        self.plan_rows()
+        self.finish_engineering(content='draft\n')
+        self.assertFalse(self.service.ao_room_verify(self.room, str(self.repo))['passed'])
+        self.send('correction', 'fix-1')
+        full, compact, view = self.read_all()
+        cs = full['current_summary']
+        self.assertEqual(cs['ladder']['formal_verification']['status'], 'failed')
+        self.assertEqual(cs['ladder']['formal_verification']['relation'],
+                         'baseline_for_live_turn')
+        self.assertEqual(self.record_only(cs)['inconsistencies'], [])
+
+    def test_a_rejected_acceptance_with_a_later_turn_is_not_a_stale_approval(self):
+        self.plan_rows()
+        self.finish_engineering()
+        self.assertTrue(self.service.ao_room_verify(self.room, str(self.repo))['passed'])
+        self.send('acceptance_review')
+        request = self.state()['requests']['acceptance_review']
+        self.fake.finish('reviewer', json.dumps({**request['review'], 'decision': 'rejected',
+                                                 'review': 'Gate evidence is incomplete.'}))
+        self.service.ao_room_sync(self.room)
+        self.send('correction', 'fix-1')
+        full, compact, view = self.read_all()
+        cs = full['current_summary']
+        self.assertEqual(cs['ladder']['independent_acceptance']['status'], 'rejected')
+        self.assertEqual(cs['ladder']['independent_acceptance']['relation'],
+                         'baseline_for_live_turn')
+        self.assertEqual([item['code'] for item in cs['inconsistencies']],
+                         ['verification_not_current'])
+
+    def test_an_error_verification_rung_produces_no_stale_code(self):
+        self._green()
+        state = self.state()
+        candidate = state['requests']['impl-1']['result_candidate_sha256']
+        path = self.directory() / state['checkpoint']
+        data = bytearray(path.read_bytes())
+        data[0] ^= 0xFF
+        path.write_bytes(bytes(data))
+        full, compact, view = self.read_all()
+        cs = full['current_summary']
+        self.assertEqual(cs['ladder']['formal_verification'],
+                         {'status': 'error', 'candidate_sha256': None, 'relation': 'none'})
+        # Acceptance does not read the checkpoint: it stays approved/current, so no code at all.
+        self.assertEqual(cs['ladder']['independent_acceptance'],
+                         {'status': 'approved', 'request_id': 'acceptance_review',
+                          'candidate_sha256': candidate, 'relation': 'current'})
+        self.assertEqual(cs['inconsistencies'], [])
+        self.assertEqual([item['code'] for item in view['current_summary']['inconsistencies']
+                          if item['code'] not in PROGRESS_ONLY], [])
+
     def test_a_superseded_handoff_makes_the_verdict_unavailable(self):
         self._green()
         self.spec(revision=2)

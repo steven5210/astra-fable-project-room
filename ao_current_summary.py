@@ -190,11 +190,13 @@ def _record_codes(latest, captured, verification_status, acceptance_status,
     """The closed inconsistency codes derived from saved records alone; identical on every
     surface."""
     codes = []
-    for code, status, relation in (("verification_not_current", verification_status,
-                                    verification_relation),
-                                   ("acceptance_not_current", acceptance_status,
-                                    acceptance_relation)):
-        if status != "none" and relation not in ("current", "unknown"):
+    for code, decided, status, relation in (("verification_not_current", "passed",
+                                             verification_status, verification_relation),
+                                            ("acceptance_not_current", "approved",
+                                             acceptance_status, acceptance_relation)):
+        # Only a decided rung (passed/approved) is an approval that can go stale; pending,
+        # failed, rejected and error rungs keep their status and relation on the ladder.
+        if status == decided and relation not in ("current", "unknown"):
             codes.append({"code": code, "kind": "stale",
                           "detail": {"relation": relation,
                                      "later_request_id": bounds.ident(later.get("request_id"))
