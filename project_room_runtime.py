@@ -18,7 +18,8 @@ import tempfile
 
 
 RUNTIME_FILES = (
-    "ao_acceptance_extension.py", "ao_account_profiles.py", "ao_acp_patch.py", "ao_delegate_launcher.py", "ao_delegates.py",
+    "ao_acceptance_extension.py", "ao_account_profiles.py", "ao_acp_patch.py", "ao_current_summary.py",
+    "ao_delegate_launcher.py", "ao_delegates.py",
     "ao_engineering_model.py", "ao_engineering_policy.py", "ao_engineering_transition.py",
     "ao_evidence_audit.py", "ao_evidence_audit_io.py", "ao_evidence_audit_native.py",
     "ao_executable_binding.py", "ao_execution_evidence.py", "ao_finding_provenance.py", "ao_findings.py", "ao_history.py", "ao_history_reconciliation.py", "ao_instruction_amendments.py", "ao_mcp_attachment.py",

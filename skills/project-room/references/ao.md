@@ -230,7 +230,22 @@ saved engineering, verification and acceptance records with closed statuses and
 identity matches — saved identities only, never the live worktree (see
 [provenance](../../../docs/reference/progress.md#provenance-and-stage-evidence)).
 An unregistered or unreadable source reports `source.available: false` with the
-reason instead of failing. The same task list drives AO's plan panel in the
+reason instead of failing. Both `ao_room_status` (full and compact) and
+`ao_room_progress` also carry the additive, read-only `current_summary`: the
+latest engineering request and newest digest-checked capture, one status per
+ladder rung (prepared, dispatch, reconciliation, engineering verdict, formal
+verification, independent acceptance), each stage rung's `relation` to the
+latest captured baseline (`current`, `superseded_by_later_candidate`,
+`spec_revised_since`, `baseline_for_live_turn`, `baseline_for_unsettled_turn`,
+`baseline_for_uncaptured_turn`, `unknown` or `none`), and a sorted, closed
+`inconsistencies` code list (`verification_not_current`,
+`acceptance_not_current`, `engineering_turn_delivery_uncertain`,
+`engineering_record_invalid`,
+`engineering_complete_reported_with_open_required_findings`, plus three
+progress-only codes where task rows exist — see
+[current summary](../../../docs/reference/progress.md#current-summary)). Read
+relations and codes as disclosures of saved facts, never as verdicts;
+`ao_room_verify` and `ao_room_accept` remain the checks that decide. The same task list drives AO's plan panel in the
 session view; the `progress_plan_v3` workflow part, the consolidated successor
 delivered once per engineer session, asks Fable to keep it current per bounded
 work unit (a task is one bounded unit, not a phase; residuals become new tasks;

@@ -248,9 +248,9 @@ that change's own modules and are not duplicated by the harness.
 ## Status distinctions (input to the minimum-correction step)
 
 What a reader must look at to tell these apart. `engineering_capture` and the reviewer rows'
-`review_decision` are the two additive, read-only projections this work added; both derive
-from saved fields and the digest-validated receipt, grant nothing, and appear identically in
-the full and compact views.
+`review_decision` (#222) and `current_summary` (#232) are additive, read-only projections; they
+derive from saved fields, digest-validated records and the digest-validated receipt, grant
+nothing, and appear identically in the full and compact views.
 
 | Operator question | Where the answer is in `ao_room_status` |
 | --- | --- |
@@ -260,6 +260,8 @@ the full and compact views.
 | invalid report | `engineering_capture.status` `capture_failed` with the request id and its `engineering_error`; `ao_room_verify` refuses with a verification-worded message naming both |
 | verification failure | `latest_verification.state` `failed`; `checkpoint` null |
 | review rejection | the reviewer row's `review_decision` (`rejected`; `approved` with `accepted` false is approved-but-not-accepted; `invalid`/`unavailable` when the saved verdict or its identities do not validate), derived read-only from the digest-validated receipt |
+| verification or acceptance of a prior candidate while a later engineering turn is live, held or uncaptured | `current_summary.ladder.formal_verification.relation` / `current_summary.ladder.independent_acceptance.relation` (`baseline_for_live_turn`, `baseline_for_unsettled_turn`, `baseline_for_uncaptured_turn`, `superseded_by_later_candidate`, `spec_revised_since`) plus the `verification_not_current`/`acceptance_not_current` codes |
+| an in-progress task label with no live engineer turn | `current_summary.inconsistencies` code `in_progress_units_without_live_engineer_turn` in `ao_room_progress` only (status reads no transcript) |
 | accepted | `latest_acceptance` |
 | installed | not representable (see room-level states) |
 

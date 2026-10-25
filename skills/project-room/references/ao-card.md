@@ -44,6 +44,18 @@ Rules for every phase:
   rate-limit window label, its used percent or `not reported`, and its reset
   time — the `ao_room_sync` result carries it, so no extra status call is
   needed; treat the reading as advisory, never as headroom.
+- `current_summary` (in `ao_room_status` and `ao_room_progress`; additive,
+  read-only) discloses the delivery ladder at this read: `engineering_line`
+  names the latest request and the newest digest-checked capture (history,
+  never an all-clear for a later turn), `ladder` gives one status per rung,
+  and `relation` says how verified or accepted evidence relates to the
+  captured baseline (`current`, `superseded_by_later_candidate`,
+  `spec_revised_since`, `baseline_for_*_turn`, `unknown`, `none`).
+  `inconsistencies` codes are sorted disclosures — `*_not_current` (stale),
+  `engineering_turn_delivery_uncertain` (unknown) and the contradiction codes —
+  never verdicts: `ao_room_verify` and `ao_room_accept` still decide. The
+  `ao_room_open` and `ao_room_sync` results carry it too, so no extra status
+  call is needed.
 - `ao_room_progress.deliverables` (additive, read-only) folds the same task list
   into requirement labels, lineage and closure. Read `closure` for measured
   counts and deltas (never a percentage), `blockers`/`blockers_total` for named
