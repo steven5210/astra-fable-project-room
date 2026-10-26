@@ -29,8 +29,6 @@ concrete diagnostics; the former never returns, and its payload's ``diagnostics`
 empty because no shape check ever ran.
 """
 
-import re
-
 from ao_quality_review import MAX_DEPTH
 import ao_report_contract
 from room import RoomError
@@ -128,7 +126,11 @@ class DraftAdmissionError(RoomError):
         self.payload = refusal_payload(message)
 
 
-_PATH_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+# The only keys a diagnostic path ever names literally: the fixed schema keys. Every other key,
+# including an identifier-shaped unknown one, is positional (key[i]) so a path never echoes a
+# submitted name.
+_LITERAL_KEYS = frozenset(FIELD_ORDER) | {"report_format", "enhancement_proposals", "operator_requests",
+                                          "controller_metadata", "delegate_job_ids"}
 TEXT_MESSAGE = "must be valid Unicode text; an escaped lone surrogate is not text"
 
 
@@ -146,9 +148,10 @@ def text_diagnostics(report):
     The report arrives as JSON text, so an escaped lone surrogate such as ``"\\ud800"`` is plain
     ASCII to the transport's UTF-8 check and survives decoding as a Python str that no digest,
     receipt or file can encode. Reported here as a shape diagnostic so a draft and its capture agree
-    instead of capture failing later with a codec error. Paths show a key literally only when it is a
-    plain identifier; any other key, and every key that is itself not text, is shown as ``key[i]``.
-    No IO, never raises; ordinary valid Unicode (including astral characters) is never flagged.
+    instead of capture failing later with a codec error. Paths name only the fixed schema keys
+    literally; any other key, including a valid identifier-shaped unknown key and every key that is
+    itself not text, is shown positionally as ``key[i]`` so no submitted name is echoed. No IO,
+    never raises; ordinary valid Unicode (including astral characters) is never flagged.
     """
     diagnostics = []
     stack = [(report, "")]
@@ -156,12 +159,12 @@ def text_diagnostics(report):
         item, path = stack.pop()
         if isinstance(item, dict):
             for index, (key, value) in enumerate(item.items()):
-                if not isinstance(key, str) or _unencodable(key) or not _PATH_KEY.fullmatch(key):
+                if isinstance(key, str) and key in _LITERAL_KEYS:
+                    child = f"{path}.{key}" if path else key
+                else:
                     child = f"{path}.key[{index}]" if path else f"key[{index}]"
                     if isinstance(key, str) and _unencodable(key):
                         diagnostics.append({"field": child, "message": "object key " + TEXT_MESSAGE})
-                else:
-                    child = f"{path}.{key}" if path else key
                 stack.append((value, child))
         elif isinstance(item, list):
             stack.extend((value, f"{path}[{index}]") for index, value in enumerate(item))

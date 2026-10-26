@@ -314,6 +314,19 @@ class TextValidityTests(unittest.TestCase):
         for entry in result["diagnostics"]:
             entry["field"].encode("utf-8")  # a path never echoes the unencodable key or value
 
+    def test_unknown_identifier_shaped_keys_are_never_echoed_in_a_path(self):
+        # Devin Review on #237: an identifier-shaped unknown key must stay positional too.
+        report = full_report(clientSecretABC="\ud800",
+                             routing_log=[{"delegate_job_ids": [], "privateNameXYZ": "\udc00"}])
+        result = ao_report_validation.validate_draft(json.dumps(report))
+        self.assertFalse(result["syntax_shape_valid"])
+        self.assertEqual(result["diagnostics"], [
+            {"field": f"key[{len(report) - 1}]", "message": self.MESSAGE},
+            {"field": "routing_log[0].key[1]", "message": self.MESSAGE}])
+        dumped = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("clientSecretABC", dumped)
+        self.assertNotIn("privateNameXYZ", dumped)
+
     def test_ordinary_unicode_including_astral_characters_stays_valid(self):
         report = full_report(changes=["héllo ✓ 日本 🎉", "\U0001F389 again"])
         text = json.dumps(report)  # the astral character becomes a surrogate PAIR escape, which is valid text
