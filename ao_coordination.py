@@ -85,6 +85,61 @@ def _lifecycle(directory):
     return record
 
 
+def _evidence(directory):
+    """(lineage, lifecycle) for one assignment directory, validated together.
+
+    A directory with neither file is empty and returns None. A lineage without a
+    lifecycle is an interrupted admission: it returns an ACTIVE synthetic lifecycle
+    (the reservation), never written. Anything corrupt or mismatched raises
+    RoomError: that evidence is unresolved, and callers must refuse, never skip it.
+    """
+    from ao_project_room import digest
+    if not (directory / "lineage.json").is_file():
+        if (directory / "state.json").is_file():
+            raise RoomError("lifecycle record without a lineage")
+        return None
+    lineage = _lineage(directory)
+    if not (directory / "state.json").is_file():
+        return lineage, {"version": VERSION, "assignment_id": lineage["assignment_id"],
+                         "state": ACTIVE, "lineage_sha256": digest(lineage), "reservation": True}
+    lifecycle = _lifecycle(directory)
+    if lifecycle.get("lineage_sha256") != digest(lineage):
+        raise RoomError("Assignment lifecycle refers to another lineage")
+    return lineage, lifecycle
+
+
+def _scan(service, owner, owned, room_id, exclude):
+    """The shared admission scan over sibling assignment directories.
+
+    Unresolved evidence refuses instead of being skipped; an engaged sibling
+    (including a lineage-only reservation) refuses an overlapping admission and
+    enforces one engaged assignment per owner room.
+    """
+    root = _root(service.root)
+    for other in sorted(root.glob("*")) if root.is_dir() else ():
+        if not other.is_dir() or other.name in exclude:
+            continue
+        try:
+            evidence = _evidence(other)
+        except (RoomError, OSError, ValueError) as exc:
+            raise RoomError("admission refused: coordination evidence unresolved for assignment "
+                            + other.name + ": " + str(exc)[:160]) from None
+        if evidence is None:
+            continue
+        other_lineage, other_lifecycle = evidence
+        if other_lifecycle.get("state") not in ENGAGED:
+            continue
+        if other_lineage.get("git_common_dir") == owner["git_common_dir"]:
+            overlapping = _overlap(owned, other_lineage.get("owned_paths") or [])
+            if overlapping:
+                raise RoomError("admission refused: admission overlaps assignment "
+                                + other.name + " on paths " + ", ".join(overlapping))
+        if other_lineage.get("owner_room_id") == room_id:
+            raise RoomError("admission refused: owner_assignment_cap: owner room already has "
+                            "engaged assignment " + other.name
+                            + "; one engaged assignment per owner")
+
+
 def _new_lifecycle(lineage):
     from ao_project_room import digest
     return {"version": VERSION, "assignment_id": lineage["assignment_id"], "state": ACTIVE,
@@ -319,27 +374,20 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
             if _body(existing) != _body(lineage):
                 raise RoomError("Assignment lineage is immutable; a different record exists for this assignment_id")
             lineage = existing
+            # A retry or repair runs the same reservation scan a fresh admission would:
+            # evidence that appeared since the interrupted write still controls.
+            try:
+                _scan(service, owner, owned, room_id, {assignment_id, supersedes})
+            except RoomError as exc:
+                raise RoomError("admission refused: retry conflicts with assignment: "
+                                + str(exc)[:220]) from None
             if not (directory / "state.json").exists():
                 atomic(directory / "state.json", _new_lifecycle(lineage))
             lifecycle = _lifecycle(directory)
             if lifecycle["lineage_sha256"] != digest(lineage):
                 raise RoomError("Assignment lifecycle refers to another lineage")
         else:
-            root = _root(service.root)
-            for other in sorted(root.glob("*")) if root.is_dir() else ():
-                if not other.is_dir() or other.name == assignment_id or other.name == supersedes:
-                    continue
-                try:
-                    other_lineage = _lineage(other)
-                    other_lifecycle = _lifecycle(other)
-                except (RoomError, OSError, ValueError):
-                    continue
-                if (other_lifecycle.get("state") in ENGAGED
-                        and other_lineage.get("git_common_dir") == owner["git_common_dir"]):
-                    overlapping = _overlap(owned, other_lineage.get("owned_paths") or [])
-                    if overlapping:
-                        raise RoomError("admission refused: admission overlaps assignment "
-                                        + other.name + " on paths " + ", ".join(overlapping))
+            _scan(service, owner, owned, room_id, {assignment_id, supersedes})
             atomic(lineage_path, lineage)
             lifecycle = _new_lifecycle(lineage)
             atomic(directory / "state.json", lifecycle)
@@ -788,12 +836,18 @@ def before_owner_accept(service, directory, state, checkpoint):
     for assignment_id in coord.get("assignment_ids") or []:
         assignment_dir = _assignment_dir(service.root, assignment_id)
         try:
-            lineage = _lineage(assignment_dir)
-            lifecycle = _lifecycle(assignment_dir)
-        except RoomError:
+            evidence = _evidence(assignment_dir)
+        except (RoomError, OSError, ValueError) as exc:
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (" + str(exc)[:120] + ")") from None
+        if evidence is None:
             continue
+        lineage, lifecycle = evidence
         if lineage.get("owner_room_id") != state["room_id"]:
-            continue
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (lineage names another owner room)")
         owned = lineage.get("owned_paths") or []
         status = lifecycle.get("state")
         if status in ENGAGED:
@@ -831,12 +885,19 @@ def before_assignment_accept(service, directory, state, checkpoint):
     for assignment_id in coord.get("assignment_ids") or []:
         assignment_dir = _assignment_dir(service.root, assignment_id)
         try:
-            candidate_lineage = _lineage(assignment_dir)
-            candidate_lifecycle = _lifecycle(assignment_dir)
-        except RoomError:
+            evidence = _evidence(assignment_dir)
+        except (RoomError, OSError, ValueError) as exc:
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (" + str(exc)[:120] + ")") from None
+        if evidence is None:
             continue
-        if (candidate_lineage.get("assignment_room_id") == state["room_id"]
-                and candidate_lifecycle.get("state") in ENGAGED):
+        candidate_lineage, candidate_lifecycle = evidence
+        if candidate_lineage.get("assignment_room_id") != state["room_id"]:
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (lineage names another assignment room)")
+        if candidate_lifecycle.get("state") in ENGAGED:
             lineage = candidate_lineage
     if lineage is None:
         return

@@ -208,6 +208,70 @@ class CoordinationFixture(Fixture):
     def lifecycle(self, assignment_id='A1'):
         return ao.read(self.assignments_root() / assignment_id / 'state.json')
 
+    def _second_owner(self, feature='owner-two'):
+        # A second owner needs its own linked worktree (prepare refuses a prepared path);
+        # a linked worktree shares git_common_dir, so the room pair still qualifies.
+        wt2 = self.root / ('wt-' + feature)
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', str(wt2), 'HEAD'],
+                       check=True, capture_output=True)
+        room = self.service.ao_room_open(
+            str(self.repo), feature, 'project', 'User authorized this second owner',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(room, 1, 'Second owner spec.', self.gates,
+                                      'Astra approves this scope')
+        self.service.ao_room_prepare(room, str(wt2))
+        self.fake.add('engineer-' + feature, 'claude-code')
+        self.fake.add('reviewer-' + feature)
+        self.fake.workspaces['engineer-' + feature] = wt2
+        self.fake.workspaces['reviewer-' + feature] = wt2
+        self.service.ao_room_bind(room, 'engineer', 'engineer-' + feature,
+                                  ao_workflow.FABLE_MODEL, 'max')
+        self.service.ao_room_bind(room, 'reviewer', 'reviewer-' + feature, 'astra', 'max')
+        # Engineer turns need native outcome evidence; register a source exactly like
+        # register_native_source_b does for the assignment room.
+        directory = self.directory(room)
+        state = ao.read(directory / 'state.json')
+        binding = state['bindings']['engineer']
+        project_dir = self.native_config_root() / 'projects' / str(wt2).replace('/', '-')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        transcript = project_dir / (feature + '.jsonl')
+        transcript.write_text('')
+        self.owners[binding['session_id']] = {
+            'id': binding['session_id'], 'project_id': state['ao_project_id'],
+            'harness': 'claude-code', 'session_mode': 'chat', 'is_terminated': 0,
+            'activity_state': 'idle', 'workspace_path': str(wt2),
+            'provider_conversation_id': feature, 'controller_generation': 'generation-1',
+            'ao_conversation_id': binding['conversation_id'], 'active_branch_id': binding['branch_id'],
+            'branch_provider_conversation_id': feature, 'branch_session_id': binding['session_id'],
+            'strategy': 'native', 'replay_truncated': 0}
+        source = {'database': str(self.root / 'owner.db'), 'transcript': str(transcript),
+                  'session_id': binding['session_id'], 'native_session_id': feature}
+        ao_native_outcome.preflight_source(directory, state, source['database'], source['transcript'])
+        ao.atomic(directory / 'state.json', state)
+        self.service.ao_room_send(room, 'engineer', 'Review the registered specification.',
+                                  'spec_review', purpose='spec_review')
+        request = ao.read(directory / 'state.json')['requests']['spec_review']
+        model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                  datetime.now(timezone.utc)).isoformat()
+        transcript.write_text(''.join(json.dumps(event) + '\n' for event in [
+            {'type': 'user', 'uuid': 'spec_review-caller', 'sessionId': feature,
+             'timestamp': stamp(0.001), 'cwd': str(wt2), 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': 'spec_review-reply', 'sessionId': feature,
+             'timestamp': stamp(0.002), 'cwd': str(wt2),
+             'message': {'role': 'assistant', 'model': model, 'id': 'spec_review-m0',
+                         'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}}]))
+        spec = self.service.spec(directory, ao.read(directory / 'state.json'))
+        self.fake.finish('engineer-' + feature, json.dumps(
+            {'interpretation': 'Implement the supplied pure behavior.', 'findings': [],
+             'decision': 'accept', 'spec_revision': 1, 'spec_sha256': spec['sha256']}))
+        self.service.ao_room_sync(room)
+        saved = ao.read(directory / 'state.json')['requests']['spec_review']
+        assert saved['state'] == 'completed', saved  # DEBUG
+        self.service.ao_room_handoff(room, str(wt2))
+        return room
+
 
 class SuccessPathTests(CoordinationFixture):
     def test_two_room_success_path(self):
@@ -883,3 +947,130 @@ class GateTests(CoordinationFixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EvidenceIntegrityTests(CoordinationFixture):
+    """F1: unresolved coordination evidence refuses; a lineage-only reservation stays engaged."""
+
+    def _interrupt_a1_lifecycle_write(self):
+        """Open A1 so its lineage.json lands but the first state.json write crashes."""
+        self.room = self.open('owner')
+        self.spec()
+        self.bind()
+        self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assign_room = self.service.ao_room_open(
+            str(self.repo), 'assignment', 'project', 'User authorized this assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.spec_b()
+        self.bind_b()
+        real = ao.atomic
+
+        def flaky(path, value):
+            if Path(path).name == 'state.json' and 'coordination' in str(path):
+                raise OSError('simulated crash between the lineage and lifecycle writes')
+            return real(path, value)
+
+        with patch.object(ao, 'atomic', side_effect=flaky):
+            with self.assertRaises(OSError):
+                self.service.ao_room_assignment_open(
+                    self.room, 'A1', self.assign_room, ['owned'],
+                    'The interface contract for the owned paths.',
+                    'User authorized this bounded assignment')
+        directory = self.assignments_root() / 'A1'
+        self.assertTrue((directory / 'lineage.json').exists())
+        self.assertFalse((directory / 'state.json').exists())
+
+    def _owner_acceptance_touching_owned(self):
+        self.send('implementation')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        (self.repo / self.OWNED).write_text('owner wrote here\n')
+        self.commit_wt(self.repo, 'owner touches owned path')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.review()
+
+    def test_interrupted_admission_keeps_the_reservation_and_retry_repairs(self):
+        # (a) a lineage-only reservation blocks overlap and repair rechecks cleanly.
+        self._interrupt_a1_lifecycle_write()
+        other_owner = self._second_owner()
+        with self.assertRaisesRegex(RoomError, 'overlap'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A2', self.assign_room, ['owned'], 'interface', 'authorization')
+        result = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.',
+            'User authorized this bounded assignment')
+        self.assertTrue(result['opened'])
+        self.assertTrue((self.assignments_root() / 'A1' / 'state.json').exists())
+        engaged = [entry for entry in self.assignments_root().glob('*/lineage.json')
+                   if 'owned' in (ao.read(entry).get('owned_paths') or [])]
+        self.assertEqual(len(engaged), 1)
+
+    def test_corrupt_lifecycle_of_another_assignment_refuses_admission(self):
+        # (b) unreadable evidence of another assignment refuses a new admission.
+        self.open_rooms()
+        other_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-two', 'project', 'User authorized another assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(other_room, 1, 'Implement the other assignment.',
+                                      self.gates_b, 'Astra approves this scope')
+        (self.assignments_root() / 'A1' / 'state.json').write_text('{garbage')
+        other_owner = self._second_owner()
+        with self.assertRaisesRegex(RoomError, 'unresolved'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A2', other_room, ['unrelated'], 'interface', 'authorization')
+
+    def test_retry_rechecks_reservations_and_refuses_a_conflict(self):
+        # (c) an engaged reservation appearing while A1 was interrupted blocks the repair.
+        self._interrupt_a1_lifecycle_write()
+        zed_dir = self.assignments_root() / 'Z1'
+        zed_dir.mkdir()
+        owner_state = self.state()
+        zed = {'version': 1, 'assignment_id': 'Z1', 'owner_room_id': 'ao-foreign-owner',
+               'assignment_room_id': self.assign_room,
+               'git_common_dir': owner_state['git_common_dir'],
+               'owner': {'spec_revision': 1, 'spec_sha256': '0' * 64,
+                         'spec_record_sha256': '0' * 64, 'handoff_sha256': '0' * 64,
+                         'baseline_commit': '0' * 40, 'worktree': str(self.repo)},
+               'assignment': {'spec_revision': 1, 'spec_sha256': '0' * 64,
+                              'spec_record_sha256': '0' * 64},
+               'owned_paths': ['owned'], 'interface': 'i', 'authorization': 'a',
+               'supersedes': None, 'created_at': 1.0}
+        ao.atomic(zed_dir / 'lineage.json', zed)
+        lifecycle = {'version': 1, 'assignment_id': 'Z1', 'state': 'active',
+                     'lineage_sha256': ao.digest(zed), 'handbacks': [], 'latest_handback': None,
+                     'preflights': [], 'import': None, 'superseded_by': None, 'refusals': [],
+                     'updated_at': 1.0}
+        ao.atomic(zed_dir / 'state.json', lifecycle)
+        with self.assertRaisesRegex(RoomError, 'retry conflicts'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A1', self.assign_room, ['owned'],
+                'The interface contract for the owned paths.',
+                'User authorized this bounded assignment')
+        self.assertFalse((self.assignments_root() / 'A1' / 'state.json').exists())
+
+    def test_missing_and_corrupt_evidence_at_both_acceptance_boundaries(self):
+        # (d) a reservation still controls owner paths; corrupt evidence refuses acceptance.
+        self.open_rooms()
+        directory = self.assignments_root() / 'A1'
+        (directory / 'state.json').unlink()
+        self._owner_acceptance_touching_owned()
+        with self.assertRaisesRegex(RoomError, 'owned_by_active_assignment'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        (directory / 'state.json').write_text('{garbage')
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        # Corrupt lineage refuses at both acceptance hooks.
+        lineage_path = directory / 'lineage.json'
+        original = lineage_path.read_bytes()
+        flipped = original[:-2] + (b'Z' if original[-2:-1] != b'Z' else b'Y') + original[-1:]
+        lineage_path.write_bytes(flipped)
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.accept_b()
