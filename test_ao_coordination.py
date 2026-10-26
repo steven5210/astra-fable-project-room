@@ -459,17 +459,18 @@ class AdmissionTests(CoordinationFixture):
 
     def test_refused_admission_leaves_no_durable_record(self):
         self.open_rooms(owned=('owned',))
+        other_owner = self._second_owner()
         second_room = self.service.ao_room_open(
             str(self.repo), 'assignment-two', 'project', 'User authorized another assignment',
             'http://127.0.0.1:1234', delegate_provider='none')['room_id']
         self.service.ao_room_spec_put(second_room, 1, 'Implement the other assignment.',
                                       self.gates_b, 'Astra approves this scope')
         with self.assertRaisesRegex(RoomError, 'overlap'):
-            self.service.ao_room_assignment_open(self.room, 'A2', second_room, ['owned/part.txt'],
+            self.service.ao_room_assignment_open(other_owner, 'A2', second_room, ['owned/part.txt'],
                                                  'interface', 'authorization')
         self.assertFalse((self.assignments_root() / 'A2').exists())
         # The clean retry succeeds.
-        result = self.service.ao_room_assignment_open(self.room, 'A2', second_room, ['unrelated'],
+        result = self.service.ao_room_assignment_open(other_owner, 'A2', second_room, ['unrelated'],
                                                       'interface', 'authorization')
         self.assertTrue(result['opened'])
 
@@ -565,11 +566,16 @@ class SupersessionUnsettledTests(CoordinationFixture):
                 self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
                 supersedes='A1')
         self.assertEqual(self.lifecycle('A1')['state'], 'active')
-        # A third owner room still cannot take the owned paths: the reservation held.
+        # A third room pair still cannot take the owned paths: the reservation held.
         other_owner = self._second_owner()
+        third_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-three', 'project', 'User authorized a third assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(third_room, 1, 'Implement the third assignment.',
+                                      self.gates_b, 'Astra approves this scope')
         with self.assertRaisesRegex(RoomError, 'overlap'):
             self.service.ao_room_assignment_open(
-                other_owner, 'A3', self.assign_room, ['owned'], 'interface', 'authorization')
+                other_owner, 'A3', third_room, ['owned'], 'interface', 'authorization')
         # Completing the turn settles the boundary; supersession proceeds.
         (self.assign_wt / self.OWNED).write_text('done\n')
         self.commit_wt(self.assign_wt, 'assignment work')
@@ -986,12 +992,12 @@ class OrdinaryRoomTests(CoordinationFixture):
         result = self.service.ao_room_accept(self.room, 'acceptance_review')
         self.assertTrue(result['accepted'])
         self.assertEqual(self.service.ao_room_status(self.room)['coordination'],
-                         {'role': None, 'assignments': []})
+                         {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
         self.assertNotIn('coordination', self.state())
         compact = self.service.ao_room_status(self.room, 'compact')['coordination']
-        self.assertEqual(compact, {'role': None, 'assignments': []})
+        self.assertEqual(compact, {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
         progress = self.service.ao_room_progress(self.room)['coordination']
-        self.assertEqual(progress, {'role': None, 'assignments': []})
+        self.assertEqual(progress, {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
         rooms = {item['room_id']: item for item in self.service.ao_room_list()['rooms']}
         self.assertEqual(rooms[self.room]['coordination'], {'role': None})
 
