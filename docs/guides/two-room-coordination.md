@@ -39,7 +39,28 @@ Identical repeats of each call return the existing digest-addressed record. A di
 - `ao_room_accept` on an owner room refuses a candidate whose `baseline..candidate` diff changes a path owned by an engaged assignment (`owned_by_active_assignment`). Import the accepted handback or supersede the assignment first.
 - `ao_room_accept` on an owner room after an import refuses unless the recorded import head is an ancestor of the checkpoint candidate and the latest engineering result postdates the import (`integration_requires_fresh_engineering`). Fresh owner engineering judgment must follow every import.
 - `ao_room_accept` on an assignment room refuses a candidate that does not descend from the lineage baseline (`baseline_mismatch`) or that changes an unowned path (`scope_drift`). A clean worktree is not required at acceptance; the handback requires it.
-- Status, compact status, progress and room list show the coordination role, assignment state, owned paths, pinned spec digests, latest handback, import kind and blockers. A room without a coordination pointer shows `{"role": None, "assignments": []}`.
+- Coordination evidence never removes ownership controls silently. A lineage without its lifecycle is an unfinished reservation and still engages its owned paths and its owner's slot until the retry repairs it or an operator removes it. A missing lifecycle for a missing lineage, a corrupt record or a record bound to another lineage is `coordination_evidence_unresolved`: admission and both acceptance boundaries refuse until the evidence is restored.
+- A retry or repair of admission re-runs the same reservation scan a fresh admission would. A conflict discovered then refuses and writes nothing.
+- Supersession requires the settled boundary: `supersedes` refuses while the assignment room holds any request that is not in a terminal state. `uncertain` is not terminal; it still blocks supersession.
+- `ao_room_import_record` revalidates the preflight's authority before it records: the preflighted handback must still be the latest, the lifecycle must still bind the pinned lineage, the blocker set is recomputed, and every recorded handback fact re-verifies against live evidence. Any change refuses and asks for a new preflight.
+- `ao_room_handback_record` refuses evidence that predates the assignment's own admission (`acceptance_predates_assignment`, `checkpoint_predates_assignment`, `engineering_predates_assignment`). A reused room's terminal history never stands in for work done under the new assignment.
+- An import counts a handback path the destination already holds byte-identically, or the handback commit already in ancestry, as incorporated and records `already_incorporated_paths`. A genuine drop still refuses by name and an unrelated advance still refuses `handback_not_incorporated`.
+- One engaged assignment per owner room: a second admission for an owner that already has an engaged assignment refuses `owner_assignment_cap`. The cap is atomic under the admission lock.
+- Status, compact status, progress and room list show the coordination role, assignment state, owned paths, pinned spec digests, latest handback, import kind, blockers and the recorded account policy. A room without a coordination pointer shows `{"role": None, "assignments": []}` plus the effective account policy.
+
+## Account mode
+
+The optional `coordination_accounts` key in `PROJECT_ROOM_HOME/ao/config.json` names the allowed account pairing for new admissions:
+
+```json
+"coordination_accounts": {"mode": "single", "owner_profile": null, "assignment_profile": null}
+```
+
+An absent key means exactly that value, so every existing setup keeps working. `single` keeps coordination inside one account: at admission an unpinned room resolves as the saved default login — that is a documented assumption for this check only, not attribution — and the owner and the assignment room must resolve the same account, else `dual_account_requires_dual_mode`. A configured `owner_profile` in single mode must equal the owner's resolved account, else `profile_mismatch`. `dual` requires two distinct enrolled profile names: both rooms must be pinned (`room_not_pinned`), the pins must name the configured profiles (`profile_mismatch`), each pin's live account identity is rechecked (`account_identity_changed`) and the two identities must differ (`same_account_identity`). The configured names resolve through the same enrollment check `ao_room_open` performs, so an unenrolled or same-account configuration refuses with the existing enrollment messages.
+
+The mode is admission-only. Handback, preflight, import and the acceptance checks never re-read it: an assignment admitted under one mode drains under its recorded policy, and a later config edit changes only the effective mode status reports. The lineage records `account_policy` with the mode and profile names — never digests, directories or credentials. Status adds `account_policy` at the top of the coordination view (the effective mode, or `{"mode": "invalid", "error": ...}` for a bad value, which still never breaks the read) and per assignment (the recorded mode).
+
+Nothing in the account mode creates a room, dispatches, switches accounts or attributes billing; the names are configuration metadata.
 
 ## What stays manual
 
@@ -53,7 +74,7 @@ Identical repeats of each call return the existing digest-addressed record. A di
 - The checks validate recorded Git facts and refuse. They do not prevent arbitrary external filesystem writes.
 - Admission is atomic within one controller home only.
 - The recorded account profile names are configuration metadata, not provider billing attribution.
-- An assignment room engages in at most one assignment at a time. An imported or superseded assignment stays in its pointer for audit and does not block a new admission. An owner room may own many assignments. A room is never both.
+- An assignment room engages in at most one assignment at a time, and an owner room engages in at most one assignment at a time. An imported or superseded assignment stays in its pointer for audit and does not block a new admission. An idempotent repair of a terminal assignment adds no engagement and stays exempt from the engaged-pointer and per-owner-cap refusals. A room is never both.
 
 ## Installation
 

@@ -883,5 +883,10 @@ operator perform the Git import by hand, then record it with
 it never merges, dispatches or writes to a worktree. A superseded or imported
 assignment releases ownership. Owner acceptance refuses a candidate that touches
 an engaged assignment's owned paths, and after an import it requires an
-engineering result recorded after that import. See
+engineering result recorded after that import. One engaged assignment per owner
+room applies at admission. The optional `coordination_accounts` key in
+`PROJECT_ROOM_HOME/ao/config.json` pins the allowed account pairing for new
+admissions (`single`, the default, or `dual` with two configured profile names);
+it never creates rooms, dispatches, switches accounts or attributes billing, and
+work admitted earlier drains under its recorded policy. See
 [two-room coordination](../../../docs/guides/two-room-coordination.md).
