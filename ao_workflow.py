@@ -216,12 +216,15 @@ def engineering_report(directory, state, request, report=None, validate_operator
     record = handoff_record(directory, state)
     if report is None:
         report = final_json(directory, request)
+    from ao_report_validation import shape_diagnostics, text_diagnostics
+    if text_diagnostics(report):
+        # Before anything digests the decoded text: an escaped lone surrogate is a shape defect, not a codec crash.
+        raise RoomError("Engineering report is incomplete or refers to another spec/handoff")
     from ao_report_contract import project
     report = project(directory, state, request, report)
     if validate_operator_requests:
         from ao_review_followups import validate
         validate(report, fields=('operator_requests',))
-    from ao_report_validation import shape_diagnostics
     if (request.get("handoff_sha256") != state["handoff_sha256"]
             or report.get("spec_revision") != record["spec_revision"]
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
