@@ -8,6 +8,7 @@ atomic under the admission lock; draining work never re-reads the mode.
 import hashlib
 import json
 import os
+from pathlib import Path
 import threading
 import unittest
 from unittest.mock import patch
@@ -213,6 +214,68 @@ class AccountModeTests(DualAccountCoordinationFixture):
                 status = self.service.ao_room_status(self.room)["coordination"]["account_policy"]
                 self.assertEqual(status["mode"], "invalid")
                 self.assertTrue(status["error"])
+        # A config file that is not a JSON object at all is invalid, never a silent
+        # default and never an exception for the read-only view.
+        path = self.service.root / "config.json"
+        for raw in ('[1]', '5', '{broken'):
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                with self.assertRaisesRegex(RoomError, 'coordination_accounts.*invalid'):
+                    self.service.ao_room_assignment_open(
+                        self.room, 'A1', self.assign_room, ['owned'], 'i', 'a')
+                status = self.service.ao_room_status(self.room)["coordination"]["account_policy"]
+                self.assertEqual(status["mode"], "invalid")
+                self.assertTrue(status["error"])
+                self.assertTrue(self.service.ao_room_progress(self.room)["coordination"])
+                self.assertTrue(self.service.ao_room_list()["rooms"])
+
+    def test_recorded_policy_governs_retry_and_repair(self):
+        # An idempotent retry or crash repair keeps the lineage's recorded policy; it
+        # changes no engagement and must not read the mode again.
+        self.write_policy(self.DUAL)
+        opened = self.open_rooms_pinned()
+        self.assertTrue(opened['opened'])
+        lineage_path = self.assignments_root() / 'A1' / 'lineage.json'
+        lineage = ao.read(lineage_path)
+        self.assertEqual(lineage['account_policy']['mode'], 'dual')
+        self.write_policy({"mode": "single", "owner_profile": None, "assignment_profile": None})
+        retry = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.',
+            'User authorized this bounded assignment')
+        self.assertTrue(retry['opened'])
+        self.assertEqual(retry['lineage_sha256'], opened['lineage_sha256'])
+        self.assertEqual(ao.read(lineage_path)['account_policy']['mode'], 'dual')
+
+    def test_crash_repair_under_recorded_policy(self):
+        # A lineage-only reservation repairs under its own recorded dual policy even
+        # after the configuration switches to single.
+        self.write_policy(self.DUAL)
+        self.open_rooms_pinned(admission=False)
+        real = ao.atomic
+
+        def flaky(path, value):
+            if Path(path).name == 'state.json' and 'coordination' in str(path):
+                raise OSError('simulated crash between the lineage and lifecycle writes')
+            return real(path, value)
+
+        with patch.object(ao, 'atomic', side_effect=flaky):
+            with self.assertRaises(OSError):
+                self.service.ao_room_assignment_open(
+                    self.room, 'A1', self.assign_room, ['owned'],
+                    'The interface contract for the owned paths.',
+                    'User authorized this bounded assignment')
+        directory = self.assignments_root() / 'A1'
+        self.assertTrue((directory / 'lineage.json').exists())
+        self.assertFalse((directory / 'state.json').exists())
+        self.write_policy({"mode": "single", "owner_profile": None, "assignment_profile": None})
+        repaired = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.',
+            'User authorized this bounded assignment')
+        self.assertTrue(repaired['opened'])
+        self.assertEqual(self.lifecycle('A1')['state'], 'active')
+        self.assertEqual(ao.read(directory / 'lineage.json')['account_policy']['mode'], 'dual')
 
     def test_dual_same_identity_default_and_b_refuses(self):
         # (c) the saved default login already enrolled as b: #220's own message surfaces.

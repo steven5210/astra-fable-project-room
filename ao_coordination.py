@@ -310,11 +310,21 @@ def account_policy(ao_root, strict=True):
     from ao_project_room import read
     path = ao_root / "config.json"
     config = {}
+    error = None
     if path.is_file():
         try:
             config = read(path)
-        except (OSError, ValueError, RecursionError):
-            config = {}
+        except (OSError, ValueError, RecursionError) as exc:
+            error = "ao/config.json is unreadable: " + str(exc)[:120]
+        else:
+            if not isinstance(config, dict):
+                error = "ao/config.json is not an object"
+    if error is not None:
+        if strict:
+            raise RoomError(
+                "coordination_accounts in PROJECT_ROOM_HOME/ao/config.json is invalid: "
+                + error) from None
+        return {"mode": "invalid", "error": error[:200]}
     value = config.get("coordination_accounts")
     if value is None:
         value = {"mode": "single", "owner_profile": None, "assignment_profile": None}
@@ -482,8 +492,16 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
         except RoomError:
             raise RoomError("Register the assignment room's authorized spec first") from None
         owner_spec = service.spec(owner_dir, owner)
-        recorded_policy = _check_account_mode(
-            service, account_policy(service.root, strict=True), owner, assign)
+        directory = _assignment_dir(service.root, assignment_id)
+        lineage_path = directory / "lineage.json"
+        existing = _lineage(directory) if lineage_path.exists() else None
+        # A retry or repair keeps the policy its lineage recorded: it changes no engagement and
+        # must not read the mode. Only a new admission resolves the current configuration.
+        if existing is not None:
+            recorded_policy = existing.get("account_policy")
+        else:
+            recorded_policy = _check_account_mode(
+                service, account_policy(service.root, strict=True), owner, assign)
         lineage = {"version": VERSION, "assignment_id": assignment_id,
                    "owner_room_id": room_id, "assignment_room_id": assignment_room_id,
                    "git_common_dir": owner["git_common_dir"],
@@ -501,10 +519,7 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
                                         "acceptance_request_ids": sorted(
                                             a["request_id"] for a in (assign.get("acceptances") or []))},
                    "supersedes": supersedes, "created_at": time.time()}
-        directory = _assignment_dir(service.root, assignment_id)
-        lineage_path = directory / "lineage.json"
-        if lineage_path.exists():
-            existing = _lineage(directory)
+        if existing is not None:
             if _body(existing) != _body(lineage):
                 raise RoomError("Assignment lineage is immutable; a different record exists for this assignment_id")
             lineage = existing
