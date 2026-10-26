@@ -1225,3 +1225,57 @@ class ImportAuthorityTests(CoordinationFixture):
         with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_busy'):
             self.service.ao_room_import_record(
                 self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+
+
+class ImportIncorporationTests(CoordinationFixture):
+    """F5: already-incorporated paths are faithful; a real drop and an unrelated commit refuse."""
+
+    def _two_file_handback(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def change():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            (self.assign_wt / 'owned' / 'two.txt').write_text('two\n')
+
+        self.implement_b(change)
+        self.review_b()
+        self.accept_b()
+        return self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_already_incorporated_paths_do_not_break_faithfulness(self):
+        # (a) the owner already holds one handback path byte-identical before the merge.
+        record = self._two_file_handback()
+        (self.repo / self.OWNED).write_text('done\n')
+        self.commit_wt(self.repo, 'owner already holds part.txt')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        imported = self.service.ao_room_import_record(
+            self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(imported['kind'], 'faithful')
+        self.assertEqual(imported['already_incorporated_paths'], ['owned/part.txt'])
+        self.assertEqual(imported['missing_paths'], [])
+
+    def test_unrelated_head_advance_still_refuses(self):
+        # (b) an unrelated owner commit is no import: nothing incorporated, no ancestry.
+        record = self._two_file_handback()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        (self.repo / 'unrelated.txt').write_text('owner only\n')
+        self.commit_wt(self.repo, 'unrelated owner commit')
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git commit unrelated',
+                resolution='Recorded an unrelated owner commit.')
+
+    def test_a_dropped_handback_path_refuses_with_its_name(self):
+        # (c) cherry-picking the work then reverting one path is a real drop.
+        record = self._two_file_handback()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        self.git(self.repo, 'rm', '-f', 'owned/part.txt')
+        self.git(self.repo, 'commit', '-m', 'drop owned/part.txt')
+        with self.assertRaisesRegex(RoomError, 'owned/part.txt'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git cherry-pick -x ' + record['commit'])

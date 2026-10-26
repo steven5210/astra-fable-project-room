@@ -846,7 +846,16 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
         for path in sorted(handback_paths):
             identical[path] = _git_run(worktree, "diff", "--quiet",
                                        handback["commit"], head, "--", path).returncode == 0
-        missing = sorted(handback_paths - destination_paths)
+        # A path already holding the handback bytes, or the handback commit already in
+        # ancestry, counts as incorporated; only a genuine advance without either refuses.
+        incorporated = handback_paths & destination_paths
+        ancestor = _is_ancestor(worktree, handback["commit"], head)
+        if not incorporated and not ancestor:
+            _refuse(directory, lifecycle, tool, "handback_not_incorporated",
+                    "the owner HEAD advanced without incorporating the handback")
+        already_incorporated = sorted(
+            path for path in handback_paths - destination_paths if identical[path])
+        missing = sorted(path for path in handback_paths - destination_paths if not identical[path])
         extra = sorted(destination_paths - handback_paths)
         modified = sorted(path for path in handback_paths & destination_paths if not identical[path])
         if missing:
@@ -857,7 +866,8 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
         kind = "faithful" if faithful else "resolved_with_modifications"
         if not faithful and resolution is None:
             _refuse(directory, lifecycle, tool, "integration_modifications_unresolved",
-                    "the destination differs from the handback; record a nonempty resolution")
+                    "the destination differs from the handback at " + ", ".join(modified)
+                    + "; record a nonempty resolution")
         if not preflight["ready"] and resolution is None:
             _refuse(directory, lifecycle, tool, "integration_modifications_unresolved",
                     "the preflight was not ready; record a nonempty resolution")
@@ -866,7 +876,8 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
                   "owner_head_before": before, "owner_head_after": head,
                   "destination_changes": destination, "content_identical": identical,
                   "kind": kind, "modified_paths": modified, "extra_paths": extra,
-                  "missing_paths": missing, "operation": operation, "resolution": resolution,
+                  "missing_paths": missing, "already_incorporated_paths": already_incorporated,
+                  "operation": operation, "resolution": resolution,
                   "recorded_at": time.time()}
         prior = _dedupe(directory / "imports", record)
         if prior is not None:
