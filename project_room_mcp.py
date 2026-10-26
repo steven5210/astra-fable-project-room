@@ -23,6 +23,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
 import ao_project_room
+import ao_report_validation
 import project_room
 
 RELATIVE_PATH_ARGUMENTS = {
@@ -142,7 +143,7 @@ def handle(message, service):
         result = {}
     elif method == "tools/list":
         legacy_visible = _legacy_tools_visible(service)
-        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list", "ao_room_engineer_model_audit", "ao_room_progress", "ao_room_timing"}
+        readonly = {"room_doctor", "room_list", "room_status", "room_job_status", "room_history", "room_implementation_audit", "room_verification_audit", "ao_room_status", "ao_room_list", "ao_room_engineer_model_audit", "ao_room_progress", "ao_room_timing", "ao_report_validate"}
         result = {"tools": [{"name": name, "description": description, "inputSchema": _listed_schema(name, schema, service),
                              "annotations": {"readOnlyHint": name in readonly, "destructiveHint": False,
                                              "openWorldHint": name in ("room_doctor", "room_review_submit", "room_implementation_submit", "ao_room_send", "ao_room_verify", "ao_room_engineer_model_audit", "ao_room_engineer_model_transition", "ao_room_engineer_model_transition_abandon", "ao_release_check")}}
@@ -150,9 +151,9 @@ def handle(message, service):
                             if legacy_visible or name.startswith("ao_")]}
     elif method == "tools/call":
         name = params.get("name")
-        if (not _legacy_tools_visible(service) and isinstance(name, str)
-                and name in project_room.TOOL_SCHEMAS
-                and not name.startswith("ao_")):
+        # Consult the legacy-tools gate only for a legacy tool name: it reads the saved config and may open the room registry, which an ao_* call (including the read-only draft validation) must never trigger.
+        if (isinstance(name, str) and name in project_room.TOOL_SCHEMAS
+                and not name.startswith("ao_") and not _legacy_tools_visible(service)):
             error = {"error": LEGACY_TOOLS_HIDDEN_ERROR}
             result = {"content": [{"type": "text", "text": json.dumps(error, ensure_ascii=False)}], "isError": True}
         else:
@@ -160,6 +161,13 @@ def handle(message, service):
                 value = service.call(name, input_arguments(name, params.get("arguments", {})))
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
                           "structuredContent": value, "isError": False}
+            except ao_report_validation.DraftAdmissionError as exc:
+                # Bounded, non-echoing admission refusal: the payload is fixed-size, carries the same
+                # unperformed_checks/limits a validated draft carries, and never contains a supplied
+                # name, value or path. Every other exception keeps the historical {"error": str(exc)}
+                # text form; this is the only tool with a structuredContent error result.
+                result = {"content": [{"type": "text", "text": json.dumps(exc.payload, ensure_ascii=False)}],
+                          "structuredContent": exc.payload, "isError": True}
             except Exception as exc:
                 result = {"content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}], "isError": True}
     else:

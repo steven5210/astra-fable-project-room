@@ -151,7 +151,13 @@ as `unknown` with the raw value kept bounded, and an untagged entry counts as
 nothing: a tagged `remaining_gaps` entry still blocks acceptance exactly like an
 untagged one, a preexisting or integration issue that prevents the approved
 behavior is `scope=required`, not cleanup, and no token changes scope, resolves
-a finding or authorizes implementation or publication.
+a finding or authorizes implementation or publication. One exception is fixed
+policy, not inference: an entry explicitly tagged `scope=required
+disposition=open` refuses engineering readiness — verification, the
+acceptance-review send and acceptance — with a refusal naming the entry.
+Untagged, scope-only, disposition-only, optional, non-vocabulary, `deferred`
+and `decision_needed` entries are not refused by this check; they stay unknown
+or open in the projection.
 
 `delegate.routing.worker_recovery` distinguishes verified current guard capability
 from unverified, historical or unconfigured routing. Only configured or verified routing with
@@ -213,6 +219,28 @@ controller's delivered-context check refuses that session's history
 because its `ao_workflow.PARTS` vocabulary does not contain the name —
 recovery is a forward fix on a controller that keeps the name, never a
 rewrite or removal of the delivered record.
+
+The one-time `evidence_closure_v1` amendment is carried through
+`ao_workflow.PARTS` exactly the same way — once per AO engineer session, fail
+closed: a new session receives it in its first packet, a retained session
+receives it once on its next ordinary engineer send (`spec_review`,
+`implementation`, or `correction`), and it stays under `undelivered_parts`
+until a `completed` or `settled_failure` engineer turn's verified receipt shows
+it was actually carried. A read-only status read, `setup`, `ao_room_prepare`, or
+a paused room never dispatches it by itself. It refines the lifecycle execution
+and closure, quality-first review, and finding provenance defaults above with an
+evidence-based handoff-assessment and finding-closure discipline, and documents
+the read-only, offline `ao_report_validate` draft-report syntax/shape check; it
+supersedes none of the frozen text or digests already recorded for those parts,
+and is delivered text only: it grants nothing. See the [Fable policy reference's
+matching section](../../skills/project-room/references/fable-policy.md#evidence-closure-one-time-part-evidence_closure_v1)
+for the exact delivered text. Rollback window: before the first engineer send
+after install, resyncing the previous plugin is safe; after a completed or
+settled engineer turn has carried this part, the previous controller's
+delivered-context check refuses that session's history because its
+`ao_workflow.PARTS` vocabulary does not contain the name — recovery is a forward
+fix on a controller that keeps the name, never a rewrite or removal of the
+delivered record.
 
 ## Finding-provenance delivery (AO rooms)
 

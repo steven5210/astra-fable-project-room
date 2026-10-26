@@ -636,6 +636,8 @@ class PreCharterRefreshFramingTests(Fixture):
         texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
         import ao_finding_provenance
         texts[ao_finding_provenance.PART] = ao_finding_provenance.INSTRUCTION
+        import ao_evidence_closure
+        texts[ao_evidence_closure.PART] = ao_evidence_closure.INSTRUCTION
         assembly = ao_prompt_metrics.PromptAssembly('\n')
         for name in request['carried']['parts']:
             assembly.add('workflow', texts[name])

@@ -75,6 +75,161 @@ it is a global default that takes effect in a room only after the updated plugin
 has been installed or resynced (see [Install and authenticate](../../README.md#install-and-authenticate));
 existing room snapshots and historical records already saved are not rewritten.
 
+## Draft report validation and evidence closure (AO rooms)
+
+The read-only `ao_report_validate` tool checks only the syntax and shape of one
+draft engineering report — the full report form or the compact
+`project_room_engineering_v2` form — against the same shared schema authoritative
+final capture uses. It takes one argument, `report_text` (a bounded string, never
+a path: at most 1,000,000 UTF-8 bytes, nesting depth at most 64), needs no
+room, provider or authentication, and is available from both the CLI and the
+bundled MCP server, where it is listed read-only. The exact local CLI form:
+
+```sh
+python3 project_room.py call ao_report_validate --args '{"report_text": "{\"report_format\": \"project_room_engineering_v2\", \"outcome\": \"completed\", \"implementation_complete\": true, \"changes\": [], \"tests_reported\": [], \"review_findings\": [], \"remaining_gaps\": [], \"backlog\": [], \"routing_log\": []}"}'
+```
+
+and, to avoid shell escaping for a large draft, the `--args-file` variant with a
+JSON file containing `{"report_text": "..."}`:
+
+```sh
+python3 project_room.py call ao_report_validate --args-file /absolute/path/to/args.json
+```
+
+(`--home`, when given, is a global option that precedes the subcommand —
+`python3 project_room.py --home /absolute/controller-home call ao_report_validate ...`
+— because the `call` subcommand does not re-accept it after `call` itself.)
+
+The result object reports `operation`, `validity_scope` (always
+`syntax_and_shape_only`), `syntax_shape_valid` (bool), `report_form` (`full`,
+`project_room_engineering_v2`, `unsupported`, or `null`), `diagnostics` (a list of
+`{field, message}` entries that block validity), `advisories` (a list of
+`{field, message}` entries that never change validity — a malformed
+`enhancement_proposals` entry is always advisory), `unperformed_checks` (always
+the same named list, naming deferred authoritative checks this call never
+performs, always including semantic correctness assessment, formal candidate
+verification and independent acceptance, even for a completed/true draft with
+no remaining gaps — a reminder of named checks, never an exhaustive contract:
+`handoff_authentication`, `spec_identity_equality`,
+`compact_contract_delivery`, `controller_metadata_attachment`,
+`delegate_attribution_verification`, `engineering_readiness`,
+`findings_projection`, `capture_receipts`, `candidate_binding`,
+`native_outcome_evidence`, `correction_chain`, `issue_dispositions`,
+`candidate_unchanged`, `semantic_correctness_assessment`,
+`formal_candidate_verification`, `independent_acceptance`; readiness also
+refuses a report entry explicitly tagged `scope=required disposition=open`),
+and `limits`
+(`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
+failures — arguments other than exactly `report_text`, or a `report_text` that
+is a non-string, empty, oversized or invalid-UTF-8, or nesting past the
+admitted depth — are refusals, never diagnostics, and every refusal carries a
+fixed, bounded payload with that same field set (`syntax_shape_valid: false`,
+`report_form: null`, empty `diagnostics`/`advisories`, the full
+`unperformed_checks` list and `limits`) plus `error`, never echoing the
+caller's supplied argument names, values or paths: the API raises
+`DraftAdmissionError` with that object on its `.payload` attribute, the CLI
+exits 2 with that object on stderr, and MCP returns an `isError` result whose
+`content` text and `structuredContent` are that same object. A malformed
+syntax or root shape is instead a diagnostic on field `$`, in a normal
+(non-refusal) result. The full form keeps whatever unknown fields it is given, including a
+model-supplied `controller_metadata`; the compact form refuses a model-supplied
+`controller_metadata` exactly as the existing compact-contract projection does.
+
+The operation itself writes nothing, creates no home, config or registry, and
+calls no provider from any public entry: the CLI preflight runs before
+controller construction; `Service.call` dispatches it, through its own bounded
+argument admission, before the shared `tool_arguments` check every other tool
+goes through and before any room or home access; and the MCP `tools/call`
+dispatch consults the shared legacy-tools gate
+(`project_room.Service.legacy_tools_visible`) only for a legacy `room_*` tool
+name, so a draft validation never opens or creates the local SQLite room
+registry, including on a configured home whose saved config selects the `ao`
+backend and whose registry file is missing. That is a fact about this
+operation, not a claim that the whole CLI or MCP process never touches the
+filesystem: ordinary controller-home provisioning at MCP process startup is
+pre-existing and unchanged; the `initialize` and `tools/list` methods still
+consult the same gate as before (pre-existing listing behavior outside this
+operation); and running any `project_room.py` command through the `python3`
+interpreter can let it write its own `__pycache__` bytecode for imported
+modules (already git-ignored, avoided with `PYTHONDONTWRITEBYTECODE=1`), never
+a room-state or controller-home write.
+
+The refusal boundary is exact: a request is inside the operation once an
+`arguments` value — any JSON value, including a non-object — reaches the
+endpoint through `Service.call`, through MCP `tools/call` naming this tool, or
+through the CLI preflight given any `--args`/`--args-file` text, including
+malformed JSON text; every refusal from that point on is the same fixed
+payload described above. A refusal raised before that point is pre-existing,
+unchanged, and carries no payload, because nothing reached the endpoint: the
+MCP transport's `-32600 Request exceeds maximum size` for an oversized line,
+its `-32700 Invalid JSON`, its invalid request/id/params and unknown-method
+errors, the generic `Unknown tool` dispatch error for a name that is not this
+endpoint, and the CLI's historical generic error for an unreadable
+`--args-file`.
+A passing result is never evidence of handoff authentication, delegate
+attribution, engineering readiness or independent acceptance, and it changes
+nothing else: the final engineering report keeps its existing format regardless
+of whether this tool ran. A qualified worker or the operator invokes it on a
+draft before a handback, as a preflight syntax/shape check, and the engineer
+reads the result; the engineer's own guard is unchanged and admits no shell,
+CLI or MCP execution. An operator may run it on a malformed engineer handback
+to get field-level diagnostics before starting the correction loop; it is
+never a substitute for capture, verification or independent acceptance, and
+the operator still inspects the actual evidence needed for those steps.
+
+The companion evidence-closure default asks Fable to ground every closure
+claim in named evidence: before reporting a lifecycle-sensitive unit closed,
+give an evidence-based handoff assessment that names, per invariant, its
+authoritative truth source (the final production path and saved state that
+decide it) and every reader, writer and interface the unit affects; an intact
+positive control exercised through the public entry point; an independently
+varied invalid case shown to reach the intended check rather than an earlier
+or unrelated one; the actual effect of each refusal on files, saved state,
+allowances, consumption and dispatch wherever those could change; and the
+assumptions the proof rests on and how they compose. State per claim which
+evidence kind backs it: applied change, worker-reported check, formal
+candidate verification, or independent acceptance. Evidence that predates a
+later edit is stale for that edit and is reused only where the edit
+demonstrably leaves it unaffected, with that reason stated. A required
+finding, gap or proof requirement closes only by citing the specific evidence
+that discharges it (a named test, a gate's actual output, or an inspected
+artifact with its digest); calling it pre-existing, private-store, backlog or
+out of scope leaves it open unless a concrete contract or evidence reason is
+given, and without such a basis it stays listed in remaining_gaps or
+review_findings with its reason, while a justified non-blocking limitation
+may be recorded as such. Resolve known required correctness and contract
+questions before expensive formal verification is requested. Known related
+defects are consolidated into complete connected units — each with one
+accountable owner, explicit interfaces and file ownership, its parent
+requirement and verified anchors, a challenging proof, and the integration
+step that connects its result to the rest — and after integration the
+connected result gets the affected focused checks again before the unit is
+reported done; no unit is reported done on its own evidence while its
+connection to the others is unverified. This adds no report schema or
+checklist, and no backlog item blocks by itself; the read-only, offline
+`ao_report_validate` operation names deferred authoritative checks it never
+performs, a qualified worker or the operator invokes it before a handback, and
+the engineer reads the result.
+
+AO engineer sessions receive this guidance once, as the one-time
+`evidence_closure_v1` workflow part: a new session receives it in its first
+packet, and a retained session receives it once, carried on its next ordinary
+engineer send (`spec_review`, `implementation`, or `correction`). A read-only
+status read, `setup`, `ao_room_prepare`, or a paused room never dispatches it by
+itself; only an actual engineer send does. It refines the already-merged
+lifecycle execution and closure, quality-first review, and finding provenance
+defaults above — their frozen text and digests stay exactly as recorded, and
+this part supersedes none of them. See [lifecycle-closure
+delivery](efficient-continuation.md#lifecycle-closure-delivery-ao-rooms) for the
+exact delivery timing it shares, and the [Fable policy reference's matching
+section](../../skills/project-room/references/fable-policy.md#evidence-closure-one-time-part-evidence_closure_v1)
+for the exact delivered text. This default is scoped to AO rooms; legacy
+`room_*` rooms are unaffected by it. Like the other reusable instructions in this
+guide, it is a global default that takes effect in a room only after the updated
+plugin has been installed or resynced (see [Install and
+authenticate](../../README.md#install-and-authenticate)); existing room
+snapshots and already-delivered workflow-part records are not rewritten.
+
 ## Enhancement issue handoff
 
 Under the user's existing filing authorization, Astra opens or links a GitHub issue for each worthwhile enhancement in the feature project's repository. Check both open and closed issues and the current implementation first; reuse an existing issue and record completed or superseded proposals rather than opening stale duplicates. A local backlog entry alone is not a filed issue.

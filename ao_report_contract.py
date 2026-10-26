@@ -18,6 +18,25 @@ For implementation/correction replies, use this compact JSON contract instead of
 This illustrates field types, not your verdict. outcome must be completed, changes_required or scope_change. Only completed/true with no remaining_gaps is eligible for independent acceptance. Each routing_log entry retains delegate_job_ids as a list naming only relevant room-owned jobs. Fill the judgment fields truthfully; do not repeat the artifact's full findings in multiple fields. The controller separately attaches the exact bound spec_revision, spec_sha256 and baseline_commit and labels that metadata as controller-authored. Never use partial as an outcome. Return one complete JSON object without surrounding prose. Existing full reports remain supported; neither raw receipts nor prior verdicts are rewritten. This update is delivered once; routine continuation remains only Continue. or actual new requirements.'''
 
 
+def supported_format(report):
+    """Raise the exact historical message when a report names an unsupported report_format.
+
+    Pure and side-effect free; shared verbatim between live projection and the offline draft validator
+    so both refuse an unknown format with byte-identical wording.
+    """
+    if 'report_format' in report and report['report_format'] != FORMAT:
+        raise RoomError('Unsupported native engineering report format')
+
+
+def refuse_model_metadata(report):
+    """Raise the exact historical message when a report tries to supply controller-owned provenance.
+
+    Pure and side-effect free; shared verbatim between live projection and the offline draft validator.
+    """
+    if 'controller_metadata' in report:
+        raise RoomError('The model cannot supply controller-owned report provenance')
+
+
 def project(directory, state, request, report, handoff=None):
     """Never repair syntax, alter judgment fields, infer verdicts, or override identities.
 
@@ -28,12 +47,10 @@ def project(directory, state, request, report, handoff=None):
     import ao_workflow
     if 'report_format' not in report:
         return report
-    if report['report_format'] != FORMAT:
-        raise RoomError('Unsupported native engineering report format')
+    supported_format(report)
     if PART not in ao_workflow.delivered(state, request['session_id'], directory)['parts']:
         raise RoomError('Compact report contract was not delivered to this native session')
-    if 'controller_metadata' in report:
-        raise RoomError('The model cannot supply controller-owned report provenance')
+    refuse_model_metadata(report)
     if handoff is None:
         handoff = ao_workflow.handoff_record(directory, state)
     metadata = {key: handoff[key] for key in ('spec_revision', 'spec_sha256', 'baseline_commit')}

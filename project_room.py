@@ -1894,15 +1894,14 @@ class Service:
                         pass
 
     def call(self, name, arguments):
-        if name not in TOOL_SCHEMAS:
-            raise room.RoomError(f"Unknown tool {name}")
-        if not isinstance(arguments, dict):
-            raise room.RoomError("arguments must be an object")
-        schema = TOOL_SCHEMAS[name][1]
-        missing = set(schema.get("required", [])) - set(arguments)
-        extra = set(arguments) - set(schema["properties"])
-        if missing or extra:
-            raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
+        if name == "ao_report_validate":
+            # Read-only and offline: dispatched before tool_arguments and before any branch that
+            # touches self.home. This endpoint admits its own arguments (bounded, non-echoing --
+            # ao_report_validation.admit_arguments) and never reaches the shared tool_arguments
+            # check below, which keeps its historical interpolated message for every other tool.
+            import ao_report_validation
+            return ao_report_validation.validate_call(arguments)
+        tool_arguments(name, arguments)
         if name.startswith("ao_room_") or name == "ao_release_check":
             import ao_project_room
             return getattr(ao_project_room.Service(self.home), name)(**arguments)
@@ -1982,6 +1981,27 @@ TOOL_SCHEMAS = {
 
 import ao_project_room
 TOOL_SCHEMAS.update(ao_project_room.TOOL_SCHEMAS)
+
+
+def tool_arguments(name, arguments):
+    """Validate one tool call's arguments against TOOL_SCHEMAS.
+
+    ao_report_validate is no longer checked here: that endpoint admits its own arguments in
+    ao_report_validation.admit_arguments (a bounded, non-echoing refusal that never interpolates a
+    supplied name or value), dispatched in Service.call and in main's CLI preflight before this
+    function, and in MCP tools/call, before either ever reaches this shared check. This historical
+    check, including its exact interpolated message text (``Invalid arguments; missing=[...],
+    unexpected=[...]``), is unchanged for every other tool.
+    """
+    if name not in TOOL_SCHEMAS:
+        raise room.RoomError(f"Unknown tool {name}")
+    if not isinstance(arguments, dict):
+        raise room.RoomError("arguments must be an object")
+    schema = TOOL_SCHEMAS[name][1]
+    missing = set(schema.get("required", [])) - set(arguments)
+    extra = set(arguments) - set(schema["properties"])
+    if missing or extra:
+        raise room.RoomError(f"Invalid arguments; missing={sorted(missing)}, unexpected={sorted(extra)}")
 
 
 def main(argv=None):
@@ -2076,6 +2096,27 @@ def main(argv=None):
                 return 2
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
             return 0 if result["coverage"] == "complete" else 1
+        if args.command == "call" and args.tool == "ao_report_validate":
+            # Dispatch before Service construction: this read-only, offline draft validator must not
+            # provision a home, matching the audit commands above. This endpoint admits its own
+            # arguments (ao_report_validation.admit_arguments), not the shared tool_arguments check:
+            # an unreadable --args-file (missing, unreadable, undecodable) still raises its own
+            # historical error below, caught by the outer except exactly like any other command;
+            # only malformed JSON *text* in --args/--args-file becomes the same fixed, bounded
+            # admission refusal as a bad report_text.
+            import ao_report_validation
+            args_text = Path(args.args_file).read_text() if args.args_file else args.args
+            try:
+                try:
+                    arguments = json.loads(args_text)
+                except (ValueError, RecursionError) as exc:
+                    raise ao_report_validation.DraftAdmissionError("arguments must be an object") from exc
+                result = ao_report_validation.validate_call(arguments)
+            except ao_report_validation.DraftAdmissionError as exc:
+                print(json.dumps(exc.payload), file=sys.stderr)
+                return 2
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
         service = Service(args.home)
         if args.command == "setup":
             result = service.setup(args.claude_bin, args.qwen_config, args.deepseek_config, args.delegate_provider,

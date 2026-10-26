@@ -91,9 +91,9 @@ a malformed report is a completed turn with an error, never a failure and never 
 | T6 | native terminal → receipt | turn, its messages, settings, usage, session and activity failures saved once by digest | `Service.observation`, `_sync_once` | `InterruptedAndQuotaTests`, `ChangedCandidateTests` |
 | T7 | completed implementation → engineering captured | first-observation candidate snapshot, usable semantic outcome, report shape and bound metadata, verified delegate claims, candidate unchanged since first observation | `ao_workflow.completion_candidate`, `ao_report_contract.project`, `ao_workflow.engineering_report`, `ao_delegates.verify_delegation` | `NormalCompletionTests`, `MalformedReportTests`, `ChangedCandidateTests` |
 | T8 | failed turn → settled failure | read-only audit of the retained outcome, resumable kind, human authorization text, diagnosis, one named unused successor | `ao_outcomes.audit`, `ao_outcomes.resume`, `ao_outcomes.validate_settlement` | `InterruptedAndQuotaTests` |
-| T9 | captured → verified | gates as argument arrays, candidate fingerprint unchanged across the run, logs by digest | `ao_room_verify`, `Service.checkpoint` | `NormalCompletionTests`, `ChangedCandidateTests` |
+| T9 | captured → verified | gates as argument arrays, candidate fingerprint unchanged across the run, logs by digest, no entry explicitly tagged `scope=required disposition=open` | `ao_room_verify`, `Service.checkpoint`, `ao_findings.explicit_required_open` | `NormalCompletionTests`, `ChangedCandidateTests` |
 | T10 | verified → acceptance review sent | review identities (spec, candidate, evidence digests) embedded in the request; three attempts per room | `ao_room_send` reviewer branch, `ao_acceptance_extension` | `NormalCompletionTests`, `MalformedReportTests`, `ChangedCandidateTests` |
-| T11 | reviewed → accepted | completed reviewer turn with provider identity, unmodified receipt, `approved` verdict naming the exact identities, captured engineering result still current, no remaining gaps or pending operator requests, delegate evidence re-verified live | `ao_room_accept`, `ao_workflow.engineering_ready` | `NormalCompletionTests`, `MalformedReportTests`, `ChangedCandidateTests` |
+| T11 | reviewed → accepted | completed reviewer turn with provider identity, unmodified receipt, `approved` verdict naming the exact identities, captured engineering result still current, no remaining gaps or pending operator requests, no entry explicitly tagged `scope=required disposition=open`, delegate evidence re-verified live | `ao_room_accept`, `ao_workflow.engineering_ready`, `ao_findings.explicit_required_open` | `NormalCompletionTests`, `MalformedReportTests`, `ChangedCandidateTests` |
 | T12 | agreed/handed off → stale | a strictly newer spec revision | `ao_room_spec_put`, `ao_workflow.retained_handoff(current_spec=True)` | `ChangedCandidateTests` |
 
 ### Where malformed reports are caught
@@ -248,9 +248,9 @@ that change's own modules and are not duplicated by the harness.
 ## Status distinctions (input to the minimum-correction step)
 
 What a reader must look at to tell these apart. `engineering_capture` and the reviewer rows'
-`review_decision` are the two additive, read-only projections this work added; both derive
-from saved fields and the digest-validated receipt, grant nothing, and appear identically in
-the full and compact views.
+`review_decision` (#222) and `current_summary` (#232) are additive, read-only projections; they
+derive from saved fields, digest-validated records and the digest-validated receipt, grant
+nothing, and appear identically in the full and compact views.
 
 | Operator question | Where the answer is in `ao_room_status` |
 | --- | --- |
@@ -260,6 +260,8 @@ the full and compact views.
 | invalid report | `engineering_capture.status` `capture_failed` with the request id and its `engineering_error`; `ao_room_verify` refuses with a verification-worded message naming both |
 | verification failure | `latest_verification.state` `failed`; `checkpoint` null |
 | review rejection | the reviewer row's `review_decision` (`rejected`; `approved` with `accepted` false is approved-but-not-accepted; `invalid`/`unavailable` when the saved verdict or its identities do not validate), derived read-only from the digest-validated receipt |
+| verification or acceptance of a prior candidate while a later engineering turn is live, held or uncaptured | `current_summary.ladder.formal_verification.relation` / `current_summary.ladder.independent_acceptance.relation` (`baseline_for_live_turn`, `baseline_for_unsettled_turn`, `baseline_for_uncaptured_turn`, `superseded_by_later_candidate`, `spec_revised_since`) plus the `verification_not_current`/`acceptance_not_current` codes |
+| an in-progress task label with no live engineer turn | `current_summary.inconsistencies` code `in_progress_units_without_live_engineer_turn` in `ao_room_progress` only (status reads no transcript) |
 | accepted | `latest_acceptance` |
 | installed | not representable (see room-level states) |
 
