@@ -332,6 +332,13 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
                 raise RoomError("supersedes must name an assignment between this owner and this assignment room")
             if old_lifecycle["state"] not in ENGAGED:
                 raise RoomError("supersedes target is already terminal")
+            from ao_project_room import TERMINAL
+            unsettled = sorted(rid for rid, request in (assign.get("requests") or {}).items()
+                               if request.get("state") not in TERMINAL)
+            if unsettled:
+                raise RoomError("supersedes refused: assignment room has unsettled request(s) "
+                                + ", ".join(unsettled[:5])
+                                + "; reach the settled or stopped boundary first")
             superseded = (superseded_dir, old_lifecycle)
         prior_coord = assign.get("coordination")
         if prior_coord:

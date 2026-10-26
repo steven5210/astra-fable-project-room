@@ -524,6 +524,65 @@ class AdmissionTests(CoordinationFixture):
             self.service.ao_room_assignment_open(self.room, 'AZ', self.assign_room, ['x'], 'i', 'a')
 
 
+class SupersessionUnsettledTests(CoordinationFixture):
+    """F2: supersedes never releases paths while an engineer request is active or uncertain."""
+
+    def _native_failure_b(self, request_id):
+        request = self.state_b()['requests'][request_id]
+        stamp = lambda offset: min(datetime.fromtimestamp(request['created_at'] + offset, timezone.utc),
+                                   datetime.now(timezone.utc)).isoformat()
+        self.b_native['events'].append(
+            {'type': 'assistant', 'uuid': request_id + '-error', 'sessionId': self.NATIVE_B,
+             'timestamp': stamp(0.002), 'cwd': str(self.assign_wt), 'isSidechain': False,
+             'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>',
+                         'content': [{'type': 'text', 'text': 'Synthetic native session limit'}]}})
+        self.b_native['transcript'].write_text(
+            ''.join(json.dumps(event) + '\n' for event in self.b_native['events']))
+        self.b_native['requests'].add(request_id)
+
+    def test_supersession_refuses_while_engineer_request_active(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.send_b('implementation')  # left running, never finished
+        with self.assertRaisesRegex(RoomError, 'unsettled request'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+                supersedes='A1')
+        self.assertEqual(self.lifecycle('A1')['state'], 'active')
+        # A third owner room still cannot take the owned paths: the reservation held.
+        other_owner = self._second_owner()
+        with self.assertRaisesRegex(RoomError, 'overlap'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A3', self.assign_room, ['owned'], 'interface', 'authorization')
+        # Completing the turn settles the boundary; supersession proceeds.
+        (self.assign_wt / self.OWNED).write_text('done\n')
+        self.commit_wt(self.assign_wt, 'assignment work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        result = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+            supersedes='A1')
+        self.assertTrue(result['opened'])
+
+    def test_supersession_refuses_while_engineer_request_uncertain(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.send_b('implementation')
+        self._native_failure_b('implementation')
+        self.fake.finish('engineer-b', state='failed')
+        self.service.ao_room_sync(self.assign_room)
+        self.assertEqual(self.state_b()['requests']['implementation']['state'], 'uncertain')
+        with self.assertRaisesRegex(RoomError, 'unsettled request'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+                supersedes='A1')
+        self.assertEqual(self.lifecycle('A1')['state'], 'active')
+        self.assertEqual(self.lifecycle('A1')['superseded_by'], None)
+
+
 class PathValidationTests(CoordinationFixture):
     def test_owned_path_grammar(self):
         bad = (['../x'], ['/abs'], ['a//b'], ['a/'], ['./a'], ['.git/x'], ['a\\b'],
