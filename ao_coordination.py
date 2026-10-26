@@ -1027,7 +1027,9 @@ def before_owner_accept(service, directory, state, checkpoint):
                             + " lineage or lifecycle is missing, corrupt or mismatched; "
                             "restore the record before acceptance (" + str(exc)[:120] + ")") from None
         if evidence is None:
-            continue
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (no lineage or lifecycle record)")
         lineage, lifecycle = evidence
         if lineage.get("owner_room_id") != state["room_id"]:
             raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
@@ -1076,7 +1078,9 @@ def before_assignment_accept(service, directory, state, checkpoint):
                             + " lineage or lifecycle is missing, corrupt or mismatched; "
                             "restore the record before acceptance (" + str(exc)[:120] + ")") from None
         if evidence is None:
-            continue
+            raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id
+                            + " lineage or lifecycle is missing, corrupt or mismatched; "
+                            "restore the record before acceptance (no lineage or lifecycle record)")
         candidate_lineage, candidate_lifecycle = evidence
         if candidate_lineage.get("assignment_room_id") != state["room_id"]:
             raise RoomError("coordination_evidence_unresolved: assignment " + assignment_id

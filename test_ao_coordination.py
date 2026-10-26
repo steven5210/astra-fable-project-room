@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -1170,6 +1171,21 @@ class EvidenceIntegrityTests(CoordinationFixture):
         original = lineage_path.read_bytes()
         flipped = original[:-2] + (b'Z' if original[-2:-1] != b'Z' else b'Y') + original[-1:]
         lineage_path.write_bytes(flipped)
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.accept_b()
+
+    def test_deleted_assignment_directory_refuses_both_acceptance_boundaries(self):
+        # A pointer that names an assignment with no records at all is unresolved at
+        # acceptance, not "no assignment"; only an empty sibling directory may be ignored.
+        self.open_rooms()
+        shutil.rmtree(self.assignments_root() / 'A1')
+        self._owner_acceptance_touching_owned()
         with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
             self.service.ao_room_accept(self.room, 'acceptance_review')
         self.agree_b()
