@@ -767,8 +767,7 @@ def _authority_blockers(service, directory, lineage, lifecycle, owner_dir, owner
 
 def import_preflight(service, room_id, assignment_id, handback_sha256):
     """Record the owner-side import readiness of the latest handback as observed facts."""
-    import ao_workflow
-    from ao_project_room import TERMINAL, atomic, digest, identifier, read
+    from ao_project_room import atomic, digest, identifier, read
     identifier(room_id)
     identifier(assignment_id)
     _sha256(handback_sha256, "handback_sha256")

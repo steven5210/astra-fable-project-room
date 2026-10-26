@@ -8,14 +8,12 @@ atomic under the admission lock; draining work never re-reads the mode.
 import hashlib
 import json
 import os
-from pathlib import Path
 import threading
 import unittest
 from unittest.mock import patch
 
 import ao_project_room as ao
 import ao_account_profiles as ap
-import ao_coordination
 import ao_native_outcome
 import ao_workflow
 import project_room
@@ -104,7 +102,6 @@ class DualAccountCoordinationFixture(CoordinationFixture):
     def _second_owner_pinned(self, feature, profile):
         """_second_owner for a pinned room: its own linked worktree, agents and native source."""
         import subprocess
-        import datetime as _dt
         wt2 = self.root / ('wt-' + feature)
         subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', str(wt2), 'HEAD'],
                        check=True, capture_output=True)

@@ -189,7 +189,7 @@
     "test_ao_compaction_failure": 22.25,
     "test_ao_context_import_ownership": 35.97,
     "test_ao_continuation": 129.07,
-    "test_ao_coordination": 77.57,
+    "test_ao_coordination": 154.584,
     "test_ao_coordination_accounts": 19.408,
     "test_ao_current_summary": 37.87,
     "test_ao_delegate_runtime_lifetime": 1.34,
