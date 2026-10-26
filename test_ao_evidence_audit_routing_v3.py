@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import sqlite3
 import unittest
+from unittest.mock import patch
 import uuid
 
 import ao_evidence_audit
@@ -149,6 +150,70 @@ class TamperedVersionThreeTests(RoutingV3AuditFixture, unittest.TestCase):
     def test_preparation_digest_mismatch_refuses(self):
         self.rewrite_preparation(lambda p: p.update(room_id='room-other'), update_state=False)
         self.assert_unbound()
+
+
+class RetainedQualificationEvidenceTests(RoutingV3AuditFixture, unittest.TestCase):
+    """The audit reads the retained qualification record and every declared source capture itself:
+    missing, changed or symlinked retained bytes are preparation_unbound, not complete coverage."""
+
+    def snapshot(self):
+        return self.prepared_routing()['worker_qualification']['snapshot']
+
+    def captures(self):
+        from ao_model_qualification import evidence_path
+        snapshot = self.snapshot()
+        return [self.directory() / evidence_path(snapshot['sha256'], descriptor)
+                for descriptor in snapshot['artifact']['sources']]
+
+    def assert_unbound(self):
+        report = self.usage()
+        self.assertEqual(report['coverage'], 'unavailable')
+        self.assertIn('preparation_unbound', report['reasons'])
+
+    def test_intact_retained_evidence_is_the_positive_control(self):
+        captures = self.captures()
+        self.assertTrue(captures and all(path.is_file() for path in captures))
+        self.assertTrue((self.directory() / self.snapshot()['record']).is_file())
+        self.assertEqual(self.usage()['coverage'], 'complete')
+
+    def test_deleted_source_capture_refuses(self):
+        self.captures()[0].unlink()
+        self.assert_unbound()
+
+    def test_changed_source_capture_refuses(self):
+        path = self.captures()[0]
+        path.write_bytes(path.read_bytes() + b'\n')
+        self.assert_unbound()
+
+    def test_symlinked_source_capture_refuses(self):
+        path = self.captures()[0]
+        copy_path = path.with_name(path.name + '.copy')
+        copy_path.write_bytes(path.read_bytes())  # identical bytes behind a symlink are still refused
+        path.unlink()
+        path.symlink_to(copy_path)
+        self.assert_unbound()
+
+    def test_changed_retained_record_refuses(self):
+        path = self.directory() / self.snapshot()['record']
+        record = ao.read(path)
+        record['note'] = 'edited after preparation'
+        path.write_text(json.dumps(record), encoding='utf-8')
+        self.assert_unbound()
+
+    def test_missing_retained_record_refuses(self):
+        (self.directory() / self.snapshot()['record']).unlink()
+        self.assert_unbound()
+
+    def test_worker_qualification_check_refuses_on_its_own(self):
+        """Discriminating case: the engineering-model binding check happens to read the same retained
+        artifact in this room, so it is neutralized here; the version-3 worker qualification check
+        itself must still translate a deleted capture to preparation_unbound (complete before the fix)."""
+        import ao_engineering_model
+        self.captures()[0].unlink()
+        with patch.object(ao_engineering_model, 'check_request', lambda *args, **kwargs: None), \
+                patch.object(ao_engineering_model, 'binding_for_request',
+                             lambda root, state, binding, request: binding):
+            self.assert_unbound()
 
 
 if __name__ == '__main__':

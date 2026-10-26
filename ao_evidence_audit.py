@@ -275,6 +275,29 @@ def _saved_record(root, relative, expected):
     return value
 
 
+def _retained_qualification(root, snapshot):
+    """The retained bytes a version-3 worker qualification declares must still exist and match.
+
+    ``recorded_agents`` authenticates the embedded snapshot against itself; this reads the room's
+    own retained record and every declared source capture through the diagnostic's bounded,
+    no-follow, owner-checked reads and translates absence, change or a symlink to
+    ``preparation_unbound``. The private originals are never consulted.
+    """
+    from ao_model_qualification import MAX_EVIDENCE_BYTES, evidence_path
+    record = _saved_record(root, snapshot.get("record"), snapshot.get("sha256"))
+    _preparation_failure(_same(record, snapshot.get("artifact")))
+    limit = min(MAX_EVIDENCE_BYTES, audit_io.MAX_BINDING_BYTES)
+    for descriptor in snapshot["artifact"]["sources"]:
+        parts = tuple(evidence_path(snapshot["sha256"], descriptor).split("/"))
+        _preparation_failure(audit_io.valid_parts(parts))
+        try:
+            data = audit_io.read_binding_file(root, parts, limit, "preparation_unbound", "preparation_unbound",
+                                              "binding_bytes_limit", "preparation_unbound")
+        except audit_io.SourceError as exc:
+            raise AuditRefusal(exc.reason)
+        _preparation_failure(hashlib.sha256(data).hexdigest() == descriptor["sha256"])
+
+
 def _preparation_record(root, relative, expected, delegate_sha256, room_id):
     _preparation_failure(_hex64(delegate_sha256))
     prepared = _saved_record(root, relative, expected)
@@ -292,6 +315,7 @@ def _preparation_record(root, relative, expected, delegate_sha256, room_id):
             ao_routing.recorded_agents(routing)
         except (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError):
             raise AuditRefusal("preparation_unbound") from None
+        _retained_qualification(root, routing["worker_qualification"]["snapshot"])
     for value in (routing.get("claude_config_dir"), prepared.get("worktree")):
         size = audit_io.bounded_bytes(value)
         _preparation_failure(size is not None and 0 < size <= audit_io.MAX_PATH_BYTES
