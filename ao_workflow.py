@@ -26,7 +26,7 @@ REVIEW_TEXT_MAX_BYTES = 30000
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
          "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
          "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1", "progress_plan_v3",
-         "execution_evidence_v1", "finding_provenance_v1")
+         "execution_evidence_v1", "finding_provenance_v1", "evidence_closure_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -221,14 +221,11 @@ def engineering_report(directory, state, request, report=None, validate_operator
     if validate_operator_requests:
         from ao_review_followups import validate
         validate(report, fields=('operator_requests',))
-    if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
-            or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
+    from ao_report_validation import shape_diagnostics
+    if (request.get("handoff_sha256") != state["handoff_sha256"]
+            or report.get("spec_revision") != record["spec_revision"]
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
-            or report.get("outcome") not in ("completed", "changes_required", "scope_change")
-            or type(report.get("implementation_complete")) is not bool
-            or any(not isinstance(report.get(k), list) for k in ("changes", "tests_reported", "review_findings", "remaining_gaps", "backlog", "routing_log"))
-            or any(not isinstance(r, dict) or not isinstance(r.get("delegate_job_ids"), list)
-                   or not all(isinstance(j, str) for j in r["delegate_job_ids"]) for r in report["routing_log"])):
+            or shape_diagnostics(report, identity_required=True)):
         raise RoomError("Engineering report is incomplete or refers to another spec/handoff")
     return report
 
@@ -1004,6 +1001,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
     import ao_finding_provenance
     texts[ao_finding_provenance.PART] = ao_finding_provenance.INSTRUCTION
+    import ao_evidence_closure
+    texts[ao_evidence_closure.PART] = ao_evidence_closure.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)
