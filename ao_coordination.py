@@ -33,7 +33,7 @@ REFUSAL_LIMIT = 20
 DEDUPE_LIMIT = 100
 GIT_TIMEOUT = 15
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_VOLATILE = {"created_at", "recorded_at", "updated_at"}
+_VOLATILE = {"created_at", "recorded_at", "updated_at", "assignment_start"}
 ENGINEERING_PURPOSES = {"implementation", "correction"}
 
 
@@ -108,12 +108,12 @@ def _evidence(directory):
     return lineage, lifecycle
 
 
-def _scan(service, owner, owned, room_id, exclude):
+def _scan(service, owner, owned, room_id, exclude, cap=True):
     """The shared admission scan over sibling assignment directories.
 
     Unresolved evidence refuses instead of being skipped; an engaged sibling
-    (including a lineage-only reservation) refuses an overlapping admission and
-    enforces one engaged assignment per owner room.
+    (including a lineage-only reservation) refuses an overlapping admission and,
+    with cap, enforces one engaged assignment per owner room.
     """
     root = _root(service.root)
     for other in sorted(root.glob("*")) if root.is_dir() else ():
@@ -134,7 +134,7 @@ def _scan(service, owner, owned, room_id, exclude):
             if overlapping:
                 raise RoomError("admission refused: admission overlaps assignment "
                                 + other.name + " on paths " + ", ".join(overlapping))
-        if other_lineage.get("owner_room_id") == room_id:
+        if cap and other_lineage.get("owner_room_id") == room_id:
             raise RoomError("admission refused: owner_assignment_cap: owner room already has "
                             "engaged assignment " + other.name
                             + "; one engaged assignment per owner")
@@ -322,6 +322,16 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
             raise RoomError("The assignment room must be a normal fable_engineering room")
         if assign["git_common_dir"] != owner["git_common_dir"]:
             raise RoomError("The assignment room must share the owner's Git repository")
+        # An idempotent repair of a terminal assignment adds no engagement: it stays
+        # exempt from the engaged-pointer and per-owner-cap refusals (the overlap and
+        # evidence scans still apply).
+        this_dir = _assignment_dir(service.root, assignment_id)
+        terminal_repair = False
+        try:
+            if (this_dir / "lineage.json").is_file() and (this_dir / "state.json").is_file():
+                terminal_repair = _lifecycle(this_dir).get("state") not in ENGAGED
+        except RoomError:
+            terminal_repair = False
         superseded = None
         if supersedes is not None:
             superseded_dir = _assignment_dir(service.root, supersedes)
@@ -355,7 +365,7 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
                 except RoomError:
                     raise RoomError(
                         "The assignment room already participates in coordination") from None
-                if prior_lifecycle.get("state") in ENGAGED:
+                if prior_lifecycle.get("state") in ENGAGED and not terminal_repair:
                     raise RoomError("The assignment room already participates in coordination")
         try:
             assign_spec = service.spec(assign_dir, assign)
@@ -373,6 +383,10 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
                                   "spec_record_sha256": assign["spec_record_sha256"]},
                    "owned_paths": owned, "interface": interface, "authorization": authorization,
                    "account_profiles": {"owner": _profile_name(owner), "assignment": _profile_name(assign)},
+                   "assignment_start": {"request_ids": sorted((assign.get("requests") or {}).keys()),
+                                        "checkpoint_sha256": assign.get("checkpoint_sha256"),
+                                        "acceptance_request_ids": sorted(
+                                            a["request_id"] for a in (assign.get("acceptances") or []))},
                    "supersedes": supersedes, "created_at": time.time()}
         directory = _assignment_dir(service.root, assignment_id)
         lineage_path = directory / "lineage.json"
@@ -381,13 +395,14 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
             if _body(existing) != _body(lineage):
                 raise RoomError("Assignment lineage is immutable; a different record exists for this assignment_id")
             lineage = existing
-            # A retry or repair runs the same reservation scan a fresh admission would:
-            # evidence that appeared since the interrupted write still controls.
-            try:
-                _scan(service, owner, owned, room_id, {assignment_id, supersedes})
-            except RoomError as exc:
-                raise RoomError("admission refused: retry conflicts with assignment: "
-                                + str(exc)[:220]) from None
+            # A retry or repair that can still engage runs the same reservation scan a fresh
+            # admission would; repairing a terminal record changes no ownership.
+            if not terminal_repair:
+                try:
+                    _scan(service, owner, owned, room_id, {assignment_id, supersedes})
+                except RoomError as exc:
+                    raise RoomError("admission refused: retry conflicts with assignment: "
+                                    + str(exc)[:220]) from None
             if not (directory / "state.json").exists():
                 atomic(directory / "state.json", _new_lifecycle(lineage))
             lifecycle = _lifecycle(directory)
@@ -478,6 +493,24 @@ def handback_record(service, room_id, assignment_id, acceptance_request_id):
         if receipt is None or digest(receipt) != request["receipt_sha256"]:
             _refuse(directory, lifecycle, operation, "tampered_receipt",
                     "the reviewer receipt is missing or modified")
+        # Evidence must postdate this assignment's own admission, not a reused room's history.
+        start = lineage.get("assignment_start")
+        if start is None:
+            _refuse(directory, lifecycle, operation, "assignment_start_missing",
+                    "re-open the assignment; this lineage predates provenance recording")
+        if acceptance_request_id in (start.get("request_ids") or []):
+            _refuse(directory, lifecycle, operation, "acceptance_predates_assignment",
+                    "the acceptance request predates this assignment's admission")
+        if (start.get("checkpoint_sha256")
+                and state.get("checkpoint_sha256") == start["checkpoint_sha256"]):
+            _refuse(directory, lifecycle, operation, "checkpoint_predates_assignment",
+                    "the verification checkpoint predates this assignment's admission")
+        import ao_workflow
+        engineering = ao_workflow.latest(state, ENGINEERING_PURPOSES)
+        if (engineering is None
+                or engineering.get("request_id") in (start.get("request_ids") or [])):
+            _refuse(directory, lifecycle, operation, "engineering_predates_assignment",
+                    "the latest engineering result predates this assignment's admission")
         worktree = Path(checkpoint["candidate_path"])
         commit = _git(worktree, "rev-parse", "HEAD")
         if commit != checkpoint["candidate"]["head"]:

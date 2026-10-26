@@ -208,6 +208,20 @@ class CoordinationFixture(Fixture):
     def lifecycle(self, assignment_id='A1'):
         return ao.read(self.assignments_root() / assignment_id / 'state.json')
 
+    def correction_b(self, request='correction-2', review='acceptance_review_2', change=None):
+        """A second verified+accepted cycle in the assignment room under the same handoff:
+        correction is the supported engineering purpose once an implementation exists."""
+        self.send_b('correction', request)
+        if change is None:
+            (self.assign_wt / 'owned' / 'more.txt').write_text('more\n')
+        else:
+            change()
+        self.commit_wt(self.assign_wt, 'more assignment work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        self.review_b(request=review)
+        return self.accept_b(request=review)
+
     def _second_owner(self, feature='owner-two'):
         # A second owner needs its own linked worktree (prepare refuses a prepared path);
         # a linked worktree shares git_common_dir, so the room pair still qualifies.
@@ -723,6 +737,31 @@ class EvidenceTests(CoordinationFixture):
             self.service.ao_room_handback_record(self.assign_room, 'ZZ', 'acceptance_review')
 
 
+class ReusedRoomProvenanceTests(CoordinationFixture):
+    """F4: a terminal assignment's checkpoint/acceptance never hand back under a new assignment."""
+
+    def test_old_acceptance_cannot_hand_back_for_a_new_assignment(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                           'git merge --no-ff --no-edit ' + record['commit'])
+        opened = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['owned'], 'interface', 'authorization')
+        self.assertTrue(opened['opened'])
+        with self.assertRaisesRegex(RoomError, 'acceptance_predates_assignment'):
+            self.service.ao_room_handback_record(self.assign_room, 'A2', 'acceptance_review')
+        # A fresh cycle under A2 supplies assignment-specific evidence.
+        self.correction_b()
+        second = self.service.ao_room_handback_record(self.assign_room, 'A2', 'acceptance_review_2')
+        self.assertEqual(second['acceptance']['request_id'], 'acceptance_review_2')
+        # An idempotent re-admission of A1 still compares the body, not the snapshot.
+        again = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.', 'User authorized this bounded assignment')
+        self.assertTrue(again['opened'])
+
+
 class RevisionTests(CoordinationFixture):
     def test_owner_spec_change_blocks_preflight(self):
         record = self.handed_back()
@@ -1160,9 +1199,7 @@ class ImportAuthorityTests(CoordinationFixture):
     def test_a_later_handback_supersedes_the_preflighted_one(self):
         # (b) a second acceptance+handback after the preflight makes it stale.
         record, preflight = self._ready_import()
-        self.implement_b(request='implementation-2')
-        self.review_b(request='acceptance_review_2')
-        self.accept_b(request='acceptance_review_2')
+        self.correction_b()
         self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review_2')
         with self.assertRaisesRegex(RoomError, 'stale_preflight'):
             self.service.ao_room_import_record(
@@ -1180,9 +1217,11 @@ class ImportAuthorityTests(CoordinationFixture):
 
     def test_unsettled_owner_request_after_preflight_refuses_the_import(self):
         # (d) an in-flight owner request after the preflight refuses.
-        record, preflight = self._ready_import()
-        self.service.ao_room_send(self.room, 'engineer', 'Perform the exact authorized purpose.',
-                                  'implementation', purpose='implementation')
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.send('implementation')  # left running while the import is performed
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
         with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_busy'):
             self.service.ao_room_import_record(
                 self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
