@@ -119,10 +119,13 @@ class RealVersionThreeTests(RoutingV3AuditFixture, unittest.TestCase):
         finally:
             binding['room_root'].close()
         report = self.usage()
-        self.assertNotIn('preparation_unbound', report['reasons'])
-        self.assertNotEqual(report['coverage'], 'unavailable')
-        self.assertIsNotNone(report['parent'])
-        self.assertIsInstance(report['parent']['counters'], dict)
+        self.assertEqual(report['coverage'], 'complete')
+        self.assertEqual(report['reasons'], [])
+        self.assertEqual(report['parent']['coverage'], 'complete')
+        self.assertEqual(report['parent']['reasons'], [])
+        self.assertEqual(report['parent']['counters'],
+                         {'input_tokens': 1, 'output_tokens': 1,
+                          'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0})
 
 
 class TamperedVersionThreeTests(RoutingV3AuditFixture, unittest.TestCase):
