@@ -19,6 +19,7 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
                         "operator work with operator_requests ([] or valid entries); omission cannot clear it")
 CAPTURE_REQUIRED = "Acceptance requires a captured completed engineering result"
+REQUIRED_OPEN_FINDING = "Engineering reports completion while"
 REVIEW_TEXT_MAX_BYTES = 30000
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
@@ -408,6 +409,25 @@ def capture_engineering(home, directory, state, request, capture_completion=True
         request[field] = str(exc)[:1000]
 
 
+def _required_open_finding_message(open_findings):
+    """The bounded refusal for a complete report carrying explicit scope=required
+    disposition=open entries: at most three named field[index] "text" entries, each with only
+    the invariant/owner tokens the engineer actually recorded, then the count of the rest."""
+    import ao_progress
+    named = []
+    for item in open_findings[:3]:
+        clipped, shortened = ao_progress._clip(item["text"], 80)
+        tokens = ", ".join(f"{key}={item[key]}" for key in ("invariant", "owner") if item.get(key))
+        named.append(f'{item["field"]}[{item["index"]}] "{clipped}{"…" if shortened else ""}"'
+                     + (f" ({tokens})" if tokens else ""))
+    count = len(open_findings)
+    return (REQUIRED_OPEN_FINDING
+            + (" a required finding is open: " if count == 1
+               else f" {count} required findings are open: ")
+            + "; ".join(named)
+            + (f" and {count - 3} more" if count > 3 else ""))
+
+
 def engineering_ready(service, directory, state):
     from ao_project_room import digest, read
     agreement(service, directory, state)
@@ -426,6 +446,10 @@ def engineering_ready(service, directory, state):
     require_disposition(links, report)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")
+    import ao_findings
+    open_findings = ao_findings.explicit_required_open(report)
+    if open_findings:
+        raise RoomError(_required_open_finding_message(open_findings))
     from ao_review_followups import pending_operator_work
     if pending_operator_work(directory, state, request, report):
         raise RoomError("Engineering has pending operator requests; complete authorized work and obtain the subsequent engineering verdict")

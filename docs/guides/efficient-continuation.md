@@ -151,7 +151,13 @@ as `unknown` with the raw value kept bounded, and an untagged entry counts as
 nothing: a tagged `remaining_gaps` entry still blocks acceptance exactly like an
 untagged one, a preexisting or integration issue that prevents the approved
 behavior is `scope=required`, not cleanup, and no token changes scope, resolves
-a finding or authorizes implementation or publication.
+a finding or authorizes implementation or publication. One exception is fixed
+policy, not inference: an entry explicitly tagged `scope=required
+disposition=open` refuses engineering readiness — verification, the
+acceptance-review send and acceptance — with a refusal naming the entry.
+Untagged, scope-only, disposition-only, optional, non-vocabulary, `deferred`
+and `decision_needed` entries are not refused by this check; they stay unknown
+or open in the projection.
 
 `delegate.routing.worker_recovery` distinguishes verified current guard capability
 from unverified, historical or unconfigured routing. Only configured or verified routing with
