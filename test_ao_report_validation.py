@@ -21,7 +21,6 @@ import project_room
 import project_room_mcp
 from room import RoomError
 from test_ao_lifecycle_contract import AgreedRoomFixture, LifecycleFixture
-from test_ao_normal import Fixture
 
 REPO_ROOT = Path(__file__).resolve().parent
 
