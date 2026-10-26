@@ -126,6 +126,53 @@ class DraftAdmissionError(RoomError):
         self.payload = refusal_payload(message)
 
 
+# The only keys a diagnostic path ever names literally: the fixed schema keys. Every other key,
+# including an identifier-shaped unknown one, is positional (key[i]) so a path never echoes a
+# submitted name.
+_LITERAL_KEYS = frozenset(FIELD_ORDER) | {"report_format", "enhancement_proposals", "operator_requests",
+                                          "controller_metadata", "delegate_job_ids"}
+TEXT_MESSAGE = "must be valid Unicode text; an escaped lone surrogate is not text"
+
+
+def _unencodable(value):
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def text_diagnostics(report):
+    """Every string in the decoded report, object keys included, must be encodable UTF-8 text.
+
+    The report arrives as JSON text, so an escaped lone surrogate such as ``"\\ud800"`` is plain
+    ASCII to the transport's UTF-8 check and survives decoding as a Python str that no digest,
+    receipt or file can encode. Reported here as a shape diagnostic so a draft and its capture agree
+    instead of capture failing later with a codec error. Paths name only the fixed schema keys
+    literally; any other key, including a valid identifier-shaped unknown key and every key that is
+    itself not text, is shown positionally as ``key[i]`` so no submitted name is echoed. No IO,
+    never raises; ordinary valid Unicode (including astral characters) is never flagged.
+    """
+    diagnostics = []
+    stack = [(report, "")]
+    while stack:
+        item, path = stack.pop()
+        if isinstance(item, dict):
+            for index, (key, value) in enumerate(item.items()):
+                if isinstance(key, str) and key in _LITERAL_KEYS:
+                    child = f"{path}.{key}" if path else key
+                else:
+                    child = f"{path}.key[{index}]" if path else f"key[{index}]"
+                    if isinstance(key, str) and _unencodable(key):
+                        diagnostics.append({"field": child, "message": "object key " + TEXT_MESSAGE})
+                stack.append((value, child))
+        elif isinstance(item, list):
+            stack.extend((value, f"{path}[{index}]") for index, value in enumerate(item))
+        elif isinstance(item, str) and _unencodable(item):
+            diagnostics.append({"field": path or "$", "message": TEXT_MESSAGE})
+    return sorted(diagnostics, key=lambda entry: entry["field"])
+
+
 def shape_diagnostics(report, identity_required):
     """The pure-shape half of the historical engineering_report predicate; no IO, never raises.
 
@@ -134,8 +181,10 @@ def shape_diagnostics(report, identity_required):
     carry it yet. A *present* identity field is always type-checked, in every form. Returns a list of
     {"field", "message"} objects; messages never include submitted values. Field paths use only the
     literal field name, "." and integer indices (never a value) so a path can be safely shown back.
+    Text validity (``text_diagnostics``) is part of the shape: a string the controller cannot encode
+    is reported here, before any field check.
     """
-    diagnostics = []
+    diagnostics = text_diagnostics(report)
     for field in FIELD_ORDER:
         if field not in report:
             if field not in _IDENTITY_FIELDS or identity_required:

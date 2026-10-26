@@ -286,6 +286,62 @@ class FullFormTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"], [{"field": "spec_revision", "message": "must be an integer"}])
 
 
+class TextValidityTests(unittest.TestCase):
+    """An escaped lone surrogate is valid JSON text but not encodable Unicode: a shape diagnostic, never a
+    codec error later (Devin Review thread on #230, head 243e586)."""
+
+    MESSAGE = ao_report_validation.TEXT_MESSAGE
+
+    def test_escaped_lone_surrogate_value_is_a_shape_diagnostic_not_valid(self):
+        text = json.dumps(full_report(changes=["\ud800"]))  # json.dumps escapes it as the ASCII text \ud800
+        self.assertIn("\\ud800", text)
+        text.encode("utf-8")  # the transport's UTF-8 check cannot see it
+        result = ao_report_validation.validate_draft(text)
+        self.assertFalse(result["syntax_shape_valid"])
+        self.assertEqual(result["report_form"], "full")
+        self.assertEqual(result["diagnostics"], [{"field": "changes[0]", "message": self.MESSAGE}])
+        json.dumps(result, ensure_ascii=False).encode("utf-8")  # the result itself stays encodable
+
+    def test_lone_surrogates_in_keys_and_nested_strings_use_safe_paths(self):
+        report = full_report(routing_log=[{"delegate_job_ids": ["job-1", "\udc00"], "\udfff": 1, "note": "ok"}])
+        report["\ud800extra"] = "value"  # last top-level key: index len(report) - 1
+        result = ao_report_validation.validate_draft(json.dumps(report))
+        self.assertFalse(result["syntax_shape_valid"])
+        self.assertEqual(result["diagnostics"], [
+            {"field": f"key[{len(report) - 1}]", "message": "object key " + self.MESSAGE},
+            {"field": "routing_log[0].delegate_job_ids[1]", "message": self.MESSAGE},
+            {"field": "routing_log[0].key[1]", "message": "object key " + self.MESSAGE}])
+        for entry in result["diagnostics"]:
+            entry["field"].encode("utf-8")  # a path never echoes the unencodable key or value
+
+    def test_unknown_identifier_shaped_keys_are_never_echoed_in_a_path(self):
+        # Devin Review on #237: an identifier-shaped unknown key must stay positional too.
+        report = full_report(clientSecretABC="\ud800",
+                             routing_log=[{"delegate_job_ids": [], "privateNameXYZ": "\udc00"}])
+        result = ao_report_validation.validate_draft(json.dumps(report))
+        self.assertFalse(result["syntax_shape_valid"])
+        self.assertEqual(result["diagnostics"], [
+            {"field": f"key[{len(report) - 1}]", "message": self.MESSAGE},
+            {"field": "routing_log[0].key[1]", "message": self.MESSAGE}])
+        dumped = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("clientSecretABC", dumped)
+        self.assertNotIn("privateNameXYZ", dumped)
+
+    def test_ordinary_unicode_including_astral_characters_stays_valid(self):
+        report = full_report(changes=["héllo ✓ 日本 🎉", "\U0001F389 again"])
+        text = json.dumps(report)  # the astral character becomes a surrogate PAIR escape, which is valid text
+        self.assertIn("\\ud83c\\udf89", text)
+        result = ao_report_validation.validate_draft(text)
+        self.assertTrue(result["syntax_shape_valid"], result)
+        self.assertEqual(result["diagnostics"], [])
+        self.assertEqual(ao_report_validation.text_diagnostics(report), [])
+
+    def test_text_diagnostics_precede_field_diagnostics_in_shape_diagnostics(self):
+        report = full_report(changes=["\ud800"], outcome="partial")
+        diagnostics = ao_report_validation.shape_diagnostics(report, identity_required=True)
+        self.assertEqual([entry["field"] for entry in diagnostics], ["changes[0]", "outcome"])
+
+
 class AdmissionTests(unittest.TestCase):
     """Only malformed admission raises; a malformed report itself always becomes diagnostics."""
 
@@ -711,6 +767,25 @@ class LifecycleDraftParityTests(AgreedRoomFixture):
         status = self.service.ao_room_status(self.room)
         self.assertEqual(
             status["review_followups"]["engineering"]["findings"]["required_open"], 1)
+
+    def test_escaped_lone_surrogate_parity_with_capture(self):
+        # (k) an escaped lone surrogate inside changes: the validator reports the text diagnostic and
+        # capture records the standard shape error -- never a codec error, never a record.
+        text = json.dumps(self.report(changes=["\ud800"]))
+        self.assertIn("\\ud800", text)
+        draft = self._validated_without_posting(text)
+        self.assertFalse(draft["syntax_shape_valid"], draft)
+        self.assertEqual(draft["diagnostics"],
+                          [{"field": "changes[0]", "message": ao_report_validation.TEXT_MESSAGE}])
+        (self.repo / "feature.txt").write_text("implemented\n")
+        request = self._captured(text)
+        self.assertEqual(request.get("engineering_error"),
+                          "Engineering report is incomplete or refers to another spec/handoff")
+        self.assertNotIn("engineering_record", request)
+        self.assertNotIn("codec", request["engineering_error"])
+        # The status surfaces read the saved error and the raw receipt without raising.
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(status["engineering_capture"]["status"], "capture_failed")
 
     def test_fixed_required_finding_draft_proceeds_through_verify_review_and_acceptance(self):
         # (i) the same entry with disposition=fixed: valid draft, captured, and the supported
