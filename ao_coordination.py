@@ -542,10 +542,10 @@ def handback_record(service, room_id, assignment_id, acceptance_request_id):
         return record | {"path": relative, "handback_sha256": sha}
 
 
-def _revalidate_handback(service, directory, lineage, lifecycle, handback, owner_worktree):
+def _revalidate_handback(service, directory, lineage, lifecycle, handback, owner_worktree,
+                         operation="import_preflight"):
     """Re-run every recorded handback fact against live room evidence and Git."""
     from ao_project_room import digest, read
-    operation = "import_preflight"
     try:
         assign_dir, assign = _room_state(service.root, lineage["assignment_room_id"])
     except RoomError as exc:
@@ -590,6 +590,33 @@ def _revalidate_handback(service, directory, lineage, lifecycle, handback, owner
     if patch.returncode or hashlib.sha256(patch.stdout).hexdigest() != handback["patch_sha256"]:
         _refuse(directory, lifecycle, operation, "tampered_handback",
                 "the recorded patch digest no longer matches the commit")
+
+
+def _authority_blockers(service, directory, lineage, lifecycle, owner_dir, owner):
+    """The sorted set of authority conditions that currently block an owner-side import."""
+    import ao_workflow
+    from ao_project_room import TERMINAL
+    blockers = []
+    baseline = lineage["owner"]["baseline_commit"]
+    try:
+        if service.spec(owner_dir, owner)["sha256"] != lineage["owner"]["spec_sha256"]:
+            blockers.append("owner_spec_changed")
+    except RoomError:
+        blockers.append("owner_spec_changed")
+    try:
+        assign_dir, assign = _room_state(service.root, lineage["assignment_room_id"])
+        if service.spec(assign_dir, assign)["sha256"] != lineage["assignment"]["spec_sha256"]:
+            blockers.append("assignment_spec_changed")
+    except RoomError:
+        blockers.append("assignment_spec_changed")
+    try:
+        if ao_workflow.handoff_record(owner_dir, owner)["baseline_commit"] != baseline:
+            blockers.append("owner_baseline_changed")
+    except RoomError:
+        blockers.append("owner_baseline_changed")
+    if any(request.get("state") not in TERMINAL for request in owner.get("requests", {}).values()):
+        blockers.append("owner_busy")
+    return sorted(blockers)
 
 
 def import_preflight(service, room_id, assignment_id, handback_sha256):
@@ -641,25 +668,7 @@ def import_preflight(service, room_id, assignment_id, handback_sha256):
                 blockers.append("owner_worktree_dirty")
         except RoomError as exc:
             _refuse(directory, lifecycle, operation, "worktree_unverified", str(exc)[:200])
-        try:
-            owner_spec = service.spec(owner_dir, owner)
-            if owner_spec["sha256"] != lineage["owner"]["spec_sha256"]:
-                blockers.append("owner_spec_changed")
-        except RoomError:
-            blockers.append("owner_spec_changed")
-        try:
-            assign_dir, assign = _room_state(service.root, lineage["assignment_room_id"])
-            if service.spec(assign_dir, assign)["sha256"] != lineage["assignment"]["spec_sha256"]:
-                blockers.append("assignment_spec_changed")
-        except RoomError:
-            blockers.append("assignment_spec_changed")
-        try:
-            if ao_workflow.handoff_record(owner_dir, owner)["baseline_commit"] != baseline:
-                blockers.append("owner_baseline_changed")
-        except RoomError:
-            blockers.append("owner_baseline_changed")
-        if any(request.get("state") not in TERMINAL for request in owner.get("requests", {}).values()):
-            blockers.append("owner_busy")
+        blockers += _authority_blockers(service, directory, lineage, lifecycle, owner_dir, owner)
         for entry in _changed(worktree, baseline, head):
             if any(_covered(path, owned) for path in _entry_paths(entry)):
                 touched.append(entry["path"])
@@ -762,6 +771,17 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
         if preflight["blockers"]:
             _refuse(directory, lifecycle, tool, "unresolvable_blockers",
                     "no recorded resolution repairs " + ", ".join(preflight["blockers"]))
+        # The preflight only observed authority once: recheck it now, under the record lock.
+        if preflight["handback_sha256"] != (lifecycle.get("latest_handback") or {}).get("sha256"):
+            _refuse(directory, lifecycle, tool, "stale_preflight",
+                    "a later handback superseded the preflighted one; run a new preflight")
+        if lifecycle.get("lineage_sha256") != digest(lineage):
+            _refuse(directory, lifecycle, tool, "tampered_lineage",
+                    "the lifecycle record no longer binds the pinned lineage")
+        current = _authority_blockers(service, directory, lineage, lifecycle, owner_dir, owner)
+        if current:
+            _refuse(directory, lifecycle, tool, "preflight_authority_changed",
+                    "since the preflight: " + ", ".join(current) + "; run a new preflight")
         worktree = Path(lineage["owner"]["worktree"])
         before = preflight["owner_head_before"]
         head = _git(worktree, "rev-parse", "HEAD")
@@ -784,6 +804,8 @@ def import_record(service, room_id, assignment_id, preflight_sha256, operation, 
         if handback is None:
             _refuse(directory, lifecycle, tool, "tampered_handback",
                     "the handback record is missing or modified")
+        _revalidate_handback(service, directory, lineage, lifecycle, handback, worktree,
+                             operation=tool)
         destination = _changed(worktree, before, head)
         destination_paths = {path for entry in destination for path in _entry_paths(entry)}
         handback_paths = {path for entry in handback["changed_paths"] for path in _entry_paths(entry)}

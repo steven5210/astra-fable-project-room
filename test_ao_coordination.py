@@ -1133,3 +1133,56 @@ class EvidenceIntegrityTests(CoordinationFixture):
         self.review_b()
         with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
             self.accept_b()
+
+
+class ImportAuthorityTests(CoordinationFixture):
+    """F3: import_record revalidates the preflight's authority against current evidence."""
+
+    def _ready_import(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        return record, preflight
+
+    def test_owner_spec_change_after_preflight_refuses_the_import(self):
+        # (a) a spec revision after the preflight changes its authority.
+        record, preflight = self._ready_import()
+        self.service.ao_room_spec_put(self.room, 2, 'Revised owner content.',
+                                      self.gates, 'Astra approves this revision')
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_spec_changed'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+        fresh = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertIn('owner_spec_changed', fresh['blockers'])
+
+    def test_a_later_handback_supersedes_the_preflighted_one(self):
+        # (b) a second acceptance+handback after the preflight makes it stale.
+        record, preflight = self._ready_import()
+        self.implement_b(request='implementation-2')
+        self.review_b(request='acceptance_review_2')
+        self.accept_b(request='acceptance_review_2')
+        self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review_2')
+        with self.assertRaisesRegex(RoomError, 'stale_preflight'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+
+    def test_assignment_spec_change_after_preflight_refuses_the_import(self):
+        # (c) an assignment spec content change after the preflight refuses.
+        record, preflight = self._ready_import()
+        self.service.ao_room_spec_put(self.assign_room, 2, 'Revised assignment content.',
+                                      self.gates_b, 'Astra approves this revision')
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*assignment_spec_changed'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+
+    def test_unsettled_owner_request_after_preflight_refuses_the_import(self):
+        # (d) an in-flight owner request after the preflight refuses.
+        record, preflight = self._ready_import()
+        self.service.ao_room_send(self.room, 'engineer', 'Perform the exact authorized purpose.',
+                                  'implementation', purpose='implementation')
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_busy'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
