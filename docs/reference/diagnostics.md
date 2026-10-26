@@ -135,7 +135,11 @@ when applicable, is opened with SQLite `mode=ro`; symlinked and non-regular ledg
 paths are refused as unsafe.
 
 Version-3 preparations are audited with their qualification binding: the recorded
-execution policy and the source-qualified worker map must match the record.
+execution policy and the source-qualified worker map must match the record. The
+audit verifies the retained qualification record and every declared source capture
+byte-for-byte inside the room, and labels each child from the worker map that
+child's own request froze — the initial preparation or one committed routing-refresh
+authority, never the latest map alone.
 
 The version-1 closed report separates parent `primary` counters, proven native child
 `workers`, and `api_delegates`. Native assistant responses are grouped by bounded

@@ -208,7 +208,7 @@
   "test_ao_evidence_audit_limits": 0.39,
   "test_ao_evidence_audit_pointer_claims": 0.69,
   "test_ao_evidence_audit_review": 0.08,
-  "test_ao_evidence_audit_routing_v3": 8.23,
+  "test_ao_evidence_audit_routing_v3": 43.81,
   "test_ao_executable_binding": 11.24,
   "test_ao_executable_upgrade": 5.74,
   "test_ao_execution_evidence": 16.7,
