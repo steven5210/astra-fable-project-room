@@ -293,6 +293,116 @@ def _profile_name(state):
     return profile.get("name") if isinstance(profile, dict) else None
 
 
+def _account_of(state):
+    """The room's pinned profile name; an unpinned room reads as the saved default login
+    for this check (a documented admission assumption, never attribution)."""
+    profile = state.get("account_profile")
+    return profile.get("name") if isinstance(profile, dict) else "default"
+
+
+def account_policy(ao_root, strict=True):
+    """The opt-in single/dual account mode from PROJECT_ROOM_HOME/ao/config.json.
+
+    Absent key: {"mode": "single", "owner_profile": None, "assignment_profile": None}.
+    strict=True raises RoomError on an invalid value; strict=False returns the
+    read-only {"mode": "invalid", "error": <bounded reason>} view.
+    """
+    from ao_project_room import read
+    path = ao_root / "config.json"
+    config = {}
+    if path.is_file():
+        try:
+            config = read(path)
+        except (OSError, ValueError, RecursionError):
+            config = {}
+    value = config.get("coordination_accounts")
+    if value is None:
+        value = {"mode": "single", "owner_profile": None, "assignment_profile": None}
+    try:
+        return _validate_account_policy(value)
+    except RoomError as exc:
+        if strict:
+            raise RoomError(
+                "coordination_accounts in PROJECT_ROOM_HOME/ao/config.json is invalid: "
+                + str(exc)[:200]) from None
+        return {"mode": "invalid", "error": str(exc)[:200]}
+
+
+def _validate_account_policy(value):
+    import ao_account_profiles
+    if not isinstance(value, dict):
+        raise RoomError("must be an object")
+    mode = value.get("mode", "single")
+    owner_profile = value.get("owner_profile")
+    assignment_profile = value.get("assignment_profile")
+    if mode not in ("single", "dual"):
+        raise RoomError("mode must be single or dual")
+    for label, name in (("owner_profile", owner_profile), ("assignment_profile", assignment_profile)):
+        if name is not None and name != ao_account_profiles.DEFAULT:
+            try:
+                ao_account_profiles.profile_name(name)
+            except RoomError as exc:
+                raise RoomError(label + ": " + str(exc)[:120]) from None
+    if mode == "single":
+        if assignment_profile is not None:
+            raise RoomError("single mode allows only owner_profile")
+    else:
+        if not owner_profile or not assignment_profile or owner_profile == assignment_profile:
+            raise RoomError("dual mode requires two distinct profile names")
+    return {"mode": mode, "owner_profile": owner_profile, "assignment_profile": assignment_profile}
+
+
+def _check_account_mode(service, policy, owner, assign):
+    """Admission-only account rules; drains never read the mode. Returns the recorded policy."""
+    import ao_account_profiles
+    from ao_project_room import read
+    distinct = None
+    if policy["mode"] == "single":
+        owner_account = _account_of(owner)
+        assign_account = _account_of(assign)
+        if owner_account != assign_account:
+            raise RoomError("admission refused: dual_account_requires_dual_mode: owner is on "
+                            + owner_account + ", assignment on " + assign_account
+                            + "; set coordination_accounts.mode to dual")
+        configured = policy.get("owner_profile")
+        if configured and owner_account != configured:
+            raise RoomError("admission refused: profile_mismatch: owner is on " + owner_account
+                            + ", configured owner_profile " + configured)
+    else:
+        owner_pin = owner.get("account_profile")
+        assign_pin = assign.get("account_profile")
+        if not isinstance(owner_pin, dict) or not owner_pin.get("name"):
+            raise RoomError("admission refused: room_not_pinned: owner room has no account profile")
+        if not isinstance(assign_pin, dict) or not assign_pin.get("name"):
+            raise RoomError("admission refused: room_not_pinned: assignment room has no account profile")
+        if (owner_pin["name"] != policy["owner_profile"]
+                or assign_pin["name"] != policy["assignment_profile"]):
+            raise RoomError("admission refused: profile_mismatch: pins name "
+                            + owner_pin["name"] + "/" + assign_pin["name"]
+                            + ", configured " + str(policy["owner_profile"])
+                            + "/" + str(policy["assignment_profile"]))
+        home = service.root.parent
+        config_path = home / "config.json"
+        controller_config = read(config_path) if config_path.is_file() else {}
+        try:
+            # The configured names resolve exactly the way ao_room_open resolves a pin: an
+            # invalid, unenrolled or same-account configuration fails with #220's own messages.
+            ao_account_profiles.pin(home, policy["owner_profile"], controller_config)
+            ao_account_profiles.pin(home, policy["assignment_profile"], controller_config)
+            ao_account_profiles.check_identity(owner_pin)
+            ao_account_profiles.check_identity(assign_pin)
+        except RoomError as exc:
+            raise RoomError("admission refused: account_identity_changed: "
+                            + str(exc)[:200]) from None
+        distinct = owner_pin["identity_digest"] != assign_pin["identity_digest"]
+        if not distinct:
+            raise RoomError("admission refused: same_account_identity: both rooms pin the "
+                            "same account identity")
+    return {"mode": policy["mode"], "owner_profile": policy.get("owner_profile"),
+            "assignment_profile": policy.get("assignment_profile"),
+            "distinct_identities": distinct}
+
+
 def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_paths,
                     interface, authorization, supersedes=None):
     """Atomically admit one owner/assignment room pair and pin the lineage record."""
@@ -372,6 +482,8 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
         except RoomError:
             raise RoomError("Register the assignment room's authorized spec first") from None
         owner_spec = service.spec(owner_dir, owner)
+        recorded_policy = _check_account_mode(
+            service, account_policy(service.root, strict=True), owner, assign)
         lineage = {"version": VERSION, "assignment_id": assignment_id,
                    "owner_room_id": room_id, "assignment_room_id": assignment_room_id,
                    "git_common_dir": owner["git_common_dir"],
@@ -383,6 +495,7 @@ def assignment_open(service, room_id, assignment_id, assignment_room_id, owned_p
                                   "spec_record_sha256": assign["spec_record_sha256"]},
                    "owned_paths": owned, "interface": interface, "authorization": authorization,
                    "account_profiles": {"owner": _profile_name(owner), "assignment": _profile_name(assign)},
+                   "account_policy": recorded_policy,
                    "assignment_start": {"request_ids": sorted((assign.get("requests") or {}).keys()),
                                         "checkpoint_sha256": assign.get("checkpoint_sha256"),
                                         "acceptance_request_ids": sorted(
@@ -1016,9 +1129,10 @@ def view(ao_root, state):
     no AO calls, and no transcript reads.
     """
     from ao_project_room import read
+    policy_view = account_policy(ao_root, strict=False)
     coord = state.get("coordination")
     if not isinstance(coord, dict) or coord.get("role") not in ("owner", "assignment"):
-        return {"role": None, "assignments": []}
+        return {"role": None, "assignments": [], "account_policy": policy_view}
     assignments = []
     for assignment_id in coord.get("assignment_ids") or []:
         entry = {"assignment_id": assignment_id, "blockers": []}
@@ -1051,6 +1165,7 @@ def view(ao_root, state):
                       for side in ("owner", "assignment")}
             entry.update(owner_room_id=lineage["owner_room_id"],
                          assignment_room_id=lineage["assignment_room_id"],
+                         account_policy=lineage.get("account_policy"),
                          state=lifecycle["state"], owned_paths=lineage.get("owned_paths") or [],
                          spec_pinned=pinned,
                          latest_handback=({"sha256": latest.get("sha256"), "commit": latest.get("commit")}
@@ -1059,4 +1174,4 @@ def view(ao_root, state):
         except (RoomError, OSError, ValueError, KeyError, TypeError, RecursionError):
             entry["state"] = "unreadable"
         assignments.append(entry)
-    return {"role": coord["role"], "assignments": assignments}
+    return {"role": coord["role"], "assignments": assignments, "account_policy": policy_view}
