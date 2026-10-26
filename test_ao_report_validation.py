@@ -22,6 +22,11 @@ import project_room_mcp
 from room import RoomError
 from test_ao_lifecycle_contract import AgreedRoomFixture, LifecycleFixture
 
+# The exact token shape an engineer records for a required-open finding; the same literal text is
+# pinned on main's test_ao_required_open_readiness (duplicated so this module collects there too).
+OPEN_REQUIRED = ("stale lock order invariant=lock_order owner=EXIT-5 origin=introduced "
+                 "scope=required disposition=open")
+
 REPO_ROOT = Path(__file__).resolve().parent
 
 # The reviewer's exact synthetic private-path/credential sentinel (B1): a value that must never be
@@ -669,6 +674,62 @@ class LifecycleDraftParityTests(AgreedRoomFixture):
         self.assertEqual(draft["diagnostics"], fixture["diagnostics"])
         request = self._captured(fixture["text"])
         self.assertEqual(request.get("engineering_error"), fixture["diagnostics"][0]["message"])
+
+    def test_explicit_open_required_draft_is_shape_valid_captured_and_readiness_refused(self):
+        # (h) an explicit scope=required disposition=open entry: the validator reports a clean
+        # shape (it never judges the finding), capture records it, and readiness alone refuses
+        # it -- before any gate runs.
+        text = json.dumps(self.report(review_findings=[OPEN_REQUIRED]))
+        draft = self._validated_without_posting(text)
+        self.assertTrue(draft["syntax_shape_valid"], draft)
+        self.assertEqual(draft["report_form"], "full")
+        self.assertEqual(draft["diagnostics"], [])
+        self.assertEqual(draft["advisories"], [])
+        self.assertIn({"check": "engineering_readiness",
+                       "description": "completed outcome, implementation_complete, empty "
+                                      "remaining_gaps, no finding explicitly tagged scope=required "
+                                      "disposition=open, no pending operator work"},
+                      draft["unperformed_checks"])
+        (self.repo / "feature.txt").write_text("implemented\n")
+        request = self._captured(text)
+        posts = len(self.fake.posts)
+        self.assertNotIn("engineering_error", request)
+        self.assertIn("engineering_record", request)  # capture is not the gate
+        self.assertEqual(self.service.ao_room_status(self.room)["engineering_capture"]["status"],
+                         "captured")
+        pattern = (r'Engineering reports completion while a required finding is open: '
+                   r'review_findings\[0\] "stale lock order" \(invariant=lock_order, owner=EXIT-5\)')
+        self.refuses(pattern, self.service.ao_room_verify, self.room, str(self.repo))
+        state = self.state()
+        self.assertEqual(state["verifications"], [])
+        self.assertIsNone(state["checkpoint"])
+        self.assertFalse((self.directory() / "verification").exists())  # no gate ran
+        # The pre-existing precondition order is unchanged: the review send still needs it.
+        self.refuses("Create a passed verification checkpoint first", self.send, "acceptance_review")
+        self.refuses(pattern, self.service.ao_room_accept, self.room, "acceptance_review")
+        self.assertEqual(len(self.fake.posts), posts)  # the refusals sent nothing
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(
+            status["review_followups"]["engineering"]["findings"]["required_open"], 1)
+
+    def test_fixed_required_finding_draft_proceeds_through_verify_review_and_acceptance(self):
+        # (i) the same entry with disposition=fixed: valid draft, captured, and the supported
+        # sequence proceeds to acceptance with required_open 0.
+        fixed = OPEN_REQUIRED.replace("disposition=open", "disposition=fixed")
+        text = json.dumps(self.report(review_findings=[fixed]))
+        draft = self._validated_without_posting(text)
+        self.assertTrue(draft["syntax_shape_valid"], draft)
+        self.assertEqual(draft["report_form"], "full")
+        (self.repo / "feature.txt").write_text("implemented\n")
+        request = self._captured(text)
+        self.assertNotIn("engineering_error", request)
+        self.assertIn("engineering_record", request)
+        self.assertTrue(self.service.ao_room_verify(self.room, str(self.repo))["passed"])
+        self.review()
+        self.assertTrue(self.service.ao_room_accept(self.room, "acceptance_review")["accepted"])
+        status = self.service.ao_room_status(self.room)
+        self.assertEqual(
+            status["review_followups"]["engineering"]["findings"]["required_open"], 0)
 
 
 class UndeliveredCompactContractParityTests(LifecycleFixture):

@@ -116,7 +116,9 @@ no remaining gaps — a reminder of named checks, never an exhaustive contract:
 `findings_projection`, `capture_receipts`, `candidate_binding`,
 `native_outcome_evidence`, `correction_chain`, `issue_dispositions`,
 `candidate_unchanged`, `semantic_correctness_assessment`,
-`formal_candidate_verification`, `independent_acceptance`), and `limits`
+`formal_candidate_verification`, `independent_acceptance`; readiness also
+refuses a report entry explicitly tagged `scope=required disposition=open`),
+and `limits`
 (`max_text_bytes`, `max_depth`, `max_diagnostics`, `truncated`). Admission
 failures — arguments other than exactly `report_text`, or a `report_text` that
 is a non-string, empty, oversized or invalid-UTF-8, or nesting past the

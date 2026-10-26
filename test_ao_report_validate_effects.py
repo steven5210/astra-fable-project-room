@@ -36,6 +36,7 @@ from room import RoomError
 from test_ao_lifecycle_contract import AgreedRoomFixture
 from test_ao_normal import DelegateFixture
 import test_ao_report_validation as rv
+from test_ao_required_open_readiness import OPEN
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -218,6 +219,8 @@ class ProvisionedLifecycleZeroEffectsTests(AgreedRoomFixture):
 
         cases = (
             ("syntax_shape_success", VALID_TEXT, False, 0),
+            ("syntax_shape_success_explicit_open_required_finding",
+             json.dumps(self.report(review_findings=[OPEN])), False, 0),
             ("syntax_shape_refusal", "{}", False, 0),
             ("admission_refusal", "", True, 2),
         )
@@ -228,7 +231,7 @@ class ProvisionedLifecycleZeroEffectsTests(AgreedRoomFixture):
                         controller.call("ao_report_validate", {"report_text": text})
                 else:
                     result = controller.call("ao_report_validate", {"report_text": text})
-                    self.assertEqual(result["syntax_shape_valid"], case == "syntax_shape_success")
+                    self.assertEqual(result["syntax_shape_valid"], case.startswith("syntax_shape_success"))
                 self.assertEqual(baseline(), before)
 
             with self.subTest(case=case, entry="mcp"):

@@ -69,7 +69,7 @@ UNPERFORMED_CHECKS = (
     {"check": "compact_contract_delivery", "description": "efficiency_contract_v1 delivered to the native session before a compact report is projected"},
     {"check": "controller_metadata_attachment", "description": "controller-owned identity attached by projection, never by the model"},
     {"check": "delegate_attribution_verification", "description": "routing_log delegate job ids verified against the room's pinned provider ledger"},
-    {"check": "engineering_readiness", "description": "completed outcome, implementation_complete, empty remaining_gaps, no pending operator work"},
+    {"check": "engineering_readiness", "description": "completed outcome, implementation_complete, empty remaining_gaps, no finding explicitly tagged scope=required disposition=open, no pending operator work"},
     {"check": "findings_projection", "description": "review_findings lineage/provenance projection"},
     {"check": "capture_receipts", "description": "response-normalization and engineering capture records written only by authoritative capture"},
     {"check": "candidate_binding", "description": "the candidate is bound to immutable completion-candidate evidence at first completed observation"},
