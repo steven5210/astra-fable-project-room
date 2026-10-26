@@ -159,7 +159,9 @@ inspect `review_followups`, `enhancement_proposals`, `operator_requests` and
 `findings` projects the engineer's provenance tokens read-only — read
 `required_open` and `preexisting_required_open` as required work (a preexisting
 defect that blocks the approved behavior is required, not cleanup), and the
-projection grants nothing. Pending operator requests block acceptance: do only
+projection grants nothing. An entry explicitly tagged `scope=required
+disposition=open` blocks verification and acceptance with a refusal naming the
+entry. Pending operator requests block acceptance: do only
 the authorized execution, return the evidence, then get Fable's next judgment.
 **Stop:** `scope_change` → a revised, agreed spec first: register the exact next
 charter revision and reach Fable's renewed exact-spec agreement on it before any
