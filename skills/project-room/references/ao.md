@@ -363,7 +363,9 @@ Codex task discovers updated MCP tools after plugin installation.
    Fable judgment. Saved `findings` projects the engineer's provenance tokens
    read-only: read `findings.required_open` and `findings.preexisting_required_open`
    as required work — a preexisting defect that blocks the approved behavior is
-   required, not cleanup — and the projection grants nothing. A request or optional
+   required, not cleanup — and the projection grants nothing. An entry
+   explicitly tagged `scope=required disposition=open` blocks verification
+   and acceptance with a refusal naming the entry. A request or optional
    proposal adds no scope authority. See the
    [report contract](../../../docs/guides/efficient-continuation.md#personal-review-operator-handoffs-and-enhancements).
 7. For a confirmed completed turn, a new `correction` request may repair the
