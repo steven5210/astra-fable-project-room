@@ -3,9 +3,11 @@
 Fable tags review_findings, remaining_gaps and backlog entries with whitespace-free key=value
 tokens (the lifecycle task-description grammar). This module projects them read-only into
 ao_room_status.review_followups.engineering.findings. A category never changes scope, resolves
-a finding, blocks anything or grants implementation or publication authority; an untagged entry
-is unknown, never resolved or optional. The projection never writes state and never raises on a
-malformed report.
+a finding or grants implementation or publication authority; an untagged entry is unknown, never
+resolved or optional. One exception is fixed policy, not inference: an entry explicitly tagged
+scope=required disposition=open refuses engineering readiness through
+explicit_required_open(). The projection never writes state and never raises on a malformed
+report.
 """
 import re
 
@@ -122,3 +124,28 @@ def project(report):
             "unknown_scope_open": unknown_scope_open, "decision_needed": decision_needed,
             "items": items, "items_total": items_total, "truncated": items_total > len(items),
             "meaning": MEANING}
+
+
+def explicit_required_open(report):
+    """Entries explicitly tagged scope=required disposition=open, in report order.
+
+    Each item carries {"field", "index", "text", "invariant", "owner"}: the bounded,
+    token-stripped text and the free provenance tokens the readiness refusal names. Only the
+    exact vocabulary pair refuses readiness; untagged, scope-only, disposition-only, optional
+    and non-vocabulary entries are returned to the projection as unknown, never refused here.
+    Never raises on a malformed report.
+    """
+    report = report if isinstance(report, dict) else {}
+    found = []
+    for field in FIELDS:
+        entries = report.get(field)
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, str):
+                continue
+            item = _item(field, entry)
+            if item["scope"] == "required" and item["disposition"] == "open":
+                found.append({"field": field, "index": index, "text": item["text"],
+                              "invariant": item["invariant"], "owner": item["owner"]})
+    return found

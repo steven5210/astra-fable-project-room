@@ -1606,6 +1606,15 @@ def _acceptance_stage(directory, state, requests, engineering_candidate, anchor)
     return stage, id_clipped or state_clipped
 
 
+def _acceptance_record_sha256(state, requests):
+    """The review request's spec record digest that _acceptance_stage compares, or None."""
+    reviews = [item for item in requests.values() if isinstance(item, dict)
+               and item.get("role") == "reviewer"
+               and item.get("purpose") in (None, "acceptance_review")]
+    review = max(reviews, key=_request_order) if reviews else None
+    return _sha256_or_none(review.get("spec_record_sha256")) if review is not None else None
+
+
 def _stages(directory, state, requests, request, anchor):
     """Saved engineering, verification and acceptance evidence, each checked only against recorded digests."""
     engineering, engineering_clipped, candidate = _engineering_stage(directory, requests, request)
@@ -1810,12 +1819,16 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     view["stages"] = _stages(directory, state, requests, request, anchor)
     import ao_coordination
     view["coordination"] = ao_coordination.view(directory.parent.parent, state)
+    import ao_current_summary  # Lazy: ao_current_summary imports this module back.
+    view["current_summary"] = ao_current_summary.summarize(directory, state)
     try:
         # The bounded tail read in _window needs no file size cap; the dispatch default stays.
         validated = ao_native_outcome.validate_registered_source(directory, state, transcript_size_limit=None)
         rows, malformed = _window(validated["source"]["transcript"], validated["source"]["native_session_id"])
     except (RoomError, OSError) as exc:
         view["source"]["reason"] = _redact(str(exc))[:200]
+        view["current_summary"]["plan_checks"] = {"available": False, "basis": None,
+                                                  "reason": "transcript unavailable"}
         return view
     # The anchor is time-bounded: from the request's observed start (or its creation, with
     # a small grace) until the next same-session request's creation. Identical request
@@ -1883,4 +1896,5 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
         view["last_text"] = _redact(text)[:max_text_chars] if text is not None else None
     _observe_provenance(view["provenance"], view["plan"], fold_extra.get("updated_row"), anchor_row, turn_rows,
                         view.get("last_text"))
+    view["current_summary"] = ao_current_summary.attach_plan(view["current_summary"], view)
     return view
