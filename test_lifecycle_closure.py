@@ -5,6 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+import ao_evidence_closure
 import ao_execution_evidence
 import ao_finding_provenance
 import ao_progress
@@ -51,15 +52,17 @@ class DigestAndFrozenBytesTests(unittest.TestCase):
                              "unexpected import line in lifecycle_closure.py: " + repr(line))
 
     def test_parts_tuple_keeps_history_and_appends_the_new_part_last(self):
-        # Re-pinned for finding_provenance_v1: OLD_PARTS (14 names) is still a frozen prefix,
+        # Re-pinned for evidence_closure_v1: OLD_PARTS (14 names) is still a frozen prefix,
         # lifecycle_closure_v1 stays 15th, progress_plan_v3 the 16th, execution_evidence_v1 the
-        # 17th, and finding_provenance_v1 is appended as the new 18th and last name.
+        # 17th, finding_provenance_v1 the 18th, and evidence_closure_v1 is appended as the new
+        # 19th and last name.
         self.assertEqual(ao_workflow.PARTS[:14], OLD_PARTS)
         self.assertEqual(ao_workflow.PARTS[14], "lifecycle_closure_v1")
         self.assertEqual(ao_workflow.PARTS[15], "progress_plan_v3")
         self.assertEqual(ao_workflow.PARTS[16], "execution_evidence_v1")
         self.assertEqual(ao_workflow.PARTS[17], "finding_provenance_v1")
-        self.assertEqual(len(ao_workflow.PARTS), 18)
+        self.assertEqual(ao_workflow.PARTS[18], "evidence_closure_v1")
+        self.assertEqual(len(ao_workflow.PARTS), 19)
 
     def test_existing_frozen_part_digests_are_unchanged(self):
         cases = (
@@ -139,21 +142,24 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.fake.finish('engineer', json.dumps(self.report()))
         self.service.ao_room_sync(self.room)
         request = self.state()['requests']['corr-1']
-        # Re-pinned for finding_provenance_v1: this retained (OLD_PARTS) session is missing all
-        # four parts added since, so a single correction now carries lifecycle_closure_v1,
-        # progress_plan_v3, execution_evidence_v1 *and* finding_provenance_v1 together, in PARTS order.
+        # Re-pinned for evidence_closure_v1: this retained (OLD_PARTS) session is missing all
+        # five parts added since, so a single correction now carries lifecycle_closure_v1,
+        # progress_plan_v3, execution_evidence_v1, finding_provenance_v1 *and* evidence_closure_v1
+        # together, in PARTS order.
         self.assertEqual(request['carried']['parts'],
                          [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART,
-                          ao_finding_provenance.PART])
+                          ao_finding_provenance.PART, ao_evidence_closure.PART])
         self.assertEqual(request['carried']['part_sha256'],
                           {lifecycle_closure.PART: lifecycle_closure.INSTRUCTION_SHA256,
                            ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256,
                            ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256,
-                           ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+                           ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256,
+                           ao_evidence_closure.PART: ao_evidence_closure.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(lifecycle_closure.INSTRUCTION), 1)
         self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
         self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_evidence_closure.INSTRUCTION), 1)
         # No other part's text is repeated: every older part was already delivered under OLD_PARTS,
         # and progress_plan_v1/v2 are additionally superseded so they are never resent regardless.
         for other_text in (ao_residual_escalation.INSTRUCTION, ao_progress.INSTRUCTION_V2,
@@ -168,6 +174,7 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertNotIn(ao_progress.INSTRUCTION_V3, text2)
         self.assertNotIn(ao_execution_evidence.INSTRUCTION, text2)
         self.assertNotIn(ao_finding_provenance.INSTRUCTION, text2)
+        self.assertNotIn(ao_evidence_closure.INSTRUCTION, text2)
 
     def test_uncertain_carried_request_is_undelivered_until_a_verified_completion(self):
         # Same lost-ack fixture shape as test_ao_continuation.ContinuationTests.
@@ -182,20 +189,22 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         request = self.state()['requests']['corr-uncertain']
         self.assertEqual(request['state'], 'uncertain')
         self.assertNotIn('receipt', request)
-        # Re-pinned for finding_provenance_v1: the same uncertain turn carries all four new
+        # Re-pinned for evidence_closure_v1: the same uncertain turn carries all five new
         # parts together.
         self.assertEqual(request['carried']['parts'],
                          [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART,
-                          ao_finding_provenance.PART])
+                          ao_finding_provenance.PART, ao_evidence_closure.PART])
         self.assertEqual(request['carried']['part_sha256'],
                           {lifecycle_closure.PART: lifecycle_closure.INSTRUCTION_SHA256,
                            ao_progress.PART_V3: ao_progress.INSTRUCTION_V3_SHA256,
                            ao_execution_evidence.PART: ao_execution_evidence.INSTRUCTION_SHA256,
-                           ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256})
+                           ao_finding_provenance.PART: ao_finding_provenance.INSTRUCTION_SHA256,
+                           ao_evidence_closure.PART: ao_evidence_closure.INSTRUCTION_SHA256})
         self.assertEqual(request['text'].count(lifecycle_closure.INSTRUCTION), 1)
         self.assertEqual(request['text'].count(ao_progress.INSTRUCTION_V3), 1)
         self.assertEqual(request['text'].count(ao_execution_evidence.INSTRUCTION), 1)
         self.assertEqual(request['text'].count(ao_finding_provenance.INSTRUCTION), 1)
+        self.assertEqual(request['text'].count(ao_evidence_closure.INSTRUCTION), 1)
 
         # Not a completed verified turn: the controller withholds credit for it.
         held = ao_workflow.delivered(self.state(), session_id, self.directory())
@@ -203,11 +212,13 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertNotIn(ao_progress.PART_V3, held['parts'])
         self.assertNotIn(ao_execution_evidence.PART, held['parts'])
         self.assertNotIn(ao_finding_provenance.PART, held['parts'])
+        self.assertNotIn(ao_evidence_closure.PART, held['parts'])
         summary = ao_workflow.context_summary(self.state(), self.directory())
         self.assertIn(lifecycle_closure.PART, summary['undelivered_parts'])
         self.assertIn(ao_progress.PART_V3, summary['undelivered_parts'])
         self.assertIn(ao_execution_evidence.PART, summary['undelivered_parts'])
         self.assertIn(ao_finding_provenance.PART, summary['undelivered_parts'])
+        self.assertIn(ao_evidence_closure.PART, summary['undelivered_parts'])
 
         # The completed-request pattern: resolve the identical request (no replay) to a
         # completed, verified turn, then confirm nothing is left to deliver.
@@ -221,17 +232,20 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertIn(ao_progress.PART_V3, held2['parts'])
         self.assertIn(ao_execution_evidence.PART, held2['parts'])
         self.assertIn(ao_finding_provenance.PART, held2['parts'])
+        self.assertIn(ao_evidence_closure.PART, held2['parts'])
         summary2 = ao_workflow.context_summary(self.state(), self.directory())
         self.assertNotIn(lifecycle_closure.PART, summary2['undelivered_parts'])
         self.assertNotIn(ao_progress.PART_V3, summary2['undelivered_parts'])
         self.assertNotIn(ao_execution_evidence.PART, summary2['undelivered_parts'])
         self.assertNotIn(ao_finding_provenance.PART, summary2['undelivered_parts'])
+        self.assertNotIn(ao_evidence_closure.PART, summary2['undelivered_parts'])
         text, carried = self.packet()
         self.assertEqual(carried['parts'], [])
         self.assertNotIn(lifecycle_closure.INSTRUCTION, text)
         self.assertNotIn(ao_progress.INSTRUCTION_V3, text)
         self.assertNotIn(ao_execution_evidence.INSTRUCTION, text)
         self.assertNotIn(ao_finding_provenance.INSTRUCTION, text)
+        self.assertNotIn(ao_evidence_closure.INSTRUCTION, text)
 
     def test_packet_is_idempotent_for_the_same_undelivered_state(self):
         state = self.state()
@@ -245,10 +259,11 @@ class RetainedSessionDeliveryTests(fixtures.Fixture):
         self.assertEqual(text1.count(ao_progress.INSTRUCTION_V3), 1)
         self.assertEqual(text1.count(ao_execution_evidence.INSTRUCTION), 1)
         self.assertEqual(text1.count(ao_finding_provenance.INSTRUCTION), 1)
-        # Re-pinned for finding_provenance_v1: all four new parts are carried together, in PARTS order.
+        self.assertEqual(text1.count(ao_evidence_closure.INSTRUCTION), 1)
+        # Re-pinned for evidence_closure_v1: all five new parts are carried together, in PARTS order.
         self.assertEqual(carried1['parts'],
                          [lifecycle_closure.PART, ao_progress.PART_V3, ao_execution_evidence.PART,
-                          ao_finding_provenance.PART])
+                          ao_finding_provenance.PART, ao_evidence_closure.PART])
 
     def test_context_summary_and_delivered_report_undelivered_then_delivered_without_mutation(self):
         state = self.state()

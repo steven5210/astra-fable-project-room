@@ -134,4 +134,43 @@ The retained AO engineer receives this text once, as the one-time workflow part 
 
 > Finding provenance (reporting default; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): in review_findings, remaining_gaps and backlog, tag each entry with whitespace-free tokens origin=introduced|preexisting|integration, scope=required|optional, disposition=fixed|open|deferred|decision_needed, and when known invariant=<name>, evidence=<reference> and owner=<unit or area>. A preexisting or integration issue that prevents the approved behavior from working is scope=required and stays a remaining gap; unrelated cleanup is scope=optional and stays separate. An ordinary in-scope fix needs no product decision: reserve disposition=decision_needed for an actual scope or contract choice. An untagged entry is read as unknown, never as resolved or optional. These tokens change no report field and grant nothing; the controller only reads them.
 
-The controller projects these tokens read-only into saved `ao_room_status.review_followups.engineering.findings`: per-field and overall counts, `by_origin`/`by_scope`/`by_disposition` histograms, the `required_open`, `preexisting_required_open`, `unknown_scope_open` and `decision_needed` counters, and bounded redacted items. A category never changes scope, resolves a finding, blocks anything or grants implementation or publication authority; an untagged entry is unknown, never resolved or optional, and a tagged `remaining_gaps` entry blocks acceptance exactly like an untagged one. The amendment is delivered text only: it changes no model, budget, guard, review allowance or existing room snapshot.
+The controller projects these tokens read-only into saved `ao_room_status.review_followups.engineering.findings`: per-field and overall counts, `by_origin`/`by_scope`/`by_disposition` histograms, the `required_open`, `preexisting_required_open`, `unknown_scope_open` and `decision_needed` counters, and bounded redacted items. A category never changes scope, resolves a finding or grants implementation or publication authority; an untagged entry is unknown, never resolved or optional, and a tagged `remaining_gaps` entry blocks acceptance exactly like an untagged one. One exception is fixed policy, not inference: an entry explicitly tagged `scope=required disposition=open` refuses engineering readiness — verification, the acceptance-review send and acceptance — with a refusal naming the entry; every other tag shape stays a projection reading, not a refusal. The amendment is delivered text only: it changes no model, budget, guard, review allowance or existing room snapshot.
+
+## Evidence closure (one-time part `evidence_closure_v1`)
+
+The retained AO engineer receives this text once, as the one-time workflow part `evidence_closure_v1` (delivered through `ao_workflow.PARTS` exactly like `lifecycle_closure_v1` above — a new session receives it in its first packet, a retained session receives it once, carried on its next engineer send):
+
+> Evidence closure v1 (engineering default; refines the lifecycle execution and closure, quality-first review and finding provenance defaults, whose frozen text stays in force; it grants no scope, execution permission, recovery or review allowance and changes no model, guard, budget or authority): before a lifecycle-sensitive unit is reported closed, give an evidence-based handoff assessment that names, per invariant, its authoritative truth source (the final production path and saved state that decide it) and every reader, writer and interface the unit affects; an intact positive control exercised through the public entry point; an independently varied invalid case shown to reach the intended check rather than an earlier or unrelated one; the actual effect of each refusal on files, saved state, allowances, consumption and dispatch wherever those could change; and the assumptions the proof rests on and how they compose. State per claim which evidence kind backs it: applied change, worker-reported check, formal candidate verification or independent acceptance. Evidence that predates a later edit is stale for that edit and is reused only where the edit demonstrably leaves it unaffected, with that reason stated. A required finding, gap or proof requirement closes only by citing the specific evidence that discharges it (a named test, a gate's actual output or an inspected artifact with its digest); calling it pre-existing, private-store, backlog or out of scope leaves it open unless a concrete contract or evidence reason is given, and without such a basis it stays listed in remaining_gaps or review_findings with its reason, while a justified non-blocking limitation may be recorded as such. Resolve known required correctness and contract questions before expensive formal verification is requested. Consolidate known related defects into complete connected units, each with one accountable owner, explicit interfaces and file ownership, its parent requirement and verified anchors, a challenging proof and the integration step that connects its result to the rest; after integration, rerun the affected focused checks on the connected result before the handback, and report no unit done on its own evidence while its connection to the others is unverified. This adds no report schema or checklist, and no backlog item blocks by itself. The read-only ao_report_validate operation (CLI or MCP) checks only the syntax and shape of one draft engineering report, names deferred authoritative checks it never performs, writes nothing and calls no provider; a qualified worker or the operator invokes it before a handback and the engineer reads its result, because the engineer's own guard admits no shell, CLI or MCP execution; a successful result never shows semantic correctness, authentication, delegate verification, readiness, formal candidate verification or independent acceptance, and the final engineering report keeps its existing format.
+
+In summary, the amendment asks for eleven things, refining rather than
+superseding the frozen `lifecycle_closure_v1`, `quality_first_review_v1` and
+`finding_provenance_v1` text: (1) an evidence-based handoff assessment naming,
+per invariant, its authoritative truth source (the final production path and
+saved state that decide it) and every reader, writer and interface the unit
+affects; (2) an intact positive control exercised through the public entry
+point; (3) an independently varied invalid case shown to reach the intended
+check rather than an earlier or unrelated one; (4) the actual effect of each
+refusal on files, saved state, allowances, consumption and dispatch wherever
+those could change; (5) the assumptions the proof rests on and how they
+compose; (6) evidence that predates a later edit is stale for that edit and is
+reused only where the edit demonstrably leaves it unaffected, with that reason
+stated; (7) a required finding, gap or proof requirement closes only by citing
+the specific evidence that discharges it — calling it pre-existing,
+private-store, backlog or out of scope leaves it open without a concrete
+contract or evidence reason, though a justified non-blocking limitation may be
+recorded as such; (8) known required correctness and contract questions are
+resolved before expensive formal verification is requested; (9) known related
+defects are consolidated into complete connected units, each with one
+accountable owner, explicit interfaces and file ownership, its parent
+requirement and verified anchors, a challenging proof and the integration step
+that connects its result to the rest, with the affected focused checks rerun on
+the connected result after integration; (10) none of this adds a report schema
+or checklist, and no backlog item blocks by itself; and (11) the read-only,
+offline `ao_report_validate` operation names deferred authoritative checks it
+never performs — a qualified worker or the operator invokes it before a
+handback and the engineer reads the result, never the engineer invoking it
+directly, and a successful result never shows semantic correctness,
+authentication, delegate verification, readiness, formal candidate verification
+or independent acceptance. The amendment is delivered text only: it changes no
+model, budget, guard, review allowance or existing room snapshot, and grants no
+scope or execution permission by itself.

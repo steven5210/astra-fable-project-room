@@ -19,13 +19,14 @@ ENGINEERING_FIELDS = {"outcome", "implementation_complete", "changes", "tests_re
 DISPOSITION_REQUIRED = ("Report-only correction after malformed operator_requests must explicitly disposition pending "
                         "operator work with operator_requests ([] or valid entries); omission cannot clear it")
 CAPTURE_REQUIRED = "Acceptance requires a captured completed engineering result"
+REQUIRED_OPEN_FINDING = "Engineering reports completion while"
 REVIEW_TEXT_MAX_BYTES = 30000
 # One-time workflow parts. A retained engineer session receives each part once; every later engineer turn
 # carries only the caller's bytes plus the parts the controller has not yet delivered to that session.
 PARTS = ("review_contract", "report_contract", "policy", "settings", "routing", "baseline_rule", "efficiency_contract_v1",
          "delegation_efficiency_v2", "review_first_routing_v1", "quality_first_review_v1", "progress_plan_v1",
          "read_admission_v1", "progress_plan_v2", "residual_escalation_v1", "lifecycle_closure_v1", "progress_plan_v3",
-         "execution_evidence_v1", "finding_provenance_v1")
+         "execution_evidence_v1", "finding_provenance_v1", "evidence_closure_v1")
 # Packets sent before delivered-context notes existed carried these parts in their saved text.
 HISTORICAL_PARTS = {"spec_review": ("review_contract",),
                     "implementation": ("report_contract", "policy", "settings", "routing"),
@@ -215,19 +216,19 @@ def engineering_report(directory, state, request, report=None, validate_operator
     record = handoff_record(directory, state)
     if report is None:
         report = final_json(directory, request)
+    from ao_report_validation import shape_diagnostics, text_diagnostics
+    if text_diagnostics(report):
+        # Before anything digests the decoded text: an escaped lone surrogate is a shape defect, not a codec crash.
+        raise RoomError("Engineering report is incomplete or refers to another spec/handoff")
     from ao_report_contract import project
     report = project(directory, state, request, report)
     if validate_operator_requests:
         from ao_review_followups import validate
         validate(report, fields=('operator_requests',))
-    if (not ENGINEERING_FIELDS.issubset(report) or request.get("handoff_sha256") != state["handoff_sha256"]
-            or report.get("spec_revision") != record["spec_revision"] or type(report.get("spec_revision")) is not int
+    if (request.get("handoff_sha256") != state["handoff_sha256"]
+            or report.get("spec_revision") != record["spec_revision"]
             or report.get("spec_sha256") != record["spec_sha256"] or report.get("baseline_commit") != record["baseline_commit"]
-            or report.get("outcome") not in ("completed", "changes_required", "scope_change")
-            or type(report.get("implementation_complete")) is not bool
-            or any(not isinstance(report.get(k), list) for k in ("changes", "tests_reported", "review_findings", "remaining_gaps", "backlog", "routing_log"))
-            or any(not isinstance(r, dict) or not isinstance(r.get("delegate_job_ids"), list)
-                   or not all(isinstance(j, str) for j in r["delegate_job_ids"]) for r in report["routing_log"])):
+            or shape_diagnostics(report, identity_required=True)):
         raise RoomError("Engineering report is incomplete or refers to another spec/handoff")
     return report
 
@@ -411,6 +412,25 @@ def capture_engineering(home, directory, state, request, capture_completion=True
         request[field] = str(exc)[:1000]
 
 
+def _required_open_finding_message(open_findings):
+    """The bounded refusal for a complete report carrying explicit scope=required
+    disposition=open entries: at most three named field[index] "text" entries, each with only
+    the invariant/owner tokens the engineer actually recorded, then the count of the rest."""
+    import ao_progress
+    named = []
+    for item in open_findings[:3]:
+        clipped, shortened = ao_progress._clip(item["text"], 80)
+        tokens = ", ".join(f"{key}={item[key]}" for key in ("invariant", "owner") if item.get(key))
+        named.append(f'{item["field"]}[{item["index"]}] "{clipped}{"…" if shortened else ""}"'
+                     + (f" ({tokens})" if tokens else ""))
+    count = len(open_findings)
+    return (REQUIRED_OPEN_FINDING
+            + (" a required finding is open: " if count == 1
+               else f" {count} required findings are open: ")
+            + "; ".join(named)
+            + (f" and {count - 3} more" if count > 3 else ""))
+
+
 def engineering_ready(service, directory, state):
     from ao_project_room import digest, read
     agreement(service, directory, state)
@@ -429,6 +449,10 @@ def engineering_ready(service, directory, state):
     require_disposition(links, report)
     if report["outcome"] != "completed" or not report["implementation_complete"] or report["remaining_gaps"]:
         raise RoomError("Engineering is incomplete or has remaining gaps")
+    import ao_findings
+    open_findings = ao_findings.explicit_required_open(report)
+    if open_findings:
+        raise RoomError(_required_open_finding_message(open_findings))
     from ao_review_followups import pending_operator_work
     if pending_operator_work(directory, state, request, report):
         raise RoomError("Engineering has pending operator requests; complete authorized work and obtain the subsequent engineering verdict")
@@ -980,6 +1004,8 @@ def packet(service, directory, state, role, purpose, message, snapshot=None, gat
     texts[ao_execution_evidence.PART] = ao_execution_evidence.INSTRUCTION
     import ao_finding_provenance
     texts[ao_finding_provenance.PART] = ao_finding_provenance.INSTRUCTION
+    import ao_evidence_closure
+    texts[ao_evidence_closure.PART] = ao_evidence_closure.INSTRUCTION
     import ao_quality_review
     quality = quality if quality is not None else ao_quality_review.inspect(directory, state)
     held = delivered(state, binding["session_id"], directory)
