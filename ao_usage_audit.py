@@ -197,24 +197,61 @@ def _api_delegates(home, state, request, receipt, room):
     return {"coverage": coverage, "jobs": jobs, "reasons": sorted(reasons)}
 
 
-def _configured_model(prepared, configured_agent):
+def _worker_map(binding):
+    """The worker selector map that labels this request's children.
+
+    A request that froze its worker expectation (``native_worker_expectations``) is labelled from
+    that frozen selection, authenticated and resolved against the exact committed routing authority
+    it names (the initial preparation or one routing-refresh record) through the room's immutable
+    ancestry only; a later refresh never relabels an earlier request, and a request made after a
+    qualified refresh is labelled with the map it actually froze. A frozen value that does not
+    authenticate, names an unreadable authority or disagrees with that authority's own map refuses
+    as ``preparation_unbound``. A historical request with no frozen selection keeps the initial
+    preparation's map. Configured intent only; never an attested served identity.
+    """
+    request, prepared = binding["request"], binding["prepared"]
+    frozen = request.get("native_worker_expectations")
+    if frozen is None:
+        routing = prepared.get("routing")
+        agents = routing.get("agents") if isinstance(routing, dict) else None
+        return agents if isinstance(agents, dict) else {}
+    import ao_model_boundaries
+    import ao_routing
+    from room import RoomError
+    root = binding["room_root"]
+    try:
+        value = ao_model_boundaries.validate_worker_expectation(frozen)
+        reference = {key: value[key] for key in ao_routing.WORKER_REFERENCE_FIELDS}
+        found = ao_routing.historical_routing(Path(root.path), binding["state"], prepared, reference,
+                                              authority=value["authority"])
+        agents = ao_routing.recorded_agents(found["routing"])
+    except (RoomError, OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        raise evidence.AuditRefusal("preparation_unbound", binding["request_sha256"], binding["owner_sha256"]) from None
+    if agents != value["agents"]:
+        raise evidence.AuditRefusal("preparation_unbound", binding["request_sha256"], binding["owner_sha256"])
+    qualification = found["routing"].get("worker_qualification")
+    if qualification is not None:
+        try:
+            evidence._retained_qualification(root, qualification["snapshot"])
+        except evidence.AuditRefusal as refusal:
+            raise evidence.AuditRefusal(refusal.reason, binding["request_sha256"], binding["owner_sha256"]) from None
+    return agents
+
+
+def _configured_model(agents, configured_agent):
     if configured_agent is None:
         return None
-    routing = prepared.get("routing")
-    agents = routing.get("agents") if isinstance(routing, dict) else None
     value = agents.get(configured_agent) if isinstance(agents, dict) else None
     return value if native.bounded_text(value) else None
 
 
-def _configured_agent(prepared, subagent_type):
-    routing = prepared.get("routing")
-    agents = routing.get("agents") if isinstance(routing, dict) else None
+def _configured_agent(agents, subagent_type):
     if isinstance(subagent_type, str) and isinstance(agents, dict) and subagent_type in agents:
         return subagent_type
     return None
 
 
-def _actor_inputs(gathered, request, prepared):
+def _actor_inputs(gathered, request, agents):
     actors = []
     parent_scan = gathered["parent_scan"]
     actors.append({"actor_sha256": gathered["parent_actor"],
@@ -222,10 +259,10 @@ def _actor_inputs(gathered, request, prepared):
                    "configured_model": request.get("model"), "configured_agent": None,
                    "entry": None, "usage": None, "counters_by_model": None})
     for entry in gathered["admitted"]:
-        configured_agent = _configured_agent(prepared, entry.get("configured_agent"))
+        configured_agent = _configured_agent(agents, entry.get("configured_agent"))
         actors.append({"actor_sha256": entry["actor_sha256"], "scan": entry["scan"],
                        "interval": entry["interval"] if not entry["ambiguous"] else None,
-                       "configured_model": _configured_model(prepared, configured_agent),
+                       "configured_model": _configured_model(agents, configured_agent),
                        "configured_agent": configured_agent, "entry": entry,
                        "usage": None, "counters_by_model": None})
     return actors
@@ -380,7 +417,7 @@ def audit(home, room, request_id, database):
             actors = []
             child_coverage = "unavailable"
         else:
-            actors = _group_actors(_actor_inputs(gathered, binding["request"], binding["prepared"]))
+            actors = _group_actors(_actor_inputs(gathered, binding["request"], _worker_map(binding)))
             parent = actors[0]["usage"]
             child_actors = actors[1:]
             child_coverage = _child_coverage(actors, gathered)
