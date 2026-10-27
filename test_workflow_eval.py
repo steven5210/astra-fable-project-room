@@ -74,6 +74,8 @@ class WorkflowEvalTests(unittest.TestCase):
             self.assertTrue(bundle["acceptance"]["bound_to_candidate"])
             self.assertIsNone(bundle["acceptance"]["unbound_reason"])
             self.assertTrue(bundle["verification"]["bound"])
+            self.assertFalse(bundle["probe"]["stale"])
+            self.assertIsNone(bundle["probe"]["stale_reason"])
             self.assertEqual(bundle["checks"]["accepted"], "pass")
             exported = score.score_bundle(bundle)
             self.assertIs(exported["accepted_correctness"], True)
@@ -128,6 +130,33 @@ class WorkflowEvalTests(unittest.TestCase):
             self.assertEqual(bundle["checks"]["gates_run_locally"], "unavailable")
             self.assertEqual(bundle["checks"]["probe_cli_stub_detected"], "unavailable")
             self.assertIs(score.score_bundle(bundle)["accepted_correctness"], None)
+
+    def test_probe_on_different_bytes_same_head_is_stale_by_content(self):
+        # A probe taken against different file bytes at the same HEAD is stale by
+        # content: frozen-path results from those bytes are never merged.
+        with tempfile.TemporaryDirectory() as temp:
+            room, repo, _ = self.bound_room(Path(temp))
+            committed = (Path(repo) / "README.md").read_bytes()
+            fixture = PACKAGE / "tasks" / "T2-helper-only-proof" / "fixture" / "README.md"
+            (Path(repo) / "README.md").write_bytes(fixture.read_bytes())
+            checks_path = self.probes_json(temp, repo)
+            (Path(repo) / "README.md").write_bytes(committed)
+            bundle = self.export(room, checks_path)
+            self.assertTrue(bundle["probe"]["stale"])
+            self.assertEqual(bundle["probe"]["stale_reason"], "content")
+            self.assertEqual(bundle["checks"]["frozen_paths_unchanged"], "unavailable")
+            self.assertIs(score.score_bundle(bundle)["accepted_correctness"], None)
+
+    def test_probe_on_a_dirty_candidate_is_stale_dirty(self):
+        # A probe taken while the worktree is dirty, still dirty at export, is stale.
+        with tempfile.TemporaryDirectory() as temp:
+            room, repo, _ = self.bound_room(Path(temp))
+            (Path(repo) / "helper.py").write_text("# uncommitted\n")
+            checks_path = self.probes_json(temp, repo)
+            bundle = self.export(room, checks_path)
+            self.assertTrue(bundle["probe"]["stale"])
+            self.assertEqual(bundle["probe"]["stale_reason"], "dirty")
+            self.assertEqual(bundle["checks"]["frozen_paths_unchanged"], "unavailable")
 
     def test_failing_control_makes_stub_probe_unavailable(self):
         # (e) a test module that fails on the unmodified copy cannot detect a stub.
@@ -232,6 +261,60 @@ class WorkflowEvalTests(unittest.TestCase):
             room, _ = self._two_observation_room(Path(temp), contradict=True, pin_first=True)
             launch = self.export(room)["requests"][1]["worker_launches"][0]
             self.assertEqual(launch["outcome"], "unresolved")
+
+    def test_agent_id_known_later_merges_into_one_launch(self):
+        # An initially unresolved child whose agent_id becomes known is one launch.
+        with tempfile.TemporaryDirectory() as temp:
+            room, _, _ = self.bound_room(Path(temp))
+            directory = room / "outcomes" / "implementation-1"
+            request = self._request_state(room)["implementation-1"]
+            base = request["created_at"]
+            launch = {"agent_id": "a1", "tool_use_id": "t1", "role": "pr-sonnet",
+                      "model": "claude-sonnet-5", "outcome": "qualified",
+                      "interval": {"launch": base + 7 * 60, "end": base + 14 * 60}}
+            earlier = {"worker_observations": {
+                "coverage": "partial", "recorded_at": base, "executions": [],
+                "launches": [{**launch, "agent_id": None, "outcome": "unresolved"}]}}
+            later = {"worker_observations": {
+                "coverage": "complete", "recorded_at": base + 60, "executions": [launch],
+                "launches": [launch, {**launch, "agent_id": "a2", "tool_use_id": "t2",
+                                      "model": "claude-other", "outcome": "contradicted",
+                                      "interval": {"launch": base + 15 * 60, "end": base + 17 * 60}}]}}
+            (directory / "o.json").unlink()
+            (directory / "a.json").write_text(json.dumps(earlier))
+            (directory / "b.json").write_text(json.dumps(later))
+            launches = self.export(room)["requests"][1]["worker_launches"]
+            merged = [launch for launch in launches
+                      if launch["observed_child_model"] == "claude-sonnet-5"]
+            self.assertEqual(len(launches), 2)
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(merged[0]["agent_ids"], ["a1"])
+            self.assertEqual(merged[0]["observations"], 2)
+            self.assertEqual(merged[0]["outcome"], "qualified")
+            self.assertNotIn("agent_id", [c["field"] for c in merged[0].get("contradictions", [])])
+
+    def test_launches_without_tool_use_id_stay_separate(self):
+        # Launches with no usable tool-use id never merge under a null key.
+        with tempfile.TemporaryDirectory() as temp:
+            room, _, _ = self.bound_room(Path(temp))
+            directory = room / "outcomes" / "implementation-1"
+            request = self._request_state(room)["implementation-1"]
+            base = request["created_at"]
+            launches = [{"agent_id": "a1", "tool_use_id": None, "role": "pr-sonnet",
+                         "model": "claude-sonnet-5", "outcome": "qualified",
+                         "interval": {"launch": base + 7 * 60, "end": base + 9 * 60}},
+                        {"agent_id": "a2", "tool_use_id": None, "role": "pr-opus",
+                         "model": "claude-opus-5", "outcome": "qualified",
+                         "interval": {"launch": base + 10 * 60, "end": base + 12 * 60}}]
+            (directory / "o.json").unlink()
+            (directory / "a.json").write_text(json.dumps(
+                {"worker_observations": {"coverage": "complete", "recorded_at": base,
+                                         "executions": [], "launches": launches}}))
+            exported = self.export(room)["requests"][1]["worker_launches"]
+            self.assertEqual(len(exported), 2)
+
+    def _request_state(self, room):
+        return json.loads((room / "state.json").read_text())["requests"]
 
     # --- Finding 3: a receipt is not proof of settlement --------------------------------
 

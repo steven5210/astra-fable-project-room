@@ -101,8 +101,9 @@ def worker_launches(room, request):
         current = max(range(len(observations)),
                       key=lambda index: (isinstance(stamp(observations[index]), (int, float)),
                                          stamp(observations[index]) or 0, index))
-    qualified = {(e.get("agent_id"), e.get("tool_use_id"))
-                 for e in (observations[current].get("worker_observations") or {}).get("executions") or []}
+    qualified = {("tool_use", e.get("tool_use_id"))
+                 for e in (observations[current].get("worker_observations") or {}).get("executions") or []
+                 if isinstance(e.get("tool_use_id"), str) and e.get("tool_use_id")}
     coverage = (observations[current].get("worker_observations") or {}).get("coverage")
     keyed = {}
     for index, observed in enumerate(observations):
@@ -110,11 +111,18 @@ def worker_launches(room, request):
         inventory = inv.get("launches")
         if inventory is None:  # an older record without the launch inventory: executions are all we have
             inventory = inv.get("executions") or []
-        for launch in inventory:
-            key = (launch.get("agent_id"), launch.get("tool_use_id"))
-            entry = keyed.setdefault(key, {"observations": 0, "by_index": {}, "fields": {}})
+        for position, launch in enumerate(inventory):
+            tool_use = launch.get("tool_use_id")
+            # tool_use_id is the launch's stable identity: an agent_id that becomes known
+            # later joins the same entry. Launches without one never share a null key.
+            key = (("tool_use", tool_use) if isinstance(tool_use, str) and tool_use
+                   else ("unkeyed", index, position))
+            entry = keyed.setdefault(key, {"observations": 0, "by_index": {}, "fields": {}, "agent_ids": set()})
             entry["observations"] += 1
             entry["by_index"][index] = launch
+            agent_id = launch.get("agent_id")
+            if isinstance(agent_id, str) and agent_id:
+                entry["agent_ids"].add(agent_id)
             for field in ("outcome", "role", "model", "interval"):
                 entry["fields"].setdefault(field, set()).add(
                     json.dumps(launch.get(field), sort_keys=True, default=str))
@@ -128,7 +136,10 @@ def worker_launches(room, request):
         # Sort the canonical JSON texts, not the decoded values: a None beside a string must not raise.
         contradictions = [{"field": field, "values": [json.loads(value) for value in sorted(values)]}
                           for field, values in entry["fields"].items() if len(values) > 1]
-        item = {"role": launch.get("role"), "observed_child_model": launch.get("model"), "minutes": minutes,
+        if len(entry["agent_ids"]) > 1:
+            contradictions.append({"field": "agent_id", "values": sorted(entry["agent_ids"])})
+        item = {"role": launch.get("role"), "agent_ids": sorted(entry["agent_ids"]),
+                "observed_child_model": launch.get("model"), "minutes": minutes,
                 "outcome": launch.get("outcome"), "qualified": key in qualified,
                 "observations": entry["observations"], "coverage": coverage,
                 "usage": {"known": False, "reason": "worker usage not exposed by the controller"}}
