@@ -125,7 +125,8 @@ def worker_launches(room, request):
         minutes = None
         if isinstance(interval.get("launch"), (int, float)) and isinstance(interval.get("end"), (int, float)):
             minutes = round((interval["end"] - interval["launch"]) / 60, 1)
-        contradictions = [{"field": field, "values": sorted(json.loads(value) for value in values)}
+        # Sort the canonical JSON texts, not the decoded values: a None beside a string must not raise.
+        contradictions = [{"field": field, "values": [json.loads(value) for value in sorted(values)]}
                           for field, values in entry["fields"].items() if len(values) > 1]
         item = {"role": launch.get("role"), "observed_child_model": launch.get("model"), "minutes": minutes,
                 "outcome": launch.get("outcome"), "qualified": key in qualified,
