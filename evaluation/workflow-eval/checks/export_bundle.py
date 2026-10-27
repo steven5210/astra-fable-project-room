@@ -79,22 +79,58 @@ def worker_launches(room, request):
     """
     launches = []
     directory = room / "outcomes" / request["request_id"]
-    if directory.is_dir():
-        for path in sorted(directory.glob("*.json")):
-            observed = (read(path).get("worker_observations") or {})
-            qualified = {(e.get("agent_id"), e.get("tool_use_id")) for e in observed.get("executions") or []}
-            inventory = observed.get("launches")
-            if inventory is None:  # an older record without the launch inventory: executions are all we have
-                inventory = observed.get("executions") or []
-            for launch in inventory:
-                interval = launch.get("interval") or {}
-                minutes = None
-                if isinstance(interval.get("launch"), (int, float)) and isinstance(interval.get("end"), (int, float)):
-                    minutes = round((interval["end"] - interval["launch"]) / 60, 1)
-                launches.append({"role": launch.get("role"), "observed_child_model": launch.get("model"), "minutes": minutes,
-                                 "outcome": launch.get("outcome"), "qualified": (launch.get("agent_id"), launch.get("tool_use_id")) in qualified,
-                                 "coverage": observed.get("coverage"), "usage": {"known": False, "reason": "worker usage not exposed by the controller"}})
-    return launches
+    files = sorted(directory.glob("*.json")) if directory.is_dir() else []
+    if not files:
+        return [], 0
+    observations = [read(path) for path in files]
+    named = request.get("semantic_outcome_sha256")
+    current = None
+    if named:
+        for index, path in enumerate(files):
+            if path.stem == named:
+                current = index
+                break
+    if current is None:
+        stamp = lambda observed: (observed.get("recorded_at") or observed.get("observed_at")
+                                  or (observed.get("worker_observations") or {}).get("recorded_at")
+                                  or (observed.get("worker_observations") or {}).get("observed_at"))
+        current = max(range(len(observations)),
+                      key=lambda index: (isinstance(stamp(observations[index]), (int, float)),
+                                         stamp(observations[index]) or 0, index))
+    qualified = {(e.get("agent_id"), e.get("tool_use_id"))
+                 for e in (observations[current].get("worker_observations") or {}).get("executions") or []}
+    coverage = (observations[current].get("worker_observations") or {}).get("coverage")
+    keyed = {}
+    for index, observed in enumerate(observations):
+        inv = observed.get("worker_observations") or {}
+        inventory = inv.get("launches")
+        if inventory is None:  # an older record without the launch inventory: executions are all we have
+            inventory = inv.get("executions") or []
+        for launch in inventory:
+            key = (launch.get("agent_id"), launch.get("tool_use_id"))
+            entry = keyed.setdefault(key, {"observations": 0, "by_index": {}, "fields": {}})
+            entry["observations"] += 1
+            entry["by_index"][index] = launch
+            for field in ("outcome", "role", "model", "interval"):
+                entry["fields"].setdefault(field, set()).add(
+                    json.dumps(launch.get(field), sort_keys=True, default=str))
+    for key in keyed:
+        entry = keyed[key]
+        launch = entry["by_index"].get(current) or entry["by_index"][max(entry["by_index"])]
+        interval = launch.get("interval") or {}
+        minutes = None
+        if isinstance(interval.get("launch"), (int, float)) and isinstance(interval.get("end"), (int, float)):
+            minutes = round((interval["end"] - interval["launch"]) / 60, 1)
+        contradictions = [{"field": field, "values": sorted(json.loads(value) for value in values)}
+                          for field, values in entry["fields"].items() if len(values) > 1]
+        item = {"role": launch.get("role"), "observed_child_model": launch.get("model"), "minutes": minutes,
+                "outcome": launch.get("outcome"), "qualified": key in qualified,
+                "observations": entry["observations"], "coverage": coverage,
+                "usage": {"known": False, "reason": "worker usage not exposed by the controller"}}
+        if contradictions:
+            item["contradictions"] = contradictions
+        launches.append(item)
+    return launches, len(files)
 
 
 def candidate_facts(room, state, task):
@@ -163,9 +199,11 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
     requests = sorted((r for r in (state.get("requests") or {}).values() if isinstance(r, dict)), key=lambda r: (r.get("created_at") or 0))
     exported = []
     for request in requests:
+        launches, observations = worker_launches(room, request) if request["role"] == "engineer" else ([], 0)
         exported.append({"request_id": request["request_id"], "role": request["role"], "purpose": request.get("purpose"), "state": request.get("state"),
-                         "created_at": request.get("created_at"), "settled_at": settled_at(room, request), "usage": usage_of(request),
-                         "worker_launches": worker_launches(room, request) if request["role"] == "engineer" else [],
+                         "created_at": request.get("created_at"), "settled_at": settled_at(room, request),
+                         "worker_observations": observations, "usage": usage_of(request),
+                         "worker_launches": launches,
                          "account_profile": (request.get("account_profile") or {}).get("name")})
     engineering = [r for r in requests if r.get("purpose") in ("implementation", "correction") and r.get("state") == "completed"]
     report = final_report(room, engineering[-1]) if engineering else None
