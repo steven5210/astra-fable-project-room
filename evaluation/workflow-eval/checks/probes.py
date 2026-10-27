@@ -47,10 +47,10 @@ def task_for(case_id):
 
 
 def snapshot(root):
-    """Relative path -> digest for every regular file under root, excluding .git."""
+    """Relative path -> digest for every regular file under root, excluding .git and __pycache__."""
     result = {}
     for path in sorted(root.rglob("*")):
-        if ".git" in path.parts or not path.is_file():
+        if ".git" in path.parts or "__pycache__" in path.parts or not path.is_file():
             continue
         result[str(path.relative_to(root))] = sha256(path)
     return result
@@ -75,7 +75,9 @@ def candidate_identity(candidate):
     status = subprocess.run(["git", "-C", str(candidate), "status", "--porcelain",
                              "--untracked-files=all"], capture_output=True, text=True, timeout=30)
     clean = status.stdout.strip() == "" if status.returncode == 0 else None
-    return head.stdout.strip(), clean
+    tree = hashlib.sha256(json.dumps(snapshot(candidate), sort_keys=True,
+                                   separators=(",", ":")).encode()).hexdigest()
+    return head.stdout.strip(), clean, tree
 
 
 def probe(case_id, candidate):
@@ -130,9 +132,9 @@ def probe(case_id, candidate):
                     code, tail = run(["python3", "-B", test_file, "-v"], copy)
                     checks["probe_cli_stub_detected"] = "pass" if code != 0 else "fail"
                     details["stub_probe"] = {"return_code": code, "tail": tail[-400:]}
-    head, clean = candidate_identity(candidate)
+    head, clean, tree = candidate_identity(candidate)
     return {"case_id": case_id, "candidate": str(candidate), "candidate_head": head,
-            "candidate_clean": clean, "checks": checks, "details": details}
+            "candidate_clean": clean, "candidate_tree_sha256": tree, "checks": checks, "details": details}
 
 
 def main(argv):

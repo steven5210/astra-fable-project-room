@@ -136,8 +136,18 @@ class WorkflowEvalTests(unittest.TestCase):
         # content: frozen-path results from those bytes are never merged.
         with tempfile.TemporaryDirectory() as temp:
             room, repo, _ = self.bound_room(Path(temp))
-            committed = (Path(repo) / "README.md").read_bytes()
             fixture = PACKAGE / "tasks" / "T2-helper-only-proof" / "fixture" / "README.md"
+            (Path(repo) / "README.md").write_text("# candidate-owned readme\n")
+            git(repo, "add", "-A")
+            head = git(repo, "commit", "-q", "-m", "candidate readme")
+            state = json.loads((room / "state.json").read_text())
+            checkpoint = json.loads((room / state["verifications"][0]["path"]).read_text())
+            checkpoint["candidate"]["head"] = head
+            (room / state["verifications"][0]["path"]).write_text(json.dumps(checkpoint))
+            state["acceptances"][0]["evidence_sha256"] = hashlib.sha256(
+                canonical(checkpoint)).hexdigest()
+            (room / "state.json").write_text(json.dumps(state))
+            committed = (Path(repo) / "README.md").read_bytes()
             (Path(repo) / "README.md").write_bytes(fixture.read_bytes())
             checks_path = self.probes_json(temp, repo)
             (Path(repo) / "README.md").write_bytes(committed)

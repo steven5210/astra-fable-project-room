@@ -149,6 +149,16 @@ def worker_launches(room, request):
     return launches, len(files)
 
 
+def tree_sha256(root):
+    """The candidate's content fingerprint: the same digest probes.py computes over its snapshot."""
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if ".git" in path.parts or "__pycache__" in path.parts or not path.is_file():
+            continue
+        result[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def candidate_facts(room, state, task):
     handoff_path = state.get("handoff")
     if not handoff_path or not (room / handoff_path).is_file():
@@ -167,7 +177,7 @@ def candidate_facts(room, state, task):
     # Committed, staged and untracked paths all count as present: the filesystem, not the commit graph, decides.
     present = sorted(relative for relative in (task.get("owned_paths") or []) if (worktree / relative).exists())
     return {"available": True, "baseline_commit": handoff["baseline_commit"], "head": head, "changed_paths": changed,
-            "present_paths": present, "file_sha256": digests,
+            "present_paths": present, "file_sha256": digests, "tree_sha256": tree_sha256(worktree),
             "clean": git(worktree, "status", "--porcelain", "--untracked-files=all").strip() == ""}
 
 
@@ -231,8 +241,22 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
     if checks_path:
         merged = read(checks_path)
         probe_head = merged.get("candidate_head")
+        probe_tree = merged.get("candidate_tree_sha256")
         candidate_head = candidate.get("head") if isinstance(candidate, dict) else None
-        probe = {"stale": probe_head != candidate_head, "candidate_head": probe_head}
+        candidate_tree = candidate.get("tree_sha256") if isinstance(candidate, dict) else None
+        # A probe binds to the candidate it ran on: same HEAD, clean, and the same bytes.
+        if probe_head is None:
+            stale_reason = "missing_identity"
+        elif probe_head != candidate_head:
+            stale_reason = "head"
+        elif probe_tree != candidate_tree:
+            stale_reason = "content"
+        elif merged.get("candidate_clean") is not True:
+            stale_reason = "dirty"
+        else:
+            stale_reason = None
+        probe = {"stale": stale_reason is not None, "stale_reason": stale_reason,
+                 "candidate_head": probe_head, "candidate_tree_sha256": probe_tree}
         # A stale probe observes a different candidate: its checks are unavailable, never merged.
         checks = {name: "unavailable" for name in merged.get("checks") or {}} if probe["stale"] \
             else dict(merged.get("checks") or {})
