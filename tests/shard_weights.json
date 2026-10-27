@@ -175,7 +175,8 @@
   "test_timed_unittest": 1,
   "test_transcript_audit": 1,
   "test_verification": 1,
-  "test_verification_matrix": 1
+  "test_verification_matrix": 1,
+  "test_workflow_eval": 0
  },
  "weights": {
   "test_ao_acceptance_extension": 79.53,
@@ -342,6 +343,7 @@
   "test_timed_unittest": 4.08,
   "test_transcript_audit": 15.99,
   "test_verification": 77.31,
-  "test_verification_matrix": 72.87
+  "test_verification_matrix": 72.87,
+  "test_workflow_eval": 6.49
  }
 }

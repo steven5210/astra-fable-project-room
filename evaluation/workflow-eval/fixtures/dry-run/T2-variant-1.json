@@ -1,0 +1,154 @@
+{
+  "acceptance": {
+    "bound_to_candidate": true,
+    "candidate_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "recorded": true,
+    "request_id": "acceptance-1",
+    "unbound_reason": null
+  },
+  "attempt": 1,
+  "candidate": {
+    "baseline_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changed_paths": [
+      "summarize_cli.py",
+      "tests/test_summarize_cli.py"
+    ],
+    "file_sha256": {},
+    "head": "1111111111111111111111111111111111111111"
+  },
+  "case_id": "T2",
+  "checks": {
+    "accepted": "pass",
+    "frozen_paths_unchanged": "pass",
+    "gates_pass": "pass",
+    "gates_run_locally": "pass",
+    "probe_cli_stub_detected": "pass",
+    "tests_exercise_cli": "pass"
+  },
+  "elapsed_minutes": 31.0,
+  "probe": null,
+  "report": {
+    "changes": [
+      "summarize_cli.py",
+      "tests/test_summarize_cli.py"
+    ],
+    "implementation_complete": true,
+    "outcome": "completed",
+    "remaining_gaps": [],
+    "review_findings": [],
+    "tests_reported": [
+      "python3 -B tests/test_summarize_cli.py -v: 6 tests OK"
+    ]
+  },
+  "requests": [
+    {
+      "account_profile": "b",
+      "created_at": 1800000000.0,
+      "purpose": "spec_review",
+      "request_id": "spec-review-1",
+      "role": "engineer",
+      "settled": true,
+      "settled_at": 1800000300.0,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": [],
+      "worker_observations": 0
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800000360,
+      "purpose": "implementation",
+      "request_id": "implementation-1",
+      "role": "engineer",
+      "settled": true,
+      "settled_at": 1800001200,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 300000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 20000
+      },
+      "worker_launches": [
+        {
+          "coverage": "complete",
+          "minutes": 7.0,
+          "observed_child_model": "claude-sonnet-5",
+          "role": "pr-sonnet",
+          "usage": {
+            "known": false,
+            "reason": "worker usage not exposed by the controller"
+          }
+        }
+      ],
+      "worker_observations": 0
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800001260,
+      "purpose": "correction",
+      "request_id": "correction-1",
+      "role": "engineer",
+      "settled": true,
+      "settled_at": 1800001560,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 1000000,
+        "inputTokens": 200,
+        "known": true,
+        "outputTokens": 13000
+      },
+      "worker_launches": [
+        {
+          "coverage": "complete",
+          "minutes": 2.0,
+          "observed_child_model": "claude-sonnet-5",
+          "role": "pr-sonnet",
+          "usage": {
+            "known": false,
+            "reason": "worker usage not exposed by the controller"
+          }
+        }
+      ],
+      "worker_observations": 0
+    },
+    {
+      "account_profile": "b",
+      "created_at": 1800001620,
+      "purpose": "acceptance_review",
+      "request_id": "acceptance-1",
+      "role": "reviewer",
+      "settled": true,
+      "settled_at": 1800001860,
+      "state": "completed",
+      "usage": {
+        "cachedTokens": 550000,
+        "inputTokens": 630000,
+        "known": true,
+        "outputTokens": 10000
+      },
+      "worker_launches": [],
+      "worker_observations": 0
+    }
+  ],
+  "run": {
+    "account_profile": "b",
+    "controller_commit": "0000000000000000000000000000000000000000",
+    "exported_at": "2026-01-01T00:00:00+0000",
+    "room_id": "ao-synthetic"
+  },
+  "schema": "workflow-eval-bundle/1",
+  "status": "completed",
+  "stop_reason": null,
+  "variant": "variant-1",
+  "verification": {
+    "bound": true,
+    "id": "verify-c",
+    "passed": true
+  }
+}

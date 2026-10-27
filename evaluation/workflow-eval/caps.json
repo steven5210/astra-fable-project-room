@@ -1,0 +1,47 @@
+{
+  "schema": "workflow-eval-caps/1",
+  "status": "proposed; execution requires separate explicit authorization",
+  "design": {
+    "cases": ["T1", "T2", "T3"],
+    "held_out": ["H1"],
+    "variants": ["baseline", "variant-1"],
+    "attempts_per_case_per_variant": 1,
+    "execution_attempts_total": 6,
+    "held_out_attempts": "H1 is scored only if it runs under the same caps as one extra case per variant (2 attempts); it is excluded from the 6-attempt cap and requires its own authorization line",
+    "retries": 0,
+    "automatic_expansion": false
+  },
+  "per_attempt": {
+    "rooms": 1,
+    "parent_dispatches_max": 3,
+    "parent_dispatch_purposes": ["spec_review", "implementation", "correction"],
+    "correction_rounds_max": 1,
+    "native_worker_launches_max": 2,
+    "concurrent_workers_max": 1,
+    "judge_dispatches_max": 1,
+    "judge_purpose": "acceptance_review (independent Astra); a rejected acceptance is recorded as a failure, never retried",
+    "tokens": {
+      "parent_output_max": 80000,
+      "worker_output_max_per_launch": 60000,
+      "judge_input_max": 800000,
+      "judge_output_max": 15000,
+      "cached_tokens": "recorded, not capped; cache reads and writes are not a quota measurement"
+    },
+    "elapsed_minutes_max_first_dispatch_to_acceptance_settle": 30,
+    "stop_on": ["quota", "authentication failure", "identity drift", "uncertain delivery", "cap exhaustion", "required controller repair"]
+  },
+  "totals": {
+    "parent_dispatches_max": 18,
+    "native_worker_launches_max": 12,
+    "judge_dispatches_max": 6,
+    "parent_output_tokens_max": 480000,
+    "judge_output_tokens_max": 90000,
+    "elapsed_hours_max": 4,
+    "model_calls_for_improvement": 0,
+    "model_calls_for_judging": "the 6 acceptance reviews above; deterministic checks cost no model call"
+  },
+  "fixed_across_variants": ["task inputs and fixtures", "specifications and gates", "exact engineering model and MAX effort", "qualified native worker expectation", "routing guards", "review budgets", "independent Astra acceptance", "account profile per attempt", "controller commit", "caps"],
+  "not_optimization_targets": ["specifications", "safety guards", "authorization boundaries", "independent acceptance", "review budgets"],
+  "basis": "Observed Part 2 trial requests: spec review 2.7-7.0 min and 11-28k output tokens; implementation 5.5-19.2 min and 9-41k output tokens; correction 5.0 min and 13k; Codex acceptance 3.0-4.1 min with 470-630k cumulative input and 7.5-10k output.",
+  "excluded": ["automatic quota continuation", "account rotation", "replacement rooms", "paid overage", "new cloud or API spend", "a sequential comparison run", "any Han room or Han worktree"]
+}

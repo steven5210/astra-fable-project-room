@@ -1,0 +1,38 @@
+{
+  "schema": "workflow-eval-tasks/1",
+  "tasks": {
+    "H1-heldout": {
+      "expected.sha256": "d1b369f400c2238a1b651ab3e941eb5741bd4c043b1c016c75515ec118421a74",
+      "fixture/README.md": "8ae25fc00f2be89494791a1fed3cba3d50a5edb2ffd9c532c72caf5c14262b98",
+      "fixture/UPSTREAM-HANDBACK.json": "1e0cb49a5f69bf0806b005efaf3083e3846cae9dc9521f8e05b501029a64d6c7",
+      "fixture/tests/test_upstream_verdict.py": "82b0b1b2f40e23219b917e395f87fada19ddbb21b7deb169420c797c638afd1d",
+      "fixture/upstream/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture/upstream/verdict.py": "53fa4cfcf81b93c96dcc4ae221bcfa67acdb757a9a7bee08633ae6c4838da980",
+      "spec.md": "b83e2a6bd9bf312d0b4fdc79943e28e4ba22ba425a11dddbe1081538765e36f8",
+      "task.json": "b11191d3b8d2eba74194ef1ccd81ea54efff5b99d55e979808d5aca7092890fc"
+    },
+    "T1-incomplete-handoff": {
+      "fixture/README.md": "41f47770eeba6fe8598512e12bfee2fda0ddbf2c5764981cd47a9e291afd7b37",
+      "fixture/metrics.py": "dfb3bcd6978da1c79f9007fe7b245375ccd369bbd2e1830af9e3be691d5eeac9",
+      "fixture/tests/test_metrics.py": "959d5097984acca01e75898ff71da53b5201b83d5eb3e8c7f57142b07fa42824",
+      "spec.md": "16a3dff2653f8bcda3a9615f979389e1296051298ceefbafcc29c836dbf7121c",
+      "task.json": "3044a5358207d84d4a8d850b02670f293b89e14c6a7db46e1454e942ac6515f0"
+    },
+    "T2-helper-only-proof": {
+      "fixture/README.md": "6995f3d612cfb8de37691b9b5e57eac50d39850f4c6cb0879f209e7762f97a58",
+      "fixture/helper.py": "c529452a26b7ec2ac9990c5f1e723d05fb7eeb1a47df3620b25883558fa47ae0",
+      "fixture/tests/test_helper.py": "e7859cea24758b8aa0b18dbb2c6d9de1b78a93bd93f5ef0fd7c8ea2b4536275e",
+      "spec.md": "0c81a7ca21ab697c6133ade31708847a760311d7ebec66d380a04f2c6bdc0607",
+      "task.json": "4729647bdc548f8ed9d4cf82b229a1cbedd144040a509942932db151478508c8"
+    },
+    "T3-integration-provenance": {
+      "fixture/README.md": "8ae25fc00f2be89494791a1fed3cba3d50a5edb2ffd9c532c72caf5c14262b98",
+      "fixture/UPSTREAM-HANDBACK.json": "947d0b9f06f015c6fb1f35db8cb5da022282e289d3802fd713b30ac45fb0b2ad",
+      "fixture/tests/test_upstream_verdict.py": "82b0b1b2f40e23219b917e395f87fada19ddbb21b7deb169420c797c638afd1d",
+      "fixture/upstream/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fixture/upstream/verdict.py": "3124eb9cbd14bb8f6b7d81eafe9f2fcf19f1276ac903254fb8fd9c9c032cbbee",
+      "spec.md": "1c5c5ea679a9a3ed489f546d4ee06665d177ef803ae74a2fa9ead31adac06137",
+      "task.json": "d987bfccba19520d25c9c1c7ca275824bfd325d6ec48f4deb22f873faa839f6e"
+    }
+  }
+}
