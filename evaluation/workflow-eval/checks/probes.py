@@ -63,6 +63,21 @@ def run(argv, cwd):
     return process.returncode, (process.stdout + process.stderr)[-2000:]
 
 
+def candidate_identity(candidate):
+    """The candidate's HEAD and cleanliness: the identity a stale probe output must name."""
+    try:
+        head = subprocess.run(["git", "-C", str(candidate), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if head.returncode:
+        return None, None
+    status = subprocess.run(["git", "-C", str(candidate), "status", "--porcelain",
+                             "--untracked-files=all"], capture_output=True, text=True, timeout=30)
+    clean = status.stdout.strip() == "" if status.returncode == 0 else None
+    return head.stdout.strip(), clean
+
+
 def probe(case_id, candidate):
     task, task_dir = task_for(case_id)
     fixture = task_dir / task["fixture_dir"]
@@ -104,11 +119,20 @@ def probe(case_id, candidate):
                 source = test_path.read_text(errors="replace")
                 passes_b = '"-B"' in source or "'-B'" in source
                 checks["tests_exercise_cli"] = "pass" if "subprocess" in source and entry in source and passes_b else "fail"
-                (copy / entry).write_text(STUB)
-                code, tail = run(["python3", "-B", test_file, "-v"], copy)
-                checks["probe_cli_stub_detected"] = "pass" if code != 0 else "fail"
-                details["stub_probe"] = {"return_code": code, "tail": tail[-400:]}
-    return {"case_id": case_id, "candidate": str(candidate), "checks": checks, "details": details}
+                # Mutation control: only a control that passes on the unmodified copy followed by a
+                # failing stubbed run detects the stub. A failing control makes the probe unavailable.
+                control_code, control_tail = run(["python3", "-B", test_file, "-v"], copy)
+                details["stub_control"] = {"return_code": control_code, "tail": control_tail[-400:]}
+                if control_code != 0:
+                    checks["probe_cli_stub_detected"] = "unavailable"
+                else:
+                    (copy / entry).write_text(STUB)
+                    code, tail = run(["python3", "-B", test_file, "-v"], copy)
+                    checks["probe_cli_stub_detected"] = "pass" if code != 0 else "fail"
+                    details["stub_probe"] = {"return_code": code, "tail": tail[-400:]}
+    head, clean = candidate_identity(candidate)
+    return {"case_id": case_id, "candidate": str(candidate), "candidate_head": head,
+            "candidate_clean": clean, "checks": checks, "details": details}
 
 
 def main(argv):

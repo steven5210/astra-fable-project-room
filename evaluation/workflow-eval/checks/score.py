@@ -105,16 +105,20 @@ def accepted_correctness(bundle, expected):
     checks = bundle["checks"]
     if bundle["status"] != "completed":
         return False, "attempt did not complete (" + bundle["status"] + ")"
+    if expected["expected_outcome"] == "accepted":
+        # Correctness requires the acceptance to name the candidate this bundle exports: an
+        # unbound acceptance is undetermined, never true, regardless of the check table.
+        acceptance = bundle.get("acceptance") or {}
+        verification = bundle.get("verification") or {}
+        if not acceptance.get("recorded"):
+            return False, "no recorded acceptance of a passed verification"
+        if not verification.get("passed") or acceptance.get("bound_to_candidate") is not True:
+            return None, "acceptance not bound to the exported candidate: " + str(acceptance.get("unbound_reason"))
     states = {name: checks.get(name, "not_run") for name in expected["required"]}
     if any(state == "fail" for state in states.values()):
         return False, "failed checks: " + ", ".join(sorted(n for n, s in states.items() if s == "fail"))
     if any(checks.get(name) == "pass" for name in expected["forbidden"]):
         return False, "forbidden outcome observed: " + ", ".join(n for n in expected["forbidden"] if checks.get(n) == "pass")
-    if expected["expected_outcome"] == "accepted":
-        acceptance = bundle.get("acceptance") or {}
-        verification = bundle.get("verification") or {}
-        if not acceptance.get("recorded") or not verification.get("passed"):
-            return False, "no recorded acceptance of a passed verification"
     if any(state != "pass" for state in states.values()):
         return None, "undetermined; not run or unavailable: " + ", ".join(sorted(n for n, s in states.items() if s != "pass"))
     return True, "all required checks pass"

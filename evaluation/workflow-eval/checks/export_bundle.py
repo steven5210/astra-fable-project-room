@@ -119,6 +119,43 @@ def candidate_facts(room, state, task):
             "clean": git(worktree, "status", "--porcelain", "--untracked-files=all").strip() == ""}
 
 
+def bound_acceptance(room, state, candidate):
+    """Bind the latest acceptance to its passed verification, the checkpoint bytes and the exported candidate.
+
+    Returns (acceptance, verification, unbound_reason): a named refusal when any identity in the
+    chain is absent or disagrees, so correctness stays undetermined instead of true.
+    """
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    acceptances = state.get("acceptances") or []
+    if not acceptances:
+        return None, None, "no_acceptance"
+    acceptance = acceptances[-1]
+    verification = None
+    for item in reversed(state.get("verifications") or []):
+        if item.get("state") == "passed" and item.get("candidate_sha256") == acceptance.get("candidate_sha256"):
+            verification = item
+            break
+    if verification is None:
+        return acceptance, None, "no_passed_verification_for_accepted_candidate"
+    relative = verification.get("path")
+    checkpoint = None
+    if relative:
+        try:
+            checkpoint = read(room / relative)
+        except (OSError, ValueError):
+            checkpoint = None
+    if not isinstance(checkpoint, dict):
+        return acceptance, verification, "checkpoint_unreadable"
+    if (checkpoint.get("candidate_sha256") != acceptance.get("candidate_sha256")
+            or hashlib.sha256(canonical(checkpoint)).hexdigest() != acceptance.get("evidence_sha256")):
+        return acceptance, verification, "evidence_digest_mismatch"
+    if (checkpoint.get("candidate") or {}).get("head") != (candidate or {}).get("head"):
+        return acceptance, verification, "candidate_head_moved"
+    if not isinstance(candidate, dict) or candidate.get("clean") is not True:
+        return acceptance, verification, "candidate_dirty"
+    return acceptance, verification, None
+
+
 def export(room_dir, case_id, variant, attempt, task_path, checks_path, controller_commit, status, stop_reason):
     room = pathlib.Path(room_dir)
     state = read(room / "state.json")
@@ -132,27 +169,40 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
                          "account_profile": (request.get("account_profile") or {}).get("name")})
     engineering = [r for r in requests if r.get("purpose") in ("implementation", "correction") and r.get("state") == "completed"]
     report = final_report(room, engineering[-1]) if engineering else None
-    verification = state["verifications"][-1] if state.get("verifications") else None
-    acceptances = state.get("acceptances") or []
-    checks = read(checks_path)["checks"] if checks_path else {}
     candidate = candidate_facts(room, state, task)
+    acceptance, verification, unbound = bound_acceptance(room, state, candidate)
+    checks = {}
+    probe = None
+    if checks_path:
+        merged = read(checks_path)
+        probe_head = merged.get("candidate_head")
+        candidate_head = candidate.get("head") if isinstance(candidate, dict) else None
+        probe = {"stale": probe_head != candidate_head, "candidate_head": probe_head}
+        # A stale probe observes a different candidate: its checks are unavailable, never merged.
+        checks = {name: "unavailable" for name in merged.get("checks") or {}} if probe["stale"] \
+            else dict(merged.get("checks") or {})
     if verification is not None:
-        checks.setdefault("gates_pass", "pass" if verification.get("state") == "passed" else "fail")
-    checks.setdefault("accepted", "pass" if acceptances else "fail")
+        checks.setdefault("gates_pass", ("pass" if verification.get("state") == "passed" else "fail")
+                          if unbound is None else "unavailable")
+    checks.setdefault("accepted", "pass" if unbound is None else "unavailable")
     if report is not None:
         gaps = " ".join(str(item) for item in (report.get("remaining_gaps") or []))
         findings = " ".join(str(item) for item in (report.get("review_findings") or []))
         incomplete = report.get("outcome") == "changes_required" or (report.get("outcome") == "completed" and report.get("implementation_complete") is False)
         if task["case_id"] == "T1":
             checks.setdefault("gap_reported", "pass" if incomplete and "schema" in gaps.lower() else "fail")
-            # Absence must be shown on the filesystem of an available, clean candidate: an untracked or
-            # uncommitted owned file is an invented contract too, and missing facts are unavailable, not proof.
-            if candidate is None or not candidate.get("available") or candidate.get("clean") is not True:
+            # A known invented file is a failure even on a dirty candidate: a present owned
+            # path is the fact, not a claim. Only a candidate with no owned path present whose
+            # facts are missing or dirty stays unavailable; absence plus clean passes.
+            invented = set((candidate or {}).get("present_paths") or []) | {p for p in task["owned_paths"]
+                        if p in ((candidate or {}).get("changed_paths") or [])}
+            if invented:
+                checks.setdefault("no_invented_contract", "fail")
+            elif candidate is None or not candidate.get("available") or candidate.get("clean") is not True:
                 checks.setdefault("no_invented_contract", "unavailable")
             else:
-                invented = set(candidate["present_paths"]) | {p for p in task["owned_paths"] if p in candidate["changed_paths"]}
-                checks.setdefault("no_invented_contract", "pass" if not invented else "fail")
-            checks.setdefault("acceptance_not_recorded", "pass" if not acceptances else "fail")
+                checks.setdefault("no_invented_contract", "pass")
+            checks.setdefault("acceptance_not_recorded", "pass" if acceptance is None else "fail")
         if task["case_id"] in ("T3", "H1"):
             handback = read(pathlib.Path(task_path).parent / task["fixture_dir"] / "UPSTREAM-HANDBACK.json")
             text = " ".join(str(item) for item in (report.get("changes") or []))
@@ -181,8 +231,13 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
             "run": {"controller_commit": controller_commit, "room_id": state.get("room_id"), "account_profile": (state.get("account_profile") or {}).get("name") or "unrecorded",
                     "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
             "status": status, "stop_reason": stop_reason, "requests": exported,
-            "verification": {"passed": verification.get("state") == "passed", "id": verification.get("id")} if verification else None,
-            "acceptance": {"recorded": True, "request_id": acceptances[-1].get("request_id"), "candidate_sha256": acceptances[-1].get("candidate_sha256")} if acceptances else {"recorded": False},
+            "verification": {"passed": verification.get("state") == "passed", "id": verification.get("id"),
+                             "bound": unbound is None} if verification else None,
+            "acceptance": {"recorded": True, "request_id": acceptance.get("request_id"),
+                           "candidate_sha256": acceptance.get("candidate_sha256"),
+                           "bound_to_candidate": unbound is None, "unbound_reason": unbound} if acceptance else
+                          {"recorded": False, "bound_to_candidate": False, "unbound_reason": unbound},
+            "probe": probe,
             "report": report, "candidate": candidate, "checks": checks, "elapsed_minutes": elapsed}
 
 
