@@ -242,6 +242,22 @@ def main(argv):
              probe6["checks"]["probe_cli_stub_detected"] == "unavailable"
              and probe6["details"]["stub_control"]["return_code"] != 0,
              json.dumps(probe6["checks"]))
+        # A probe taken against different file bytes at the same HEAD is stale by content.
+        room7, repo7, _ = synthetic_room(temp / "seventh")
+        (repo7 / "README.md").write_text("# candidate-owned readme\n")
+        _git(repo7, "add", "-A")
+        _git(repo7, "commit", "-q", "-m", "candidate readme")
+        committed7 = (repo7 / "README.md").read_bytes()
+        fixture_readme = (fixture / "README.md").read_bytes()
+        (repo7 / "README.md").write_bytes(fixture_readme)
+        checks7 = temp / "checks7.json"
+        checks7.write_text(json.dumps(probes.probe("T2", repo7)))
+        (repo7 / "README.md").write_bytes(committed7)
+        bundle7 = export_bundle.export(room7, "T2", "variant-1", 1, task_path, checks7, "0" * 40, "completed", None)
+        step(report, "exporter: a probe on different bytes at the same HEAD is stale by content",
+             bundle7["probe"]["stale"] is True and bundle7["probe"]["stale_reason"] == "content"
+             and bundle7["checks"]["frozen_paths_unchanged"] == "unavailable",
+             json.dumps(bundle7["probe"]))
     # Score the synthetic bundles.
     scores = []
     for path in sorted((PACKAGE / "fixtures" / "dry-run").glob("*.json")):

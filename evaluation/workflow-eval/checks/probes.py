@@ -69,9 +69,9 @@ def candidate_identity(candidate):
         head = subprocess.run(["git", "-C", str(candidate), "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     if head.returncode:
-        return None, None
+        return None, None, None
     status = subprocess.run(["git", "-C", str(candidate), "status", "--porcelain",
                              "--untracked-files=all"], capture_output=True, text=True, timeout=30)
     clean = status.stdout.strip() == "" if status.returncode == 0 else None

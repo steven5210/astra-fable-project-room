@@ -120,4 +120,5 @@ credentials and makes no network call. Exit code 0 means every step passed.
 - The probes replace an entry point with a stub in a disposable copy, after a passing control on the unmodified copy;
   a failing control makes the stub check `unavailable`. They do not prove test quality beyond that dependency.
 - The acceptance binding trusts the controller's retained checkpoint bytes; a room without verification checkpoints
-  stays undetermined for `accepted` outcomes. Stale probe output is refused, not merged.
+  stays undetermined for `accepted` outcomes. Probe output binds to the candidate's HEAD, cleanliness and content
+  fingerprint; stale output (including different bytes at the same HEAD) is refused, not merged.
