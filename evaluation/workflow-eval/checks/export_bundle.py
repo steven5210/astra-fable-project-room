@@ -14,7 +14,9 @@ import sys
 import time
 
 SCHEMA = "workflow-eval-bundle/1"
-TERMINAL = {"completed", "settled_failure", "failed", "uncertain", "unknown", "rejected", "cancelled", "refused"}
+# The controller's settled states only: a receipt on an uncertain, running or unknown request
+# is evidence, never proof of settlement.
+TERMINAL = {"completed", "failed", "cancelled", "interrupted", "settled_failure"}
 
 
 def read(path):
@@ -54,6 +56,8 @@ def final_report(room, request):
 
 
 def settled_at(room, request):
+    if request.get("state") not in TERMINAL:
+        return None
     relative = request.get("receipt")
     if relative and (room / relative).is_file():
         value = read(room / relative).get("observed_at")
@@ -199,9 +203,10 @@ def export(room_dir, case_id, variant, attempt, task_path, checks_path, controll
     requests = sorted((r for r in (state.get("requests") or {}).values() if isinstance(r, dict)), key=lambda r: (r.get("created_at") or 0))
     exported = []
     for request in requests:
+        settled = settled_at(room, request)
         launches, observations = worker_launches(room, request) if request["role"] == "engineer" else ([], 0)
         exported.append({"request_id": request["request_id"], "role": request["role"], "purpose": request.get("purpose"), "state": request.get("state"),
-                         "created_at": request.get("created_at"), "settled_at": settled_at(room, request),
+                         "created_at": request.get("created_at"), "settled": settled is not None, "settled_at": settled,
                          "worker_observations": observations, "usage": usage_of(request),
                          "worker_launches": launches,
                          "account_profile": (request.get("account_profile") or {}).get("name")})
