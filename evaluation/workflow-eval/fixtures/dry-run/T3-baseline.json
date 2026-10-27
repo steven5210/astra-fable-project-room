@@ -1,6 +1,8 @@
 {
   "acceptance": {
-    "recorded": false
+    "bound_to_candidate": false,
+    "recorded": false,
+    "unbound_reason": "no_acceptance"
   },
   "attempt": 1,
   "candidate": {
@@ -21,6 +23,7 @@
     "verification_claimed_in_report": "not_run"
   },
   "elapsed_minutes": null,
+  "probe": null,
   "report": null,
   "requests": [
     {
@@ -29,6 +32,7 @@
       "purpose": "spec_review",
       "request_id": "spec-review-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800000360.0,
       "state": "completed",
       "usage": {
@@ -37,7 +41,8 @@
         "known": true,
         "outputTokens": 20000
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -45,13 +50,15 @@
       "purpose": "implementation",
       "request_id": "implementation-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800000540,
       "state": "settled_failure",
       "usage": {
         "known": false,
         "reason": "overlap_or_incomplete_history"
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     }
   ],
   "run": {

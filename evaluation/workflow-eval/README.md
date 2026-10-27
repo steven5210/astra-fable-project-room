@@ -62,9 +62,16 @@ One attempt is one ordinary `fable_engineering` AO room on an isolated controlle
 5. Verify, then send one acceptance review. A rejected acceptance is a recorded failure. There is no second review.
 6. Run `checks/probes.py --case <id> --candidate <worktree>` (disposable copy only), then
    `checks/export_bundle.py` with the probe output to produce the attempt bundle. Score all bundles with `checks/score.py`.
-   The exporter counts every observed worker launch with its outcome (qualified launches are a separate flag), proves
-   provenance against the candidate's file bytes rather than the report text, treats an untracked owned file as an invented
-   contract, marks missing facts `unavailable`, and leaves `elapsed_minutes` unknown while any request is unsettled.
+   The exporter binds correctness to the exact candidate the room verified and accepted: the acceptance must name the
+   passed verification of the same candidate, the verification's retained checkpoint bytes must match the recorded
+   evidence digest, and the worktree HEAD must still be the checkpoint's head on a clean candidate. Any gap names a
+   refusal (`unbound_reason`) and the correctness verdict is undetermined, never true. Probe output names its
+   candidate's HEAD; a stale probe merges every probe check as `unavailable`. Worker launches are deduplicated across
+   a request's outcome observations on `(agent_id, tool_use_id)` — the current observation wins and contradictions
+   stay recorded. The exporter proves provenance against the candidate's file bytes rather than the report text,
+   treats an untracked owned file as an invented contract (a failure, not `unavailable`), marks missing facts
+   `unavailable`, and leaves `elapsed_minutes` unknown unless every request is settled — a receipt on an
+   `uncertain` or running request is not settlement.
 
 Attempts run sequentially, or at most two at a time on distinct account profiles. The order is fixed before execution and recorded.
 Interleaving does not change inputs. Observed overlap is reported as an interval, never as a speedup.
@@ -73,7 +80,9 @@ Interleaving does not change inputs. Observed overlap is reported as an interval
 
 Per attempt: `accepted_correctness` (true, false or undetermined), `correction_rounds`, `integration_effort` (engineer
 dispatches, judge dispatches, worker launches, elapsed minutes), `usage` split into parent, worker and judge with unknown items
-counted separately, and `elapsed_minutes`. Failures, stops and skips stay in the table with their status. Unknown usage is never
+counted separately, and `elapsed_minutes`. An `accepted` outcome requires the recorded acceptance to bind to the exported
+candidate (`acceptance.bound_to_candidate`); without that binding the verdict is undetermined. Failures, stops and skips stay
+in the table with their status. Unknown usage is never
 zero. Per-variant numbers are counts over at most three cases and carry no significance claim.
 
 ## Proposed caps
@@ -108,4 +117,7 @@ credentials and makes no network call. Exit code 0 means every step passed.
 - Deterministic checks detect the modeled failure patterns only. A passing table does not prove general quality.
 - Worker usage is unknown unless the controller exposes it. Cached tokens combine reads and writes and are not quota.
 - Configured account identity is not provider billing attribution. Elapsed time depends on provider latency.
-- The probes replace an entry point with a stub in a disposable copy. They do not prove test quality beyond that dependency.
+- The probes replace an entry point with a stub in a disposable copy, after a passing control on the unmodified copy;
+  a failing control makes the stub check `unavailable`. They do not prove test quality beyond that dependency.
+- The acceptance binding trusts the controller's retained checkpoint bytes; a room without verification checkpoints
+  stays undetermined for `accepted` outcomes. Stale probe output is refused, not merged.

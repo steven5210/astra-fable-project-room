@@ -96,9 +96,16 @@ def synthetic_room(temp, settled_review=True):
     (room / "outcomes" / "implementation-1").mkdir(parents=True, exist_ok=True)
     (room / "outcomes" / "implementation-1" / "o.json").write_text(json.dumps(
         {"worker_observations": {"coverage": "complete", "executions": [launch], "launches": [launch, contradicted]}}))
+    checkpoint = {"candidate_sha256": "1" * 64, "candidate": {"head": head}, "passed": True}
+    (room / "verification" / "verify-synthetic").mkdir(parents=True, exist_ok=True)
+    (room / "verification" / "verify-synthetic" / "checkpoint.json").write_text(json.dumps(checkpoint))
+    evidence = hashlib.sha256(json.dumps(checkpoint, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=False).encode()).hexdigest()
     state = {"room_id": "ao-synthetic", "requests": requests, "handoff": "handoffs/h.json", "account_profile": {"name": "b"},
-             "verifications": [{"id": "verify-synthetic", "state": "passed", "candidate_sha256": "1" * 64}],
-             "acceptances": [{"request_id": "acceptance-1", "candidate_sha256": "1" * 64}]}
+             "verifications": [{"id": "verify-synthetic", "state": "passed", "candidate_sha256": "1" * 64,
+                                "path": "verification/verify-synthetic/checkpoint.json"}],
+             "acceptances": [{"request_id": "acceptance-1", "candidate_sha256": "1" * 64,
+                              "evidence_sha256": evidence}]}
     (room / "state.json").write_text(json.dumps(state))
     return room, repo, head
 
@@ -190,6 +197,51 @@ def main(argv):
         bundle2 = export_bundle.export(room2, "T2", "baseline", 1, task_path, None, "0" * 40, "completed", None)
         step(report, "exporter: an unsettled review leaves elapsed_minutes unknown", bundle2["elapsed_minutes"] is None,
              json.dumps({"elapsed": bundle2["elapsed_minutes"]}))
+        # An unreviewed regression after the acceptance moves the candidate HEAD: correctness
+        # is undetermined, never the stale recorded acceptance.
+        room3, repo3, _ = synthetic_room(temp / "third")
+        (repo3 / "summarize_cli.py").write_text("raise RuntimeError('unreviewed')\n")
+        _git(repo3, "add", "-A")
+        _git(repo3, "commit", "-q", "-m", "unreviewed regression")
+        checks3 = temp / "checks3.json"
+        checks3.write_text(json.dumps(probes.probe("T2", repo3)))
+        bundle3 = export_bundle.export(room3, "T2", "variant-1", 1, task_path, checks3, "0" * 40, "completed", None)
+        exported3 = score.score_bundle(bundle3)
+        step(report, "exporter: an unreviewed regression after acceptance leaves correctness undetermined",
+             exported3["accepted_correctness"] is None
+             and bundle3["acceptance"]["unbound_reason"] == "candidate_head_moved"
+             and bundle3["checks"]["accepted"] == "unavailable",
+             json.dumps({"correct": exported3["accepted_correctness"], "reason": bundle3["acceptance"]["unbound_reason"]}))
+        # Two outcome observations of the same two launches count two launches once.
+        room4, _, _ = synthetic_room(temp / "fourth")
+        base4 = 1_800_000_000.0
+        first_launch = {"agent_id": "a1", "tool_use_id": "t1", "role": "pr-sonnet", "model": "claude-sonnet-5",
+                        "outcome": "qualified", "interval": {"launch": base4 + 7 * 60, "end": base4 + 14 * 60}}
+        earlier = {"worker_observations": {"coverage": "partial", "recorded_at": base4,
+                                           "executions": [], "launches": [first_launch]}}
+        (room4 / "outcomes" / "implementation-1" / "a.json").write_text(json.dumps(earlier))
+        bundle4 = export_bundle.export(room4, "T2", "variant-1", 1, task_path, None, "0" * 40, "completed", None)
+        launches4 = [launch for request in bundle4["requests"] for launch in request["worker_launches"]]
+        step(report, "exporter: launches are deduplicated across outcome observations",
+             len(launches4) == 2 and bundle4["requests"][1]["worker_observations"] == 2,
+             json.dumps({"launches": len(launches4), "observations": bundle4["requests"][1]["worker_observations"]}))
+        # An uncertain request with an intact receipt is not settled.
+        room5, _, _ = synthetic_room(temp / "fifth")
+        state5 = json.loads((room5 / "state.json").read_text())
+        state5["requests"]["implementation-1"]["state"] = "uncertain"
+        (room5 / "state.json").write_text(json.dumps(state5))
+        bundle5 = export_bundle.export(room5, "T2", "baseline", 1, task_path, None, "0" * 40, "completed", None)
+        step(report, "exporter: an uncertain request with a receipt stays unsettled",
+             bundle5["elapsed_minutes"] is None and bundle5["requests"][1]["settled"] is False,
+             json.dumps({"elapsed": bundle5["elapsed_minutes"], "settled": bundle5["requests"][1]["settled"]}))
+        # A test module that already fails cannot detect a stub.
+        room6, repo6, _ = synthetic_room(temp / "sixth")
+        (repo6 / "tests" / "test_summarize_cli.py").write_text("import sys\nsys.exit(1)\n")
+        probe6 = probes.probe("T2", repo6)
+        step(report, "probe: a failing control makes the stub probe unavailable",
+             probe6["checks"]["probe_cli_stub_detected"] == "unavailable"
+             and probe6["details"]["stub_control"]["return_code"] != 0,
+             json.dumps(probe6["checks"]))
     # Score the synthetic bundles.
     scores = []
     for path in sorted((PACKAGE / "fixtures" / "dry-run").glob("*.json")):

@@ -1,8 +1,10 @@
 {
   "acceptance": {
+    "bound_to_candidate": true,
     "candidate_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "recorded": true,
-    "request_id": "acceptance-1"
+    "request_id": "acceptance-1",
+    "unbound_reason": null
   },
   "attempt": 1,
   "candidate": {
@@ -24,6 +26,7 @@
     "tests_exercise_cli": "pass"
   },
   "elapsed_minutes": 31.0,
+  "probe": null,
   "report": {
     "changes": [
       "summarize_cli.py",
@@ -44,6 +47,7 @@
       "purpose": "spec_review",
       "request_id": "spec-review-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800000300.0,
       "state": "completed",
       "usage": {
@@ -52,7 +56,8 @@
         "known": true,
         "outputTokens": 20000
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -60,6 +65,7 @@
       "purpose": "implementation",
       "request_id": "implementation-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800001200,
       "state": "completed",
       "usage": {
@@ -79,7 +85,8 @@
             "reason": "worker usage not exposed by the controller"
           }
         }
-      ]
+      ],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -87,6 +94,7 @@
       "purpose": "correction",
       "request_id": "correction-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800001560,
       "state": "completed",
       "usage": {
@@ -106,7 +114,8 @@
             "reason": "worker usage not exposed by the controller"
           }
         }
-      ]
+      ],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -114,6 +123,7 @@
       "purpose": "acceptance_review",
       "request_id": "acceptance-1",
       "role": "reviewer",
+      "settled": true,
       "settled_at": 1800001860,
       "state": "completed",
       "usage": {
@@ -122,7 +132,8 @@
         "known": true,
         "outputTokens": 10000
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     }
   ],
   "run": {
@@ -136,6 +147,7 @@
   "stop_reason": null,
   "variant": "variant-1",
   "verification": {
+    "bound": true,
     "id": "verify-c",
     "passed": true
   }

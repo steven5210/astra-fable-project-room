@@ -1,8 +1,10 @@
 {
   "acceptance": {
+    "bound_to_candidate": true,
     "candidate_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
     "recorded": true,
-    "request_id": "acceptance-1"
+    "request_id": "acceptance-1",
+    "unbound_reason": null
   },
   "attempt": 1,
   "candidate": {
@@ -27,6 +29,7 @@
     "verification_claimed_in_report": "pass"
   },
   "elapsed_minutes": 27.0,
+  "probe": null,
   "report": {
     "changes": [
       "verdict_cli.py wraps upstream.verdict (commit 4c1f0b6e9d2a7f3b8e5c0a1d6f9b2c4e7a8d3f10, sha256 3124eb9cbd14bb8f6b7d81eafe9f2fcf19f1276ac903254fb8fd9c9c032cbbee)"
@@ -46,6 +49,7 @@
       "purpose": "spec_review",
       "request_id": "spec-review-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800000300.0,
       "state": "completed",
       "usage": {
@@ -54,7 +58,8 @@
         "known": true,
         "outputTokens": 20000
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -62,6 +67,7 @@
       "purpose": "implementation",
       "request_id": "implementation-1",
       "role": "engineer",
+      "settled": true,
       "settled_at": 1800001380,
       "state": "completed",
       "usage": {
@@ -81,7 +87,8 @@
             "reason": "worker usage not exposed by the controller"
           }
         }
-      ]
+      ],
+      "worker_observations": 0
     },
     {
       "account_profile": "b",
@@ -89,6 +96,7 @@
       "purpose": "acceptance_review",
       "request_id": "acceptance-1",
       "role": "reviewer",
+      "settled": true,
       "settled_at": 1800001620,
       "state": "completed",
       "usage": {
@@ -97,7 +105,8 @@
         "known": true,
         "outputTokens": 7640
       },
-      "worker_launches": []
+      "worker_launches": [],
+      "worker_observations": 0
     }
   ],
   "run": {
@@ -111,6 +120,7 @@
   "stop_reason": null,
   "variant": "variant-1",
   "verification": {
+    "bound": true,
     "id": "verify-d",
     "passed": true
   }
