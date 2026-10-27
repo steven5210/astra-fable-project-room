@@ -1539,9 +1539,12 @@ class Service:
     def ao_room_accept(self, room_id, request_id):
         with self.locked(room_id) as (directory, state):
             self.quiet(state)
+            import ao_coordination
             if ao_workflow.normal(state):
                 ao_workflow.engineering_ready(self, directory, state)
             checkpoint = self.checkpoint(directory, state)
+            ao_coordination.before_owner_accept(self, directory, state, checkpoint)
+            ao_coordination.before_assignment_accept(self, directory, state, checkpoint)
             request = state["requests"].get(identifier(request_id))
             if not request or request["role"] != "reviewer" or request["state"] != "completed":
                 raise RoomError("Acceptance needs a completed independent reviewer request")
@@ -1579,6 +1582,26 @@ class Service:
                 state["acceptances"].append(acceptance)
                 self.save(directory, state)
             return acceptance | {"accepted": True, "publication": "not performed"}
+
+    def ao_room_assignment_open(self, room_id, assignment_id, assignment_room_id, owned_paths,
+                                interface, authorization, supersedes=None):
+        import ao_coordination
+        return ao_coordination.assignment_open(self, room_id, assignment_id, assignment_room_id,
+                                               owned_paths, interface, authorization,
+                                               supersedes=supersedes)
+
+    def ao_room_handback_record(self, room_id, assignment_id, acceptance_request_id):
+        import ao_coordination
+        return ao_coordination.handback_record(self, room_id, assignment_id, acceptance_request_id)
+
+    def ao_room_import_preflight(self, room_id, assignment_id, handback_sha256):
+        import ao_coordination
+        return ao_coordination.import_preflight(self, room_id, assignment_id, handback_sha256)
+
+    def ao_room_import_record(self, room_id, assignment_id, preflight_sha256, operation, resolution=None):
+        import ao_coordination
+        return ao_coordination.import_record(self, room_id, assignment_id, preflight_sha256, operation,
+                                             resolution=resolution)
 
     def request_summary(self, request, directory=None, state=None):
         fields = ("request_id", "role", "session_id", "state", "turn_id", "provider_turn_id", "created_at", "created_order", "delivery_error",
@@ -1622,8 +1645,10 @@ class Service:
                     totals[field] += usage[field]
             else:
                 unknown.append(request["request_id"])
+        import ao_coordination
         extra = {"exception_authorization": state.get("exception_authorization"),
-                 "account_profile": state.get("account_profile") or "unrecorded"}
+                 "account_profile": state.get("account_profile") or "unrecorded",
+                 "coordination": ao_coordination.view(directory.parent.parent, state)}
         if ao_workflow.normal(state):
             import ao_provider_transition
             import ao_review_extension
@@ -1771,6 +1796,7 @@ class Service:
             if selected is None or state["project_path"] == selected:
                 item = {key: state[key] for key in ("room_id", "project_path", "feature", "workflow", "created_at")}
                 item["account_profile"] = (state.get("account_profile") or {}).get("name") or "unrecorded"
+                item["coordination"] = {"role": (state.get("coordination") or {}).get("role")}
                 items.append(item)
         items.sort(key=lambda item: item["created_at"], reverse=True)
         return {"rooms": items[:50], "count": len(items), "truncated": len(items) > 50}
@@ -1840,5 +1866,9 @@ TOOL_SCHEMAS = {
     "ao_room_spec_verdict_recovery_close": ("Record Astra's explicit negative comparison of the completed format-recovery result, closing this source review's one re-ask lane without agreement. The completed result stays unusable as agreement, ordinary limits apply afterwards and no second re-ask exists for that source. Refuses a missing, unfinished, failed, already-agreed or identity-mismatched result; identical inputs read the saved closure. No model call and never edits either native receipt.", schema({**R, "recovery_request_id": S, "receipt_sha256": S, "final_text_sha256": S, "astra_review": S})),
     "ao_room_response_normalize": ("Operator-only audited presentation repair, with no model call: Astra first reads the COMPLETE saved final response and confirms ALL outside prose adds no additional or contradictory verdict. Select exactly one complete top-level JSON object by Unicode-character offsets in the untrimmed final text, with its exact receipt and text SHA256. Refuses ambiguity, incomplete or stale evidence and missing candidate-at-completion evidence. Preserves native bytes, verdicts, failures and review budgets. Never use this to decide or override a verdict, ignore a blocker or repair JSON content.", schema({**R, "request_id": S, "receipt_sha256": S, "final_text_sha256": S, "json_start": {"type": "integer", "minimum": 0}, "json_end": {"type": "integer", "minimum": 1}, "astra_review": S, "confirm_no_additional_verdict": {"type": "boolean", "const": True}})),
     "ao_room_accept": ("Validate an independent AO reviewer's completed JSON approval against the unchanged spec, candidate and gate evidence. Never merges or publishes.", schema({**R, "request_id": S})),
+    "ao_room_assignment_open": ("Admit one owner normal room and one assignment normal room in the same controller home and Git repository under the adapter-wide lock. Requires the owner's agreed spec and handoff and the assignment room's registered spec. Pins the immutable lineage (owner spec, handoff, baseline commit, worktree, assignment spec, owned paths, interface, authorization, account profile names, optional supersession) and starts the active lifecycle. Refuses overlapping owned paths of engaged assignments in the same repository and admits at most one engaged assignment per owner room. The opt-in coordination_accounts setting in ao/config.json pins the allowed account pairing at admission only. No model call, merge or dispatch.", schema({**R, "assignment_id": S, "assignment_room_id": S, "owned_paths": {"type": "array", "minItems": 1, "items": S}, "interface": S, "authorization": S, "supersedes": S}, ["room_id", "assignment_id", "assignment_room_id", "owned_paths", "interface", "authorization"])),
+    "ao_room_handback_record": ("Record the assignment room's accepted candidate as an immutable digest-addressed handback. Requires the current pinned spec, a passed checkpoint, a completed reviewer request and a matching recorded acceptance. Binds the acceptance, reviewer receipt, checkpoint, spec digests, baseline and candidate commit, in-scope changed paths and the binary patch digest. Refuses scope drift, bad baselines, dirty worktrees and missing, stale or tampered evidence. No model call or merge.", schema({**R, "assignment_id": S, "acceptance_request_id": S})),
+    "ao_room_import_preflight": ("Record the owner-side import readiness of the latest handback as observed Git facts: owner HEAD, worktree cleanliness, spec digests, owner-touched assigned paths and the merge-tree conflict preview. Revalidates the handback against live assignment evidence. Immutable and digest-addressed; a preflight with blockers is recorded but not ready. No model call or merge.", schema({**R, "assignment_id": S, "handback_sha256": S})),
+    "ao_room_import_record": ("Record the operator's performed Git import of the preflighted handback. Requires the latest recorded preflight and an owner HEAD strictly descending from its head. Verifies the destination diff against the handback paths and content, records the kind (faithful or resolved_with_modifications with the modified, extra and missing paths), the operator operation string and the required resolution text for a non-faithful import. Refuses stale or blocked preflights, unresolved modifications and tampered records. No model call or Git write.", schema({**R, "assignment_id": S, "preflight_sha256": S, "operation": S, "resolution": S}, ["room_id", "assignment_id", "preflight_sha256", "operation"])),
     "ao_report_validate": ("Read-only, offline syntax/shape check of one draft Fable engineering report. Admits exactly one argument, report_text, a bounded string, never a path. Zero side effects: no room, provider or network call, no writes, directory/config creation or counters. Applies the same shape rules authoritative capture applies, so a draft reporting syntax_shape_valid=true cannot later fail capture for a shape reason this call did not surface. Parses report_text as one unambiguous JSON object (a ```json fence is accepted; surrounding prose is never extracted), and returns bounded diagnostics (blocking) and advisories (non-blocking), plus the fixed unperformed_checks list naming deferred authoritative checks this call never performs, always including semantic correctness assessment, formal candidate verification and independent acceptance -- a reminder of named checks, never an exhaustive contract. A refused admission -- arguments other than exactly report_text, or a report_text that is not a string, blank, not valid UTF-8, over 1,000,000 UTF-8 bytes, or nested deeper than 64 -- is a fixed, bounded error that never repeats a supplied name, value or path, and still carries the same unperformed_checks and limits: the API raises DraftAdmissionError with a .payload attribute, the CLI exits 2 with the refusal object on stderr, and MCP returns an isError result whose text and structuredContent are that same refusal object. This is distinct from a validated-but-invalid draft, which always comes back as a normal result with diagnostics, never a refusal. Never implies acceptance, delivery or capture.", schema({"report_text": S}, ["report_text"])),
 }
