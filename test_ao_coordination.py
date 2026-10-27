@@ -1,0 +1,1303 @@
+"""Offline two-room coordination contracts (fake AO, synthetic homes only)."""
+import copy
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+import unittest
+from unittest.mock import patch
+
+import ao_coordination
+import ao_native_outcome
+import ao_project_room as ao
+import ao_workflow
+from room import RoomError
+from test_ao_normal import Fixture
+
+
+class CoordinationFixture(Fixture):
+    """The shared fixture plus a second normal room bound to a linked worktree of the same repo."""
+
+    OWNED = 'owned/part.txt'
+    NATIVE_B = 'native-b'
+
+    def _populate_root(self):
+        super()._populate_root()
+        # An owned file at the baseline enables rename/delete coverage below it.
+        (self.repo / 'owned').mkdir()
+        (self.repo / 'owned' / 'old.txt').write_text('base\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-m', 'owned base'], check=True, capture_output=True)
+        self.assign_wt = self.root / 'assign'
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', str(self.assign_wt), 'HEAD'],
+                       check=True, capture_output=True)
+
+    def _activate(self):
+        super()._activate()
+        self.owners = {}
+        patcher = patch('ao_native_identity.read_owner',
+                        side_effect=lambda database, session_id: copy.deepcopy(self.owners.get(session_id)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.fake.add('engineer-b', 'claude-code')
+        self.fake.add('reviewer-b')
+        self.fake.snapshots['engineer-b']['settings']['model'] = ao_workflow.FABLE_MODEL
+        self.fake.workspaces['engineer-b'] = self.assign_wt
+        self.fake.workspaces['reviewer-b'] = self.assign_wt
+        self.b_native = None
+        self.gates_b = [[sys.executable, '-c',
+                         "from pathlib import Path; assert Path('owned/part.txt').read_text() == 'done\\n'"]]
+
+    def _patch_owner_reader(self):
+        # The per-session selector patch installed in _activate dispatches to this map.
+        self.owners[self.owner['id']] = copy.deepcopy(self.owner)
+
+    def state_b(self):
+        return ao.read(self.directory(self.assign_room) / 'state.json')
+
+    def git(self, path, *args):
+        result = subprocess.run(['git', '-C', str(path), *args], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return result.stdout.decode().strip()
+
+    def commit_wt(self, path, message='work'):
+        self.git(path, 'add', '-A')
+        self.git(path, 'commit', '-m', message)
+
+    def open_rooms(self, owned=('owned',)):
+        self.room = self.open('owner')
+        self.spec()
+        self.bind()
+        self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assign_room = self.service.ao_room_open(
+            str(self.repo), 'assignment', 'project', 'User authorized this assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.spec_b()
+        self.bind_b()
+        return self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, list(owned),
+            'The interface contract for the owned paths.', 'User authorized this bounded assignment')
+
+    def spec_b(self, content='Implement the bounded assignment.', gates=None, revision=1):
+        return self.service.ao_room_spec_put(self.assign_room, revision, content,
+                                             gates if gates is not None else self.gates_b,
+                                             'Astra approves this scope')
+
+    def bind_b(self):
+        self.service.ao_room_prepare(self.assign_room, str(self.assign_wt))
+        self.service.ao_room_bind(self.assign_room, 'engineer', 'engineer-b', ao_workflow.FABLE_MODEL, 'max')
+        self.service.ao_room_bind(self.assign_room, 'reviewer', 'reviewer-b', 'astra', 'max')
+        self.register_native_source_b()
+
+    def native_config_root_b(self):
+        path = self.directory(self.assign_room) / 'preparation.json'
+        routing = ao.read(path).get('routing') or {} if path.exists() else {}
+        value = routing.get('claude_config_dir')
+        return Path(value) if isinstance(value, str) and value else self.claude_env
+
+    def register_native_source_b(self):
+        directory = self.directory(self.assign_room)
+        state = ao.read(directory / 'state.json')
+        binding = state['bindings']['engineer']
+        config_root = self.native_config_root_b()
+        project_dir = config_root / 'projects' / str(self.assign_wt).replace('/', '-')
+        transcript = project_dir / (self.NATIVE_B + '.jsonl')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('')
+        self.owners[binding['session_id']] = {
+            'id': binding['session_id'], 'project_id': state['ao_project_id'],
+            'harness': 'claude-code', 'session_mode': 'chat', 'is_terminated': 0,
+            'activity_state': 'idle', 'workspace_path': str(self.assign_wt),
+            'provider_conversation_id': self.NATIVE_B, 'controller_generation': 'generation-1',
+            'ao_conversation_id': binding['conversation_id'], 'active_branch_id': binding['branch_id'],
+            'branch_provider_conversation_id': self.NATIVE_B, 'branch_session_id': binding['session_id'],
+            'strategy': 'native', 'replay_truncated': 0}
+        source = {'database': str(self.root / 'owner.db'), 'transcript': str(transcript),
+                  'session_id': binding['session_id'], 'native_session_id': self.NATIVE_B}
+        ao_native_outcome.preflight_source(directory, state, source['database'], source['transcript'])
+        ao.atomic(directory / 'state.json', state)
+        self.b_native = {'transcript': transcript, 'events': [], 'requests': set(), 'source': source}
+
+    def note_native_turn_b(self, request_id):
+        bag = self.b_native
+        if bag is None or request_id in bag['requests']:
+            return
+        request = self.state_b()['requests'][request_id]
+        if request.get('state') in ('completed', 'settled_failure'):
+            return
+        model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                  datetime.now(timezone.utc)).isoformat()
+        bag['events'].extend([
+            {'type': 'user', 'uuid': request_id + '-caller', 'sessionId': self.NATIVE_B,
+             'timestamp': stamp(0.001), 'cwd': str(self.assign_wt), 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': request_id + '-reply', 'sessionId': self.NATIVE_B,
+             'timestamp': stamp(0.002), 'cwd': str(self.assign_wt),
+             'message': {'role': 'assistant', 'model': model, 'id': request_id + '-m0',
+                         'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}}])
+        bag['transcript'].write_text(''.join(json.dumps(event) + '\n' for event in bag['events']))
+        bag['requests'].add(request_id)
+
+    def send_b(self, purpose, key=None):
+        role = 'reviewer' if purpose == 'acceptance_review' else 'engineer'
+        result = self.service.ao_room_send(self.assign_room, role, 'Perform the exact authorized purpose.',
+                                           key or purpose, purpose=purpose)
+        if role == 'engineer':
+            self.note_native_turn_b(key or purpose)
+        return result
+
+    def agree_b(self, decision='accept', revision=1, key='spec_review'):
+        self.send_b('spec_review', key)
+        spec = self.service.spec(self.directory(self.assign_room), self.state_b())
+        self.fake.finish('engineer-b', json.dumps({'interpretation': 'Implement the supplied pure behavior.',
+                         'findings': [], 'decision': decision, 'spec_revision': revision,
+                         'spec_sha256': spec['sha256']}))
+        return self.service.ao_room_sync(self.assign_room)
+
+    def report_b(self, **changes):
+        handoff = ao_workflow.handoff_record(self.directory(self.assign_room), self.state_b())
+        return {'outcome': 'completed', 'implementation_complete': True,
+                'changes': ['Implemented assignment'], 'tests_reported': ['Focused tests pass'],
+                'review_findings': [], 'remaining_gaps': [], 'backlog': [], 'routing_log': [],
+                'spec_revision': handoff['spec_revision'], 'spec_sha256': handoff['spec_sha256'],
+                'baseline_commit': handoff['baseline_commit'], **changes}
+
+    def implement_b(self, change=None, commit=True, request='implementation'):
+        self.send_b('implementation', request)
+        if change is None:
+            (self.assign_wt / self.OWNED).write_text('done\n')
+        else:
+            change()
+        if commit:
+            self.commit_wt(self.assign_wt, 'assignment work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        return self.service.ao_room_sync(self.assign_room)
+
+    def review_b(self, request='acceptance_review'):
+        self.service.ao_room_verify(self.assign_room, str(self.assign_wt))
+        self.send_b('acceptance_review', request)
+        saved = self.state_b()['requests'][request]
+        self.fake.finish('reviewer-b', json.dumps({**saved['review'], 'decision': 'approved',
+                         'review': 'Independently inspected exact behavior and gates.'}))
+        return self.service.ao_room_sync(self.assign_room)
+
+    def accept_b(self, request='acceptance_review'):
+        return self.service.ao_room_accept(self.assign_room, request)
+
+    def assignment_accepted(self):
+        """Open A1, then take the assignment room through agree, implement, review and accept."""
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        return self.accept_b()
+
+    def handed_back(self):
+        self.assignment_accepted()
+        return self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def assignments_root(self):
+        return self.home / 'ao' / 'coordination' / 'assignments'
+
+    def lifecycle(self, assignment_id='A1'):
+        return ao.read(self.assignments_root() / assignment_id / 'state.json')
+
+    def correction_b(self, request='correction-2', review='acceptance_review_2', change=None):
+        """A second verified+accepted cycle in the assignment room under the same handoff:
+        correction is the supported engineering purpose once an implementation exists."""
+        self.send_b('correction', request)
+        if change is None:
+            (self.assign_wt / 'owned' / 'more.txt').write_text('more\n')
+        else:
+            change()
+        self.commit_wt(self.assign_wt, 'more assignment work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        self.review_b(request=review)
+        return self.accept_b(request=review)
+
+    def _second_owner(self, feature='owner-two'):
+        # A second owner needs its own linked worktree (prepare refuses a prepared path);
+        # a linked worktree shares git_common_dir, so the room pair still qualifies.
+        wt2 = self.root / ('wt-' + feature)
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', str(wt2), 'HEAD'],
+                       check=True, capture_output=True)
+        room = self.service.ao_room_open(
+            str(self.repo), feature, 'project', 'User authorized this second owner',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(room, 1, 'Second owner spec.', self.gates,
+                                      'Astra approves this scope')
+        self.service.ao_room_prepare(room, str(wt2))
+        self.fake.add('engineer-' + feature, 'claude-code')
+        self.fake.add('reviewer-' + feature)
+        self.fake.workspaces['engineer-' + feature] = wt2
+        self.fake.workspaces['reviewer-' + feature] = wt2
+        self.service.ao_room_bind(room, 'engineer', 'engineer-' + feature,
+                                  ao_workflow.FABLE_MODEL, 'max')
+        self.service.ao_room_bind(room, 'reviewer', 'reviewer-' + feature, 'astra', 'max')
+        # Engineer turns need native outcome evidence; register a source exactly like
+        # register_native_source_b does for the assignment room.
+        directory = self.directory(room)
+        state = ao.read(directory / 'state.json')
+        binding = state['bindings']['engineer']
+        project_dir = self.native_config_root() / 'projects' / str(wt2).replace('/', '-')
+        project_dir.mkdir(parents=True, exist_ok=True)
+        transcript = project_dir / (feature + '.jsonl')
+        transcript.write_text('')
+        self.owners[binding['session_id']] = {
+            'id': binding['session_id'], 'project_id': state['ao_project_id'],
+            'harness': 'claude-code', 'session_mode': 'chat', 'is_terminated': 0,
+            'activity_state': 'idle', 'workspace_path': str(wt2),
+            'provider_conversation_id': feature, 'controller_generation': 'generation-1',
+            'ao_conversation_id': binding['conversation_id'], 'active_branch_id': binding['branch_id'],
+            'branch_provider_conversation_id': feature, 'branch_session_id': binding['session_id'],
+            'strategy': 'native', 'replay_truncated': 0}
+        source = {'database': str(self.root / 'owner.db'), 'transcript': str(transcript),
+                  'session_id': binding['session_id'], 'native_session_id': feature}
+        ao_native_outcome.preflight_source(directory, state, source['database'], source['transcript'])
+        ao.atomic(directory / 'state.json', state)
+        self.service.ao_room_send(room, 'engineer', 'Review the registered specification.',
+                                  'spec_review', purpose='spec_review')
+        request = ao.read(directory / 'state.json')['requests']['spec_review']
+        model = (request.get('engineering_resolution') or {}).get('expected_model') or request['model']
+        stamp = lambda seconds: min(datetime.fromtimestamp(request['created_at'] + seconds, timezone.utc),
+                                  datetime.now(timezone.utc)).isoformat()
+        transcript.write_text(''.join(json.dumps(event) + '\n' for event in [
+            {'type': 'user', 'uuid': 'spec_review-caller', 'sessionId': feature,
+             'timestamp': stamp(0.001), 'cwd': str(wt2), 'isSidechain': False,
+             'origin': {'kind': 'human'}, 'message': {'role': 'user', 'content': request['text']}},
+            {'type': 'assistant', 'uuid': 'spec_review-reply', 'sessionId': feature,
+             'timestamp': stamp(0.002), 'cwd': str(wt2),
+             'message': {'role': 'assistant', 'model': model, 'id': 'spec_review-m0',
+                         'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}}]))
+        spec = self.service.spec(directory, ao.read(directory / 'state.json'))
+        self.fake.finish('engineer-' + feature, json.dumps(
+            {'interpretation': 'Implement the supplied pure behavior.', 'findings': [],
+             'decision': 'accept', 'spec_revision': 1, 'spec_sha256': spec['sha256']}))
+        self.service.ao_room_sync(room)
+        saved = ao.read(directory / 'state.json')['requests']['spec_review']
+        assert saved['state'] == 'completed', saved  # DEBUG
+        self.service.ao_room_handoff(room, str(wt2))
+        return room
+
+
+class SuccessPathTests(CoordinationFixture):
+    def test_two_room_success_path(self):
+        self.open_rooms()
+        # A captured first implementation result (no worktree change) keeps the owner
+        # clean for a ready preflight and authorizes a correction turn after the import.
+        self.send('implementation')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        self.accept_b()
+        lineage = ao.read(self.assignments_root() / 'A1' / 'lineage.json')
+        baseline = lineage['owner']['baseline_commit']
+        commit = self.git(self.assign_wt, 'rev-parse', 'HEAD')
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(record['commit'], commit)
+        self.assertEqual(record['baseline_commit'], baseline)
+        self.assertEqual(record['owner_room_id'], self.room)
+        self.assertEqual(record['assignment_room_id'], self.assign_room)
+        changed = {entry['path']: entry['status'] for entry in record['changed_paths']}
+        self.assertEqual(changed, {'owned/part.txt': 'A'})
+        patch = subprocess.run(['git', '-C', str(self.assign_wt), 'diff', '--binary', baseline, commit],
+                               capture_output=True, check=True)
+        self.assertEqual(record['patch_sha256'], hashlib.sha256(patch.stdout).hexdigest())
+        self.assertTrue((self.assignments_root() / 'A1' / 'handbacks' / (record['handback_sha256'] + '.json')).is_file())
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.assertEqual(preflight['preview'], 'clean')
+        self.assertEqual(preflight['conflicts'], [])
+        self.assertEqual(preflight['owner_head_before'], self.git(self.repo, 'rev-parse', 'HEAD'))
+        self.git(self.repo, 'cherry-pick', '-x', commit)
+        imported = self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                                    'git cherry-pick -x ' + commit)
+        self.assertEqual(imported['kind'], 'faithful')
+        self.assertIsNone(imported['resolution'])
+        self.assertEqual(imported['owner_head_after'], self.git(self.repo, 'rev-parse', 'HEAD'))
+        self.assertEqual(self.lifecycle()['state'], 'imported')
+        # A fresh post-import engineering result lets the owner accept.
+        self.send('correction')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.review()
+        result = self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.assertTrue(result['accepted'])
+        status = self.service.ao_room_status(self.room)['coordination']
+        self.assertEqual(status['role'], 'owner')
+        entry = status['assignments'][0]
+        self.assertEqual(entry['assignment_id'], 'A1')
+        self.assertEqual(entry['state'], 'imported')
+        self.assertEqual(entry['assignment_room_id'], self.assign_room)
+        self.assertEqual(entry['owner_room_id'], self.room)
+        self.assertEqual(entry['owned_paths'], ['owned'])
+        self.assertEqual(entry['latest_handback']['sha256'], record['handback_sha256'])
+        self.assertEqual(entry['import']['sha256'], imported['import_sha256'])
+        self.assertEqual(entry['import']['kind'], 'faithful')
+        self.assertEqual(entry['import']['owner_head_after'], imported['owner_head_after'])
+        self.assertEqual(entry['blockers'], [])
+        compact = self.service.ao_room_status(self.room, 'compact')['coordination']
+        self.assertEqual(compact['role'], 'owner')
+        self.assertEqual(compact['assignments'][0]['state'], 'imported')
+        assign_status = self.service.ao_room_status(self.assign_room)['coordination']
+        self.assertEqual(assign_status['role'], 'assignment')
+        self.assertEqual(assign_status['assignments'][0]['owner_room_id'], self.room)
+        progress = self.service.ao_room_progress(self.room)['coordination']
+        self.assertEqual(progress['role'], 'owner')
+        self.assertEqual(progress['assignments'][0]['assignment_id'], 'A1')
+        rooms = {item['room_id']: item for item in self.service.ao_room_list()['rooms']}
+        self.assertEqual(rooms[self.room]['coordination'], {'role': 'owner'})
+        self.assertEqual(rooms[self.assign_room]['coordination'], {'role': 'assignment'})
+        pointers = self.state()['coordination']
+        self.assertEqual(pointers, {'role': 'owner', 'assignment_ids': ['A1']})
+        self.assertEqual(self.state_b()['coordination'],
+                         {'role': 'assignment', 'assignment_ids': ['A1']})
+
+
+class OwnerAcceptanceTests(CoordinationFixture):
+    def test_owner_candidate_touching_owned_path_refuses(self):
+        self.open_rooms()
+        self.send('implementation')
+        (self.repo / 'owned' / 'part.txt').write_text('owner touched\n')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        self.commit_wt(self.repo, 'owner work')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.review()
+        with self.assertRaisesRegex(RoomError, 'owned_by_active_assignment'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+
+    def test_owner_accept_after_import_requires_post_import_result(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        self.accept_b()
+        self.send('implementation')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        # A pre-import implementation result alone does not satisfy the post-import
+        # freshness rule; correction needs one completed implementation first.
+        self.send('correction')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                           'git cherry-pick -x ' + record['commit'])
+        self.review()
+        with self.assertRaisesRegex(RoomError, 'integration_requires_fresh_engineering'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        # A fresh engineering result recorded after the import allows acceptance.
+        self.send('correction', 'correction-2')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.service.ao_room_verify(self.room, str(self.repo))
+        self.send('acceptance_review', 'acceptance_review-2')
+        saved = self.state()['requests']['acceptance_review-2']
+        self.fake.finish('reviewer', json.dumps({**saved['review'], 'decision': 'approved',
+                                                 'review': 'Independently inspected exact behavior and gates.'}))
+        self.service.ao_room_sync(self.room)
+        result = self.service.ao_room_accept(self.room, 'acceptance_review-2')
+        self.assertTrue(result['accepted'])
+
+
+class AdmissionTests(CoordinationFixture):
+    def test_concurrent_overlapping_admission_exactly_one_wins(self):
+        self.room = self.open('owner')
+        self.spec()
+        self.bind()
+        self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assign_room = self.service.ao_room_open(
+            str(self.repo), 'assignment', 'project', 'User authorized this assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        second_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-two', 'project', 'User authorized another assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.spec_b()
+        self.service.ao_room_spec_put(second_room, 1, 'Implement the other assignment.',
+                                      self.gates_b, 'Astra approves this scope')
+        other_service = ao.Service(self.home, lambda url: self.fake)
+        outcomes = {}
+
+        def admit(tag, service, assignment_id, room_id):
+            try:
+                outcomes[tag] = service.ao_room_assignment_open(
+                    self.room, assignment_id, room_id, ['owned'], 'interface', 'authorization')
+            except RoomError as exc:
+                outcomes[tag] = exc
+
+        threads = [threading.Thread(target=admit, args=('a', self.service, 'A1', self.assign_room)),
+                   threading.Thread(target=admit, args=('b', other_service, 'A2', second_room))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wins = [value for value in outcomes.values() if isinstance(value, dict)]
+        losses = [value for value in outcomes.values() if isinstance(value, RoomError)]
+        self.assertEqual(len(wins), 1)
+        self.assertEqual(len(losses), 1)
+        self.assertIn('overlap', str(losses[0]))
+        self.assertEqual(len(list(self.assignments_root().glob('*/lineage.json'))), 1)
+
+    def test_refused_admission_leaves_no_durable_record(self):
+        self.open_rooms(owned=('owned',))
+        other_owner = self._second_owner()
+        second_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-two', 'project', 'User authorized another assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(second_room, 1, 'Implement the other assignment.',
+                                      self.gates_b, 'Astra approves this scope')
+        with self.assertRaisesRegex(RoomError, 'overlap'):
+            self.service.ao_room_assignment_open(other_owner, 'A2', second_room, ['owned/part.txt'],
+                                                 'interface', 'authorization')
+        self.assertFalse((self.assignments_root() / 'A2').exists())
+        # The clean retry succeeds.
+        result = self.service.ao_room_assignment_open(other_owner, 'A2', second_room, ['unrelated'],
+                                                      'interface', 'authorization')
+        self.assertTrue(result['opened'])
+
+    def test_supersede_marks_old_and_admits_new(self):
+        self.open_rooms()
+        result = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+            supersedes='A1')
+        self.assertTrue(result['opened'])
+        old = self.lifecycle('A1')
+        self.assertEqual(old['state'], 'superseded')
+        self.assertEqual(old['superseded_by'], 'A2')
+        self.assertEqual(self.lifecycle('A2')['state'], 'active')
+        self.assertEqual(self.state_b()['coordination']['assignment_ids'], ['A1', 'A2'])
+        with self.assertRaisesRegex(RoomError, 'terminal'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization',
+                supersedes='A1')
+
+    def test_terminal_assignments_admit_new_ones(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                           'git merge --no-ff --no-edit ' + record['commit'])
+        # The imported assignment stays in the pointer for audit without blocking A2.
+        opened = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization')
+        self.assertTrue(opened['opened'])
+        status = self.service.ao_room_status(self.assign_room)['coordination']
+        states = {entry['assignment_id']: entry['state'] for entry in status['assignments']}
+        self.assertEqual(states, {'A1': 'imported', 'A2': 'active'})
+        # The engaged A2 still blocks a plain A3; supersession admits it and keeps history.
+        with self.assertRaisesRegex(RoomError, 'participates'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization')
+        self.service.ao_room_assignment_open(
+            self.room, 'A3', self.assign_room, ['other'], 'interface', 'authorization',
+            supersedes='A2')
+        status = self.service.ao_room_status(self.assign_room)['coordination']
+        states = {entry['assignment_id']: entry['state'] for entry in status['assignments']}
+        self.assertEqual(states, {'A1': 'imported', 'A2': 'superseded', 'A3': 'active'})
+        self.assertEqual(self.state_b()['coordination']['assignment_ids'], ['A1', 'A2', 'A3'])
+
+    def test_wrong_repository_and_role_refusals(self):
+        self.open_rooms()
+        other = self.root / 'other-repo'
+        other.mkdir()
+        (other / 'f.txt').write_text('x\n')
+        for args in (('init',), ('config', 'user.name', 'T'), ('config', 'user.email', 't@i'),
+                     ('add', '.'), ('commit', '-m', 'foreign')):
+            subprocess.run(['git', '-C', str(other), *args], check=True, capture_output=True)
+        self.fake.path = str(other)
+        try:
+            foreign = self.service.ao_room_open(
+                str(other), 'foreign', 'project', 'User authorized this foreign feature',
+                'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        finally:
+            self.fake.path = str(self.repo)
+        self.service.ao_room_spec_put(foreign, 1, 'Foreign work.', self.gates_b, 'Astra approves')
+        with self.assertRaisesRegex(RoomError, 'Git repository'):
+            self.service.ao_room_assignment_open(self.room, 'AX', foreign, ['x'], 'i', 'a')
+        with self.assertRaisesRegex(RoomError, 'different room'):
+            self.service.ao_room_assignment_open(self.room, 'AY', self.room, ['x'], 'i', 'a')
+        with self.assertRaisesRegex(RoomError, 'participates'):
+            self.service.ao_room_assignment_open(self.room, 'AZ', self.assign_room, ['x'], 'i', 'a')
+
+
+class SupersessionUnsettledTests(CoordinationFixture):
+    """F2: supersedes never releases paths while an engineer request is active or uncertain."""
+
+    def _native_failure_b(self, request_id):
+        request = self.state_b()['requests'][request_id]
+        stamp = lambda offset: min(datetime.fromtimestamp(request['created_at'] + offset, timezone.utc),
+                                   datetime.now(timezone.utc)).isoformat()
+        self.b_native['events'].append(
+            {'type': 'assistant', 'uuid': request_id + '-error', 'sessionId': self.NATIVE_B,
+             'timestamp': stamp(0.002), 'cwd': str(self.assign_wt), 'isSidechain': False,
+             'isApiErrorMessage': True, 'error': 'rate_limit', 'apiErrorStatus': 429,
+             'message': {'role': 'assistant', 'model': '<synthetic>',
+                         'content': [{'type': 'text', 'text': 'Synthetic native session limit'}]}})
+        self.b_native['transcript'].write_text(
+            ''.join(json.dumps(event) + '\n' for event in self.b_native['events']))
+        self.b_native['requests'].add(request_id)
+
+    def test_supersession_refuses_while_engineer_request_active(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.send_b('implementation')  # left running, never finished
+        with self.assertRaisesRegex(RoomError, 'unsettled request'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+                supersedes='A1')
+        self.assertEqual(self.lifecycle('A1')['state'], 'active')
+        # A third room pair still cannot take the owned paths: the reservation held.
+        other_owner = self._second_owner()
+        third_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-three', 'project', 'User authorized a third assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(third_room, 1, 'Implement the third assignment.',
+                                      self.gates_b, 'Astra approves this scope')
+        with self.assertRaisesRegex(RoomError, 'overlap'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A3', third_room, ['owned'], 'interface', 'authorization')
+        # Completing the turn settles the boundary; supersession proceeds.
+        (self.assign_wt / self.OWNED).write_text('done\n')
+        self.commit_wt(self.assign_wt, 'assignment work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        result = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+            supersedes='A1')
+        self.assertTrue(result['opened'])
+
+    def test_supersession_refuses_while_engineer_request_uncertain(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.send_b('implementation')
+        self._native_failure_b('implementation')
+        self.fake.finish('engineer-b', state='failed')
+        self.service.ao_room_sync(self.assign_room)
+        self.assertEqual(self.state_b()['requests']['implementation']['state'], 'uncertain')
+        with self.assertRaisesRegex(RoomError, 'unsettled request'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A2', self.assign_room, ['unrelated'], 'interface', 'authorization',
+                supersedes='A1')
+        self.assertEqual(self.lifecycle('A1')['state'], 'active')
+        self.assertEqual(self.lifecycle('A1')['superseded_by'], None)
+
+
+class PathValidationTests(CoordinationFixture):
+    def test_owned_path_grammar(self):
+        bad = (['../x'], ['/abs'], ['a//b'], ['a/'], ['./a'], ['.git/x'], ['a\\b'],
+               ['a', 'a'], ['a', 'a/b'], [], [1], ['a', ''], ['.'], ['a/../b'], ['a//b'])
+        for paths in bad:
+            with self.subTest(paths=paths):
+                with self.assertRaises(RoomError):
+                    self.service.ao_room_assignment_open('ao-x', 'V1', 'ao-y', paths, 'i', 'a')
+        with self.assertRaises(RoomError):
+            self.service.ao_room_assignment_open('ao-x', 'V1', 'ao-y', ['x'] * 201, 'i', 'a')
+        for paths in (['.github/workflows/ci.yml'], ['.gitignore']):
+            with self.subTest(paths=paths):
+                self.assertEqual(ao_coordination._owned_paths(paths), paths)
+        for paths in (['.git/x'], ['a/.git/x'], ['a\x00b']):
+            with self.subTest(paths=paths):
+                with self.assertRaises(RoomError):
+                    ao_coordination._owned_paths(paths)
+
+    def test_rename_and_delete_scope(self):
+        # Deleting an owned file records D; renaming inside owned paths passes.
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def change():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            self.git(self.assign_wt, 'mv', 'owned/old.txt', 'owned/new.txt')
+
+        self.implement_b(change)
+        self.review_b()
+        self.accept_b()
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        statuses = {entry['path']: entry['status'] for entry in record['changed_paths']}
+        self.assertEqual(statuses['owned/part.txt'], 'A')
+        renames = [entry for entry in record['changed_paths'] if entry['status'] == 'R']
+        self.assertEqual(renames, [{'status': 'R', 'path': 'owned/new.txt', 'old_path': 'owned/old.txt'}])
+
+    def _drifting_acceptance(self, change):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def apply():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            change()
+
+        self.implement_b(apply)
+        self.review_b()
+
+    def test_rename_owned_to_unowned_refuses(self):
+        self._drifting_acceptance(lambda: self.git(self.assign_wt, 'mv', 'owned/old.txt', 'moved.txt'))
+        with self.assertRaisesRegex(RoomError, 'scope_drift'):
+            self.accept_b()
+        with self.assertRaisesRegex(RoomError, 'missing_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_unowned_delete_refuses(self):
+        self._drifting_acceptance(lambda: self.git(self.assign_wt, 'rm', 'feature.txt'))
+        with self.assertRaisesRegex(RoomError, 'scope_drift'):
+            self.accept_b()
+        with self.assertRaisesRegex(RoomError, 'missing_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_owned_delete_records_d(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def change():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            self.git(self.assign_wt, 'rm', 'owned/old.txt')
+
+        self.implement_b(change)
+        self.review_b()
+        self.accept_b()
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        statuses = {entry['path']: entry['status'] for entry in record['changed_paths']}
+        self.assertEqual(statuses['owned/old.txt'], 'D')
+
+
+class EvidenceTests(CoordinationFixture):
+    def test_handback_requires_acceptance_and_fresh_evidence(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        # No acceptance recorded yet.
+        with self.assertRaisesRegex(RoomError, 'missing_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.accept_b()
+        # Newer candidate work makes the earlier acceptance stale.
+        self.send_b('correction', 'correction-1')
+        (self.assign_wt / 'owned' / 'more.txt').write_text('more\n')
+        self.commit_wt(self.assign_wt, 'more work')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        self.service.ao_room_verify(self.assign_room, str(self.assign_wt))
+        with self.assertRaisesRegex(RoomError, 'stale_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_tampered_checkpoint_and_receipt_refuse(self):
+        self.assignment_accepted()
+        checkpoint_path = self.directory(self.assign_room) / self.state_b()['checkpoint']
+        checkpoint = ao.read(checkpoint_path)
+        original = checkpoint_path.read_bytes()
+        checkpoint['id'] = 'tampered'
+        checkpoint_path.write_text(json.dumps(checkpoint))
+        with self.assertRaisesRegex(RoomError, 'tampered_checkpoint'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        checkpoint_path.write_bytes(original)
+        request = self.state_b()['requests']['acceptance_review']
+        receipt_path = self.directory(self.assign_room) / request['receipt']
+        receipt = ao.read(receipt_path)
+        original = receipt_path.read_bytes()
+        receipt['tampered'] = True
+        receipt_path.write_text(json.dumps(receipt))
+        with self.assertRaisesRegex(RoomError, 'tampered_receipt'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        receipt_path.write_bytes(original)
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(record['assignment_id'], 'A1')
+
+    def test_tampered_handback_blocks_preflight(self):
+        record = self.handed_back()
+        path = self.assignments_root() / 'A1' / 'handbacks' / (record['handback_sha256'] + '.json')
+        saved = ao.read(path)
+        saved['commit'] = '0' * 40
+        path.write_text(json.dumps(saved))
+        with self.assertRaisesRegex(RoomError, 'tampered_handback'):
+            self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+
+    def test_mismatched_assignment_and_room_refuse(self):
+        self.assignment_accepted()
+        with self.assertRaisesRegex(RoomError, 'mismatched_assignment_id'):
+            self.service.ao_room_handback_record(self.room, 'A1', 'acceptance_review')
+        with self.assertRaisesRegex(RoomError, 'coordination assignment'):
+            self.service.ao_room_handback_record(self.assign_room, 'ZZ', 'acceptance_review')
+
+
+class ReusedRoomProvenanceTests(CoordinationFixture):
+    """F4: a terminal assignment's checkpoint/acceptance never hand back under a new assignment."""
+
+    def test_old_acceptance_cannot_hand_back_for_a_new_assignment(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                           'git merge --no-ff --no-edit ' + record['commit'])
+        opened = self.service.ao_room_assignment_open(
+            self.room, 'A2', self.assign_room, ['owned'], 'interface', 'authorization')
+        self.assertTrue(opened['opened'])
+        with self.assertRaisesRegex(RoomError, 'acceptance_predates_assignment'):
+            self.service.ao_room_handback_record(self.assign_room, 'A2', 'acceptance_review')
+        # A fresh cycle under A2 supplies assignment-specific evidence.
+        self.correction_b()
+        second = self.service.ao_room_handback_record(self.assign_room, 'A2', 'acceptance_review_2')
+        self.assertEqual(second['acceptance']['request_id'], 'acceptance_review_2')
+        # An idempotent re-admission of A1 still compares the body, not the snapshot.
+        again = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.', 'User authorized this bounded assignment')
+        self.assertTrue(again['opened'])
+
+
+class RevisionTests(CoordinationFixture):
+    def test_owner_spec_change_blocks_preflight(self):
+        record = self.handed_back()
+        self.service.ao_room_spec_put(self.room, 2, 'Revised owner content.',
+                                      self.gates, 'Astra approves this revision')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertFalse(preflight['ready'])
+        self.assertIn('owner_spec_changed', preflight['blockers'])
+
+    def test_assignment_spec_content_change_refuses_handback(self):
+        self.assignment_accepted()
+        self.service.ao_room_spec_put(self.assign_room, 2, 'Revised assignment content.',
+                                      self.gates_b, 'Astra approves this revision')
+        with self.assertRaisesRegex(RoomError, 'assignment_spec_changed'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_gates_only_revision_remains_allowed(self):
+        self.open_rooms()
+        # The same spec content under a different gate list keeps the lineage binding.
+        gates = self.gates_b + [[sys.executable, '-c', 'pass']]
+        self.service.ao_room_spec_put(self.assign_room, 2, 'Implement the bounded assignment.',
+                                      gates, 'Astra approves this revision')
+        self.agree_b(revision=2)
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        self.accept_b()
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(record['spec']['revision'], 2)
+
+    def test_bad_baseline_and_scope_drift_refuse(self):
+        self.open_rooms()
+        self.agree_b()
+        # An orphan HEAD in the assignment worktree does not descend from the lineage baseline.
+        self.git(self.assign_wt, 'checkout', '--orphan', 'unrelated')
+        (self.assign_wt / self.OWNED).write_text('done\n')
+        self.commit_wt(self.assign_wt, 'orphan root')
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.send_b('implementation')
+        self.fake.finish('engineer-b', json.dumps(self.report_b()))
+        self.service.ao_room_sync(self.assign_room)
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'baseline_mismatch'):
+            self.accept_b()
+        with self.assertRaisesRegex(RoomError, 'refused'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+
+class InterruptionTests(CoordinationFixture):
+    def test_repeated_records_are_idempotent(self):
+        recorded = self.handed_back()
+        first = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(first, recorded)
+        self.assertEqual(len(list((self.assignments_root() / 'A1' / 'handbacks').glob('*.json'))), 1)
+        lineage_dir = self.assignments_root() / 'A1'
+        self.assertEqual(first['handback_sha256'], self.lifecycle()['latest_handback']['sha256'])
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', first['handback_sha256'])
+        again = self.service.ao_room_import_preflight(self.room, 'A1', first['handback_sha256'])
+        self.assertEqual(again['preflight_sha256'], preflight['preflight_sha256'])
+        self.assertEqual(len(list((lineage_dir / 'import-preflights').glob('*.json'))), 1)
+        self.git(self.repo, 'cherry-pick', '-x', first['commit'])
+        imported = self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                                    'git cherry-pick -x ' + first['commit'])
+        repeat = self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                                  'git cherry-pick -x ' + first['commit'])
+        self.assertEqual(repeat['import_sha256'], imported['import_sha256'])
+        self.assertEqual(len(list((lineage_dir / 'imports').glob('*.json'))), 1)
+        with self.assertRaisesRegex(RoomError, 'immutable_import'):
+            self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'], 'git merge other')
+
+    def test_interrupted_handback_retry_completes_pointers(self):
+        self.assignment_accepted()
+        real = ao.atomic
+
+        def flaky(path, value):
+            if Path(path).name == 'state.json' and 'coordination' in str(path):
+                raise OSError('simulated crash after the immutable write')
+            return real(path, value)
+
+        with patch.object(ao, 'atomic', side_effect=flaky):
+            with self.assertRaises(OSError):
+                self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        files = list((self.assignments_root() / 'A1' / 'handbacks').glob('*.json'))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self.lifecycle()['handbacks'], [])
+        result = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(result['handback_sha256'], files[0].stem)
+        self.assertEqual(self.lifecycle()['latest_handback']['sha256'], files[0].stem)
+        self.assertEqual(len(list((self.assignments_root() / 'A1' / 'handbacks').glob('*.json'))), 1)
+        with self.assertRaisesRegex(RoomError, 'missing_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'different-request')
+
+    def test_lineage_immutability(self):
+        self.open_rooms()
+        again = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.', 'User authorized this bounded assignment')
+        self.assertTrue(again['opened'])
+        with self.assertRaisesRegex(RoomError, 'immutable'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A1', self.assign_room, ['other'], 'interface', 'authorization')
+
+
+class ImportConflictTests(CoordinationFixture):
+    def test_owner_conflict_requires_recorded_resolution(self):
+        record = self.handed_back()
+        # The owner modifies the same owned path the assignment changed.
+        (self.repo / 'owned' / 'part.txt').write_text('owner version\n')
+        self.commit_wt(self.repo, 'owner touch')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertFalse(preflight['ready'])
+        self.assertEqual(preflight['preview'], 'conflicts')
+        self.assertEqual(preflight['blockers'], [])
+        self.assertIn('owned/part.txt', preflight['owner_touched_assigned_paths'])
+        self.assertIn('owned/part.txt', preflight['conflicts'])
+        # An import record requires an owner HEAD that descends from the preflight head.
+        with self.assertRaisesRegex(RoomError, 'import_not_performed'):
+            self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'], 'git merge')
+        # The operator writes the merged content and commits; the destination differs
+        # from the handback bytes, so the record requires a nonempty resolution.
+        (self.repo / 'owned' / 'part.txt').write_text('merged content\n')
+        self.commit_wt(self.repo, 'resolve owned/part.txt')
+        with self.assertRaisesRegex(RoomError, 'integration_modifications_unresolved'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'manual merge then record')
+        imported = self.service.ao_room_import_record(
+            self.room, 'A1', preflight['preflight_sha256'], 'manual merge then record',
+            resolution='Merged owner and assignment bytes in owned/part.txt by hand.')
+        self.assertEqual(imported['kind'], 'resolved_with_modifications')
+        self.assertEqual(imported['modified_paths'], ['owned/part.txt'])
+        self.assertEqual(imported['resolution'],
+                         'Merged owner and assignment bytes in owned/part.txt by hand.')
+
+    def test_unrelated_commit_is_not_an_import(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        # An owner commit that carries none of the handback paths is not an import;
+        # a resolution text cannot repair the missing handback.
+        (self.repo / 'unrelated.txt').write_text('owner only\n')
+        self.commit_wt(self.repo, 'unrelated owner commit')
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git commit unrelated',
+                resolution='Recorded an unrelated owner commit.')
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+
+    def test_owner_head_advance_reports_stale_preflight(self):
+        record = self.handed_back()
+        clean = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(clean['ready'])
+        # The owner may advance its own unowned scope; a new preflight stays ready.
+        (self.repo / 'feature.txt').write_text('advanced\n')
+        self.commit_wt(self.repo, 'owner advances unowned path')
+        advanced = self.git(self.repo, 'rev-parse', 'HEAD')
+        later = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(later['ready'])
+        self.assertEqual(later['owner_touched_assigned_paths'], [])
+        self.assertEqual(later['owner_head_before'], advanced)
+        # Only the latest recorded preflight may be imported.
+        with self.assertRaisesRegex(RoomError, 'stale_preflight'):
+            self.service.ao_room_import_record(self.room, 'A1', clean['preflight_sha256'], 'git merge')
+        # An owner HEAD that does not descend from the preflight head is stale too.
+        self.git(self.repo, 'reset', '--hard', 'HEAD~1')
+        with self.assertRaisesRegex(RoomError, 'preflight_stale'):
+            self.service.ao_room_import_record(self.room, 'A1', later['preflight_sha256'], 'git merge')
+        self.git(self.repo, 'reset', '--hard', advanced)
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        imported = self.service.ao_room_import_record(self.room, 'A1', later['preflight_sha256'],
+                                                      'git cherry-pick -x ' + record['commit'])
+        self.assertEqual(imported['kind'], 'faithful')
+
+    def test_multi_commit_handback_suggests_and_imports_the_range(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def two_commits():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            self.commit_wt(self.assign_wt, 'first assignment commit')
+            (self.assign_wt / 'owned' / 'second.txt').write_text('second\n')
+            self.commit_wt(self.assign_wt, 'second assignment commit')
+
+        self.implement_b(two_commits, commit=False)
+        self.review_b()
+        self.accept_b()
+        record = self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+        self.assertEqual(sorted(entry['path'] for entry in record['changed_paths']),
+                         ['owned/part.txt', 'owned/second.txt'])
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.assertEqual(preflight['preview'], 'clean')
+        self.assertIn('merge', preflight['suggested_operation'])
+        self.assertEqual(preflight['suggested_operation'][-1], record['commit'])
+        # Importing only the last commit leaves a handback path missing: the handback is
+        # not incorporated and no resolution text can repair that.
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
+            self.service.ao_room_import_record(self.room, 'A1', preflight['preflight_sha256'],
+                                               'git cherry-pick -x ' + record['commit'],
+                                               resolution='Imported only the tip.')
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+        self.git(self.repo, 'reset', '--hard', preflight['owner_head_before'])
+        # The suggested merge reproduces every handback path byte for byte.
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        imported = self.service.ao_room_import_record(
+            self.room, 'A1', preflight['preflight_sha256'],
+            'git merge --no-ff --no-edit ' + record['commit'])
+        self.assertEqual(imported['kind'], 'faithful')
+        self.assertEqual(imported['missing_paths'], [])
+        self.assertEqual(self.lifecycle()['state'], 'imported')
+
+
+class OrdinaryRoomTests(CoordinationFixture):
+    def test_ordinary_room_is_unchanged(self):
+        self.room = self.open('normal')
+        self.spec()
+        self.bind()
+        self.agree()
+        self.implement()
+        self.review()
+        result = self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.assertTrue(result['accepted'])
+        self.assertEqual(self.service.ao_room_status(self.room)['coordination'],
+                         {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
+        self.assertNotIn('coordination', self.state())
+        compact = self.service.ao_room_status(self.room, 'compact')['coordination']
+        self.assertEqual(compact, {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
+        progress = self.service.ao_room_progress(self.room)['coordination']
+        self.assertEqual(progress, {'role': None, 'assignments': [], 'account_policy': {'mode': 'single', 'owner_profile': None, 'assignment_profile': None}})
+        rooms = {item['room_id']: item for item in self.service.ao_room_list()['rooms']}
+        self.assertEqual(rooms[self.room]['coordination'], {'role': None})
+
+
+class GateTests(CoordinationFixture):
+    def test_mutating_failing_gate_blocks_handback(self):
+        mutating = [[sys.executable, '-c',
+                     "from pathlib import Path; Path('owned/part.txt').write_text('mutated\\n')"]]
+        self.open_rooms()
+        self.service.ao_room_spec_put(self.assign_room, 2, 'Implement the bounded assignment.',
+                                      mutating, 'Astra approves this revision')
+        self.agree_b(revision=2)
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        result = self.service.ao_room_verify(self.assign_room, str(self.assign_wt))
+        self.assertFalse(result['passed'])
+        with self.assertRaises(RoomError):
+            self.accept_b()
+        with self.assertRaisesRegex(RoomError, 'missing_checkpoint'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_unverifiable_worktree_refuses(self):
+        self.assignment_accepted()
+        real = ao_coordination._git_run
+
+        def broken(path, *args):
+            if args and args[0] == 'status':
+                return subprocess.CompletedProcess(['git'], 1, b'', b'fatal: not a git repository')
+            return real(path, *args)
+
+        with patch.object(ao_coordination, '_git_run', side_effect=broken):
+            with self.assertRaisesRegex(RoomError, 'worktree_unverified'):
+                self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_scope_drift_refuses_at_accept_and_handback(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def change():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            (self.assign_wt / 'feature.txt').write_text('out of scope\n')
+
+        self.implement_b(change)
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'scope_drift'):
+            self.accept_b()
+        with self.assertRaisesRegex(RoomError, 'missing_acceptance'):
+            self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class EvidenceIntegrityTests(CoordinationFixture):
+    """F1: unresolved coordination evidence refuses; a lineage-only reservation stays engaged."""
+
+    def _interrupt_a1_lifecycle_write(self):
+        """Open A1 so its lineage.json lands but the first state.json write crashes."""
+        self.room = self.open('owner')
+        self.spec()
+        self.bind()
+        self.agree()
+        self.service.ao_room_handoff(self.room, str(self.repo))
+        self.assign_room = self.service.ao_room_open(
+            str(self.repo), 'assignment', 'project', 'User authorized this assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.spec_b()
+        self.bind_b()
+        real = ao.atomic
+
+        def flaky(path, value):
+            if Path(path).name == 'state.json' and 'coordination' in str(path):
+                raise OSError('simulated crash between the lineage and lifecycle writes')
+            return real(path, value)
+
+        with patch.object(ao, 'atomic', side_effect=flaky):
+            with self.assertRaises(OSError):
+                self.service.ao_room_assignment_open(
+                    self.room, 'A1', self.assign_room, ['owned'],
+                    'The interface contract for the owned paths.',
+                    'User authorized this bounded assignment')
+        directory = self.assignments_root() / 'A1'
+        self.assertTrue((directory / 'lineage.json').exists())
+        self.assertFalse((directory / 'state.json').exists())
+
+    def _owner_acceptance_touching_owned(self):
+        self.send('implementation')
+        (self.repo / 'feature.txt').write_text('implemented\n')
+        (self.repo / self.OWNED).write_text('owner wrote here\n')
+        self.commit_wt(self.repo, 'owner touches owned path')
+        self.fake.finish('engineer', json.dumps(self.report()))
+        self.service.ao_room_sync(self.room)
+        self.review()
+
+    def test_interrupted_admission_keeps_the_reservation_and_retry_repairs(self):
+        # (a) a lineage-only reservation blocks overlap and repair rechecks cleanly.
+        self._interrupt_a1_lifecycle_write()
+        other_owner = self._second_owner()
+        with self.assertRaisesRegex(RoomError, 'overlap'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A2', self.assign_room, ['owned'], 'interface', 'authorization')
+        result = self.service.ao_room_assignment_open(
+            self.room, 'A1', self.assign_room, ['owned'],
+            'The interface contract for the owned paths.',
+            'User authorized this bounded assignment')
+        self.assertTrue(result['opened'])
+        self.assertTrue((self.assignments_root() / 'A1' / 'state.json').exists())
+        engaged = [entry for entry in self.assignments_root().glob('*/lineage.json')
+                   if 'owned' in (ao.read(entry).get('owned_paths') or [])]
+        self.assertEqual(len(engaged), 1)
+
+    def test_corrupt_lifecycle_of_another_assignment_refuses_admission(self):
+        # (b) unreadable evidence of another assignment refuses a new admission.
+        self.open_rooms()
+        other_room = self.service.ao_room_open(
+            str(self.repo), 'assignment-two', 'project', 'User authorized another assignment',
+            'http://127.0.0.1:1234', delegate_provider='none')['room_id']
+        self.service.ao_room_spec_put(other_room, 1, 'Implement the other assignment.',
+                                      self.gates_b, 'Astra approves this scope')
+        (self.assignments_root() / 'A1' / 'state.json').write_text('{garbage')
+        other_owner = self._second_owner()
+        with self.assertRaisesRegex(RoomError, 'unresolved'):
+            self.service.ao_room_assignment_open(
+                other_owner, 'A2', other_room, ['unrelated'], 'interface', 'authorization')
+
+    def test_retry_rechecks_reservations_and_refuses_a_conflict(self):
+        # (c) an engaged reservation appearing while A1 was interrupted blocks the repair.
+        self._interrupt_a1_lifecycle_write()
+        zed_dir = self.assignments_root() / 'Z1'
+        zed_dir.mkdir()
+        owner_state = self.state()
+        zed = {'version': 1, 'assignment_id': 'Z1', 'owner_room_id': 'ao-foreign-owner',
+               'assignment_room_id': self.assign_room,
+               'git_common_dir': owner_state['git_common_dir'],
+               'owner': {'spec_revision': 1, 'spec_sha256': '0' * 64,
+                         'spec_record_sha256': '0' * 64, 'handoff_sha256': '0' * 64,
+                         'baseline_commit': '0' * 40, 'worktree': str(self.repo)},
+               'assignment': {'spec_revision': 1, 'spec_sha256': '0' * 64,
+                              'spec_record_sha256': '0' * 64},
+               'owned_paths': ['owned'], 'interface': 'i', 'authorization': 'a',
+               'supersedes': None, 'created_at': 1.0}
+        ao.atomic(zed_dir / 'lineage.json', zed)
+        lifecycle = {'version': 1, 'assignment_id': 'Z1', 'state': 'active',
+                     'lineage_sha256': ao.digest(zed), 'handbacks': [], 'latest_handback': None,
+                     'preflights': [], 'import': None, 'superseded_by': None, 'refusals': [],
+                     'updated_at': 1.0}
+        ao.atomic(zed_dir / 'state.json', lifecycle)
+        with self.assertRaisesRegex(RoomError, 'retry conflicts'):
+            self.service.ao_room_assignment_open(
+                self.room, 'A1', self.assign_room, ['owned'],
+                'The interface contract for the owned paths.',
+                'User authorized this bounded assignment')
+        self.assertFalse((self.assignments_root() / 'A1' / 'state.json').exists())
+
+    def test_missing_and_corrupt_evidence_at_both_acceptance_boundaries(self):
+        # (d) a reservation still controls owner paths; corrupt evidence refuses acceptance.
+        self.open_rooms()
+        directory = self.assignments_root() / 'A1'
+        (directory / 'state.json').unlink()
+        self._owner_acceptance_touching_owned()
+        with self.assertRaisesRegex(RoomError, 'owned_by_active_assignment'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        (directory / 'state.json').write_text('{garbage')
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        # Corrupt lineage refuses at both acceptance hooks.
+        lineage_path = directory / 'lineage.json'
+        original = lineage_path.read_bytes()
+        flipped = original[:-2] + (b'Z' if original[-2:-1] != b'Z' else b'Y') + original[-1:]
+        lineage_path.write_bytes(flipped)
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.accept_b()
+
+    def test_deleted_assignment_directory_refuses_both_acceptance_boundaries(self):
+        # A pointer that names an assignment with no records at all is unresolved at
+        # acceptance, not "no assignment"; only an empty sibling directory may be ignored.
+        self.open_rooms()
+        shutil.rmtree(self.assignments_root() / 'A1')
+        self._owner_acceptance_touching_owned()
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.service.ao_room_accept(self.room, 'acceptance_review')
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+        self.implement_b()
+        self.review_b()
+        with self.assertRaisesRegex(RoomError, 'coordination_evidence_unresolved'):
+            self.accept_b()
+
+
+class ImportAuthorityTests(CoordinationFixture):
+    """F3: import_record revalidates the preflight's authority against current evidence."""
+
+    def _ready_import(self):
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        return record, preflight
+
+    def test_owner_spec_change_after_preflight_refuses_the_import(self):
+        # (a) a spec revision after the preflight changes its authority.
+        record, preflight = self._ready_import()
+        self.service.ao_room_spec_put(self.room, 2, 'Revised owner content.',
+                                      self.gates, 'Astra approves this revision')
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_spec_changed'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+        fresh = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertIn('owner_spec_changed', fresh['blockers'])
+
+    def test_a_later_handback_supersedes_the_preflighted_one(self):
+        # (b) a second acceptance+handback after the preflight makes it stale.
+        record, preflight = self._ready_import()
+        self.correction_b()
+        self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review_2')
+        with self.assertRaisesRegex(RoomError, 'stale_preflight'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(self.lifecycle()['state'], 'handback_recorded')
+
+    def test_assignment_spec_change_after_preflight_refuses_the_import(self):
+        # (c) an assignment spec content change after the preflight refuses.
+        record, preflight = self._ready_import()
+        self.service.ao_room_spec_put(self.assign_room, 2, 'Revised assignment content.',
+                                      self.gates_b, 'Astra approves this revision')
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*assignment_spec_changed'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+
+    def test_unsettled_owner_request_after_preflight_refuses_the_import(self):
+        # (d) an in-flight owner request after the preflight refuses.
+        record = self.handed_back()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.send('implementation')  # left running while the import is performed
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        with self.assertRaisesRegex(RoomError, 'preflight_authority_changed.*owner_busy'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+
+
+class ImportIncorporationTests(CoordinationFixture):
+    """F5: already-incorporated paths are faithful; a real drop and an unrelated commit refuse."""
+
+    def _two_file_handback(self):
+        self.open_rooms()
+        self.agree_b()
+        self.service.ao_room_handoff(self.assign_room, str(self.assign_wt))
+
+        def change():
+            (self.assign_wt / self.OWNED).write_text('done\n')
+            (self.assign_wt / 'owned' / 'two.txt').write_text('two\n')
+
+        self.implement_b(change)
+        self.review_b()
+        self.accept_b()
+        return self.service.ao_room_handback_record(self.assign_room, 'A1', 'acceptance_review')
+
+    def test_already_incorporated_paths_do_not_break_faithfulness(self):
+        # (a) the owner already holds one handback path byte-identical before the merge.
+        record = self._two_file_handback()
+        (self.repo / self.OWNED).write_text('done\n')
+        self.commit_wt(self.repo, 'owner already holds part.txt')
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.assertTrue(preflight['ready'])
+        self.git(self.repo, 'merge', '--no-ff', '--no-edit', record['commit'])
+        imported = self.service.ao_room_import_record(
+            self.room, 'A1', preflight['preflight_sha256'], 'git merge ' + record['commit'])
+        self.assertEqual(imported['kind'], 'faithful')
+        self.assertEqual(imported['already_incorporated_paths'], ['owned/part.txt'])
+        self.assertEqual(imported['missing_paths'], [])
+
+    def test_unrelated_head_advance_still_refuses(self):
+        # (b) an unrelated owner commit is no import: nothing incorporated, no ancestry.
+        record = self._two_file_handback()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        (self.repo / 'unrelated.txt').write_text('owner only\n')
+        self.commit_wt(self.repo, 'unrelated owner commit')
+        with self.assertRaisesRegex(RoomError, 'handback_not_incorporated'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git commit unrelated',
+                resolution='Recorded an unrelated owner commit.')
+
+    def test_a_dropped_handback_path_refuses_with_its_name(self):
+        # (c) cherry-picking the work then reverting one path is a real drop.
+        record = self._two_file_handback()
+        preflight = self.service.ao_room_import_preflight(self.room, 'A1', record['handback_sha256'])
+        self.git(self.repo, 'cherry-pick', '-x', record['commit'])
+        self.git(self.repo, 'rm', '-f', 'owned/part.txt')
+        self.git(self.repo, 'commit', '-m', 'drop owned/part.txt')
+        with self.assertRaisesRegex(RoomError, 'owned/part.txt'):
+            self.service.ao_room_import_record(
+                self.room, 'A1', preflight['preflight_sha256'], 'git cherry-pick -x ' + record['commit'])

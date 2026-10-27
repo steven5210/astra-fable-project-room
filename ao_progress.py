@@ -1817,6 +1817,8 @@ def inspect(directory, state, request_id=None, max_text_chars=400):
     # Controller facts only, computed before the transcript is opened so an unavailable source keeps them.
     view["provenance"] = _provenance(state, requests, request, explicit=request_id is not None)
     view["stages"] = _stages(directory, state, requests, request, anchor)
+    import ao_coordination
+    view["coordination"] = ao_coordination.view(directory.parent.parent, state)
     import ao_current_summary  # Lazy: ao_current_summary imports this module back.
     view["current_summary"] = ao_current_summary.summarize(directory, state)
     try:
