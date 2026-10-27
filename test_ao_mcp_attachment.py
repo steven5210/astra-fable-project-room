@@ -194,6 +194,16 @@ class AttachmentTests(unittest.TestCase):
         self.send(proc, {"jsonrpc": "2.0", "id": identifier, "method": "tools/list", "params": {}})
         return self.receive(proc)
 
+    def observed(self, proc, identifier):
+        """Deterministic barrier: the fake server echoes `probe` frames, and the
+        wrapper's server->client pump forwards and observes frames in order on one
+        thread, so when the echo reaches the client every earlier server frame
+        (the initialize or tools/list response) has already been observed by the
+        witness and any receipt it triggers has been written. No timing involved."""
+        frame = {"jsonrpc": "2.0", "id": identifier, "method": "probe", "params": {}}
+        self.send(proc, frame)
+        self.assertEqual(json.loads(self.receive(proc)), frame)
+
     def handshake(self, proc):
         self.initialize(proc)
         self.enumerate(proc)
@@ -329,12 +339,22 @@ class AttachmentTests(unittest.TestCase):
             attachment.validate_attachment(self.room, self.state, self.prepared)
 
     def test_reused_request_id_after_initialize_is_not_a_second_initialize(self):
+        # A request id reused after the initialize response is an ordinary
+        # request, not a second initialize. The wrapper observes a forwarded
+        # frame only after writing it to the client, so a reuse sent immediately
+        # after receive() could otherwise race the witness; the probe barriers
+        # wait for the witness to record each response before the next send.
         proc = self.start()
         self.initialize(proc, identifier="same")
+        self.observed(proc, "barrier-1")  # the witness has recorded the initialize response
         self.enumerate(proc, identifier="same")
-        self.wait_for(self.ready_receipt)
+        self.observed(proc, "barrier-2")  # ... and the tools/list response, so the receipt is written
+        self.assertFalse(self.invalid_receipt())
+        self.assertIsNotNone(self.ready_receipt())
         attachment.validate_attachment(self.room, self.state, self.prepared)
         self.enumerate(proc, identifier="same", initialized=False)
+        self.observed(proc, "barrier-3")
+        self.assertFalse(self.invalid_receipt())
         attachment.validate_attachment(self.room, self.state, self.prepared)
 
     def test_native_session_and_cwd_mismatches_refuse_before_child_launch(self):
