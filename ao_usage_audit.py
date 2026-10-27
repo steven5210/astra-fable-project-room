@@ -229,12 +229,8 @@ def _worker_map(binding):
         raise evidence.AuditRefusal("preparation_unbound", binding["request_sha256"], binding["owner_sha256"]) from None
     if agents != value["agents"]:
         raise evidence.AuditRefusal("preparation_unbound", binding["request_sha256"], binding["owner_sha256"])
-    qualification = found["routing"].get("worker_qualification")
-    if qualification is not None:
-        try:
-            evidence._retained_qualification(root, qualification["snapshot"])
-        except evidence.AuditRefusal as refusal:
-            raise evidence.AuditRefusal(refusal.reason, binding["request_sha256"], binding["owner_sha256"]) from None
+    # historical_routing already verified the found routing's retained qualification record and
+    # every declared capture (verify_reference); the initial preparation's were verified at binding.
     return agents
 
 
