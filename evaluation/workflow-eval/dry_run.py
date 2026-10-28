@@ -22,9 +22,11 @@ import tempfile
 
 PACKAGE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE / "checks"))
+sys.path.insert(0, str(PACKAGE.parent.parent))
 import export_bundle  # noqa: E402
 import probes  # noqa: E402
 import score  # noqa: E402
+import ao_timing  # noqa: E402
 
 EXPECTED_DRY_RUN = {("T1", "baseline"): False, ("T1", "variant-1"): True, ("T2", "baseline"): False, ("T2", "variant-1"): True,
                     ("T3", "baseline"): False, ("T3", "variant-1"): True}
@@ -110,6 +112,125 @@ def synthetic_room(temp, settled_review=True):
     return room, repo, head
 
 
+def audit_room(temp):
+    """A synthetic room exercising ao_timing.inspect: implementation, a quota-held settled
+    correction, a second correction, a timed verification and an acceptance (fixed epochs)."""
+    room, repo, head = synthetic_room(temp, settled_review=True)
+    base = 1_800_000_000.0
+    handoff = json.loads((room / "handoffs" / "h.json").read_text())
+    report = {"outcome": "completed", "implementation_complete": True, "changes": ["summarize_cli.py"],
+              "tests_reported": ["python3 -B tests/test_summarize_cli.py -v: OK"], "review_findings": [],
+              "remaining_gaps": [], "backlog": [], "routing_log": [], "spec_revision": 1,
+              "spec_sha256": "0" * 64, "baseline_commit": handoff["baseline_commit"]}
+    rows = (("spec-review-1", "engineer", "spec_review", "completed", 0, 5, None, '{"decision": "accept"}'),
+            ("implementation-1", "engineer", "implementation", "completed", 6, 20, None, json.dumps(report)),
+            ("correction-1", "engineer", "correction", "settled_failure", 22, 24,
+             {"kind": "quota_limit", "hold": True, "reason": "synthetic quota hold"}, '{"outcome": "failed"}'),
+            ("correction-2", "engineer", "correction", "completed", 70, 84, None, json.dumps(report)),
+            ("acceptance-1", "reviewer", "acceptance_review", "completed", 88, 91, None, '{"decision": "approved"}'))
+    shutil.rmtree(room / "receipts")
+    requests = {}
+    for rid, role, purpose, state_value, created, observed, semantic, text in rows:
+        request = {"request_id": rid, "role": role, "purpose": purpose, "state": state_value,
+                   "created_at": base + created * 60,
+                   "usage": {"known": True, "inputTokens": 200, "outputTokens": 20000,
+                             "cachedTokens": 300000, "totalTokens": 320200},
+                   "account_profile": {"name": "b"}}
+        if semantic is not None:
+            request["semantic_status"] = semantic
+        receipt = {"observed_at": base + observed * 60,
+                   "messages": [{"role": "user", "text": "Perform the exact authorized purpose."},
+                                {"role": "assistant", "text": text}]}
+        relative = "receipts/" + rid + "/" + hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest() + ".json"
+        (room / relative).parent.mkdir(parents=True, exist_ok=True)
+        (room / relative).write_text(json.dumps(receipt))
+        (room / relative).chmod(0o600)
+        request["receipt"] = relative
+        requests[rid] = request
+    state = json.loads((room / "state.json").read_text())
+    state["requests"] = requests
+    state["verifications"] = [dict(state["verifications"][0], started_at=base + 85 * 60,
+                                   finished_at=base + 87 * 60)]
+    (room / "state.json").write_text(json.dumps(state))
+    return room, repo, state
+
+
+def render_audit_example():
+    """Deterministic audit-measurement example from the synthetic audit room (fixed epochs)."""
+    with tempfile.TemporaryDirectory() as temp:
+        temp = pathlib.Path(temp).resolve()
+        room, repo, state = audit_room(temp)
+        timing = ao_timing.inspect(room, state)
+        task_path = PACKAGE / "tasks" / "T2-helper-only-proof" / "task.json"
+        bundle = export_bundle.export(room, "T2", "variant-1", 1, task_path, None, "0" * 40, "completed", None)
+        exported = score.score_bundle(bundle)
+        caps = json.loads((PACKAGE / "caps.json").read_text())
+        cap = score.capacity([exported], caps)
+    totals, gaps, coverage = timing["totals"], timing["totals"]["gaps"], timing["coverage"]
+    outcomes, usage = exported["outcomes"], exported["usage"]
+    lines = ["# Audit measurement example (synthetic room, fixed epochs)",
+             "",
+             "Intervals and gaps come from `ao_room_timing` over saved controller records only; "
+             "the census, usage and capacity come from the exporter and scorer on the same room.",
+             "",
+             "## Intervals and gaps by category",
+             "",
+             "| category | seconds |", "|---|---|"]
+    for name, seconds in sorted(totals["by_category"].items()):
+        lines.append(f"| {name} | {seconds} |")
+    lines += ["", "| gap kind | seconds |", "|---|---|",
+              f"| quota_wait | {gaps['quota_wait']} |", f"| hold_wait | {gaps['hold_wait']} |",
+              f"| unattributed | {gaps['unattributed']} |",
+              f"| unknown_bounds count | {gaps['unknown_bounds']} |", "",
+              f"Coverage: first {coverage['first_started_at']} to last {coverage['last_known_at']} "
+              f"(span {coverage['span_seconds']} s).",
+              f"Overlap (sum - union): {totals['overlap_seconds']} s; elapsed alone is never a speedup.",
+              "", "## Audit classes", "",
+              "| audit class | value |", "|---|---|",
+              "| implementation | engineering intervals of `implementation` purpose |",
+              "| product-correctness repair | engineering intervals of `correction` purpose; the cause is not recorded |",
+              "| operator or harness failure | unknown: no representation in controller records |",
+              f"| provider wait | quota_wait gaps, {gaps['quota_wait']} s, basis: saved semantic status kind quota_limit; "
+              f"hold_wait gaps of kind provider_error would count too (none here) |",
+              "| resource wait | unknown: no representation in controller records |",
+              "| handoff delay | inside unattributed; not separable |",
+              f"| accepted outcomes (complete) | {1 if outcomes['accepted_candidate'] else 0} "
+              f"(latest acceptance bound to the exported candidate: {outcomes['accepted_candidate']}) |",
+              f"| recorded acceptances (any) | {timing['closure']['acceptances_recorded']} |",
+              "| engineering-integrated outcomes | unavailable: a single-room bundle carries no coordination import record |",
+              f"| tasks | {outcomes['tasks']} |",
+              f"| reports | engineering requests completed {outcomes['engineering_requests_completed']}, "
+              f"not completed {outcomes['engineering_requests_not_completed']}; correction dispatches {exported['correction_rounds']} "
+              f"(dispatches, not completed corrections) |",
+              f"| tests | {len((bundle['report'] or {}).get('tests_reported') or [])} tests_reported entries in the final report; "
+              f"claims, never summed across requests |",
+              "", "## Usage", "",
+              "| role | input | output | cached | known items | unknown items |", "|---|---|---|---|---|---|"]
+    for role in ("parent", "worker", "judge"):
+        u = usage[role]
+        def shown(counter, u=u):
+            if u["known_items"] == 0:
+                return "unknown"
+            return str(u[counter]) + (" (partial)" if u["unknown_items"] else "")
+        lines.append(f"| {role} | {shown('inputTokens')} | {shown('outputTokens')} | {shown('cachedTokens')} | "
+                     f"{u['known_items']} | {u['unknown_items']} |")
+    lines += ["Unknown is not zero: a role with no known item shows unknown; a partial sum is labelled partial. "
+              "Cached tokens are recorded, never a quota. Shared-account rate readings are never attributable.",
+              "", "## Capacity vs caps.json", "",
+              "| counter | used | retired | remaining | cap |", "|---|---|---|---|---|"]
+    for name, figure in sorted(cap["overall"].items()):
+        remaining = figure["remaining"]
+        lines.append(f"| {name} | {figure['used']} | {figure['retired']} | "
+                     f"{remaining if remaining is not None else figure.get('reason')} | {figure['cap']} |")
+    lines += ["", "## Limitations", ""]
+    for item in sorted(timing["limitations"]):
+        lines.append("- " + item)
+    lines += ["- The room is synthetic; figures exercise the fields, not real behavior.",
+              "- tasks stay unavailable: bundles carry no plan or transcript.",
+              ""]
+    return "\n".join(lines)
+
+
 def step(report, name, ok, detail=""):
     report.append({"step": name, "ok": bool(ok), "detail": detail})
     return ok
@@ -119,8 +240,14 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--freeze", action="store_true", help="write tasks/manifest.json from the current task inputs")
     parser.add_argument("--unseal", help="plaintext sealed expectation for H1 (kept outside the repository)")
+    parser.add_argument("--write-audit-example", metavar="PATH",
+                        help="render the deterministic audit-measurement example and exit")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if args.write_audit_example:
+        pathlib.Path(args.write_audit_example).write_text(render_audit_example())
+        print("wrote " + args.write_audit_example)
+        return 0
     report = []
     manifest_path = PACKAGE / "tasks" / "manifest.json"
     current = task_manifest()
@@ -170,12 +297,94 @@ def main(argv):
             shutil.copytree(fixture, candidate)
             shutil.copytree(PACKAGE / "fixtures" / "dry-run" / name, candidate, dirs_exist_ok=True)
             subprocess.run(["git", "init", "-q", str(candidate)], check=True)
-            outcomes[name] = probes.probe("T2", candidate)["checks"]
-    good, helper_only = outcomes["reference-T2-good"], outcomes["reference-T2-helper-only"]
+            outcomes[name] = probes.probe("T2", candidate)
+    results = outcomes
+    good, helper_only = results["reference-T2-good"]["checks"], results["reference-T2-helper-only"]["checks"]
     step(report, "probe: entry-point tests detect the stub (good candidate)",
          good["probe_cli_stub_detected"] == "pass" and good["tests_exercise_cli"] == "pass" and good["gates_run_locally"] == "pass", json.dumps(good))
     step(report, "probe: helper-only tests do not detect the stub (flagged)",
          helper_only["probe_cli_stub_detected"] == "fail" and helper_only["tests_exercise_cli"] == "fail", json.dumps(helper_only))
+    with tempfile.TemporaryDirectory() as temp:
+        temp = pathlib.Path(temp)
+        regression = {}
+        for name in ("reference-T2-import-coupled", "reference-T2-many-failures",
+                     "reference-T2-syntax-error-tests", "reference-T2-comment-only"):
+            candidate = temp / name
+            shutil.copytree(fixture, candidate)
+            shutil.copytree(PACKAGE / "fixtures" / "dry-run" / name, candidate, dirs_exist_ok=True)
+            subprocess.run(["git", "init", "-q", str(candidate)], check=True)
+            records = temp / (name + ".records")
+            regression[name] = probes.probe("T2", candidate, records_dir=records)
+        coupled = regression["reference-T2-import-coupled"]
+        stub_run = coupled["details"].get("stub_probe") or {}
+        step(report, "probe: a harness error under the stub is unavailable, never detected",
+             coupled["checks"]["probe_cli_stub_detected"] == "unavailable"
+             and coupled["details"]["stub_classification"] == "stub_run_harness_error"
+             and coupled["details"]["stub_control"]["ran"] == 2 and stub_run.get("ran") == 0
+             and stub_run.get("harness_error") and stub_run["failures_total"] == 0,
+             json.dumps(coupled["checks"]))
+        many = regression["reference-T2-many-failures"]
+        stub_run = many["details"]["stub_probe"]
+        record_bytes = (temp / "reference-T2-many-failures.records" / "stub_probe.json").read_bytes()
+        step(report, "probe: a many-failure stub run names every failure with an intact complete record",
+             many["checks"]["probe_cli_stub_detected"] == "pass"
+             and many["details"]["stub_classification"] == "behavior_reds_named"
+             and stub_run["ran"] == 6 and stub_run["failures_total"] == 6
+             and len(stub_run["failures"]) == 6 and stub_run["omitted_failures"] == 0
+             and stub_run["complete_record_sha256"] == hashlib.sha256(record_bytes).hexdigest(),
+             json.dumps({"failures": [f["test"] for f in stub_run["failures"]]}))
+        syntax = regression["reference-T2-syntax-error-tests"]
+        step(report, "probe: an unparseable test module is a control harness error",
+             syntax["checks"]["probe_cli_stub_detected"] == "unavailable"
+             and syntax["details"]["stub_classification"] == "stub_control_harness_error"
+             and "SyntaxError" in (syntax["details"]["stub_control"]["harness_error"] or "")
+             and syntax["checks"]["tests_exercise_cli"] == "unavailable"
+             and syntax["details"]["tests_exercise_reason"] == "tests_module_unparseable",
+             json.dumps(syntax["checks"]))
+        comment = regression["reference-T2-comment-only"]
+        step(report, "probe: docstring and comment mentions do not count as exercising the CLI",
+             comment["checks"]["tests_exercise_cli"] == "fail"
+             and comment["checks"]["probe_cli_stub_detected"] == "fail"
+             and comment["details"]["stub_classification"] == "stub_undetected",
+             json.dumps(comment["checks"]))
+        mass = temp / "oversized"
+        shutil.copytree(fixture, mass)
+        shutil.copytree(PACKAGE / "fixtures" / "dry-run" / "reference-T2-good", mass, dirs_exist_ok=True)
+        lines = ["import json, os, subprocess, sys, tempfile, unittest",
+                 "ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))",
+                 "EXPECTED = {\"count\": 3, \"max\": 4.0, \"mean\": 2.5, \"min\": 1.0}",
+                 "class Mass(unittest.TestCase):",
+                 "    def run_cli(self):",
+                 "        with tempfile.TemporaryDirectory() as directory:",
+                 "            path = os.path.join(directory, \"in.txt\")",
+                 "            open(path, \"w\").write(\"1\\n2.5\\n\\n4\\n\")",
+                 "            return subprocess.run([sys.executable, \"-B\", os.path.join(ROOT, \"summarize_cli.py\"), path], capture_output=True, text=True)"]
+        for index in range(25):
+            lines.append("    def test_fail_%02d(self):" % index)
+            lines.append("        self.assertEqual(json.loads(self.run_cli().stdout or \"{}\"), EXPECTED)")
+        (mass / "tests" / "test_summarize_cli.py").write_text("\n".join(lines) + "\n")
+        subprocess.run(["git", "init", "-q", str(mass)], check=True)
+        mass_result = probes.probe("T2", mass, records_dir=temp / "mass.records")
+        stub_run = mass_result["details"]["stub_probe"]
+        step(report, "probe: more than MAX_NAMED failures reports an explicit omitted count",
+             stub_run["failures_total"] == 25 and len(stub_run["failures"]) == 20
+             and stub_run["omitted_failures"] == 5,
+             json.dumps({"total": stub_run["failures_total"], "omitted": stub_run["omitted_failures"]}))
+        summary_size = len(json.dumps(mass_result["details"]["stub_probe"]).encode())
+        mass_record = (temp / "mass.records" / "stub_probe.json").read_bytes()
+        step(report, "probe: the bounded summary never contains the complete record",
+             summary_size < 8192
+             and stub_run["complete_record_bytes"] == len(mass_record)
+             and stub_run["complete_record_sha256"] == hashlib.sha256(mass_record).hexdigest(),
+             json.dumps({"summary_bytes": summary_size,
+                         "complete_record_bytes": stub_run["complete_record_bytes"]}))
+        step(report, "probe: baseline outcomes are preserved",
+             good["probe_cli_stub_detected"] == "pass"
+             and results["reference-T2-good"]["details"]["stub_classification"] == "behavior_reds_named"
+             and results["reference-T2-good"]["details"]["stub_probe"]["failures_total"] == 2
+             and helper_only["probe_cli_stub_detected"] == "fail"
+             and results["reference-T2-helper-only"]["details"]["stub_classification"] == "stub_undetected",
+             json.dumps({"good": good, "helper": helper_only}))
     # Export and score a synthetic room through the real exporter, with the real probes.
     with tempfile.TemporaryDirectory() as temp:
         temp = pathlib.Path(temp)
@@ -258,6 +467,48 @@ def main(argv):
              bundle7["probe"]["stale"] is True and bundle7["probe"]["stale_reason"] == "content"
              and bundle7["checks"]["frozen_paths_unchanged"] == "unavailable",
              json.dumps(bundle7["probe"]))
+    # Audit measurement example: ao_timing over the synthetic audit room, then exporter and scorer.
+    with tempfile.TemporaryDirectory() as temp:
+        temp = pathlib.Path(temp).resolve()
+        room, repo, state = audit_room(temp)
+        timing = ao_timing.inspect(room, state)
+        task_path = PACKAGE / "tasks" / "T2-helper-only-proof" / "task.json"
+        bundle = export_bundle.export(room, "T2", "variant-1", 1, task_path, None, "0" * 40, "completed", None)
+        exported = score.score_bundle(bundle)
+        caps = json.loads((PACKAGE / "caps.json").read_text())
+        cap = score.capacity([exported], caps)
+        engineering = [iv for iv in timing["intervals"] if iv["category"] == "engineering"]
+        kinds = [gap["kind"] for gap in timing["gaps"]]
+        after_quota = [gap for gap in timing["gaps"] if gap["kind"] == "quota_wait"]
+        step(report, "audit: ao_timing folds engineering intervals and a quota_wait gap",
+             [iv["purpose"] for iv in engineering] == ["implementation", "correction", "correction"]
+             and len(after_quota) == 1 and after_quota[0]["after"] == "correction-1"
+             and timing["totals"]["gaps"]["hold_wait"] == 0.0
+             and "unattributed" in kinds, json.dumps(kinds))
+        outcomes = exported["outcomes"]
+        step(report, "audit: outcome census and capacity figures are additive projections",
+             outcomes["accepted_candidate"] is True
+             and outcomes["engineering_requests_completed"] == 2
+             and outcomes["engineering_requests_not_completed"] == 1
+             and exported["correction_rounds"] == 2
+             and exported["usage"]["worker"]["unknown_items"] == 2
+             and exported["elapsed_minutes"] == 91.0
+             and cap["overall"]["parent_dispatches"]["used"] == 4
+             and cap["overall"]["judge_dispatches"]["used"] == 1
+             and cap["overall"]["native_worker_launches"]["used"] == 2,
+             json.dumps({"outcomes": outcomes, "elapsed": exported["elapsed_minutes"]}))
+        injected = json.loads(json.dumps(bundle))
+        injected["caps"] = {"per_attempt": {}, "totals": {}}
+        injected["capacity"] = {"parent_dispatches": {"remaining": 999}}
+        injected["report"]["tests_reported"] = ["capacity refilled"]
+        injected_score = score.score_bundle(injected)
+        step(report, "audit: caps come from caps.json only; bundle and report text cannot refill them",
+             score.capacity([injected_score], caps) == cap
+             and score.capacity([exported], caps) == cap, "")
+        rendered = render_audit_example()
+        committed = (PACKAGE / "audit" / "EXAMPLE-REPORT.md")
+        step(report, "audit: the committed example equals the deterministic render",
+             committed.is_file() and committed.read_text() == rendered, "")
     # Score the synthetic bundles.
     scores = []
     for path in sorted((PACKAGE / "fixtures" / "dry-run").glob("*.json")):

@@ -7,12 +7,20 @@ Checks:
   frozen_paths_unchanged     every frozen path in the candidate has the fixture digest
   upstream_unchanged         (T3/H1) upstream/verdict.py has the fixture digest
   handback_record_unchanged  (H1) UPSTREAM-HANDBACK.json has the fixture digest
-  tests_exercise_cli         the CLI test module names subprocess, the entry point and -B
-  probe_cli_stub_detected    with the entry point replaced by a stub, the CLI test module fails
+  tests_exercise_cli         AST-parsed: the CLI test module imports and calls subprocess on the entry point with -B
+  probe_cli_stub_detected    with the entry point replaced by a stub, the CLI test module records assertion failures
   gates_run_locally          the task's gates exit 0 on the copy and leave the copy unchanged (informational;
                              the bundle's gates_pass comes from the room's formal verification)
+
+Red/green classification is structural, never console text: structured_unittest.py runs the
+candidate's test module and records unittest's own failure/error/skipped split. A behavior red is
+a named assertion failure; harness or collection errors (ImportError, SyntaxError, SystemExit)
+are recorded as harness_error and make the probe unavailable, never "detected". The bounded
+summary names up to MAX_NAMED failures/errors with explicit omitted counts and the complete
+record's digest; complete records stay in separate files under --records.
 """
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -32,6 +40,8 @@ GATES = {"T1": [["python3", "-B", "tests/test_metrics.py", "-v"], ["python3", "-
          "T3": [["python3", "-B", "tests/test_upstream_verdict.py", "-v"], ["python3", "-B", "tests/test_verdict_cli.py", "-v"]],
          "H1": [["python3", "-B", "tests/test_upstream_verdict.py", "-v"], ["python3", "-B", "tests/test_verdict_cli.py", "-v"]]}
 STUB = "import sys\nsys.stdout.write('{}\\n')\nsys.exit(0)\n"
+RUNNER = HERE / "structured_unittest.py"
+MAX_NAMED = 20
 
 
 def sha256(path):
@@ -57,10 +67,11 @@ def snapshot(root):
 
 
 def run(argv, cwd):
+    """Run argv in cwd and return (return_code, the COMPLETE captured output text)."""
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR",)}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     process = subprocess.run([sys.executable if argv[0] == "python3" else argv[0], *argv[1:]], cwd=cwd, capture_output=True, text=True, env=env, timeout=300)
-    return process.returncode, (process.stdout + process.stderr)[-2000:]
+    return process.returncode, process.stdout + process.stderr
 
 
 def candidate_identity(candidate):
@@ -80,10 +91,88 @@ def candidate_identity(candidate):
     return head.stdout.strip(), clean, tree
 
 
-def probe(case_id, candidate):
+def exercises_cli(source, entry):
+    """True iff the parsed test module really launches the entry point under subprocess -B.
+
+    Docstrings and comments never count: only import statements, calls and string constants
+    outside docstring position are evidence. Returns None when the module does not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    docstring_values = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            docstring_values.add(id(body[0].value))
+    imported = subprocess_called = entry_named = b_flag = False
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "subprocess" for alias in node.names):
+                imported = True
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            imported = True
+            imported_names.update(alias.asname or alias.name for alias in node.names)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"
+                    and func.attr in ("run", "Popen", "check_output", "call", "check_call")):
+                subprocess_called = True
+            elif isinstance(func, ast.Name) and func.id in imported_names:
+                subprocess_called = True
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and id(node) not in docstring_values):
+            if node.value == entry or node.value.endswith("/" + entry):
+                entry_named = True
+            if node.value == "-B":
+                b_flag = True
+    return imported and subprocess_called and entry_named and b_flag
+
+
+def summarize(record, record_bytes):
+    """The bounded summary of one complete structured runner record; never the complete text."""
+    failures, errors = record["failures"], record["errors"]
+    return {"ran": record["ran"], "failures_total": len(failures), "errors_total": len(errors),
+            "failures": failures[:MAX_NAMED], "errors": errors[:MAX_NAMED],
+            "omitted_failures": max(0, len(failures) - MAX_NAMED),
+            "omitted_errors": max(0, len(errors) - MAX_NAMED),
+            "skipped": record["skipped"],
+            "harness_error": (record["harness_error"] or "")[-400:] or None,
+            "complete_record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+            "complete_record_bytes": len(record_bytes),
+            # What `python3 -B <test_file> -v` would have exited: nonzero on a harness abort
+            # or any failure or error, zero otherwise.
+            "return_code": 0 if (record["harness_error"] is None
+                                 and not failures and not errors) else 1}
+
+
+def structured_run(test_file, cwd):
+    """Run the structured unittest runner on the disposable copy; return (record, record_bytes)."""
+    out = cwd / ".structured-run.json"
+    code, output = run(["python3", "-B", str(RUNNER), str(test_file), str(out)], cwd)
+    if code != 0 or not out.is_file():
+        return {"ran": 0, "failures": [], "errors": [], "skipped": 0,
+                "expected_failures": 0, "unexpected_successes": 0,
+                "harness_error": ("the structured runner itself failed: " + output[-1000:])
+                if output else "the structured runner itself failed",
+                "runner_output_sha256": None, "runner_output_bytes": 0}, b""
+    return json.loads(out.read_text()), out.read_bytes()
+
+
+def probe(case_id, candidate, records_dir=None):
     task, task_dir = task_for(case_id)
     fixture = task_dir / task["fixture_dir"]
     candidate = pathlib.Path(candidate).resolve()
+    records_dir = pathlib.Path(records_dir).resolve() if records_dir else None
+    if records_dir is not None:
+        records_dir.mkdir(parents=True, exist_ok=True)
     checks, details = {}, {}
     frozen = {}
     for relative in task["frozen_paths"]:
@@ -101,9 +190,16 @@ def probe(case_id, candidate):
         shutil.copytree(candidate, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"), symlinks=True)
         before = snapshot(copy)
         gate_results = []
-        for argv in GATES[case_id]:
-            code, tail = run(argv, copy)
-            gate_results.append({"argv": argv, "return_code": code, "tail": tail[-400:]})
+        for index, argv in enumerate(GATES[case_id]):
+            code, output = run(argv, copy)
+            record = {"argv": argv, "return_code": code, "tail": output[-400:],
+                      "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                      "output_bytes": len(output.encode())}
+            if records_dir is not None:
+                name = "gate-%d.log" % index
+                (records_dir / name).write_text(output)
+                record["complete_record"] = name
+            gate_results.append(record)
             if code != 0:
                 break
         unchanged = snapshot(copy) == before
@@ -119,19 +215,48 @@ def probe(case_id, candidate):
                 details["missing"] = [p for p in (entry, test_file) if not (copy / p).is_file()]
             else:
                 source = test_path.read_text(errors="replace")
-                passes_b = '"-B"' in source or "'-B'" in source
-                checks["tests_exercise_cli"] = "pass" if "subprocess" in source and entry in source and passes_b else "fail"
-                # Mutation control: only a control that passes on the unmodified copy followed by a
-                # failing stubbed run detects the stub. A failing control makes the probe unavailable.
-                control_code, control_tail = run(["python3", "-B", test_file, "-v"], copy)
-                details["stub_control"] = {"return_code": control_code, "tail": control_tail[-400:]}
-                if control_code != 0:
+                parsed = exercises_cli(source, entry)
+                if parsed is None:
+                    checks["tests_exercise_cli"] = "unavailable"
+                    details["tests_exercise_reason"] = "tests_module_unparseable"
+                else:
+                    checks["tests_exercise_cli"] = "pass" if parsed else "fail"
+                # Mutation control: only a control whose structured record is green on the
+                # unmodified copy lets a stubbed run mean anything. A control harness error,
+                # an empty control or a red control all make the probe unavailable.
+                record, raw = structured_run(test_path, copy)
+                control = summarize(record, raw)
+                if records_dir is not None:
+                    (records_dir / "stub_control.json").write_bytes(raw)
+                    control["complete_record"] = "stub_control.json"
+                details["stub_control"] = control
+                reason = ("stub_control_harness_error" if record["harness_error"] is not None
+                          else "stub_control_ran_no_tests" if record["ran"] == 0
+                          else "stub_control_not_green" if (control["failures_total"] or control["errors_total"])
+                          else None)
+                if reason is not None:
                     checks["probe_cli_stub_detected"] = "unavailable"
+                    details["stub_classification"] = reason
                 else:
                     (copy / entry).write_text(STUB)
-                    code, tail = run(["python3", "-B", test_file, "-v"], copy)
-                    checks["probe_cli_stub_detected"] = "pass" if code != 0 else "fail"
-                    details["stub_probe"] = {"return_code": code, "tail": tail[-400:]}
+                    record, raw = structured_run(test_path, copy)
+                    stub = summarize(record, raw)
+                    if records_dir is not None:
+                        (records_dir / "stub_probe.json").write_bytes(raw)
+                        stub["complete_record"] = "stub_probe.json"
+                    details["stub_probe"] = stub
+                    if record["harness_error"] is not None:
+                        state, reason = "unavailable", "stub_run_harness_error"
+                    elif stub["ran"] != control["ran"]:
+                        state, reason = "unavailable", "stub_run_population_changed"
+                    elif stub["failures_total"] >= 1:
+                        state, reason = "pass", "behavior_reds_named"
+                    elif stub["errors_total"] >= 1:
+                        state, reason = "unavailable", "stub_run_errors_only"
+                    else:
+                        state, reason = "fail", "stub_undetected"
+                    checks["probe_cli_stub_detected"] = state
+                    details["stub_classification"] = reason
     head, clean, tree = candidate_identity(candidate)
     return {"case_id": case_id, "candidate": str(candidate), "candidate_head": head,
             "candidate_clean": clean, "candidate_tree_sha256": tree, "checks": checks, "details": details}
@@ -142,8 +267,10 @@ def main(argv):
     parser.add_argument("--case", required=True, choices=sorted(GATES))
     parser.add_argument("--candidate", required=True, help="candidate checkout (read-only; probes run on a disposable copy)")
     parser.add_argument("--out", help="write the result JSON here (default stdout)")
+    parser.add_argument("--records", help="directory for the complete run records (default <out>.records when --out is given)")
     args = parser.parse_args(argv)
-    result = probe(args.case, args.candidate)
+    records = args.records or (args.out + ".records" if args.out else None)
+    result = probe(args.case, args.candidate, records_dir=records)
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.out:
         pathlib.Path(args.out).write_text(text)
