@@ -308,7 +308,8 @@ def main(argv):
         temp = pathlib.Path(temp)
         regression = {}
         for name in ("reference-T2-import-coupled", "reference-T2-many-failures",
-                     "reference-T2-syntax-error-tests", "reference-T2-comment-only"):
+                     "reference-T2-syntax-error-tests", "reference-T2-comment-only",
+                     "reference-T2-unrelated-subprocess", "reference-T2-aliased-subprocess"):
             candidate = temp / name
             shutil.copytree(fixture, candidate)
             if name == "reference-T2-syntax-error-tests":
@@ -349,6 +350,18 @@ def main(argv):
              and syntax["checks"]["tests_exercise_cli"] == "unavailable"
              and syntax["details"]["tests_exercise_reason"] == "tests_module_unparseable",
              json.dumps(syntax["checks"]))
+        unrelated = regression["reference-T2-unrelated-subprocess"]
+        step(report, "probe: a subprocess call on another file does not exercise the entry point",
+             unrelated["checks"]["tests_exercise_cli"] == "fail"
+             and unrelated["checks"]["probe_cli_stub_detected"] == "unavailable"
+             and unrelated["details"]["stub_classification"] == "stub_run_harness_error",
+             json.dumps(unrelated["checks"]))
+        aliased = regression["reference-T2-aliased-subprocess"]
+        step(report, "probe: aliased subprocess imports still count as exercising the CLI",
+             aliased["checks"]["tests_exercise_cli"] == "pass"
+             and aliased["checks"]["probe_cli_stub_detected"] == "pass"
+             and aliased["details"]["stub_classification"] == "behavior_reds_named",
+             json.dumps(aliased["checks"]))
         comment = regression["reference-T2-comment-only"]
         step(report, "probe: docstring and comment mentions do not count as exercising the CLI",
              comment["checks"]["tests_exercise_cli"] == "fail"
@@ -386,6 +399,14 @@ def main(argv):
              and stub_run["complete_record_sha256"] == hashlib.sha256(mass_record).hexdigest(),
              json.dumps({"summary_bytes": summary_size,
                          "complete_record_bytes": stub_run["complete_record_bytes"]}))
+        bound = ("import os, subprocess, sys\nROOT = '.'\nSCRIPT = os.path.join(ROOT, 'summarize_cli.py')\n"
+                 "def run():\n    return subprocess.run([sys.executable, '-B', SCRIPT, 'in.txt'], capture_output=True)\n")
+        split = ("import subprocess, sys\nSCRIPT = 'summarize_cli.py'\n"
+                 "def run():\n    return subprocess.run([sys.executable, '-B', 'other.py'])\n")
+        step(report, "probe: exercises_cli follows one level of binding into the same call and nothing across calls",
+             probes.exercises_cli(bound, "summarize_cli.py") is True
+             and probes.exercises_cli(split, "summarize_cli.py") is False
+             and probes.exercises_cli("def x(:\n", "summarize_cli.py") is None, "")
         step(report, "probe: baseline outcomes are preserved",
              good["probe_cli_stub_detected"] == "pass"
              and results["reference-T2-good"]["details"]["stub_classification"] == "behavior_reds_named"
@@ -527,6 +548,33 @@ def main(argv):
     held = [s for s in scores if s["case_id"] == "H1"]
     step(report, "held-out bundle stays undetermined until unsealed" if not args.unseal else "held-out bundle scores against the unsealed expectation",
          (held and held[0]["accepted_correctness"] is None) if not args.unseal else (held and held[0]["accepted_correctness"] is True), held[0]["reason"] if held else "")
+    capacity_figures = score.capacity(scores, caps)
+    t2_variant = [item for item in capacity_figures["per_attempt"]
+                  if item["case_id"] == "T2" and item["variant"] == "variant-1"][0]
+    step(report, "capacity: elapsed over the per-attempt cap is not within caps",
+         t2_variant["within_per_attempt_caps"]["elapsed_minutes"] is False
+         and t2_variant["within_per_attempt_caps"]["correction_rounds"] is True,
+         json.dumps(t2_variant["within_per_attempt_caps"]))
+    inflated = json.loads(json.dumps(scores))
+    for item in inflated:
+        item["usage"]["judge"]["inputTokens"] = 900000
+    step(report, "capacity: judge input over the per-attempt cap is not within caps",
+         all(item["within_per_attempt_caps"]["judge_input_tokens"] is False
+             for item in score.capacity(inflated, caps)["per_attempt"]), "")
+    for item in inflated:
+        item["usage"]["judge"]["inputTokens"] = 0
+        item["usage"]["judge"]["unknown_items"] = 1
+    step(report, "capacity: unknown judge usage leaves the judge input check unknown",
+         all(item["within_per_attempt_caps"]["judge_input_tokens"] is None
+             for item in score.capacity(inflated, caps)["per_attempt"]), "")
+    blown = json.loads(json.dumps(scores[0]))
+    blown["status"] = "completed"
+    blown["usage"]["parent"] = {"inputTokens": 0, "outputTokens": 500000, "cachedTokens": 0,
+                                "known_items": 1, "unknown_items": 1, "complete": False}
+    figure = score.capacity([blown], caps)["overall"]["parent_output_tokens"]
+    step(report, "capacity: exceeded stays true beside unknown usage items",
+         figure["remaining"] is None and figure.get("exceeded") is True and figure["used"] == 500000,
+         json.dumps(figure))
     stopped = [s for s in scores if s["status"] == "stopped"]
     step(report, "stopped attempt is preserved with unknown usage (not zero)", bool(stopped) and stopped[0]["usage"]["parent"]["unknown_items"] == 1 and stopped[0]["elapsed_minutes"] is None)
     totals_by_variant = score.aggregate(scores)

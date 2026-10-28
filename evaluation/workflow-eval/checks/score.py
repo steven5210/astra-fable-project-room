@@ -230,6 +230,8 @@ def capacity(scores, caps):
         if unknown:
             out["remaining"] = None
             out["reason"] = "usage unknown for %d items" % unknown
+            if used + retired > cap:
+                out["exceeded"] = True
         else:
             remaining = cap - used - retired
             out["remaining"] = max(0, remaining)
@@ -242,12 +244,17 @@ def capacity(scores, caps):
         parent_out = score["usage"]["parent"]
         judge_out = score["usage"]["judge"]
         return {"parent_dispatches": effort["engineer_dispatches"] <= per_caps["parent_dispatches_max"],
+                "correction_rounds": score["correction_rounds"] <= per_caps["correction_rounds_max"],
                 "judge_dispatches": effort["judge_dispatches"] <= per_caps["judge_dispatches_max"],
                 "worker_launches": effort["worker_launches"] <= per_caps["native_worker_launches_max"],
                 "parent_output_tokens": (parent_out["outputTokens"] <= token_caps["parent_output_max"]
                                          if parent_out["unknown_items"] == 0 else None),
+                "judge_input_tokens": (judge_out["inputTokens"] <= token_caps["judge_input_max"]
+                                       if judge_out["unknown_items"] == 0 else None),
                 "judge_output_tokens": (judge_out["outputTokens"] <= token_caps["judge_output_max"]
-                                        if judge_out["unknown_items"] == 0 else None)}
+                                        if judge_out["unknown_items"] == 0 else None),
+                "elapsed_minutes": (score["elapsed_minutes"] <= per_caps["elapsed_minutes_max_first_dispatch_to_acceptance_settle"]
+                                    if isinstance(score["elapsed_minutes"], (int, float)) else None)}
 
     return {"basis": "caps.json only; no bundle, score or report field can change the caps",
             "overall": {"parent_dispatches": figure(parent_used, parent_retired, total_caps["parent_dispatches_max"]),

@@ -92,48 +92,73 @@ def candidate_identity(candidate):
 
 
 def exercises_cli(source, entry):
-    """True iff the parsed test module really launches the entry point under subprocess -B.
+    """True iff one subprocess invocation launches the entry point under -B.
 
-    Docstrings and comments never count: only import statements, calls and string constants
-    outside docstring position are evidence. Returns None when the module does not parse.
+    The "-B" flag and the entry name must be reachable from the SAME call's arguments:
+    positional and keyword values, Constants inside List/Tuple elements, nested calls
+    (os.path.join(ROOT, "summarize_cli.py")), JoinedStr and BinOp operands, and one level
+    of simple Name indirection through Assign/AnnAssign bindings to a Constant, List, Tuple,
+    Call, JoinedStr or BinOp expression.
+    Constants elsewhere in the module, docstrings and comments never count. subprocess
+    may be imported under an alias or its callables bound by from-import. Returns None
+    when the module does not parse.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    docstring_values = set()
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if (isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                and body and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)):
-            docstring_values.add(id(body[0].value))
-    imported = subprocess_called = entry_named = b_flag = False
-    imported_names = set()
+    call_names = ("run", "Popen", "check_output", "call", "check_call")
+    module_names = set()
+    func_names = set()
+    bindings = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(alias.name == "subprocess" for alias in node.names):
-                imported = True
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    module_names.add(alias.asname or alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
-            imported = True
-            imported_names.update(alias.asname or alias.name for alias in node.names)
-    for node in ast.walk(tree):
+            for alias in node.names:
+                if alias.name in call_names:
+                    func_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            bindings.setdefault(node.targets[0].id, node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            bindings.setdefault(node.target.id, node.value)
+
+    def literals(node, resolve=True):
+        """String constants inside an argument expression. A Name resolves once through a
+        module- or class-level binding (resolve=True); Names inside that bound value do not."""
+        if isinstance(node, ast.Constant):
+            return [node.value] if isinstance(node.value, str) else []
+        if isinstance(node, ast.Name):
+            value = bindings.get(node.id)
+            return literals(value, resolve=False) if resolve and value is not None else []
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return [found for element in node.elts for found in literals(element, resolve)]
         if isinstance(node, ast.Call):
-            func = node.func
-            if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-                    and func.value.id == "subprocess"
-                    and func.attr in ("run", "Popen", "check_output", "call", "check_call")):
-                subprocess_called = True
-            elif isinstance(func, ast.Name) and func.id in imported_names:
-                subprocess_called = True
-        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
-              and id(node) not in docstring_values):
-            if node.value == entry or node.value.endswith("/" + entry):
-                entry_named = True
-            if node.value == "-B":
-                b_flag = True
-    return imported and subprocess_called and entry_named and b_flag
+            return ([found for argument in node.args for found in literals(argument, resolve)]
+                    + [found for keyword in node.keywords for found in literals(keyword.value, resolve)])
+        if isinstance(node, ast.JoinedStr):
+            return [found for value in node.values for found in literals(value, resolve)]
+        if isinstance(node, ast.FormattedValue):
+            return literals(node.value, resolve)
+        if isinstance(node, ast.BinOp):
+            return literals(node.left, resolve) + literals(node.right, resolve)
+        return []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not ((isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                 and func.value.id in module_names and func.attr in call_names)
+                or (isinstance(func, ast.Name) and func.id in func_names)):
+            continue
+        found = [text for argument in node.args for text in literals(argument)]
+        found += [text for keyword in node.keywords for text in literals(keyword.value)]
+        if "-B" in found and any(text == entry or text.endswith("/" + entry) for text in found):
+            return True
+    return False
 
 
 def summarize(record, record_bytes):

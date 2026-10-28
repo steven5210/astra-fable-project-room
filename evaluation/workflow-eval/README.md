@@ -104,7 +104,9 @@ measurement reuses `ao_room_timing` (`ao_timing.inspect`), the exporter and the 
 no new ledger, schema or tool, and overlap or elapsed alone is never a speedup claim. Probe
 classifications are structural: `checks/structured_unittest.py` records unittest's own
 failure/error split, so a harness error is `unavailable`, never a counted red; `tests_exercise_cli`
-is AST-parsed, so docstring or comment mentions of subprocess never pass.
+is AST-parsed: `-B` and the entry file must be arguments of the same `subprocess` call (module
+aliases and from-imports count; one level of name binding is followed), so docstring or comment
+mentions never pass.
 
 ## Dry run
 
