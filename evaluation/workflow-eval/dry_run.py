@@ -311,7 +311,15 @@ def main(argv):
                      "reference-T2-syntax-error-tests", "reference-T2-comment-only"):
             candidate = temp / name
             shutil.copytree(fixture, candidate)
-            shutil.copytree(PACKAGE / "fixtures" / "dry-run" / name, candidate, dirs_exist_ok=True)
+            if name == "reference-T2-syntax-error-tests":
+                # Generated here, not committed: a deliberately unparseable module would fail the
+                # repository-wide lint. The good entry point with a test module that never parses.
+                shutil.copytree(PACKAGE / "fixtures" / "dry-run" / "reference-T2-good", candidate, dirs_exist_ok=True)
+                (candidate / "tests" / "test_summarize_cli.py").write_text(
+                    "import unittest\n\nclass BrokenTests(unittest.TestCase):\n"
+                    "    def test_never_parses(self):\n        self.assertTrue(\n")
+            else:
+                shutil.copytree(PACKAGE / "fixtures" / "dry-run" / name, candidate, dirs_exist_ok=True)
             subprocess.run(["git", "init", "-q", str(candidate)], check=True)
             records = temp / (name + ".records")
             regression[name] = probes.probe("T2", candidate, records_dir=records)
