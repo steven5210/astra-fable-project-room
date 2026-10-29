@@ -93,7 +93,8 @@ def candidate_identity(candidate):
     return head.stdout.strip(), clean, tree
 
 
-_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+                ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SUBPROCESS_CALLS = ("run", "Popen", "check_output", "call", "check_call")
 
 
@@ -110,8 +111,9 @@ def _target_names(node):
 
 def _scope_bindings(scope):
     """Every name bound directly in one lexical scope: name -> list of ("assign", Assign/AnnAssign)
-    or ("other", node). Nested function, lambda and class bodies are separate scopes and are
-    not entered; the parameters of a function scope bind inside it."""
+    or ("other", node). Nested function, lambda, class and comprehension bodies are separate
+    scopes and are not entered; the parameters of a function scope and the iteration targets
+    of a comprehension scope bind inside it."""
     bindings = {}
 
     def bind(name, kind, node):
@@ -179,9 +181,11 @@ def exercises_cli(source, entry):
     (its first positional argument or args=; input=, env= and other keywords are data, never
     launch arguments): Constants inside List/Tuple elements, nested calls
     (os.path.join(ROOT, "summarize_cli.py")), JoinedStr and BinOp operands, and one level
-    of simple Name indirection. A Name resolves in its own lexical scope first (the enclosing
-    function, then the module), only when that scope binds it exactly once by a plain
-    Assign/AnnAssign; inside a function the assignment must also precede the call. A name
+    of simple Name indirection. A Name resolves through its lexical scopes from the innermost
+    (comprehension, lambda, function; a class body only for code directly inside it) out to
+    the module, stopping at the first scope that binds it, and only when that scope binds it
+    exactly once by a plain Assign/AnnAssign; outside the module the assignment must also
+    precede the call. A name
     bound more than once, bound by a parameter, loop, with, import, walrus or unpacking, or
     not bound at all stays unresolved and contributes nothing, so a reassigned or borrowed
     binding can never satisfy the check. Constants elsewhere in the module, docstrings and
@@ -203,12 +207,16 @@ def exercises_cli(source, entry):
             for alias in node.names:
                 if alias.name in _SUBPROCESS_CALLS:
                     func_names.add(alias.asname or alias.name)
-    # Lexical scope of every node (the nearest enclosing function, lambda or class, else the module).
+    # Lexical scope of every node (the nearest enclosing function, lambda, class or
+    # comprehension, else the module) and each scope's enclosing scope.
     scope_of = {}
+    parent_scope = {}
 
     def assign_scopes(node, scope):
         for child in ast.iter_child_nodes(node):
             inner = child if isinstance(child, _SCOPE_NODES) else scope
+            if inner is child:
+                parent_scope[id(child)] = scope
             scope_of[id(child)] = inner
             assign_scopes(child, inner)
 
@@ -224,7 +232,12 @@ def exercises_cli(source, entry):
     def resolve(name, call):
         """The single plain assignment a Name refers to at this call, or None when unresolved."""
         scope = scope_of.get(id(call), tree)
-        chain = [scope] if scope is tree else [scope, tree]
+        chain, current = [], scope
+        while current is not None:
+            # A class body is visible only to code directly inside it, never to its methods.
+            if current is scope or not isinstance(current, ast.ClassDef):
+                chain.append(current)
+            current = parent_scope.get(id(current))
         for current in chain:
             entries = bindings(current).get(name)
             if entries is None:

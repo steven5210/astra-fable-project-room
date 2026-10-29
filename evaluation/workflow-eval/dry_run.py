@@ -439,6 +439,24 @@ def main(argv):
         step(report, "probe: a single plain binding in the call's own scope or the module still resolves",
              probes.exercises_cli(local_before, "summarize_cli.py") is True
              and probes.exercises_cli(late_module, "summarize_cli.py") is True, "")
+        # Comprehensions, lambdas and nested functions are their own scopes: an iteration variable
+        # never shadows the enclosing command vector, and a call inside one sees its enclosing scopes.
+        shadowed_outer = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                          "    unused = [args for args in ()]\n    subprocess.run(args)\n")
+        inner_call = ("import subprocess, sys\ndef go():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                      "    return [subprocess.run(args) for _ in range(1)]\n")
+        own_target = ("import subprocess, sys\ndef go():\n"
+                      "    return [subprocess.run(a) for a in ([sys.executable, '-B', 'summarize_cli.py'],)]\n")
+        nested_function = ("import subprocess, sys\ndef outer():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                           "    def inner():\n        return subprocess.run(args)\n    return inner()\n")
+        class_attribute = ("import subprocess, sys\nclass T:\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                           "    def go(self):\n        return subprocess.run(args)\n")
+        step(report, "probe: comprehension and nested scopes bind their own names only",
+             probes.exercises_cli(shadowed_outer, "summarize_cli.py") is True
+             and probes.exercises_cli(inner_call, "summarize_cli.py") is True
+             and probes.exercises_cli(own_target, "summarize_cli.py") is False
+             and probes.exercises_cli(nested_function, "summarize_cli.py") is True
+             and probes.exercises_cli(class_attribute, "summarize_cli.py") is False, "")
         # An unexpected success is not a green control: unittest's wasSuccessful is false and
         # `python3 -B tests/test_x.py` exits 1, so the structured record must say the same.
         unexpected = temp / "unexpected"
