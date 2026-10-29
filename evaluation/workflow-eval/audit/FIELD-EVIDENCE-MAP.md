@@ -1,0 +1,34 @@
+# Field evidence map: audit classes to saved-record fields
+
+Every row names the exact source field in `ao_room_timing` (`ao_timing.inspect`), the exported
+bundle (`export_bundle`) or the score (`score`). A field that does not exist is unknown, never zero.
+`ao_timing.BASIS` quotes are the evidence basis the record itself declares.
+
+| Audit class | Source field | Evidence basis | Classification rule | Unknown when |
+|---|---|---|---|---|
+| implementation | `timing["intervals"][*]` with `category == "engineering"` and `purpose == "implementation"`; seconds in `totals["by_purpose"]["implementation"]` | "an engineer-role implementation or correction request, from its saved start to its saved end" | request intervals of implementation purpose | the request's start or end basis is `unknown` |
+| product-correctness repair | `intervals` with `purpose == "correction"`; `score["correction_rounds"]` counts the dispatches | same engineering basis; the cause of the correction is not recorded | engineering intervals of correction purpose | same; and the repair reason is never recorded |
+| operator or harness failure | none | no representation in controller records | unknown, always | always |
+| provider wait | `gaps[*]` with `kind == "quota_wait"` (`totals["gaps"]["quota_wait"]`); `gaps[*]` with `kind == "hold_wait"` and `semantic_kind == "provider_error"` | "the gap after a terminal engineer turn whose saved semantic status kind is quota_limit, until the next recorded activity starts"; `hold_wait`: "the saved records do not separate diagnosis, controller repair and operator latency inside it" | a quota gap is a provider wait; a hold gap counts as a provider wait only when its `semantic_kind` is `provider_error`; hold gaps of kind `output_truncated`, `model_mismatch` or `unknown` stay unknown | the turn has no saved semantic status, the hold kind is not a provider kind, or no later activity bounds the gap (`unknown_bounds`) |
+| resource wait | none | no representation in controller records (locks, worktrees, machines and reviewer availability are not recorded as waits) | unknown, always | always |
+| handoff delay | inside `unattributed` gaps | "a gap that follows no held turn: operator or reviewer latency, decisions, integration and anything else the room does not record" | unattributed gap seconds; not separable into handoff, decision or integration latency | always entangled; a hold-free gap is unattributed |
+| accepted outcomes (complete) | `score["outcomes"]["accepted_candidate"]` = `acceptance.bound_to_candidate is True and verification.passed`; per variant `aggregate()["accepted_candidates"]` | the bundle's bound-acceptance chain (candidate head, checkpoint bytes, evidence digest) | one complete accepted outcome per attempt whose latest acceptance binds the exported candidate | the acceptance is unbound (`unbound_reason`), the candidate moved or is dirty, or no verification passed |
+| recorded acceptances (any) | `timing["closure"]["acceptances_recorded"]`, `latest_acceptance_request_id` | "saved verification and acceptance records only; task counts are not closure" | count of saved acceptance records, including acceptances of superseded candidates | no acceptance saved |
+| engineering-integrated outcomes | none in a bundle; for coordinated rooms the owner's `ao_room_status`/`ao_room_progress` `coordination` lineage states (`imported`) | an explicit operator import of an accepted handback recorded by `ao_room_import_record` | count `imported` lineages of the owner room; never inferred from an acceptance alone | the room uses no coordination, or the export is a single-room bundle (unavailable) |
+| tasks | `score["outcomes"]["tasks"]`; for a live room `ao_room_progress.plan.counts` | bundles carry no plan or transcript; the progress view reads the task tools of the native transcript | unavailable in bundles; in a live room the counts are task rows, never outcomes | the transcript is unavailable or shows no task-tool activity |
+| reports | `bundle["report"]` fields; `score["outcomes"]["engineering_requests_completed"]` and `engineering_requests_not_completed`; `score["correction_rounds"]` | the last assistant message's JSON of the final completed engineering request; request `purpose` and `state` | report fields are recorded claims; completed engineering requests and correction dispatches are counts of requests, never of outcomes | no completed engineering request with a parseable report |
+| tests | probe `details.stub_control` / `stub_probe` summaries and `complete_record`; `tests_reported` strings | `structured_unittest.py` JSON: ran, named failures/errors, harness_error; report strings are claims | unittest's own failure/error split; counts are exact, the named list is capped with `omitted_*` counts; `tests_reported` entries and probe populations are never summed across requests or attempts because populations overlap | the test module fails to load (`harness_error`); a report claim has no structured record |
+| usage — parent | `score["usage"]["parent"]` counters; per-request `requests[*].usage` | "AO-reported counters; cached tokens combine reads and writes; not billing or quota" | sum known engineer usage; `unknown_items` counted separately | a request's usage receipt is absent (`unknown_items > 0`) |
+| usage — worker | `score["usage"]["worker"]`, `worker_launches[*].usage` | worker usage is not exposed by the controller | launches counted; usage unknown | always, with the current records |
+| usage — judge | `score["usage"]["judge"]` | same counter basis | sum known reviewer usage | judge request usage unknown |
+| cached tokens | `usage[*]["cachedTokens"]` inside each role's totals | cache reads and writes combined; recorded, never a quota measurement | reported inside usage, never a cap | a usage item is unknown |
+| shared-account rate readings | `ao_room_status` `rate_limits` projection only | provider-reported shared-account readings | informational, never attributable to one attempt | no provider reading saved |
+| overlap-elapsed | `totals["sum_seconds"]`, `union_seconds`, `overlap_seconds`; `score["elapsed_minutes"]` | interval sums vs. union; elapsed from first dispatch to last settle | overlap or elapsed alone is never a speedup claim | any request unsettled leaves `elapsed_minutes` null |
+
+Unknowns stay unknown: operator/harness failure and resource wait have no saved representation;
+handoff delay is folded into `unattributed`; the cause of a correction is not recorded; cached
+tokens are not quota; rate-limit readings are shared-account and never attributable; overlap and
+elapsed never prove a speedup. A usage role with no known item is reported as unknown, never as
+zero. Nothing here adds a record: every value is a read of an existing saved record or a
+projection the scorer computes from the bundle; a metric the records cannot support is listed
+above as unknown or unavailable instead of being estimated.

@@ -69,3 +69,25 @@ class CompactReportTests(Fixture):
         report = ao_workflow.engineering_report(self.directory(), self.state(), request)
         self.assertNotIn('controller_metadata', report)
         self.assertNotIn('report_format', report)
+
+    def test_report_never_refills_or_relabels_capacity(self):
+        # A report may carry extra keys; none of them may reach the capacity,
+        # budget or rate-limit projections, which derive from saved state only.
+        import ao_spec_review_budget, ao_current_summary
+        self.implement(spec_review_budget={"debate_attempts": 0, "dispatch_ceiling": 999},
+                       review_attempts_remaining=99, capacity="refilled",
+                       rate_limits={"used_percent": 0})
+        directory, state = self.directory(), self.state()
+        full = self.service.ao_room_status(self.room)
+        compact = self.service.ao_room_status(self.room, view="compact")
+        progress = self.service.ao_room_progress(self.room)
+        self.assertEqual(full["spec_review_budget"], ao_spec_review_budget.summary(directory, state))
+        self.assertEqual(full["current_summary"], ao_current_summary.summarize(directory, state))
+        text = json.dumps([full, compact, progress], sort_keys=True, default=str)
+        # The injected key values may never surface; note dispatch_ceiling and
+        # debate_attempts are legitimate summary keys, so only the injected
+        # values (999, 99, refilled, used_percent, the whole injected objects)
+        # are the needles.
+        for needle in ('"dispatch_ceiling": 999', '"review_attempts_remaining"',
+                       '"refilled"', '"used_percent"', '"capacity": "refilled"'):
+            self.assertNotIn(needle, text)

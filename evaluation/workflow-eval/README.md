@@ -95,6 +95,23 @@ output tokens, 90,000 judge output tokens, 4 hours. No retries, no automatic exp
 no replacement rooms, no overage and no new cloud or API spend. The held-out case is not in the 6 attempts; running it needs its
 own authorization line (2 attempts). Variant authoring used no model calls. Judging costs are the 6 acceptance reviews.
 
+## Audit measurement preparation
+
+[`audit/FIELD-EVIDENCE-MAP.md`](audit/FIELD-EVIDENCE-MAP.md) maps each audit class to the exact
+saved-record field it comes from, and [`audit/EXAMPLE-REPORT.md`](audit/EXAMPLE-REPORT.md) is the
+deterministic render over a synthetic room (`python3 dry_run.py --write-audit-example`). The
+measurement reuses `ao_room_timing` (`ao_timing.inspect`), the exporter and the scorer — there is
+no new ledger, schema or tool, and overlap or elapsed alone is never a speedup claim. Probe
+classifications are structural: `checks/structured_unittest.py` records unittest's own
+failure/error split, so a harness error is `unavailable`, never a counted red; `tests_exercise_cli`
+is AST-parsed: `-B` and the entry file must both be in the command vector of the same `subprocess`
+call (its first positional argument or `args=`; `input=` and other keyword data never count; module
+aliases and from-imports count; a name is followed one level only when its own lexical scope, then the
+module, binds it exactly once by a plain assignment that precedes a local call; a reassigned, borrowed,
+parameter- or loop-bound name resolves to nothing), so docstring or comment
+mentions never pass. A control run with an unexpected success is not green, matching unittest's
+own exit status.
+
 ## Dry run
 
 ```
