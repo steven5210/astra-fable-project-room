@@ -93,6 +93,85 @@ def candidate_identity(candidate):
     return head.stdout.strip(), clean, tree
 
 
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_SUBPROCESS_CALLS = ("run", "Popen", "check_output", "call", "check_call")
+
+
+def _target_names(node):
+    """Plain names bound by an assignment, loop, with or walrus target (tuples unpacked)."""
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [name for element in node.elts for name in _target_names(element)]
+    if isinstance(node, ast.Starred):
+        return _target_names(node.value)
+    return []
+
+
+def _scope_bindings(scope):
+    """Every name bound directly in one lexical scope: name -> list of ("assign", Assign/AnnAssign)
+    or ("other", node). Nested function, lambda and class bodies are separate scopes and are
+    not entered; the parameters of a function scope bind inside it."""
+    bindings = {}
+
+    def bind(name, kind, node):
+        bindings.setdefault(name, []).append((kind, node))
+
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        arguments = scope.args
+        for argument in arguments.posonlyargs + arguments.args + arguments.kwonlyargs:
+            bind(argument.arg, "other", scope)
+        for argument in (arguments.vararg, arguments.kwarg):
+            if argument is not None:
+                bind(argument.arg, "other", scope)
+
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _SCOPE_NODES):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    bind(child.name, "other", child)
+                continue  # a nested scope binds its own names
+            if isinstance(child, ast.Assign):
+                if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
+                    bind(child.targets[0].id, "assign", child)
+                else:
+                    for target in child.targets:
+                        for name in _target_names(target):
+                            bind(name, "other", child)
+            elif isinstance(child, ast.AnnAssign):
+                if isinstance(child.target, ast.Name):
+                    bind(child.target.id, "assign" if child.value is not None else "other", child)
+            elif isinstance(child, ast.AugAssign):
+                for name in _target_names(child.target):
+                    bind(name, "other", child)
+            elif isinstance(child, (ast.For, ast.AsyncFor)):
+                for name in _target_names(child.target):
+                    bind(name, "other", child)
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        for name in _target_names(item.optional_vars):
+                            bind(name, "other", child)
+            elif isinstance(child, ast.NamedExpr):
+                for name in _target_names(child.target):
+                    bind(name, "other", child)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    bind((alias.asname or alias.name).split(".")[0], "other", child)
+            elif isinstance(child, (ast.Global, ast.Nonlocal)):
+                for name in child.names:
+                    bind(name, "other", child)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                bind(child.name, "other", child)
+            elif isinstance(child, ast.comprehension):
+                for name in _target_names(child.target):
+                    bind(name, "other", child)
+            walk(child)
+
+    walk(scope)
+    return bindings
+
+
 def exercises_cli(source, entry):
     """True iff one subprocess invocation launches the entry point under -B.
 
@@ -100,20 +179,21 @@ def exercises_cli(source, entry):
     (its first positional argument or args=; input=, env= and other keywords are data, never
     launch arguments): Constants inside List/Tuple elements, nested calls
     (os.path.join(ROOT, "summarize_cli.py")), JoinedStr and BinOp operands, and one level
-    of simple Name indirection through Assign/AnnAssign bindings to a Constant, List, Tuple,
-    Call, JoinedStr or BinOp expression.
-    Constants elsewhere in the module, docstrings and comments never count. subprocess
-    may be imported under an alias or its callables bound by from-import. Returns None
-    when the module does not parse.
+    of simple Name indirection. A Name resolves in its own lexical scope first (the enclosing
+    function, then the module), only when that scope binds it exactly once by a plain
+    Assign/AnnAssign; inside a function the assignment must also precede the call. A name
+    bound more than once, bound by a parameter, loop, with, import, walrus or unpacking, or
+    not bound at all stays unresolved and contributes nothing, so a reassigned or borrowed
+    binding can never satisfy the check. Constants elsewhere in the module, docstrings and
+    comments never count. subprocess may be imported under an alias or its callables bound
+    by from-import. Returns None when the module does not parse.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    call_names = ("run", "Popen", "check_output", "call", "check_call")
     module_names = set()
     func_names = set()
-    bindings = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -121,32 +201,61 @@ def exercises_cli(source, entry):
                     module_names.add(alias.asname or alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
             for alias in node.names:
-                if alias.name in call_names:
+                if alias.name in _SUBPROCESS_CALLS:
                     func_names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            bindings.setdefault(node.targets[0].id, node.value)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
-            bindings.setdefault(node.target.id, node.value)
+    # Lexical scope of every node (the nearest enclosing function, lambda or class, else the module).
+    scope_of = {}
 
-    def literals(node, resolve=True):
-        """String constants inside an argument expression. A Name resolves once through a
-        module- or class-level binding (resolve=True); Names inside that bound value do not."""
+    def assign_scopes(node, scope):
+        for child in ast.iter_child_nodes(node):
+            inner = child if isinstance(child, _SCOPE_NODES) else scope
+            scope_of[id(child)] = inner
+            assign_scopes(child, inner)
+
+    scope_of[id(tree)] = tree
+    assign_scopes(tree, tree)
+    bindings_of = {}
+
+    def bindings(scope):
+        if id(scope) not in bindings_of:
+            bindings_of[id(scope)] = _scope_bindings(scope)
+        return bindings_of[id(scope)]
+
+    def resolve(name, call):
+        """The single plain assignment a Name refers to at this call, or None when unresolved."""
+        scope = scope_of.get(id(call), tree)
+        chain = [scope] if scope is tree else [scope, tree]
+        for current in chain:
+            entries = bindings(current).get(name)
+            if entries is None:
+                continue  # not bound here: look outward
+            if len(entries) != 1 or entries[0][0] != "assign":
+                return None  # reassigned, parameter, loop, import, walrus or unpacking: ambiguous
+            assignment = entries[0][1]
+            if current is not tree and (assignment.lineno, assignment.col_offset) > (call.lineno, call.col_offset):
+                return None  # a local assigned after the call never fed it
+            return assignment.value
+        return None
+
+    def literals(node, call, resolve_names=True):
+        """String constants inside an argument expression. A Name resolves once through its
+        scope's single plain binding (resolve_names=True); Names inside that value do not."""
         if isinstance(node, ast.Constant):
             return [node.value] if isinstance(node.value, str) else []
         if isinstance(node, ast.Name):
-            value = bindings.get(node.id)
-            return literals(value, resolve=False) if resolve and value is not None else []
+            value = resolve(node.id, call) if resolve_names else None
+            return literals(value, call, False) if value is not None else []
         if isinstance(node, (ast.List, ast.Tuple)):
-            return [found for element in node.elts for found in literals(element, resolve)]
+            return [found for element in node.elts for found in literals(element, call, resolve_names)]
         if isinstance(node, ast.Call):
-            return ([found for argument in node.args for found in literals(argument, resolve)]
-                    + [found for keyword in node.keywords for found in literals(keyword.value, resolve)])
+            return ([found for argument in node.args for found in literals(argument, call, resolve_names)]
+                    + [found for keyword in node.keywords for found in literals(keyword.value, call, resolve_names)])
         if isinstance(node, ast.JoinedStr):
-            return [found for value in node.values for found in literals(value, resolve)]
+            return [found for value in node.values for found in literals(value, call, resolve_names)]
         if isinstance(node, ast.FormattedValue):
-            return literals(node.value, resolve)
+            return literals(node.value, call, resolve_names)
         if isinstance(node, ast.BinOp):
-            return literals(node.left, resolve) + literals(node.right, resolve)
+            return literals(node.left, call, resolve_names) + literals(node.right, call, resolve_names)
         return []
 
     for node in ast.walk(tree):
@@ -154,14 +263,14 @@ def exercises_cli(source, entry):
             continue
         func = node.func
         if not ((isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-                 and func.value.id in module_names and func.attr in call_names)
+                 and func.value.id in module_names and func.attr in _SUBPROCESS_CALLS)
                 or (isinstance(func, ast.Name) and func.id in func_names)):
             continue
         # Only the command vector counts: the first positional argument or args=. Text passed
         # through input=, env=, cwd= or any other keyword is data, never a launch argument.
         vector = node.args[0] if node.args else next((keyword.value for keyword in node.keywords
                                                       if keyword.arg == "args"), None)
-        found = literals(vector) if vector is not None else []
+        found = literals(vector, node) if vector is not None else []
         if "-B" in found and any(text == entry or text.endswith("/" + entry) for text in found):
             return True
     return False

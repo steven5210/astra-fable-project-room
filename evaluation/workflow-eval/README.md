@@ -106,7 +106,9 @@ classifications are structural: `checks/structured_unittest.py` records unittest
 failure/error split, so a harness error is `unavailable`, never a counted red; `tests_exercise_cli`
 is AST-parsed: `-B` and the entry file must both be in the command vector of the same `subprocess`
 call (its first positional argument or `args=`; `input=` and other keyword data never count; module
-aliases and from-imports count; one level of name binding is followed), so docstring or comment
+aliases and from-imports count; a name is followed one level only when its own lexical scope, then the
+module, binds it exactly once by a plain assignment that precedes a local call; a reassigned, borrowed,
+parameter- or loop-bound name resolves to nothing), so docstring or comment
 mentions never pass. A control run with an unexpected success is not green, matching unittest's
 own exit status.
 

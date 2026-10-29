@@ -414,6 +414,31 @@ def main(argv):
         step(report, "probe: only the command vector counts, never stdin text or other keyword data",
              probes.exercises_cli(stdin_text, "summarize_cli.py") is False
              and probes.exercises_cli(keyword_args, "summarize_cli.py") is True, "")
+        # Names resolve in their own lexical scope with binding order; a borrowed or reassigned
+        # binding never satisfies the check (reviewer reproductions on 3801ee9).
+        borrowed = ("import subprocess, sys\ndef unused():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                    "def actual():\n    args = [sys.executable, '-B', 'other.py']\n    subprocess.run(args)\nactual()\n")
+        reassigned = ("import subprocess, sys\nargs = [sys.executable, '-B', 'summarize_cli.py']\n"
+                      "args = [sys.executable, '-B', 'other.py']\nsubprocess.run(args)\n")
+        local_before = ("import subprocess, sys\ndef go():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                        "    return subprocess.run(args)\n")
+        local_after = ("import subprocess, sys\ndef go():\n    r = subprocess.run(args)\n"
+                       "    args = [sys.executable, '-B', 'summarize_cli.py']\n    return r\n")
+        parameter = ("import subprocess, sys\nargs = [sys.executable, '-B', 'summarize_cli.py']\n"
+                     "def go(args):\n    return subprocess.run(args)\n")
+        loop_bound = ("import subprocess, sys\nfor args in ([sys.executable, '-B', 'summarize_cli.py'],"
+                      " [sys.executable, '-B', 'other.py']):\n    subprocess.run(args)\n")
+        late_module = ("import subprocess, sys\ndef go():\n    return subprocess.run(ARGS)\n"
+                       "ARGS = [sys.executable, '-B', 'summarize_cli.py']\n")
+        step(report, "probe: a name borrowed from another scope or reassigned never satisfies the launch check",
+             probes.exercises_cli(borrowed, "summarize_cli.py") is False
+             and probes.exercises_cli(reassigned, "summarize_cli.py") is False
+             and probes.exercises_cli(local_after, "summarize_cli.py") is False
+             and probes.exercises_cli(parameter, "summarize_cli.py") is False
+             and probes.exercises_cli(loop_bound, "summarize_cli.py") is False, "")
+        step(report, "probe: a single plain binding in the call's own scope or the module still resolves",
+             probes.exercises_cli(local_before, "summarize_cli.py") is True
+             and probes.exercises_cli(late_module, "summarize_cli.py") is True, "")
         # An unexpected success is not a green control: unittest's wasSuccessful is false and
         # `python3 -B tests/test_x.py` exits 1, so the structured record must say the same.
         unexpected = temp / "unexpected"
