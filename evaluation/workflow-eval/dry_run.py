@@ -457,6 +457,15 @@ def main(argv):
              and probes.exercises_cli(own_target, "summarize_cli.py") is False
              and probes.exercises_cli(nested_function, "summarize_cli.py") is True
              and probes.exercises_cli(class_attribute, "summarize_cli.py") is False, "")
+        # A walrus inside a comprehension binds in the enclosing scope (PEP 572): it reassigns the
+        # command vector there, while a walrus on another name leaves the vector resolvable.
+        walrus_reassign = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                           "    [(args := [sys.executable, '-B', 'other.py']) for _ in range(1)]\n    subprocess.run(args)\n")
+        walrus_other = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                        "    [(other := 1) for _ in range(1)]\n    subprocess.run(args)\n")
+        step(report, "probe: a walrus inside a comprehension reassigns the enclosing command vector",
+             probes.exercises_cli(walrus_reassign, "summarize_cli.py") is False
+             and probes.exercises_cli(walrus_other, "summarize_cli.py") is True, "")
         # An unexpected success is not a green control: unittest's wasSuccessful is false and
         # `python3 -B tests/test_x.py` exits 1, so the structured record must say the same.
         unexpected = temp / "unexpected"

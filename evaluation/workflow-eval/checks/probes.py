@@ -112,8 +112,9 @@ def _target_names(node):
 def _scope_bindings(scope):
     """Every name bound directly in one lexical scope: name -> list of ("assign", Assign/AnnAssign)
     or ("other", node). Nested function, lambda, class and comprehension bodies are separate
-    scopes and are not entered; the parameters of a function scope and the iteration targets
-    of a comprehension scope bind inside it."""
+    scopes and are not entered, except that a walrus inside a comprehension binds in the
+    enclosing scope; the parameters of a function scope and the iteration targets of a
+    comprehension scope bind inside it."""
     bindings = {}
 
     def bind(name, kind, node):
@@ -127,11 +128,24 @@ def _scope_bindings(scope):
             if argument is not None:
                 bind(argument.arg, "other", scope)
 
+    def walrus_targets(node):
+        """Walrus targets inside a comprehension bind in the enclosing scope (PEP 572); nested
+        comprehensions pass them through, nested functions, lambdas and classes keep their own."""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.NamedExpr):
+                for name in _target_names(child.target):
+                    bind(name, "other", child)
+            walrus_targets(child)
+
     def walk(node):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, _SCOPE_NODES):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     bind(child.name, "other", child)
+                elif isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    walrus_targets(child)
                 continue  # a nested scope binds its own names
             if isinstance(child, ast.Assign):
                 if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
