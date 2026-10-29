@@ -112,8 +112,9 @@ def _target_names(node):
 def _scope_bindings(scope):
     """Every name bound directly in one lexical scope: name -> list of ("assign", Assign/AnnAssign)
     or ("other", node). Nested function, lambda, class and comprehension bodies are separate
-    scopes and are not entered, except that a walrus inside a comprehension binds in the
-    enclosing scope; the parameters of a function scope and the iteration targets of a
+    scopes and are not entered, except that a walrus inside a comprehension, or inside the
+    defaults, decorators, annotations or bases of a nested function, lambda or class, binds in
+    the enclosing scope; the parameters of a function scope and the iteration targets of a
     comprehension scope bind inside it."""
     bindings = {}
 
@@ -128,11 +129,35 @@ def _scope_bindings(scope):
             if argument is not None:
                 bind(argument.arg, "other", scope)
 
+    def enclosing_parts(node):
+        """The parts of a nested function, lambda or class that Python evaluates in the
+        enclosing scope: decorators, default values, annotations, bases and keywords."""
+        parts = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            parts += arguments.defaults + [value for value in arguments.kw_defaults if value is not None]
+            if not isinstance(node, ast.Lambda):
+                parts += node.decorator_list
+                parts += [argument.annotation for argument in
+                          arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+                          if argument.annotation is not None]
+                parts += [node.returns] if node.returns is not None else []
+        elif isinstance(node, ast.ClassDef):
+            parts += node.decorator_list + node.bases + [keyword.value for keyword in node.keywords]
+        return parts
+
     def walrus_targets(node):
         """Walrus targets inside a comprehension bind in the enclosing scope (PEP 572); nested
-        comprehensions pass them through, nested functions, lambdas and classes keep their own."""
+        comprehensions pass them through; nested functions, lambdas and classes keep their own
+        except in the parts Python evaluates in the enclosing scope (defaults, decorators,
+        annotations, bases)."""
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                for part in enclosing_parts(child):
+                    walrus_targets(part)
+                    if isinstance(part, ast.NamedExpr):
+                        for name in _target_names(part.target):
+                            bind(name, "other", part)
                 continue
             if isinstance(child, ast.NamedExpr):
                 for name in _target_names(child.target):
@@ -144,8 +169,14 @@ def _scope_bindings(scope):
             if isinstance(child, _SCOPE_NODES):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     bind(child.name, "other", child)
-                elif isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                if isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                     walrus_targets(child)
+                else:
+                    for part in enclosing_parts(child):
+                        if isinstance(part, ast.NamedExpr):
+                            for name in _target_names(part.target):
+                                bind(name, "other", part)
+                        walrus_targets(part)
                 continue  # a nested scope binds its own names
             if isinstance(child, ast.Assign):
                 if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
