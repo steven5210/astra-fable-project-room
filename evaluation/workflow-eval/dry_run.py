@@ -403,10 +403,35 @@ def main(argv):
                  "def run():\n    return subprocess.run([sys.executable, '-B', SCRIPT, 'in.txt'], capture_output=True)\n")
         split = ("import subprocess, sys\nSCRIPT = 'summarize_cli.py'\n"
                  "def run():\n    return subprocess.run([sys.executable, '-B', 'other.py'])\n")
+        stdin_text = ("import subprocess, sys\n"
+                      "def run():\n    return subprocess.run([sys.executable, '-B', 'other.py'], input='summarize_cli.py', text=True)\n")
+        keyword_args = ("import subprocess, sys\nSCRIPT = 'summarize_cli.py'\n"
+                        "def run():\n    return subprocess.run(args=[sys.executable, '-B', SCRIPT], capture_output=True)\n")
         step(report, "probe: exercises_cli follows one level of binding into the same call and nothing across calls",
              probes.exercises_cli(bound, "summarize_cli.py") is True
              and probes.exercises_cli(split, "summarize_cli.py") is False
              and probes.exercises_cli("def x(:\n", "summarize_cli.py") is None, "")
+        step(report, "probe: only the command vector counts, never stdin text or other keyword data",
+             probes.exercises_cli(stdin_text, "summarize_cli.py") is False
+             and probes.exercises_cli(keyword_args, "summarize_cli.py") is True, "")
+        # An unexpected success is not a green control: unittest's wasSuccessful is false and
+        # `python3 -B tests/test_x.py` exits 1, so the structured record must say the same.
+        unexpected = temp / "unexpected"
+        shutil.copytree(fixture, unexpected)
+        shutil.copytree(PACKAGE / "fixtures" / "dry-run" / "reference-T2-good", unexpected, dirs_exist_ok=True)
+        (unexpected / "tests" / "test_summarize_cli.py").write_text(
+            "import unittest\n\nclass Marked(unittest.TestCase):\n"
+            "    @unittest.expectedFailure\n    def test_passes_unexpectedly(self):\n        self.assertTrue(True)\n"
+            "    def test_plain(self):\n        self.assertTrue(True)\n")
+        subprocess.run(["git", "init", "-q", str(unexpected)], check=True)
+        unexpected_result = probes.probe("T2", unexpected)
+        control = unexpected_result["details"]["stub_control"]
+        step(report, "probe: an unexpected success is not a green control",
+             unexpected_result["checks"]["probe_cli_stub_detected"] == "unavailable"
+             and unexpected_result["details"]["stub_classification"] == "stub_control_not_green"
+             and control["unexpected_successes"] == 1 and control["return_code"] == 1
+             and control["failures_total"] == 0 and control["errors_total"] == 0,
+             json.dumps(control))
         step(report, "probe: baseline outcomes are preserved",
              good["probe_cli_stub_detected"] == "pass"
              and results["reference-T2-good"]["details"]["stub_classification"] == "behavior_reds_named"

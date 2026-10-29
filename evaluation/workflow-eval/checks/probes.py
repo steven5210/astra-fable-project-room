@@ -15,7 +15,9 @@ Checks:
 Red/green classification is structural, never console text: structured_unittest.py runs the
 candidate's test module and records unittest's own failure/error/skipped split. A behavior red is
 a named assertion failure; harness or collection errors (ImportError, SyntaxError, SystemExit)
-are recorded as harness_error and make the probe unavailable, never "detected". The bounded
+are recorded as harness_error and make the probe unavailable, never "detected"; runtime errors
+and unexpected successes are reported and never credited, and a control with any of them is
+not green (unittest's own exit status). The bounded
 summary names up to MAX_NAMED failures/errors with explicit omitted counts and the complete
 record's digest; complete records stay in separate files under --records.
 """
@@ -94,8 +96,9 @@ def candidate_identity(candidate):
 def exercises_cli(source, entry):
     """True iff one subprocess invocation launches the entry point under -B.
 
-    The "-B" flag and the entry name must be reachable from the SAME call's arguments:
-    positional and keyword values, Constants inside List/Tuple elements, nested calls
+    The "-B" flag and the entry name must be reachable from the SAME call's command vector
+    (its first positional argument or args=; input=, env= and other keywords are data, never
+    launch arguments): Constants inside List/Tuple elements, nested calls
     (os.path.join(ROOT, "summarize_cli.py")), JoinedStr and BinOp operands, and one level
     of simple Name indirection through Assign/AnnAssign bindings to a Constant, List, Tuple,
     Call, JoinedStr or BinOp expression.
@@ -154,8 +157,11 @@ def exercises_cli(source, entry):
                  and func.value.id in module_names and func.attr in call_names)
                 or (isinstance(func, ast.Name) and func.id in func_names)):
             continue
-        found = [text for argument in node.args for text in literals(argument)]
-        found += [text for keyword in node.keywords for text in literals(keyword.value)]
+        # Only the command vector counts: the first positional argument or args=. Text passed
+        # through input=, env=, cwd= or any other keyword is data, never a launch argument.
+        vector = node.args[0] if node.args else next((keyword.value for keyword in node.keywords
+                                                      if keyword.arg == "args"), None)
+        found = literals(vector) if vector is not None else []
         if "-B" in found and any(text == entry or text.endswith("/" + entry) for text in found):
             return True
     return False
@@ -169,13 +175,15 @@ def summarize(record, record_bytes):
             "omitted_failures": max(0, len(failures) - MAX_NAMED),
             "omitted_errors": max(0, len(errors) - MAX_NAMED),
             "skipped": record["skipped"],
+            "expected_failures": record.get("expected_failures", 0),
+            "unexpected_successes": record.get("unexpected_successes", 0),
             "harness_error": (record["harness_error"] or "")[-400:] or None,
             "complete_record_sha256": hashlib.sha256(record_bytes).hexdigest(),
             "complete_record_bytes": len(record_bytes),
-            # What `python3 -B <test_file> -v` would have exited: nonzero on a harness abort
-            # or any failure or error, zero otherwise.
-            "return_code": 0 if (record["harness_error"] is None
-                                 and not failures and not errors) else 1}
+            # What `python3 -B <test_file> -v` would have exited: nonzero on a harness abort,
+            # any failure or error, or an unexpected success (unittest's wasSuccessful is false).
+            "return_code": 0 if (record["harness_error"] is None and not failures and not errors
+                                 and not record.get("unexpected_successes")) else 1}
 
 
 def structured_run(test_file, cwd):
@@ -257,7 +265,8 @@ def probe(case_id, candidate, records_dir=None):
                 details["stub_control"] = control
                 reason = ("stub_control_harness_error" if record["harness_error"] is not None
                           else "stub_control_ran_no_tests" if record["ran"] == 0
-                          else "stub_control_not_green" if (control["failures_total"] or control["errors_total"])
+                          else "stub_control_not_green" if (control["failures_total"] or control["errors_total"]
+                                                           or control["unexpected_successes"])
                           else None)
                 if reason is not None:
                     checks["probe_cli_stub_detected"] = "unavailable"
@@ -278,6 +287,8 @@ def probe(case_id, candidate, records_dir=None):
                         state, reason = "pass", "behavior_reds_named"
                     elif stub["errors_total"] >= 1:
                         state, reason = "unavailable", "stub_run_errors_only"
+                    elif stub["unexpected_successes"] >= 1:
+                        state, reason = "unavailable", "stub_run_unexpected_successes_only"
                     else:
                         state, reason = "fail", "stub_undetected"
                     checks["probe_cli_stub_detected"] = state
