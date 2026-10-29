@@ -147,21 +147,18 @@ def _scope_bindings(scope):
         return parts
 
     def walrus_targets(node):
-        """Walrus targets inside a comprehension bind in the enclosing scope (PEP 572); nested
-        comprehensions pass them through; nested functions, lambdas and classes keep their own
-        except in the parts Python evaluates in the enclosing scope (defaults, decorators,
-        annotations, bases)."""
+        """Walrus targets that bind in the scope being collected. A comprehension passes its
+        walruses through (PEP 572); a nested function, lambda or class contributes only the
+        walruses in the parts Python evaluates in the enclosing scope (defaults, decorators,
+        annotations, bases) and keeps the ones in its body, wherever that node appears."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            for part in enclosing_parts(node):
+                walrus_targets(part)
+            return
+        if isinstance(node, ast.NamedExpr):
+            for name in _target_names(node.target):
+                bind(name, "other", node)
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-                for part in enclosing_parts(child):
-                    walrus_targets(part)
-                    if isinstance(part, ast.NamedExpr):
-                        for name in _target_names(part.target):
-                            bind(name, "other", part)
-                continue
-            if isinstance(child, ast.NamedExpr):
-                for name in _target_names(child.target):
-                    bind(name, "other", child)
             walrus_targets(child)
 
     def walk(node):
@@ -169,15 +166,8 @@ def _scope_bindings(scope):
             if isinstance(child, _SCOPE_NODES):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     bind(child.name, "other", child)
-                if isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-                    walrus_targets(child)
-                else:
-                    for part in enclosing_parts(child):
-                        if isinstance(part, ast.NamedExpr):
-                            for name in _target_names(part.target):
-                                bind(name, "other", part)
-                        walrus_targets(part)
-                continue  # a nested scope binds its own names
+                walrus_targets(child)  # enclosing-scope walruses only; the body binds its own names
+                continue
             if isinstance(child, ast.Assign):
                 if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
                     bind(child.targets[0].id, "assign", child)

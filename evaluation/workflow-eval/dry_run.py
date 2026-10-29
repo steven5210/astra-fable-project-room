@@ -472,14 +472,21 @@ def main(argv):
                           "    [(lambda x=(args := [sys.executable, '-B', 'other.py']): x) for _ in range(1)]\n"
                           "    subprocess.run(args)\n")
         decorator_walrus = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
-                            "    @(lambda f: (args := [sys.executable, '-B', 'other.py']) and f)\n    def inner():\n        pass\n"
-                            "    subprocess.run(args)\n")
+                            "    @(args := (lambda f: f))\n    def inner():\n        pass\n    subprocess.run(args)\n")
+        decorator_lambda_body = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                                 "    @(lambda f: (args := [sys.executable, '-B', 'other.py']) and f)\n    def inner():\n        pass\n"
+                                 "    subprocess.run(args)\n")
         body_walrus = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
                        "    f = lambda: (args := 1)\n    subprocess.run(args)\n")
+        # A lambda that is itself a default or decorator keeps its body's walrus to itself.
+        nested_body_walrus = ("import subprocess, sys\ndef test_cli():\n    args = [sys.executable, '-B', 'summarize_cli.py']\n"
+                              "    def inner(x=lambda: (args := 1)):\n        pass\n    subprocess.run(args)\n")
         step(report, "probe: a walrus in a nested default or decorator reassigns the enclosing vector; a lambda body does not",
              probes.exercises_cli(default_walrus, "summarize_cli.py") is False
              and probes.exercises_cli(decorator_walrus, "summarize_cli.py") is False
-             and probes.exercises_cli(body_walrus, "summarize_cli.py") is True, "")
+             and probes.exercises_cli(body_walrus, "summarize_cli.py") is True
+             and probes.exercises_cli(nested_body_walrus, "summarize_cli.py") is True
+             and probes.exercises_cli(decorator_lambda_body, "summarize_cli.py") is True, "")
         # An unexpected success is not a green control: unittest's wasSuccessful is false and
         # `python3 -B tests/test_x.py` exits 1, so the structured record must say the same.
         unexpected = temp / "unexpected"
